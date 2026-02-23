@@ -718,9 +718,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        info!("[Startup] Watchdog: state → Idle, bot ready to flip");
-                        *bot_state_wd.write() = BotState::Idle;
-                        let _ = event_tx_wd.send(BotEvent::StartupComplete);
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd).await;
                     }
                 });
             }
@@ -835,38 +833,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            // === Startup Workflow (matches TypeScript runStartupWorkflow in BAF.ts) ===
-                            *bot_state.write() = BotState::Startup;
-                            info!("╔══════════════════════════════════════╗");
-                            info!("║        BAF Startup Workflow          ║");
-                            info!("╚══════════════════════════════════════╝");
-
-                            // Step 1/4: Cookie check handled by main.rs after StartupComplete
-                            info!("[Startup] Step 1/4: Cookie check will run after startup");
-                            // Step 2/4: Bazaar order management handled periodically
-                            info!("[Startup] Step 2/4: Bazaar order management enabled (periodic)");
-
-                            // Step 3/4: Claim sold items
-                            info!("[Startup] Step 3/4: Claiming sold items...");
-                            bot_clone.write_chat_packet("/ah");
-                            *bot_state.write() = BotState::ClaimingSold;
-
-                            // Wait up to 30 seconds for claiming to finish (state → Idle when done)
-                            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                let cur = *bot_state.read();
-                                if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
-                                    break;
-                                }
-                            }
-                            // Ensure we're in Idle for step 4
-                            *bot_state.write() = BotState::Idle;
-
-                            // Step 4/4: Emit StartupComplete — main.rs will request bazaar flips
-                            // and send the startup webhook from there.
-                            info!("[Startup] Step 4/4: Startup complete - bot is ready to flip!");
-                            let _ = event_tx_startup.send(BotEvent::StartupComplete);
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup).await;
                         });
                     }
                 }
@@ -1713,6 +1680,40 @@ async fn handle_window_interaction(
                         *state.auction_step.write() = AuctionStep::SelectBIN;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, window_id, 48).await;
+                    } else if window_title.contains("Create BIN Auction") {
+                        // Hypixel sometimes opens "Create BIN Auction" directly after clicking
+                        // "Create Auction" in Manage Auctions (skipping the type-select step).
+                        // Run SelectBIN logic inline so the flow continues without getting stuck.
+                        info!("[Auction] ClickCreate: jumped straight to Create BIN Auction, handling as SelectBIN");
+                        let player_start = *menu.player_slots_range().start();
+                        let target_slot = if let Some(mj_slot) = item_slot_opt {
+                            if mj_slot >= 9 && mj_slot <= 44 {
+                                let offset = (mj_slot as usize) - 9;
+                                let ws = player_start + offset;
+                                if ws < slots.len() && !slots[ws].is_empty() {
+                                    Some(ws)
+                                } else {
+                                    find_slot_by_name(&slots, &item_name)
+                                }
+                            } else {
+                                find_slot_by_name(&slots, &item_name)
+                            }
+                        } else {
+                            find_slot_by_name(&slots, &item_name)
+                        };
+                        if let Some(i) = target_slot {
+                            info!("[Auction] ClickCreate→SelectBIN: clicking item at slot {}", i);
+                            let item_to_carry = slots[i].clone();
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            click_window_slot(bot, window_id, i as i16).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                            info!("[Auction] ClickCreate→SelectBIN: clicking slot 31 (price setter)");
+                            *state.auction_step.write() = AuctionStep::PriceSign;
+                            click_window_slot_carrying(bot, window_id, 31, &item_to_carry).await;
+                        } else {
+                            warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
+                            *state.bot_state.write() = BotState::Idle;
+                        }
                     }
                 }
                 AuctionStep::SelectBIN => {
@@ -1858,6 +1859,49 @@ async fn click_window_slot_carrying(
 
     bot.write_packet(packet);
     info!("Clicked slot {} in window {} (carrying item)", slot, window_id);
+}
+
+/// Shared startup workflow: claim sold items then emit StartupComplete.
+/// Called from both the chat-based detection path and the 30-second watchdog.
+/// Matches TypeScript BAF.ts `runStartupWorkflow` steps 3 & 4.
+async fn run_startup_workflow(
+    bot: Client,
+    bot_state: Arc<RwLock<BotState>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
+) {
+    info!("╔══════════════════════════════════════╗");
+    info!("║        BAF Startup Workflow          ║");
+    info!("╚══════════════════════════════════════╝");
+
+    // Set state = Startup to block flips/bazaar during the workflow
+    *bot_state.write() = BotState::Startup;
+
+    // Step 1/4: Cookie check (not yet implemented — placeholder)
+    info!("[Startup] Step 1/4: Cookie check (skipped — not implemented)");
+
+    // Step 2/4: Bazaar order management (not yet implemented — placeholder)
+    info!("[Startup] Step 2/4: Bazaar order management (skipped — not implemented)");
+
+    // Step 3/4: Claim sold items
+    info!("[Startup] Step 3/4: Claiming sold items...");
+    bot.write_chat_packet("/ah");
+    *bot_state.write() = BotState::ClaimingSold;
+
+    // Wait up to 30 seconds for claiming to finish (state → Idle when done)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let cur = *bot_state.read();
+        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    // Ensure Idle before proceeding
+    *bot_state.write() = BotState::Idle;
+
+    // Step 4/4: Emit StartupComplete — main.rs requests bazaar flips and sends webhook
+    info!("[Startup] Step 4/4: Startup complete - bot is ready to flip!");
+    let _ = event_tx.send(BotEvent::StartupComplete);
 }
 
 /// Parse "You purchased <item> for <price> coins!" → (item_name, price)

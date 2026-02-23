@@ -691,8 +691,9 @@ async fn main() -> Result<()> {
                         }
                     }
                 } else if is_selling {
-                    // Wait up to 60s for the full auction creation flow to complete
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    // Wait up to 15s for the full auction creation flow to complete
+                    // (matching TypeScript's 10s sellItem timeout with a small buffer)
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                     loop {
                         sleep(Duration::from_millis(250)).await;
                         let s = bot_client_clone.state();
@@ -701,6 +702,12 @@ async fn main() -> Result<()> {
                         {
                             break;
                         }
+                    }
+                    // Safety: if the flow got stuck and the bot is still in Selling state,
+                    // force it back to Idle so subsequent commands can run.
+                    if bot_client_clone.state() == frikadellen_baf::types::BotState::Selling {
+                        warn!("[SellToAuction] Timed out waiting for auction creation, resetting state to Idle");
+                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
                     }
                 } else {
                     sleep(Duration::from_secs(5)).await;
