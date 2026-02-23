@@ -262,3 +262,30 @@ pub async fn send_webhook_bazaar_order_placed(
     });
     post_embed(webhook_url, payload).await;
 }
+
+pub async fn send_webhook_auction_listed(
+    ingame_name: &str,
+    item_name: &str,
+    starting_bid: u64,
+    duration_hours: u64,
+    webhook_url: &str,
+) {
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🏷️ BIN Auction Listed",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0xe67e22u32,
+            "fields": [
+                {"name": "💵 BIN Price",  "value": format!("```fix\n{} coins\n```", format_number(starting_bid as f64)), "inline": true},
+                {"name": "⏳ Duration",   "value": format!("```\n{}h\n```", duration_hours),                             "inline": true},
+            ],
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}

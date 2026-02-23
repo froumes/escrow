@@ -400,6 +400,22 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
+                frikadellen_baf::bot::BotEvent::AuctionListed { item_name, starting_bid, duration_hours } => {
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §a🏷️ BIN listed: §r{} §7@ §6{}§7 coins for §e{}h",
+                        item_name, format_coins(starting_bid as i64), duration_hours
+                    ));
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        let url = webhook_url.to_string();
+                        let name = ingame_name_for_events.clone();
+                        let item = item_name.clone();
+                        tokio::spawn(async move {
+                            frikadellen_baf::webhook::send_webhook_auction_listed(
+                                &name, &item, starting_bid, duration_hours, &url,
+                            ).await;
+                        });
+                    }
+                }
             }
         }
     });

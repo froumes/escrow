@@ -113,6 +113,12 @@ pub enum BotEvent {
         price_per_unit: f64,
         is_buy_order: bool,
     },
+    /// AH BIN auction listed successfully
+    AuctionListed {
+        item_name: String,
+        starting_bid: u64,
+        duration_hours: u64,
+    },
 }
 
 impl BotClient {
@@ -1337,18 +1343,22 @@ async fn handle_window_interaction(
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") {
                 if state.confirm_skip {
-                    // Confirm-skip: send slot 31 twice (~one tick apart).
-                    // The second packet skips the Confirm Purchase dialog entirely.
+                    // Confirm-skip: click Buy (slot 31) then immediately pre-click Confirm
+                    // (slot 11) on the NEXT window ID (window_id+1, wrapping at 100).
+                    // This matches TypeScript flipHandler.ts: clickSlot(bot, 11, nextWindowID, 159)
+                    // The pre-click reaches the server before Confirm Purchase GUI is even rendered.
                     click_window_slot(bot, window_id, 31).await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    click_window_slot(bot, window_id, 31).await;
-                    *state.bot_state.write() = BotState::Idle;
+                    let next_id = if window_id == 100 { 1u8 } else { window_id + 1 };
+                    click_window_slot(bot, next_id, 11).await;
+                    // Keep state = Purchasing so the Confirm Purchase handler below can
+                    // click slot 11 again as a safety retry if the pre-click was lost.
                 } else {
                     // Normal flow: click Buy and wait for the Confirm Purchase window.
                     click_window_slot(bot, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
-                // Only reached when confirm_skip is disabled.
+                // Reached in normal flow, and as a safety retry for confirm_skip if the
+                // pre-click packet was dropped.
                 click_window_slot(bot, window_id, 11).await;
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -1372,83 +1382,111 @@ async fn handle_window_interaction(
             //
             // Sign writing is handled separately in the OpenSignEditor packet handler below.
 
-            // Wait 300ms for ContainerSetContent to arrive before reading slots
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
             let item_name = state.bazaar_item_name.read().clone();
             let is_buy_order = *state.bazaar_is_buy_order.read();
             let current_step = *state.bazaar_step.read();
 
-            let menu = bot.menu();
-            let slots = menu.slots();
-
             info!("[Bazaar] Window: \"{}\" | step: {:?}", window_title, current_step);
 
-            // Step 2: Item-detail page — identified by having the order-creation button.
-            // This MUST be checked before the "Bazaar" title check so that direct-tag
-            // lookups (which go straight to item-detail, no search results) still work.
-            let buy_slot  = find_slot_by_name(&slots, "Create Buy Order");
-            let sell_slot = find_slot_by_name(&slots, "Create Sell Offer");
-            // Only consider a button "found" for this order type
-            let order_button_slot = if is_buy_order { buy_slot } else { sell_slot };
+            // Poll every 50ms for up to 1500ms for slots to be populated by ContainerSetContent.
+            // Matching TypeScript's findAndClick() poll pattern (checks every 50ms, up to ~600ms).
+            // This is more reliable than a fixed sleep because ContainerSetContent may arrive
+            // at any time after OpenScreen.
+            let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
 
-            if order_button_slot.is_some() && current_step != BazaarStep::SelectOrderType {
-                let i = order_button_slot.unwrap();
-                let btn = if is_buy_order { "Create Buy Order" } else { "Create Sell Offer" };
-                info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", btn, i);
-                *state.bazaar_step.write() = BazaarStep::SelectOrderType;
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                click_window_slot(bot, window_id, i as i16).await;
-            }
-            // Step 1: Search-results page — "Bazaar" in title, still on Initial step.
-            // If the title contains "➜" this is an item-detail page opened directly (via
-            // /bz <tag>).  The order buttons may not have arrived in the first 300 ms;
-            // retry once with an additional 500 ms before giving up.
-            else if window_title.contains("Bazaar") && current_step == BazaarStep::Initial {
-                if window_title.contains("➜") {
-                    // Item-detail page: wait a bit more and retry finding order buttons.
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    let menu2 = bot.menu();
-                    let slots2 = menu2.slots();
-                    let buy_slot2  = find_slot_by_name(&slots2, "Create Buy Order");
-                    let sell_slot2 = find_slot_by_name(&slots2, "Create Sell Offer");
-                    let order_slot2 = if is_buy_order { buy_slot2 } else { sell_slot2 };
-                    if let Some(i) = order_slot2 {
-                        let btn = if is_buy_order { "Create Buy Order" } else { "Create Sell Offer" };
-                        info!("[Bazaar] Item detail (retry): clicking \"{}\" at slot {}", btn, i);
-                        *state.bazaar_step.write() = BazaarStep::SelectOrderType;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, i as i16).await;
-                    } else {
-                        warn!("[Bazaar] Item detail page: order button not found after retry, going idle");
-                        *state.bot_state.write() = BotState::Idle;
-                    }
-                } else {
-                    info!("[Bazaar] Search results: looking for \"{}\"", item_name);
-                    *state.bazaar_step.write() = BazaarStep::SearchResults;
+            // Helper: read the current slots from the menu
+            let read_slots = || {
+                let menu = bot.menu();
+                menu.slots()
+            };
 
-                    // Find item by name (exact → token → partial, same as TypeScript)
-                    let found = find_slot_by_name(&slots, &item_name);
-                    match found {
-                        Some(i) => {
-                            info!("[Bazaar] Found item at slot {}", i);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, window_id, i as i16).await;
-                        }
-                        None => {
-                            warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
-                            *state.bot_state.write() = BotState::Idle;
-                        }
+            // Determine which button name to look for on the item-detail page
+            let order_btn_name = if is_buy_order { "Create Buy Order" } else { "Create Sell Offer" };
+
+            // Step 2: Item-detail page — poll for the order-creation button.
+            // Check this BEFORE the "Bazaar" title check so direct-tag lookups work too.
+            if current_step != BazaarStep::SelectOrderType {
+                // Poll until we find either "Create Buy Order" or "Create Sell Offer"
+                let order_button_slot = loop {
+                    let slots = read_slots();
+                    let buy_s  = find_slot_by_name(&slots, "Create Buy Order");
+                    let sell_s = find_slot_by_name(&slots, "Create Sell Offer");
+                    let found = if is_buy_order { buy_s } else { sell_s };
+                    if found.is_some() {
+                        break found;
                     }
+                    // Also break early if we're on a search-results or amount/price screen
+                    // (those don't have order buttons, no point waiting)
+                    let has_custom_amount = find_slot_by_name(&slots, "Custom Amount").is_some();
+                    let has_custom_price  = find_slot_by_name(&slots, "Custom Price").is_some();
+                    if has_custom_amount || has_custom_price {
+                        break None;
+                    }
+                    // On a plain "Bazaar" search-results page (no "➜"), don't wait for order buttons
+                    if window_title.contains("Bazaar") && !window_title.contains("➜") {
+                        break None;
+                    }
+                    if tokio::time::Instant::now() >= poll_deadline {
+                        // Log all non-empty slots for debugging
+                        warn!("[Bazaar] Polling timed out waiting for \"{}\" in \"{}\"", order_btn_name, window_title);
+                        for (i, item) in slots.iter().enumerate() {
+                            if let Some(name) = get_item_display_name_from_slot(item) {
+                                warn!("[Bazaar]   slot {}: {}", i, name);
+                            }
+                        }
+                        break None;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                };
+
+                if let Some(i) = order_button_slot {
+                    info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", order_btn_name, i);
+                    *state.bazaar_step.write() = BazaarStep::SelectOrderType;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    click_window_slot(bot, window_id, i as i16).await;
+                    return;
                 }
             }
+
+            // Step 1: Search-results page — "Bazaar" in title (no "➜"), step == Initial.
+            if window_title.contains("Bazaar") && !window_title.contains("➜") && current_step == BazaarStep::Initial {
+                info!("[Bazaar] Search results: looking for \"{}\"", item_name);
+                *state.bazaar_step.write() = BazaarStep::SearchResults;
+
+                // Poll briefly for the item to appear in search results
+                let found = loop {
+                    let slots = read_slots();
+                    let f = find_slot_by_name(&slots, &item_name);
+                    if f.is_some() || tokio::time::Instant::now() >= poll_deadline {
+                        break f;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                };
+
+                match found {
+                    Some(i) => {
+                        info!("[Bazaar] Found item at slot {}", i);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, i as i16).await;
+                    }
+                    None => {
+                        warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
+                        *state.bot_state.write() = BotState::Idle;
+                    }
+                }
+                return;
+            }
+
+            // For the remaining steps, do one initial wait then read slots once.
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            let slots = read_slots();
+
             // Step 3: Amount screen (buy orders only)
-            else if let (Some(i), true) = (find_slot_by_name(&slots, "Custom Amount"),
+            if let (Some(i), true) = (find_slot_by_name(&slots, "Custom Amount"),
                 is_buy_order && current_step == BazaarStep::SelectOrderType)
             {
                 info!("[Bazaar] Amount screen: clicking Custom Amount at slot {}", i);
                 *state.bazaar_step.write() = BazaarStep::SetAmount;
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
             }
@@ -1458,7 +1496,6 @@ async fn handle_window_interaction(
             {
                 info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
                 *state.bazaar_step.write() = BazaarStep::SetPrice;
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
             }
@@ -1466,7 +1503,6 @@ async fn handle_window_interaction(
             else if current_step == BazaarStep::SetPrice {
                 info!("[Bazaar] Confirm screen: clicking slot 13");
                 *state.bazaar_step.write() = BazaarStep::Confirm;
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, window_id, 13).await;
 
                 // Order placement complete — emit event and go idle after short wait
@@ -1481,6 +1517,10 @@ async fn handle_window_interaction(
                     is_buy_order,
                 });
                 info!("[Bazaar] ===== ORDER COMPLETE =====");
+                *state.bot_state.write() = BotState::Idle;
+            } else if current_step == BazaarStep::Initial && window_title.contains("➜") {
+                // Direct item-detail page but polling timed out finding order buttons — give up
+                warn!("[Bazaar] Item detail page: order button not found after polling, going idle");
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -1804,6 +1844,15 @@ async fn handle_window_interaction(
                         click_window_slot(bot, window_id, 11).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         info!("[Auction] ===== AUCTION CREATED =====");
+                        // Emit AuctionListed event for the listing webhook
+                        let item = state.auction_item_name.read().clone();
+                        let bid  = *state.auction_starting_bid.read();
+                        let dur  = *state.auction_duration_hours.read();
+                        let _ = state.event_tx.send(BotEvent::AuctionListed {
+                            item_name: item,
+                            starting_bid: bid,
+                            duration_hours: dur,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
