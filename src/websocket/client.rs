@@ -175,19 +175,19 @@ impl CoflWebSocket {
             }
             // Handle ALL message types for 100% compatibility (matching TypeScript BAF.ts)
             "getInventory" => {
-                info!("Received getInventory request - will upload inventory");
+                debug!("Received getInventory request");
                 let _ = tx.send(CoflEvent::GetInventory);
             }
             "tradeResponse" => {
-                info!("Received tradeResponse - will click slot 39");
+                debug!("Received tradeResponse");
                 let _ = tx.send(CoflEvent::TradeResponse);
             }
             "privacySettings" => {
-                info!("Received privacySettings");
+                debug!("Received privacySettings");
                 let _ = tx.send(CoflEvent::PrivacySettings(msg.data.clone()));
             }
             "swapProfile" => {
-                info!("Received swapProfile request");
+                debug!("Received swapProfile request");
                 if let Ok(profile_name) = parse_message_data::<String>(&msg.data) {
                     let _ = tx.send(CoflEvent::SwapProfile(profile_name));
                 } else {
@@ -195,21 +195,21 @@ impl CoflWebSocket {
                 }
             }
             "createAuction" => {
-                info!("Received createAuction request");
+                debug!("Received createAuction request");
                 let _ = tx.send(CoflEvent::CreateAuction(msg.data.clone()));
             }
             "trade" => {
-                info!("Received trade request");
+                debug!("Received trade request");
                 let _ = tx.send(CoflEvent::Trade(msg.data.clone()));
             }
             "runSequence" => {
-                info!("Received runSequence request");
+                debug!("Received runSequence request");
                 let _ = tx.send(CoflEvent::RunSequence(msg.data.clone()));
             }
             "countdown" => {
                 // COFL sends this ~10 seconds before AH flips arrive.
                 // Matches TypeScript: used by bazaarFlipPauser to pause bazaar flips.
-                info!("[COFL] Flips in 10 seconds (countdown)");
+                debug!("Received countdown");
                 let _ = tx.send(CoflEvent::Countdown);
             }
             _ => {
@@ -227,7 +227,7 @@ impl CoflWebSocket {
         let mut write = self.write.lock().await;
         write.send(Message::Text(message.to_string())).await
             .context("Failed to send message to WebSocket")?;
-        info!("Sent message to COFL WebSocket: {}", message);
+        debug!("Sent WS message ({} bytes)", message.len());
         Ok(())
     }
 }

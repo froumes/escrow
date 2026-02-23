@@ -559,15 +559,18 @@ fn remove_mc_colors(s: &str) -> String {
     result
 }
 
-/// Get the display name of an item slot as a plain string (no color codes)
+/// Get the display name of an item slot as a plain string (no color codes).
+/// Checks `minecraft:custom_name` first (custom-named items), then falls back
+/// to `minecraft:item_name` (base item name override used by some Hypixel GUI items).
 fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
-            // Try components["minecraft:custom_name"]
-            if let Some(name_val) = value
-                .get("components")
+            let components = value.get("components");
+            // Try minecraft:custom_name first, then minecraft:item_name as fallback
+            let name_val = components
                 .and_then(|c| c.get("minecraft:custom_name"))
-            {
+                .or_else(|| components.and_then(|c| c.get("minecraft:item_name")));
+            if let Some(name_val) = name_val {
                 let raw = if name_val.is_string() {
                     name_val.as_str().unwrap_or("").to_string()
                 } else {

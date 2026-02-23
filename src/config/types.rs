@@ -179,7 +179,7 @@ impl Default for Config {
             proxy: None,
             proxy_username: None,
             proxy_password: None,
-            webhook_url: Some(String::new()),
+            webhook_url: None,
             web_gui_password: None,
             accounts: None,
             auto_switching: None,

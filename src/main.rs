@@ -31,6 +31,23 @@ fn calculate_ah_fee(price: u64) -> u64 {
     }
 }
 
+/// Format a coin amount with thousands separators.
+/// e.g. `24000000` → `"24,000,000"`, `-500000` → `"-500,000"`
+fn format_coins(amount: i64) -> String {
+    let negative = amount < 0;
+    let abs = amount.unsigned_abs();
+    let s = abs.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    let formatted: String = result.chars().rev().collect();
+    if negative { format!("-{}", formatted) } else { formatted }
+}
+
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant)>>>;
@@ -202,13 +219,14 @@ async fn main() -> Result<()> {
                     info!("✓ Bot spawned in world and ready");
                 }
                 frikadellen_baf::bot::BotEvent::ChatMessage(msg) => {
-                    info!("[Minecraft] {}", msg);
+                    // Print Minecraft chat with color codes converted to ANSI
+                    print_mc_chat(&msg);
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
-                    info!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
+                    debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
                 }
                 frikadellen_baf::bot::BotEvent::WindowClose => {
-                    info!("Window closed");
+                    debug!("Window closed");
                 }
                 frikadellen_baf::bot::BotEvent::Disconnected(reason) => {
                     warn!("Bot disconnected: {}", reason);
@@ -228,7 +246,7 @@ async fn main() -> Result<()> {
                             let tab_msg = serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
                             let _ = ws.send_message(&scoreboard_msg).await;
                             let _ = ws.send_message(&tab_msg).await;
-                            info!("[Startup] Uploaded scoreboard ({} lines)", scoreboard_lines.len());
+                            debug!("[Startup] Uploaded scoreboard ({} lines)", scoreboard_lines.len());
                         });
                     }
                     // Request bazaar flips immediately after startup (matching TypeScript runStartupWorkflow)
@@ -255,7 +273,6 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::ItemPurchased { item_name, price } => {
-                    info!("[Minecraft] You purchased {} for {} coins!", item_name, price);
                     // Send uploadScoreboard (with real data) and uploadTab to COFL
                     let ws = ws_client_for_events.clone();
                     let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
@@ -272,8 +289,9 @@ async fn main() -> Result<()> {
                         frikadellen_baf::types::CommandPriority::High,
                         false,
                     );
-                    // Look up stored flip data and update with real buy price + purchase time
-                    let (opt_target, opt_profit) = {
+                    // Look up stored flip data and update with real buy price + purchase time.
+                    // Also grab the color-coded item name from the flip for colorful output.
+                    let (opt_target, opt_profit, colored_name) = {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
                             Ok(mut tracker) => {
@@ -283,17 +301,26 @@ async fn main() -> Result<()> {
                                     let target = entry.0.target;
                                     let ah_fee = calculate_ah_fee(target);
                                     let expected_profit = target as i64 - price as i64 - ah_fee as i64;
-                                    (Some(target), Some(expected_profit))
+                                    (Some(target), Some(expected_profit), entry.0.item_name.clone())
                                 } else {
-                                    (None, None)
+                                    (None, None, item_name.clone())
                                 }
                             }
                             Err(e) => {
                                 warn!("Flip tracker lock failed at ItemPurchased: {}", e);
-                                (None, None)
+                                (None, None, item_name.clone())
                             }
                         }
                     };
+                    // Print colorful purchase announcement (item rarity shown via color code)
+                    let profit_str = opt_profit.map(|p| {
+                        let color = if p >= 0 { "§a" } else { "§c" };
+                        format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
+                    }).unwrap_or_default();
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}",
+                        colored_name, format_coins(price as i64), profit_str
+                    ));
                     // Send webhook
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
@@ -305,7 +332,6 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::ItemSold { item_name, price, buyer } => {
-                    info!("[Minecraft] {} bought {} for {} coins!", buyer, item_name, price);
                     command_queue_clone.enqueue(
                         frikadellen_baf::types::CommandType::ClaimSoldItem,
                         frikadellen_baf::types::CommandPriority::High,
@@ -336,6 +362,15 @@ async fn main() -> Result<()> {
                             }
                         }
                     };
+                    // Print colorful sold announcement
+                    let profit_str = opt_profit.map(|p| {
+                        let color = if p >= 0 { "§a" } else { "§c" };
+                        format!(" §7| Profit: {}{}§r", color, format_coins(p))
+                    }).unwrap_or_default();
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §6⚡ SOLD §r{} §7to §e{}§7 for §6{}§7 coins!{}",
+                        item_name, buyer, format_coins(price as i64), profit_str
+                    ));
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
@@ -347,9 +382,11 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
-                    let order_type = if is_buy_order { "BUY" } else { "SELL" };
-                    info!("[Bazaar] {} order placed: {}x {} @ {:.1} coins/unit",
-                        order_type, amount, item_name, price_per_unit);
+                    let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
+                        order_color, order_type, amount, item_name, format_coins(price_per_unit as i64)
+                    ));
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
@@ -386,16 +423,21 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip if in startup state - use bot_client state (authoritative source)
+                    // Skip if in startup/claiming state - use bot_client state (authoritative source)
                     if !bot_client_for_ws.state().allows_commands() {
-                        warn!("Skipping flip during startup: {}", flip.item_name);
+                        debug!("Skipping flip — bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);
                         continue;
                     }
 
-                    info!("Received auction flip: {} (profit: {})", 
-                        flip.item_name, 
-                        flip.target.saturating_sub(flip.starting_bid)
-                    );
+                    // Print colorful flip announcement (item name keeps its rarity color code)
+                    let profit = flip.target.saturating_sub(flip.starting_bid);
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §eTrying to purchase flip: §r{}§r §7for §6{}§7 coins §7(Target: §6{}§7, Profit: §a{}§7)",
+                        flip.item_name,
+                        format_coins(flip.starting_bid as i64),
+                        format_coins(flip.target as i64),
+                        format_coins(profit as i64)
+                    ));
 
                     // Store flip in tracker so ItemPurchased / ItemSold webhooks can include profit
                     {
@@ -418,24 +460,27 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip if in startup state - use bot_client state (authoritative source)
+                    // Skip if in startup/claiming state - use bot_client state (authoritative source)
                     if !bot_client_for_ws.state().allows_commands() {
-                        warn!("Skipping bazaar flip during startup: {}", bazaar_flip.item_name);
+                        debug!("Skipping bazaar flip — bot busy ({:?}): {}", bot_client_for_ws.state(), bazaar_flip.item_name);
                         continue;
                     }
 
                     // Skip if bazaar flips are paused due to incoming AH flip (matching bazaarFlipPauser.ts)
                     if bazaar_flips_paused_ws.load(Ordering::Relaxed) {
-                        info!("Bazaar flips paused (AH flip incoming), skipping: {}", bazaar_flip.item_name);
+                        debug!("Bazaar flips paused (AH flip incoming), skipping: {}", bazaar_flip.item_name);
                         continue;
                     }
 
-                    info!("Received bazaar flip: {} x{} @ {} coins/unit ({})", 
+                    // Print colorful bazaar flip announcement
+                    let (order_color, order_label) = if bazaar_flip.is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
+                    print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
+                        order_color, order_label,
                         bazaar_flip.item_name,
                         bazaar_flip.amount,
-                        bazaar_flip.price_per_unit,
-                        if bazaar_flip.is_buy_order { "BUY" } else { "SELL" }
-                    );
+                        format_coins(bazaar_flip.price_per_unit as i64)
+                    ));
 
                     // Queue the bazaar command.
                     // Matching TypeScript: SELL orders use HIGH priority (free up inventory),
@@ -519,7 +564,7 @@ async fn main() -> Result<()> {
                 }
                 // Handle advanced message types (matching TypeScript BAF.ts)
                 CoflEvent::GetInventory => {
-                    info!("Processing getInventory request");
+                    debug!("Processing getInventory request");
                     // Queue command to upload inventory from event handler where bot is accessible
                     command_queue_clone.enqueue(
                         CommandType::UploadInventory,
@@ -528,7 +573,7 @@ async fn main() -> Result<()> {
                     );
                 }
                 CoflEvent::TradeResponse => {
-                    info!("Processing tradeResponse - clicking accept button");
+                    debug!("Processing tradeResponse - clicking accept button");
                     // TypeScript: clicks slot 39 after checking for "Deal!" or "Warning!"
                     // Sleep is handled in TypeScript before clicking - we'll do the same
                     command_queue_clone.enqueue(
@@ -538,10 +583,8 @@ async fn main() -> Result<()> {
                     );
                 }
                 CoflEvent::PrivacySettings(data) => {
-                    info!("Received privacySettings: {}", data);
                     // TypeScript stores this in bot.privacySettings
-                    // For now, just log it - can be enhanced later
-                    debug!("Privacy settings data: {}", data);
+                    debug!("Received privacySettings: {}", data);
                 }
                 CoflEvent::SwapProfile(profile_name) => {
                     info!("Processing swapProfile request: {}", profile_name);
@@ -590,7 +633,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 CoflEvent::Trade(data) => {
-                    info!("Processing trade request");
+                    debug!("Processing trade request");
                     // Parse trade data to get player name
                     if let Ok(trade_data) = serde_json::from_str::<serde_json::Value>(&data) {
                         if let Some(player) = trade_data.get("playerName").and_then(|v| v.as_str()) {
@@ -607,25 +650,21 @@ async fn main() -> Result<()> {
                     }
                 }
                 CoflEvent::RunSequence(data) => {
-                    info!("Received runSequence request");
-                    // TypeScript has a runSequence handler but it's not fully implemented
-                    // For now, just log it
-                    debug!("Sequence data: {}", data);
+                    debug!("Received runSequence: {}", data);
                     warn!("runSequence is not yet fully implemented");
                 }
                 CoflEvent::Countdown => {
                     // COFL sends this ~10 seconds before AH flips arrive.
                     // Matching TypeScript bazaarFlipPauser.ts: pause bazaar flips for 20 seconds
                     // when both AH flips and bazaar flips are enabled.
-                    info!("[COFL] Flips in 10 seconds");
                     if config_clone.enable_bazaar_flips && config_clone.enable_ah_flips {
-                        info!("AH flip incoming – pausing bazaar flips for 20 seconds");
+                        print_mc_chat("§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips");
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
-                            info!("Bazaar flips resumed after AH flip window");
+                            debug!("Bazaar flips resumed after AH flip window");
                         });
                     }
                 }
@@ -642,7 +681,7 @@ async fn main() -> Result<()> {
         loop {
             // Process commands from queue
             if let Some(cmd) = command_queue_processor.start_current() {
-                info!("Processing command: {:?}", cmd.command_type);
+                debug!("Processing command: {:?}", cmd.command_type);
                 
                 // Send command to bot for execution
                 if let Err(e) = bot_client_clone.send_command(cmd.clone()) {
