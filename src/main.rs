@@ -6,13 +6,34 @@ use frikadellen_baf::{
     state::CommandQueue,
     websocket::CoflWebSocket,
     bot::BotClient,
+    types::Flip,
 };
 use tracing::{debug, error, info, warn};
 use tokio::time::{sleep, Duration};
 use serde_json;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::collections::HashMap;
+use std::time::Instant;
 
 const VERSION: &str = "af-3.0";
+
+/// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
+/// - <10M  → 1%
+/// - <100M → 2%
+/// - ≥100M → 2.5%
+fn calculate_ah_fee(price: u64) -> u64 {
+    if price < 10_000_000 {
+        price / 100
+    } else if price < 100_000_000 {
+        price * 2 / 100
+    } else {
+        price * 25 / 1000
+    }
+}
+
+/// Flip tracker entry: (flip, actual_buy_price, purchase_instant)
+/// buy_price is 0 until ItemPurchased fires and updates it.
+type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant)>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,6 +105,11 @@ async fn main() -> Result<()> {
     // Bazaar-flip pause flag (matches TypeScript bazaarFlipPauser.ts).
     // Set to true for 20 seconds when a `countdown` message arrives (AH flips incoming).
     let bazaar_flips_paused = Arc::new(AtomicBool::new(false));
+
+    // Flip tracker: stores pending/active AH flips for profit reporting in webhooks.
+    // Key = clean item_name (lowercase), value = (flip, actual_buy_price, purchase_time).
+    // buy_price starts at 0 until ItemPurchased fires and sets it to the real price.
+    let flip_tracker: FlipTrackerMap = Arc::new(Mutex::new(HashMap::new()));
 
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
@@ -165,6 +191,7 @@ async fn main() -> Result<()> {
     let config_for_events = config.clone();
     let command_queue_clone = command_queue.clone();
     let ingame_name_for_events = ingame_name.clone();
+    let flip_tracker_events = flip_tracker.clone();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -245,13 +272,35 @@ async fn main() -> Result<()> {
                         frikadellen_baf::types::CommandPriority::High,
                         false,
                     );
+                    // Look up stored flip data and update with real buy price + purchase time
+                    let (opt_target, opt_profit) = {
+                        let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
+                        match flip_tracker_events.lock() {
+                            Ok(mut tracker) => {
+                                if let Some(entry) = tracker.get_mut(&key) {
+                                    entry.1 = price; // actual buy price
+                                    entry.2 = Instant::now(); // purchase time
+                                    let target = entry.0.target;
+                                    let ah_fee = calculate_ah_fee(target);
+                                    let expected_profit = target as i64 - price as i64 - ah_fee as i64;
+                                    (Some(target), Some(expected_profit))
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Flip tracker lock failed at ItemPurchased: {}", e);
+                                (None, None)
+                            }
+                        }
+                    };
                     // Send webhook
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, None, None, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, opt_target, opt_profit, &url).await;
                         });
                     }
                 }
@@ -262,13 +311,38 @@ async fn main() -> Result<()> {
                         frikadellen_baf::types::CommandPriority::High,
                         true,
                     );
+                    // Look up flip data to calculate actual profit + time to sell
+                    let (opt_profit, opt_time_secs) = {
+                        let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
+                        match flip_tracker_events.lock() {
+                            Ok(mut tracker) => {
+                                if let Some(entry) = tracker.remove(&key) {
+                                    let (_, buy_price, purchase_time) = entry;
+                                    if buy_price > 0 {
+                                        let ah_fee = calculate_ah_fee(price);
+                                        let profit = price as i64 - buy_price as i64 - ah_fee as i64;
+                                        let time_secs = purchase_time.elapsed().as_secs();
+                                        (Some(profit), Some(time_secs))
+                                    } else {
+                                        (None, None)
+                                    }
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Flip tracker lock failed at ItemSold: {}", e);
+                                (None, None)
+                            }
+                        }
+                    };
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let b = buyer.clone();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, opt_profit, opt_time_secs, &url).await;
                         });
                     }
                 }
@@ -298,6 +372,7 @@ async fn main() -> Result<()> {
     let ws_client_clone = ws_client.clone();
     let bot_client_for_ws = bot_client.clone();
     let bazaar_flips_paused_ws = bazaar_flips_paused.clone();
+    let flip_tracker_ws = flip_tracker.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -321,6 +396,14 @@ async fn main() -> Result<()> {
                         flip.item_name, 
                         flip.target.saturating_sub(flip.starting_bid)
                     );
+
+                    // Store flip in tracker so ItemPurchased / ItemSold webhooks can include profit
+                    {
+                        let key = frikadellen_baf::utils::remove_minecraft_colors(&flip.item_name).to_lowercase();
+                        if let Ok(mut tracker) = flip_tracker_ws.lock() {
+                            tracker.insert(key, (flip.clone(), 0, Instant::now()));
+                        }
+                    }
 
                     // Queue the flip command
                     command_queue_clone.enqueue(

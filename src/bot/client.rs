@@ -935,6 +935,16 @@ async fn event_handler(
                                 info!("[Bazaar] Sign opened for price — writing: {}", price);
                                 price.to_string()
                             }
+                            BazaarStep::SelectOrderType => {
+                                // Hypixel opened a sign directly after clicking "Create Sell/Buy Order"
+                                // (direct-sign flow — no intermediate "Custom Price" GUI button).
+                                // Treat this as the price sign (matching TypeScript behaviour where
+                                // sell offers go straight to the price sign).
+                                let price = *state.bazaar_price_per_unit.read();
+                                info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", price);
+                                *state.bazaar_step.write() = BazaarStep::SetPrice;
+                                price.to_string()
+                            }
                             _ => {
                                 warn!("[Bazaar] Unexpected sign opened at step {:?}", step);
                                 return Ok(());
@@ -1630,6 +1640,44 @@ async fn handle_window_interaction(
                             click_window_slot(bot, window_id, i as i16).await;
                         } else {
                             warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
+                            *state.bot_state.write() = BotState::Idle;
+                        }
+                    } else if window_title.contains("Create Auction") && !window_title.contains("BIN") {
+                        // Co-op AH or similar: jumped directly to "Create Auction" — click slot 48 (BIN)
+                        info!("[Auction] Skipped Manage Auctions, in Create Auction — clicking slot 48 (BIN)");
+                        *state.auction_step.write() = AuctionStep::SelectBIN;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        click_window_slot(bot, window_id, 48).await;
+                    } else if window_title.contains("Create BIN Auction") {
+                        // Co-op AH opened "Create BIN Auction" directly (skipping Manage Auctions).
+                        // Run the SelectBIN logic inline.
+                        info!("[Auction] Co-op AH: jumped straight to Create BIN Auction, handling as SelectBIN");
+                        let player_start = *menu.player_slots_range().start();
+                        let target_slot = if let Some(mj_slot) = item_slot_opt {
+                            if mj_slot >= 9 && mj_slot <= 44 {
+                                let offset = (mj_slot as usize) - 9;
+                                let ws = player_start + offset;
+                                if ws < slots.len() && !slots[ws].is_empty() {
+                                    Some(ws)
+                                } else {
+                                    find_slot_by_name(&slots, &item_name)
+                                }
+                            } else {
+                                find_slot_by_name(&slots, &item_name)
+                            }
+                        } else {
+                            find_slot_by_name(&slots, &item_name)
+                        };
+                        if let Some(i) = target_slot {
+                            info!("[Auction] Co-op AH: clicking item at slot {}", i);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            click_window_slot(bot, window_id, i as i16).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                            info!("[Auction] Co-op AH: clicking slot 31 (price setter)");
+                            *state.auction_step.write() = AuctionStep::PriceSign;
+                            click_window_slot(bot, window_id, 31).await;
+                        } else {
+                            warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }

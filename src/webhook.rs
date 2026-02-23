@@ -38,6 +38,20 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Format seconds as a human-readable duration ("2h 5m 30s" etc.)
+fn format_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{}h {}m", h, m)
+    } else if m > 0 {
+        format!("{}m {}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
 pub async fn send_webhook_initialized(
     ingame_name: &str,
     ah_enabled: bool,
@@ -156,18 +170,55 @@ pub async fn send_webhook_item_sold(
     item_name: &str,
     price: u64,
     buyer: &str,
+    profit: Option<i64>,
+    time_to_sell_secs: Option<u64>,
     webhook_url: &str,
 ) {
     let safe_item = sanitize_item_name(item_name);
+    let status_emoji = match profit {
+        Some(p) if p >= 0 => "✅",
+        Some(_) => "❌",
+        None => "✅",
+    };
+    let title = match profit {
+        Some(p) if p >= 0 => "Item Sold (Profit)",
+        Some(_) => "Item Sold (Loss)",
+        None => "Item Sold",
+    };
+    let mut fields = vec![
+        serde_json::json!({
+            "name": "👤 Buyer",
+            "value": format!("```\n{}\n```", buyer),
+            "inline": true
+        }),
+        serde_json::json!({
+            "name": "💵 Sale Price",
+            "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
+            "inline": true
+        }),
+    ];
+    if let Some(p) = profit {
+        let sign = if p >= 0 { "+" } else { "-" };
+        let abs_profit = if p >= 0 { p as f64 } else { (-p) as f64 };
+        fields.push(serde_json::json!({
+            "name": "💰 Net Profit",
+            "value": format!("```diff\n{}{} coins\n```", sign, format_number(abs_profit)),
+            "inline": true
+        }));
+    }
+    if let Some(secs) = time_to_sell_secs {
+        fields.push(serde_json::json!({
+            "name": "⏱️ Time to Sell",
+            "value": format!("```\n{}\n```", format_duration(secs)),
+            "inline": true
+        }));
+    }
     let payload = serde_json::json!({
         "embeds": [{
-            "title": "✅ Item Sold",
+            "title": format!("{} {}", status_emoji, title),
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0x0099ff,
-            "fields": [
-                {"name": "👤 Buyer", "value": format!("```\n{}\n```", buyer), "inline": true},
-                {"name": "💵 Sale Price", "value": format!("```fix\n{} coins\n```", format_number(price as f64)), "inline": true},
-            ],
+            "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
                 "text": format!("BAF • {}", ingame_name),
