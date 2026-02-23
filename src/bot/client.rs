@@ -1342,20 +1342,23 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") {
+                // Always click slot 31 twice — the second click is a redundant packet to guard
+                // against packet loss (matches TypeScript flipHandler.ts:
+                //   clickSlot(bot, 31, windowID, 371)  ← primary
+                //   clickWindow(bot, 31)                ← redundant fallback).
+                click_window_slot(bot, window_id, 31).await;
+                click_window_slot(bot, window_id, 31).await;
                 if state.confirm_skip {
-                    // Confirm-skip: click Buy (slot 31) then immediately pre-click Confirm
-                    // (slot 11) on the NEXT window ID (window_id+1, wrapping at 100).
-                    // This matches TypeScript flipHandler.ts: clickSlot(bot, 11, nextWindowID, 159)
-                    // The pre-click reaches the server before Confirm Purchase GUI is even rendered.
-                    click_window_slot(bot, window_id, 31).await;
+                    // Confirm-skip: also pre-click slot 11 on the NEXT window ID
+                    // (window_id+1, wrapping at 100).  This reaches the server before
+                    // Confirm Purchase GUI is even rendered.
+                    // Matches TypeScript: clickSlot(bot, 11, nextWindowID, 159)
                     let next_id = if window_id == 100 { 1u8 } else { window_id + 1 };
                     click_window_slot(bot, next_id, 11).await;
-                    // Keep state = Purchasing so the Confirm Purchase handler below can
-                    // click slot 11 again as a safety retry if the pre-click was lost.
-                } else {
-                    // Normal flow: click Buy and wait for the Confirm Purchase window.
-                    click_window_slot(bot, window_id, 31).await;
+                    // Keep state = Purchasing so the Confirm Purchase handler below acts
+                    // as a safety retry if the pre-click packet was dropped.
                 }
+                // Normal flow (no skip): just wait for Confirm Purchase window.
             } else if window_title.contains("Confirm Purchase") {
                 // Reached in normal flow, and as a safety retry for confirm_skip if the
                 // pre-click packet was dropped.
