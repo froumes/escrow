@@ -53,34 +53,68 @@ impl CoflWebSocket {
 
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(Mutex::new(write));
+        let write_for_task = write.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         let tx_clone = tx.clone();
 
-        // Spawn task to handle incoming messages
+        // Spawn task to handle incoming messages, with automatic reconnection
         tokio::spawn(async move {
-            while let Some(msg) = read.next().await {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Err(e) = Self::handle_message(&text, &tx_clone) {
-                            error!("Error handling WebSocket message: {}", e);
+            loop {
+                // ── inner read loop ───────────────────────────────────────────
+                loop {
+                    match read.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Err(e) = Self::handle_message(&text, &tx_clone) {
+                                error!("Error handling WebSocket message: {}", e);
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            warn!("WebSocket closed by server");
+                            break;
+                        }
+                        Some(Ok(Message::Ping(_data))) => {
+                            debug!("Received ping, sending pong");
+                            // Pong is handled automatically by tungstenite
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        None => {
+                            warn!("WebSocket stream ended");
+                            break;
+                        }
+                        Some(Ok(_)) => {}
+                    }
+                }
+
+                // ── reconnection loop ─────────────────────────────────────────
+                let _ = tx_clone.send(CoflEvent::ChatMessage(
+                    "§f[§4BAF§f]: §cWebSocket disconnected — reconnecting...".to_string(),
+                ));
+
+                let mut backoff_secs = 5u64;
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                    match connect_async(&full_url).await {
+                        Ok((new_stream, _)) => {
+                            let (new_write, new_read) = new_stream.split();
+                            *write_for_task.lock().await = new_write;
+                            read = new_read;
+                            info!("[WS] Reconnected to COFL WebSocket");
+                            let _ = tx_clone.send(CoflEvent::ChatMessage(
+                                "§f[§4BAF§f]: §aWebSocket reconnected!".to_string(),
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            error!("[WS] Reconnection failed (retry in {}s): {}", backoff_secs, e);
+                            backoff_secs = (backoff_secs * 2).min(60);
                         }
                     }
-                    Ok(Message::Close(_)) => {
-                        warn!("WebSocket closed by server");
-                        break;
-                    }
-                    Ok(Message::Ping(_data)) => {
-                        debug!("Received ping, sending pong");
-                        // Pong is handled automatically by tungstenite
-                    }
-                    Err(e) => {
-                        error!("WebSocket error: {}", e);
-                        break;
-                    }
-                    _ => {}
                 }
+                // Resume outer loop → inner read loop continues on new connection
             }
-            info!("WebSocket connection closed");
         });
 
         Ok((Self { tx, write }, rx))
