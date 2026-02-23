@@ -799,6 +799,21 @@ async fn event_handler(
                     *state.claim_sold_uuid.write() = uuid;
                     let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                 }
+            } else if clean_message.contains("BIN Auction started for") {
+                // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
+                // was accepted.  Emit AuctionListed using the context stored in state.
+                // This matches TypeScript sellHandler.ts messageListener pattern.
+                let item = state.auction_item_name.read().clone();
+                let bid  = *state.auction_starting_bid.read();
+                let dur  = *state.auction_duration_hours.read();
+                if !item.is_empty() {
+                    info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
+                    let _ = state.event_tx.send(BotEvent::AuctionListed {
+                        item_name: item,
+                        starting_bid: bid,
+                        duration_hours: dur,
+                    });
+                }
             }
             
             // Check if we've teleported to island yet
@@ -1342,23 +1357,22 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") {
-                // Always click slot 31 twice — the second click is a redundant packet to guard
-                // against packet loss (matches TypeScript flipHandler.ts:
-                //   clickSlot(bot, 31, windowID, 371)  ← primary
-                //   clickWindow(bot, 31)                ← redundant fallback).
-                click_window_slot(bot, window_id, 31).await;
-                click_window_slot(bot, window_id, 31).await;
                 if state.confirm_skip {
-                    // Confirm-skip: also pre-click slot 11 on the NEXT window ID
-                    // (window_id+1, wrapping at 100).  This reaches the server before
-                    // Confirm Purchase GUI is even rendered.
+                    // Skip mode: click slot 31 twice (primary + redundant packet-loss guard,
+                    // matches TypeScript: clickSlot(bot,31,wid,371) + clickWindow(bot,31)),
+                    // then immediately pre-click slot 11 on the NEXT window ID so the
+                    // Confirm Purchase is accepted before the GUI is even rendered.
                     // Matches TypeScript: clickSlot(bot, 11, nextWindowID, 159)
+                    click_window_slot(bot, window_id, 31).await;
+                    click_window_slot(bot, window_id, 31).await;
                     let next_id = if window_id == 100 { 1u8 } else { window_id + 1 };
                     click_window_slot(bot, next_id, 11).await;
                     // Keep state = Purchasing so the Confirm Purchase handler below acts
                     // as a safety retry if the pre-click packet was dropped.
+                } else {
+                    // Normal flow: single click slot 31 then wait for Confirm Purchase window.
+                    click_window_slot(bot, window_id, 31).await;
                 }
-                // Normal flow (no skip): just wait for Confirm Purchase window.
             } else if window_title.contains("Confirm Purchase") {
                 // Reached in normal flow, and as a safety retry for confirm_skip if the
                 // pre-click packet was dropped.
@@ -1840,22 +1854,15 @@ async fn handle_window_interaction(
                     }
                 }
                 AuctionStep::FinalConfirm => {
-                    // "Confirm BIN Auction" window — click slot 11 to finalize
+                    // "Confirm BIN Auction" window — click slot 11 to finalize.
+                    // AuctionListed event is emitted from the chat handler when Hypixel sends
+                    // "BIN Auction started for ..." (matches TypeScript sellHandler.ts).
                     if window_title.contains("Confirm BIN Auction") || window_title.contains("Confirm") {
                         info!("[Auction] Confirm BIN Auction window, clicking slot 11 (final confirm)");
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, window_id, 11).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         info!("[Auction] ===== AUCTION CREATED =====");
-                        // Emit AuctionListed event for the listing webhook
-                        let item = state.auction_item_name.read().clone();
-                        let bid  = *state.auction_starting_bid.read();
-                        let dur  = *state.auction_duration_hours.read();
-                        let _ = state.event_tx.send(BotEvent::AuctionListed {
-                            item_name: item,
-                            starting_bid: bid,
-                            duration_hours: dur,
-                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }

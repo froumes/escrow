@@ -284,10 +284,11 @@ async fn main() -> Result<()> {
                         let _ = ws.send_message(&scoreboard_msg).await;
                         let _ = ws.send_message(&tab_msg).await;
                     });
-                    // Queue claim
+                    // Queue claim at Normal priority so any pending High-priority flip
+                    // purchases run before we open the AH windows to collect.
                     command_queue_clone.enqueue(
                         frikadellen_baf::types::CommandType::ClaimPurchasedItem,
-                        frikadellen_baf::types::CommandPriority::High,
+                        frikadellen_baf::types::CommandPriority::Normal,
                         false,
                     );
                     // Look up stored flip data and update with real buy price + purchase time.
