@@ -52,6 +52,21 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+/// Format purse amount with b/m/k suffixes matching TypeScript formatPurse()
+/// Examples: 1_404_040_000 → "1.40b", 96_532_000 → "96.53m", 590_278 → "590.3k"
+fn format_purse(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.2}b", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.2}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+
 pub async fn send_webhook_initialized(
     ingame_name: &str,
     ah_enabled: bool,
@@ -124,6 +139,7 @@ pub async fn send_webhook_item_purchased(
     price: u64,
     target: Option<u64>,
     profit: Option<i64>,
+    purse: Option<u64>,
     webhook_url: &str,
 ) {
     let mut fields = vec![
@@ -157,7 +173,8 @@ pub async fn send_webhook_item_purchased(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}", ingame_name),
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         }]
@@ -172,6 +189,7 @@ pub async fn send_webhook_item_sold(
     buyer: &str,
     profit: Option<i64>,
     time_to_sell_secs: Option<u64>,
+    purse: Option<u64>,
     webhook_url: &str,
 ) {
     let safe_item = sanitize_item_name(item_name);
@@ -221,7 +239,8 @@ pub async fn send_webhook_item_sold(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}", ingame_name),
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         }]
@@ -236,6 +255,7 @@ pub async fn send_webhook_bazaar_order_placed(
     price_per_unit: f64,
     total_price: f64,
     is_buy_order: bool,
+    purse: Option<u64>,
     webhook_url: &str,
 ) {
     let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
@@ -255,7 +275,8 @@ pub async fn send_webhook_bazaar_order_placed(
             ],
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}", ingame_name),
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         }]
@@ -268,6 +289,7 @@ pub async fn send_webhook_auction_listed(
     item_name: &str,
     starting_bid: u64,
     duration_hours: u64,
+    purse: Option<u64>,
     webhook_url: &str,
 ) {
     let safe_item = sanitize_item_name(item_name);
@@ -282,7 +304,8 @@ pub async fn send_webhook_auction_listed(
             ],
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}", ingame_name),
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         }]

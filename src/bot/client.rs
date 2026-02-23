@@ -338,6 +338,31 @@ impl BotClient {
         }).collect()
     }
 
+    /// Parse the player's current purse from the SkyBlock scoreboard sidebar.
+    ///
+    /// Looks for a line matching "Purse: X" or "Piggy: X" (Hypixel uses "Piggy" in
+    /// certain areas). Strips color codes and commas before parsing.
+    /// Matches TypeScript `getCurrentPurse()` in BAF.ts.
+    pub fn get_purse(&self) -> Option<u64> {
+        for line in self.get_scoreboard_lines() {
+            let clean = remove_mc_colors(&line);
+            let trimmed = clean.trim();
+            for prefix in &["Purse: ", "Piggy: "] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    let num_str = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .replace(',', "");
+                    if let Ok(n) = num_str.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Documentation for sending chat messages
     /// 
     /// **Important**: This method cannot be called directly because the azalea Client

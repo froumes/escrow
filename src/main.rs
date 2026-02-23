@@ -328,8 +328,9 @@ async fn main() -> Result<()> {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, opt_target, opt_profit, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, opt_target, opt_profit, purse, &url).await;
                         });
                     }
                 }
@@ -378,8 +379,9 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let b = buyer.clone();
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, opt_profit, opt_time_secs, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, opt_profit, opt_time_secs, purse, &url).await;
                         });
                     }
                 }
@@ -394,9 +396,10 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let total = price_per_unit * amount as f64;
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_bazaar_order_placed(
-                                &name, &item, amount, price_per_unit, total, is_buy_order, &url,
+                                &name, &item, amount, price_per_unit, total, is_buy_order, purse, &url,
                             ).await;
                         });
                     }
@@ -410,9 +413,10 @@ async fn main() -> Result<()> {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_auction_listed(
-                                &name, &item, starting_bid, duration_hours, &url,
+                                &name, &item, starting_bid, duration_hours, purse, &url,
                             ).await;
                         });
                     }
