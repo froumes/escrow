@@ -1425,22 +1425,45 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, window_id, i as i16).await;
             }
-            // Step 1: Search-results page — "Bazaar" in title, still on Initial step
+            // Step 1: Search-results page — "Bazaar" in title, still on Initial step.
+            // If the title contains "➜" this is an item-detail page opened directly (via
+            // /bz <tag>).  The order buttons may not have arrived in the first 300 ms;
+            // retry once with an additional 500 ms before giving up.
             else if window_title.contains("Bazaar") && current_step == BazaarStep::Initial {
-                info!("[Bazaar] Search results: looking for \"{}\"", item_name);
-                *state.bazaar_step.write() = BazaarStep::SearchResults;
-
-                // Find item by name (exact → token → partial, same as TypeScript)
-                let found = find_slot_by_name(&slots, &item_name);
-                match found {
-                    Some(i) => {
-                        info!("[Bazaar] Found item at slot {}", i);
+                if window_title.contains("➜") {
+                    // Item-detail page: wait a bit more and retry finding order buttons.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let menu2 = bot.menu();
+                    let slots2 = menu2.slots();
+                    let buy_slot2  = find_slot_by_name(&slots2, "Create Buy Order");
+                    let sell_slot2 = find_slot_by_name(&slots2, "Create Sell Offer");
+                    let order_slot2 = if is_buy_order { buy_slot2 } else { sell_slot2 };
+                    if let Some(i) = order_slot2 {
+                        let btn = if is_buy_order { "Create Buy Order" } else { "Create Sell Offer" };
+                        info!("[Bazaar] Item detail (retry): clicking \"{}\" at slot {}", btn, i);
+                        *state.bazaar_step.write() = BazaarStep::SelectOrderType;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, window_id, i as i16).await;
-                    }
-                    None => {
-                        warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
+                    } else {
+                        warn!("[Bazaar] Item detail page: order button not found after retry, going idle");
                         *state.bot_state.write() = BotState::Idle;
+                    }
+                } else {
+                    info!("[Bazaar] Search results: looking for \"{}\"", item_name);
+                    *state.bazaar_step.write() = BazaarStep::SearchResults;
+
+                    // Find item by name (exact → token → partial, same as TypeScript)
+                    let found = find_slot_by_name(&slots, &item_name);
+                    match found {
+                        Some(i) => {
+                            info!("[Bazaar] Found item at slot {}", i);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            click_window_slot(bot, window_id, i as i16).await;
+                        }
+                        None => {
+                            warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
+                            *state.bot_state.write() = BotState::Idle;
+                        }
                     }
                 }
             }
@@ -1670,12 +1693,13 @@ async fn handle_window_interaction(
                         };
                         if let Some(i) = target_slot {
                             info!("[Auction] Co-op AH: clicking item at slot {}", i);
+                            let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                             click_window_slot(bot, window_id, i as i16).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Co-op AH: clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot(bot, window_id, 31).await;
+                            click_window_slot_carrying(bot, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
                             *state.bot_state.write() = BotState::Idle;
@@ -1720,13 +1744,14 @@ async fn handle_window_interaction(
 
                         if let Some(i) = target_slot {
                             info!("[Auction] Clicking item at slot {}", i);
+                            let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                             click_window_slot(bot, window_id, i as i16).await;
                             // Click slot 31 (price setter) — sign will open, handled in OpenSignEditor
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot(bot, window_id, 31).await;
+                            click_window_slot_carrying(bot, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
                             *state.bot_state.write() = BotState::Idle;
@@ -1802,6 +1827,37 @@ async fn click_window_slot(bot: &Client, window_id: u8, slot: i16) {
     
     bot.write_packet(packet);
     info!("Clicked slot {} in window {}", slot, window_id);
+}
+
+/// Click a window slot while reporting the item currently on the cursor.
+/// Used when the cursor already holds an item from a previous pick-up click,
+/// so the server receives the correct `carried_item` and processes the interaction
+/// (e.g. placing the item in the auction item-slot to trigger the price sign).
+async fn click_window_slot_carrying(
+    bot: &Client,
+    window_id: u8,
+    slot: i16,
+    carried: &azalea_inventory::ItemStack,
+) {
+    use azalea_protocol::packets::game::s_container_click::{
+        ServerboundContainerClick,
+        HashedStack,
+    };
+
+    let carried_item = bot.with_registry_holder(|reg| HashedStack::from_item_stack(carried, reg));
+
+    let packet = ServerboundContainerClick {
+        container_id: window_id as i32,
+        state_id: 0,
+        slot_num: slot,
+        button_num: 0,
+        click_type: ClickType::Pickup,
+        changed_slots: Default::default(),
+        carried_item,
+    };
+
+    bot.write_packet(packet);
+    info!("Clicked slot {} in window {} (carrying item)", slot, window_id);
 }
 
 /// Parse "You purchased <item> for <price> coins!" → (item_name, price)
