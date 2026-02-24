@@ -48,9 +48,10 @@ fn format_coins(amount: i64) -> String {
     if negative { format!("-{}", formatted) } else { formatted }
 }
 
-/// Flip tracker entry: (flip, actual_buy_price, purchase_instant)
+/// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
-type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant)>>>;
+/// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
+type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -235,8 +236,8 @@ async fn main() -> Result<()> {
                 frikadellen_baf::bot::BotEvent::Kicked(reason) => {
                     warn!("Bot kicked: {}", reason);
                 }
-                frikadellen_baf::bot::BotEvent::StartupComplete => {
-                    info!("[Startup] Startup complete - bot is ready to flip!");
+                frikadellen_baf::bot::BotEvent::StartupComplete { orders_cancelled } => {
+                    info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
                     // Upload scoreboard to COFL (with real data matching TypeScript runStartupWorkflow)
                     {
                         let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
@@ -269,7 +270,7 @@ async fn main() -> Result<()> {
                         let ah = config_for_events.enable_ah_flips;
                         let bz = config_for_events.enable_bazaar_flips;
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_startup_complete(&name, 0, ah, bz, &url).await;
+                            frikadellen_baf::webhook::send_webhook_startup_complete(&name, orders_cancelled, ah, bz, &url).await;
                         });
                     }
                 }
@@ -293,24 +294,26 @@ async fn main() -> Result<()> {
                     );
                     // Look up stored flip data and update with real buy price + purchase time.
                     // Also grab the color-coded item name from the flip for colorful output.
-                    let (opt_target, opt_profit, colored_name) = {
+                    let (opt_target, opt_profit, colored_name, opt_buy_speed_ms, opt_auction_uuid) = {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
                             Ok(mut tracker) => {
                                 if let Some(entry) = tracker.get_mut(&key) {
+                                    let buy_speed_ms = entry.3.elapsed().as_millis() as u64;
                                     entry.1 = price; // actual buy price
                                     entry.2 = Instant::now(); // purchase time
                                     let target = entry.0.target;
                                     let ah_fee = calculate_ah_fee(target);
                                     let expected_profit = target as i64 - price as i64 - ah_fee as i64;
-                                    (Some(target), Some(expected_profit), entry.0.item_name.clone())
+                                    let uuid = entry.0.uuid.clone();
+                                    (Some(target), Some(expected_profit), entry.0.item_name.clone(), Some(buy_speed_ms), uuid)
                                 } else {
-                                    (None, None, item_name.clone())
+                                    (None, None, item_name.clone(), None, None)
                                 }
                             }
                             Err(e) => {
                                 warn!("Flip tracker lock failed at ItemPurchased: {}", e);
-                                (None, None, item_name.clone())
+                                (None, None, item_name.clone(), None, None)
                             }
                         }
                     };
@@ -319,9 +322,10 @@ async fn main() -> Result<()> {
                         let color = if p >= 0 { "§a" } else { "§c" };
                         format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
                     }).unwrap_or_default();
+                    let speed_str = opt_buy_speed_ms.map(|ms| format!(" §7| Buy speed: §e{}ms§r", ms)).unwrap_or_default();
                     print_mc_chat(&format!(
-                        "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}",
-                        colored_name, format_coins(price as i64), profit_str
+                        "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}{}",
+                        colored_name, format_coins(price as i64), profit_str, speed_str
                     ));
                     // Send webhook
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
@@ -329,8 +333,12 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
+                        let uuid_str = opt_auction_uuid.clone();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_purchased(&name, &item, price, opt_target, opt_profit, purse, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_purchased(
+                                &name, &item, price, opt_target, opt_profit, purse,
+                                opt_buy_speed_ms, uuid_str.as_deref(), &url,
+                            ).await;
                         });
                     }
                 }
@@ -341,27 +349,27 @@ async fn main() -> Result<()> {
                         true,
                     );
                     // Look up flip data to calculate actual profit + time to sell
-                    let (opt_profit, opt_time_secs) = {
+                    let (opt_profit, opt_buy_price, opt_time_secs, opt_auction_uuid) = {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
                             Ok(mut tracker) => {
                                 if let Some(entry) = tracker.remove(&key) {
-                                    let (_, buy_price, purchase_time) = entry;
+                                    let (flip, buy_price, purchase_time, _receive_time) = entry;
                                     if buy_price > 0 {
                                         let ah_fee = calculate_ah_fee(price);
                                         let profit = price as i64 - buy_price as i64 - ah_fee as i64;
                                         let time_secs = purchase_time.elapsed().as_secs();
-                                        (Some(profit), Some(time_secs))
+                                        (Some(profit), Some(buy_price), Some(time_secs), flip.uuid)
                                     } else {
-                                        (None, None)
+                                        (None, None, None, flip.uuid)
                                     }
                                 } else {
-                                    (None, None)
+                                    (None, None, None, None)
                                 }
                             }
                             Err(e) => {
                                 warn!("Flip tracker lock failed at ItemSold: {}", e);
-                                (None, None)
+                                (None, None, None, None)
                             }
                         }
                     };
@@ -380,8 +388,12 @@ async fn main() -> Result<()> {
                         let item = item_name.clone();
                         let b = buyer.clone();
                         let purse = bot_client_clone.get_purse();
+                        let uuid_str = opt_auction_uuid.clone();
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_sold(&name, &item, price, &b, opt_profit, opt_time_secs, purse, &url).await;
+                            frikadellen_baf::webhook::send_webhook_item_sold(
+                                &name, &item, price, &b, opt_profit, opt_buy_price,
+                                opt_time_secs, purse, uuid_str.as_deref(), &url,
+                            ).await;
                         });
                     }
                 }
@@ -465,7 +477,8 @@ async fn main() -> Result<()> {
                     {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&flip.item_name).to_lowercase();
                         if let Ok(mut tracker) = flip_tracker_ws.lock() {
-                            tracker.insert(key, (flip.clone(), 0, Instant::now()));
+                            let now = Instant::now();
+                            tracker.insert(key, (flip.clone(), 0, now, now));
                         }
                     }
 
