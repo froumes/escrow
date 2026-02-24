@@ -140,6 +140,8 @@ pub async fn send_webhook_item_purchased(
     target: Option<u64>,
     profit: Option<i64>,
     purse: Option<u64>,
+    buy_speed_ms: Option<u64>,
+    auction_uuid: Option<&str>,
     webhook_url: &str,
 ) {
     let mut fields = vec![
@@ -158,11 +160,36 @@ pub async fn send_webhook_item_purchased(
     }
     if let Some(p) = profit {
         let sign = if p >= 0 { "+" } else { "" };
+        let roi_str = if let Some(t) = target {
+            if t > 0 && price > 0 {
+                format!(" ({:.1}%)", (p as f64 / price as f64) * 100.0)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
         fields.push(serde_json::json!({
             "name": "📈 Expected Profit",
-            "value": format!("```diff\n{}{} coins\n```", sign, format_number(p as f64)),
+            "value": format!("```diff\n{}{} coins{}\n```", sign, format_number(p as f64), roi_str),
             "inline": true
         }));
+    }
+    if let Some(ms) = buy_speed_ms {
+        fields.push(serde_json::json!({
+            "name": "⚡ Buy Speed",
+            "value": format!("```\n{}ms\n```", ms),
+            "inline": true
+        }));
+    }
+    if let Some(uuid) = auction_uuid {
+        if !uuid.is_empty() {
+            fields.push(serde_json::json!({
+                "name": "🔗 Auction Link",
+                "value": format!("[View on Coflnet](https://sky.coflnet.com/auction/{}?refId=9KKPN9)", uuid),
+                "inline": false
+            }));
+        }
     }
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
@@ -188,8 +215,10 @@ pub async fn send_webhook_item_sold(
     price: u64,
     buyer: &str,
     profit: Option<i64>,
+    buy_price: Option<u64>,
     time_to_sell_secs: Option<u64>,
     purse: Option<u64>,
+    auction_uuid: Option<&str>,
     webhook_url: &str,
 ) {
     let safe_item = sanitize_item_name(item_name);
@@ -223,6 +252,17 @@ pub async fn send_webhook_item_sold(
             "value": format!("```diff\n{}{} coins\n```", sign, format_number(abs_profit)),
             "inline": true
         }));
+        // ROI percentage (matching TypeScript sendWebhookItemSold)
+        if let Some(bp) = buy_price {
+            if bp > 0 {
+                let roi = (p as f64 / bp as f64) * 100.0;
+                fields.push(serde_json::json!({
+                    "name": "📊 ROI",
+                    "value": format!("```{:.1}%```", roi),
+                    "inline": true
+                }));
+            }
+        }
     }
     if let Some(secs) = time_to_sell_secs {
         fields.push(serde_json::json!({
@@ -230,6 +270,15 @@ pub async fn send_webhook_item_sold(
             "value": format!("```\n{}\n```", format_duration(secs)),
             "inline": true
         }));
+    }
+    if let Some(uuid) = auction_uuid {
+        if !uuid.is_empty() {
+            fields.push(serde_json::json!({
+                "name": "🔗 Auction Link",
+                "value": format!("[View on Coflnet](https://sky.coflnet.com/auction/{}?refId=9KKPN9)", uuid),
+                "inline": false
+            }));
+        }
     }
     let payload = serde_json::json!({
         "embeds": [{
@@ -293,6 +342,7 @@ pub async fn send_webhook_auction_listed(
     webhook_url: &str,
 ) {
     let safe_item = sanitize_item_name(item_name);
+    let expires_unix = now_unix() + duration_hours * 3600;
     let payload = serde_json::json!({
         "embeds": [{
             "title": "🏷️ BIN Auction Listed",
@@ -301,6 +351,7 @@ pub async fn send_webhook_auction_listed(
             "fields": [
                 {"name": "💵 BIN Price",  "value": format!("```fix\n{} coins\n```", format_number(starting_bid as f64)), "inline": true},
                 {"name": "⏳ Duration",   "value": format!("```\n{}h\n```", duration_hours),                             "inline": true},
+                {"name": "📅 Expires",    "value": format!("<t:{}:R>", expires_unix),                                    "inline": true},
             ],
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {

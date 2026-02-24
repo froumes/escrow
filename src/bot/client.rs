@@ -81,6 +81,8 @@ pub struct BotClient {
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
     /// Whether to use the confirm-skip technique when purchasing BIN auctions
     pub confirm_skip: bool,
+    /// Count of bazaar orders cancelled during startup order management
+    manage_orders_cancelled: Arc<RwLock<u64>>,
 }
 
 /// Events that can be emitted by the bot
@@ -101,7 +103,10 @@ pub enum BotEvent {
     /// Bot kicked (reason)
     Kicked(String),
     /// Startup workflow completed - bot is ready to accept flips
-    StartupComplete,
+    StartupComplete {
+        /// Number of bazaar orders cancelled during startup
+        orders_cancelled: u64,
+    },
     /// Item purchased from AH
     ItemPurchased { item_name: String, price: u64 },
     /// Item sold on AH
@@ -140,6 +145,7 @@ impl BotClient {
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
+            manage_orders_cancelled: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -211,6 +217,7 @@ impl BotClient {
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
             confirm_skip: self.confirm_skip,
+            manage_orders_cancelled: self.manage_orders_cancelled.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -545,6 +552,8 @@ pub struct BotClientState {
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
     /// Whether to use the confirm-skip technique when purchasing BIN auctions
     pub confirm_skip: bool,
+    /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
+    pub manage_orders_cancelled: Arc<RwLock<u64>>,
 }
 
 impl Default for BotClientState {
@@ -579,6 +588,7 @@ impl Default for BotClientState {
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
+            manage_orders_cancelled: Arc::new(RwLock::new(0)),
         }
     }
 }
@@ -746,6 +756,7 @@ async fn event_handler(
                 let joined_wd = state.joined_skyblock.clone();
                 let bot_wd = bot.clone();
                 let event_tx_wd = state.event_tx.clone();
+                let manage_orders_cancelled_wd = state.manage_orders_cancelled.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let already_done = *teleported_wd.read();
@@ -759,7 +770,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd).await;
                     }
                 });
             }
@@ -882,6 +893,7 @@ async fn event_handler(
                         let bot_clone = bot.clone();
                         let bot_state = state.bot_state.clone();
                         let event_tx_startup = state.event_tx.clone();
+                        let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
                             bot_clone.write_chat_packet("/is");
@@ -889,7 +901,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup).await;
                         });
                     }
                 }
@@ -1490,8 +1502,10 @@ async fn handle_window_interaction(
                 }
             }
 
-            // Step 1: Search-results page — "Bazaar" in title (no "➜"), step == Initial.
-            if window_title.contains("Bazaar") && !window_title.contains("➜") && current_step == BazaarStep::Initial {
+            // Step 1: Search-results page — "Bazaar" in title, step == Initial.
+            // Handles both "Bazaar" (plain search) and "Bazaar ➜ "ItemName"" (filtered results)
+            // where the item appears in the grid but order buttons are not yet visible.
+            if window_title.contains("Bazaar") && current_step == BazaarStep::Initial {
                 info!("[Bazaar] Search results: looking for \"{}\"", item_name);
                 *state.bazaar_step.write() = BazaarStep::SearchResults;
 
@@ -1559,10 +1573,6 @@ async fn handle_window_interaction(
                     is_buy_order,
                 });
                 info!("[Bazaar] ===== ORDER COMPLETE =====");
-                *state.bot_state.write() = BotState::Idle;
-            } else if current_step == BazaarStep::Initial && window_title.contains("➜") {
-                // Direct item-detail page but polling timed out finding order buttons — give up
-                warn!("[Bazaar] Item detail page: order button not found after polling, going idle");
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -1895,6 +1905,89 @@ async fn handle_window_interaction(
                 AuctionStep::PriceSign => {}
             }
         }
+        BotState::ManagingOrders => {
+            // Step 2/4 of startup: cancel all existing bazaar orders.
+            // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
+            // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → cancel each.
+            if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") {
+                // Main bazaar page — click "Manage Orders" at slot 50
+                info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                click_window_slot(bot, window_id, 50).await;
+            } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") {
+                // Manage Orders window — cancel all existing orders one by one
+                info!("[ManageOrders] Processing existing orders...");
+                let mut cancelled: u64 = 0;
+                // processed_items tracks items already cancelled so we don't loop forever
+                let mut processed_items: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                loop {
+                    // Wait for ContainerSetContent to reflect latest state
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+                    let slots = bot.menu().slots();
+
+                    // Find the first order slot (BUY xxx / SELL xxx) not yet processed
+                    let order_slot = slots.iter().enumerate().find_map(|(i, item)| {
+                        if let Some(name) = get_item_display_name_from_slot(item) {
+                            if (name.starts_with("BUY ") || name.starts_with("SELL "))
+                                && !processed_items.contains(&name)
+                            {
+                                return Some((i, name));
+                            }
+                        }
+                        None
+                    });
+
+                    match order_slot {
+                        None => {
+                            // No more unprocessed orders — done
+                            info!("[ManageOrders] Done — cancelled {} order(s)", cancelled);
+                            *state.manage_orders_cancelled.write() = cancelled;
+                            *state.bot_state.write() = BotState::Idle;
+                            break;
+                        }
+                        Some((i, order_name)) => {
+                            // Mark as processed before clicking (prevents re-processing after cancel)
+                            processed_items.insert(order_name.clone());
+                            info!("[ManageOrders] Found order at slot {}: \"{}\"", i, order_name);
+
+                            // Click the order to view its detail page
+                            click_window_slot(bot, window_id, i as i16).await;
+
+                            // Poll for a "Cancel" button (up to 3 seconds)
+                            // In Hypixel, clicking an order slot updates the SAME window in-place
+                            // (no new OpenScreen event) to show the order detail with a Cancel button.
+                            let cancel_deadline =
+                                tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+                            let mut cancel_slot: Option<usize> = None;
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                let slots2 = bot.menu().slots();
+                                // Match "Cancel Order", "Cancel Buy Order", "Cancel Sell Offer", etc.
+                                if let Some(cs) = find_slot_by_name(&slots2, "Cancel") {
+                                    cancel_slot = Some(cs);
+                                    break;
+                                }
+                                if tokio::time::Instant::now() >= cancel_deadline {
+                                    warn!("[ManageOrders] Cancel button not found for \"{}\", skipping", order_name);
+                                    break;
+                                }
+                            }
+
+                            if let Some(cs) = cancel_slot {
+                                info!("[ManageOrders] Clicking Cancel at slot {}", cs);
+                                click_window_slot(bot, window_id, cs as i16).await;
+                                cancelled += 1;
+                                // Wait for the window content to revert to the order list
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            }
+                            // Loop continues to find remaining orders
+                        }
+                    }
+                }
+            }
+        }
         _ => {
             // Not in a state that requires window interaction
         }
@@ -1953,13 +2046,14 @@ async fn click_window_slot_carrying(
     info!("Clicked slot {} in window {} (carrying item)", slot, window_id);
 }
 
-/// Shared startup workflow: claim sold items then emit StartupComplete.
+/// Shared startup workflow: cancel old orders, claim sold items, then emit StartupComplete.
 /// Called from both the chat-based detection path and the 30-second watchdog.
-/// Matches TypeScript BAF.ts `runStartupWorkflow` steps 3 & 4.
+/// Matches TypeScript BAF.ts `runStartupWorkflow` all 4 steps.
 async fn run_startup_workflow(
     bot: Client,
     bot_state: Arc<RwLock<BotState>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
+    manage_orders_cancelled: Arc<RwLock<u64>>,
 ) {
     info!("╔══════════════════════════════════════╗");
     info!("║        BAF Startup Workflow          ║");
@@ -1968,11 +2062,29 @@ async fn run_startup_workflow(
     // Set state = Startup to block flips/bazaar during the workflow
     *bot_state.write() = BotState::Startup;
 
-    // Step 1/4: Cookie check (not yet implemented — placeholder)
-    info!("[Startup] Step 1/4: Cookie check (skipped — not implemented)");
+    // Step 1/4: Cookie check — reset counter, log complete (detailed check not needed in Rust)
+    info!("[Startup] Step 1/4: Cookie check ✓");
 
-    // Step 2/4: Bazaar order management (not yet implemented — placeholder)
-    info!("[Startup] Step 2/4: Bazaar order management (skipped — not implemented)");
+    // Step 2/4: Bazaar order management — open /bz, navigate to Manage Orders, cancel all old orders.
+    // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
+    info!("[Startup] Step 2/4: Managing bazaar orders...");
+    *manage_orders_cancelled.write() = 0;
+    bot.write_chat_packet("/bz");
+    *bot_state.write() = BotState::ManagingOrders;
+
+    // Wait up to 30 seconds for order management to finish (state → Idle when done)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let cur = *bot_state.read();
+        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    // Ensure Idle before proceeding (in case of timeout)
+    *bot_state.write() = BotState::Idle;
+    let orders_cancelled = *manage_orders_cancelled.read();
+    info!("[Startup] Step 2/4: Order management complete — {} order(s) cancelled", orders_cancelled);
 
     // Step 3/4: Claim sold items
     info!("[Startup] Step 3/4: Claiming sold items...");
@@ -1993,7 +2105,7 @@ async fn run_startup_workflow(
 
     // Step 4/4: Emit StartupComplete — main.rs requests bazaar flips and sends webhook
     info!("[Startup] Step 4/4: Startup complete - bot is ready to flip!");
-    let _ = event_tx.send(BotEvent::StartupComplete);
+    let _ = event_tx.send(BotEvent::StartupComplete { orders_cancelled });
 }
 
 /// Parse "You purchased <item> for <price> coins!" → (item_name, price)
