@@ -187,8 +187,15 @@ async fn main() -> Result<()> {
         let name = ingame_name.clone();
         let ah = config.enable_ah_flips;
         let bz = config.enable_bazaar_flips;
+        // Connection ID and premium may not be available yet at startup (COFL sends them shortly
+        // after WS connect), so we delay 3s to give COFL time to send those messages first.
+        let conn_id_init = cofl_connection_id.clone();
+        let premium_init = cofl_premium.clone();
         tokio::spawn(async move {
-            frikadellen_baf::webhook::send_webhook_initialized(&name, ah, bz, &url).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let conn_id = conn_id_init.lock().ok().and_then(|g| g.clone());
+            let premium = premium_init.lock().ok().and_then(|g| g.clone());
+            frikadellen_baf::webhook::send_webhook_initialized(&name, ah, bz, conn_id.as_deref(), premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())), &url).await;
         });
     }
 
@@ -219,6 +226,8 @@ async fn main() -> Result<()> {
     let command_queue_clone = command_queue.clone();
     let ingame_name_for_events = ingame_name.clone();
     let flip_tracker_events = flip_tracker.clone();
+    let cofl_connection_id_events = cofl_connection_id.clone();
+    let cofl_premium_events = cofl_premium.clone();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -277,12 +286,14 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let ah = config_for_events.enable_ah_flips;
                         let bz = config_for_events.enable_bazaar_flips;
+                        let conn_id = cofl_connection_id_events.lock().ok().and_then(|g| g.clone());
+                        let premium = cofl_premium_events.lock().ok().and_then(|g| g.clone());
                         tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_startup_complete(&name, orders_cancelled, ah, bz, &url).await;
+                            frikadellen_baf::webhook::send_webhook_startup_complete(&name, orders_cancelled, ah, bz, conn_id.as_deref(), premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())), &url).await;
                         });
                     }
                 }
-                frikadellen_baf::bot::BotEvent::ItemPurchased { item_name, price } => {
+                frikadellen_baf::bot::BotEvent::ItemPurchased { item_name, price, buy_speed_ms: event_buy_speed_ms } => {
                     // Send uploadScoreboard (with real data) and uploadTab to COFL
                     let ws = ws_client_for_events.clone();
                     let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
@@ -302,26 +313,27 @@ async fn main() -> Result<()> {
                     );
                     // Look up stored flip data and update with real buy price + purchase time.
                     // Also grab the color-coded item name from the flip for colorful output.
-                    let (opt_target, opt_profit, colored_name, opt_buy_speed_ms, opt_auction_uuid) = {
+                    // Buy speed comes from the event (BIN Auction View open → escrow message),
+                    // which is more accurate than the flip-receive-to-purchase tracker timing.
+                    let (opt_target, opt_profit, colored_name, opt_auction_uuid) = {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
                             Ok(mut tracker) => {
                                 if let Some(entry) = tracker.get_mut(&key) {
-                                    let buy_speed_ms = entry.3.elapsed().as_millis() as u64;
                                     entry.1 = price; // actual buy price
                                     entry.2 = Instant::now(); // purchase time
                                     let target = entry.0.target;
                                     let ah_fee = calculate_ah_fee(target);
                                     let expected_profit = target as i64 - price as i64 - ah_fee as i64;
                                     let uuid = entry.0.uuid.clone();
-                                    (Some(target), Some(expected_profit), entry.0.item_name.clone(), Some(buy_speed_ms), uuid)
+                                    (Some(target), Some(expected_profit), entry.0.item_name.clone(), uuid)
                                 } else {
-                                    (None, None, item_name.clone(), None, None)
+                                    (None, None, item_name.clone(), None)
                                 }
                             }
                             Err(e) => {
                                 warn!("Flip tracker lock failed at ItemPurchased: {}", e);
-                                (None, None, item_name.clone(), None, None)
+                                (None, None, item_name.clone(), None)
                             }
                         }
                     };
@@ -330,7 +342,7 @@ async fn main() -> Result<()> {
                         let color = if p >= 0 { "§a" } else { "§c" };
                         format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
                     }).unwrap_or_default();
-                    let speed_str = opt_buy_speed_ms.map(|ms| format!(" §7| Buy speed: §e{}ms§r", ms)).unwrap_or_default();
+                    let speed_str = event_buy_speed_ms.map(|ms| format!(" §7| Buy speed: §e{}ms§r", ms)).unwrap_or_default();
                     print_mc_chat(&format!(
                         "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}{}",
                         colored_name, format_coins(price as i64), profit_str, speed_str
@@ -345,7 +357,7 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_item_purchased(
                                 &name, &item, price, opt_target, opt_profit, purse,
-                                opt_buy_speed_ms, uuid_str.as_deref(), &url,
+                                event_buy_speed_ms, uuid_str.as_deref(), &url,
                             ).await;
                         });
                     }
@@ -452,6 +464,8 @@ async fn main() -> Result<()> {
     let bot_client_for_ws = bot_client.clone();
     let bazaar_flips_paused_ws = bazaar_flips_paused.clone();
     let flip_tracker_ws = flip_tracker.clone();
+    let cofl_connection_id_ws = cofl_connection_id.clone();
+    let cofl_premium_ws = cofl_premium.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -556,6 +570,38 @@ async fn main() -> Result<()> {
                     );
                 }
                 CoflEvent::ChatMessage(msg) => {
+                    // Parse "Your connection id is XXXX" (from chatMessage, matches TypeScript BAF.ts)
+                    if let Some(cap) = msg.find("Your connection id is ") {
+                        let rest = &msg[cap + "Your connection id is ".len()..];
+                        let conn_id: String = rest.chars()
+                            .take_while(|c| c.is_ascii_hexdigit())
+                            .collect();
+                        if conn_id.len() == 32 {
+                            info!("[Coflnet] Connection ID: {}", conn_id);
+                            if let Ok(mut g) = cofl_connection_id_ws.lock() {
+                                *g = Some(conn_id);
+                            }
+                        }
+                    }
+                    // Parse "You have X until Y" premium info (from writeToChat/chatMessage)
+                    // Format: "You have Premium Plus until 2026-Feb-10 08:55 UTC"
+                    if let Some(cap) = msg.find("You have ") {
+                        let rest = &msg[cap + "You have ".len()..];
+                        if let Some(until_pos) = rest.find(" until ") {
+                            let tier = rest[..until_pos].trim().to_string();
+                            let expires_raw = &rest[until_pos + " until ".len()..];
+                            let expires: String = expires_raw.chars()
+                                .take_while(|&c| c != '\n' && c != '\\')
+                                .collect();
+                            let expires = expires.trim().to_string();
+                            if !tier.is_empty() && !expires.is_empty() {
+                                info!("[Coflnet] Premium: {} until {}", tier, expires);
+                                if let Ok(mut g) = cofl_premium_ws.lock() {
+                                    *g = Some((tier, expires));
+                                }
+                            }
+                        }
+                    }
                     // Display COFL chat messages with proper color formatting
                     // These are informational messages and should NOT be sent to Hypixel server
                     if config_clone.use_cofl_chat {

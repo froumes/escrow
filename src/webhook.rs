@@ -71,25 +71,52 @@ pub async fn send_webhook_initialized(
     ingame_name: &str,
     ah_enabled: bool,
     bazaar_enabled: bool,
+    connection_id: Option<&str>,
+    premium: Option<(&str, &str)>, // (tier, expires)
     webhook_url: &str,
 ) {
-    let description = format!(
+    let mut description = format!(
         "AH Flips: {} | Bazaar Flips: {}\n<t:{}:R>",
         if ah_enabled { "✅" } else { "❌" },
         if bazaar_enabled { "✅" } else { "❌" },
         now_unix()
     );
-    let payload = serde_json::json!({
-        "embeds": [{
+    if let Some((tier, expires)) = premium {
+        description.push_str(&format!("\n\n**Coflnet {}** expires {}", tier, expires));
+    }
+
+    let mut fields: Vec<serde_json::Value> = Vec::new();
+    if let Some(conn_id) = connection_id {
+        fields.push(serde_json::json!({
+            "name": "Connection ID",
+            "value": format!("`{}`", conn_id),
+            "inline": false
+        }));
+    }
+
+    let embed = if fields.is_empty() {
+        serde_json::json!({
             "title": "✓ Started BAF",
             "description": description,
-            "color": 0x00ff88,
+            "color": 0x00ff88u32,
             "footer": {
                 "text": format!("BAF - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
-        }]
-    });
+        })
+    } else {
+        serde_json::json!({
+            "title": "✓ Started BAF",
+            "description": description,
+            "color": 0x00ff88u32,
+            "fields": fields,
+            "footer": {
+                "text": format!("BAF - {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        })
+    };
+    let payload = serde_json::json!({ "embeds": [embed] });
     post_embed(webhook_url, payload).await;
 }
 
@@ -98,31 +125,46 @@ pub async fn send_webhook_startup_complete(
     orders_found: u64,
     ah_enabled: bool,
     bazaar_enabled: bool,
+    connection_id: Option<&str>,
+    premium: Option<(&str, &str)>, // (tier, expires)
     webhook_url: &str,
 ) {
-    let description = format!(
+    let mut description = format!(
         "Ready to accept flips!\n\nAH Flips: {}\nBazaar Flips: {}",
         if ah_enabled { "✅ Enabled" } else { "❌ Disabled" },
         if bazaar_enabled { "✅ Enabled" } else { "❌ Disabled" }
     );
+    if let Some((tier, expires)) = premium {
+        description.push_str(&format!("\n\n**Coflnet {}** expires {}", tier, expires));
+    }
+
+    let mut fields = vec![
+        serde_json::json!({"name": "1️⃣ Cookie Check", "value": "```✓ Complete```", "inline": true}),
+        serde_json::json!({
+            "name": "2️⃣ Order Discovery",
+            "value": if bazaar_enabled {
+                format!("```✓ Found {} order(s)```", orders_found)
+            } else {
+                "```- Skipped (Bazaar disabled)```".to_string()
+            },
+            "inline": true
+        }),
+        serde_json::json!({"name": "3️⃣ Claim Items", "value": "```✓ Complete```", "inline": true}),
+    ];
+    if let Some(conn_id) = connection_id {
+        fields.push(serde_json::json!({
+            "name": "Connection ID",
+            "value": format!("`{}`", conn_id),
+            "inline": false
+        }));
+    }
+
     let payload = serde_json::json!({
         "embeds": [{
             "title": "🚀 Startup Workflow Complete",
             "description": description,
-            "color": 0x2ecc71,
-            "fields": [
-                {"name": "1️⃣ Cookie Check", "value": "```✓ Complete```", "inline": true},
-                {
-                    "name": "2️⃣ Order Discovery",
-                    "value": if bazaar_enabled {
-                        format!("```✓ Found {} order(s)```", orders_found)
-                    } else {
-                        "```- Skipped (Bazaar disabled)```".to_string()
-                    },
-                    "inline": true
-                },
-                {"name": "3️⃣ Claim Items", "value": "```✓ Complete```", "inline": true},
-            ],
+            "color": 0x2ecc71u32,
+            "fields": fields,
             "footer": {
                 "text": format!("BAF - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)

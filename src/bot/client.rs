@@ -83,10 +83,6 @@ pub struct BotClient {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
-    /// Time when BIN Auction View opened — start of buy-speed measurement
-    pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
-    /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
-    pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -992,8 +988,11 @@ async fn event_handler(
                             }
                             BazaarStep::SetPrice => {
                                 let price = *state.bazaar_price_per_unit.read();
-                                info!("[Bazaar] Sign opened for price — writing: {}", price);
-                                price.to_string()
+                                // Round to 1 decimal place: "8.2" stays "8.2", "8.3894384" → "8.4"
+                                // Matches user requirement; avoids f64 toString giving "8" for 8.0.
+                                let s = format!("{:.1}", price);
+                                info!("[Bazaar] Sign opened for price — writing: {}", s);
+                                s
                             }
                             BazaarStep::SelectOrderType => {
                                 // Hypixel opened a sign directly after clicking "Create Sell/Buy Order"
@@ -1001,9 +1000,10 @@ async fn event_handler(
                                 // Treat this as the price sign (matching TypeScript behaviour where
                                 // sell offers go straight to the price sign).
                                 let price = *state.bazaar_price_per_unit.read();
-                                info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", price);
+                                let s = format!("{:.1}", price);
+                                info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
                                 *state.bazaar_step.write() = BazaarStep::SetPrice;
-                                price.to_string()
+                                s
                             }
                             _ => {
                                 warn!("[Bazaar] Unexpected sign opened at step {:?}", step);
