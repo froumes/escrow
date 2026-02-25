@@ -83,6 +83,10 @@ pub struct BotClient {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Time when BIN Auction View opened — start of buy-speed measurement
+    pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
+    pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -108,7 +112,7 @@ pub enum BotEvent {
         orders_cancelled: u64,
     },
     /// Item purchased from AH
-    ItemPurchased { item_name: String, price: u64 },
+    ItemPurchased { item_name: String, price: u64, buy_speed_ms: Option<u64> },
     /// Item sold on AH
     ItemSold { item_name: String, price: u64, buyer: String },
     /// Bazaar order placed successfully
@@ -218,6 +222,8 @@ impl BotClient {
             scoreboard_teams: self.scoreboard_teams.clone(),
             confirm_skip: self.confirm_skip,
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
+            purchase_start_time: Arc::new(RwLock::new(None)),
+            last_buy_speed_ms: Arc::new(RwLock::new(None)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -554,6 +560,10 @@ pub struct BotClientState {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Time when BIN Auction View opened — start of buy-speed measurement
+    pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
+    pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
 }
 
 impl Default for BotClientState {
@@ -589,6 +599,8 @@ impl Default for BotClientState {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
+            purchase_start_time: Arc::new(RwLock::new(None)),
+            last_buy_speed_ms: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -825,7 +837,20 @@ async fn event_handler(
             if clean_message.contains("You purchased") && clean_message.contains("coins!") {
                 // "You purchased <item> for <price> coins!"
                 if let Some((item_name, price)) = parse_purchased_message(&clean_message) {
-                    let _ = state.event_tx.send(BotEvent::ItemPurchased { item_name, price });
+                    // Include the buy speed measured from BIN Auction View open to escrow message
+                    let buy_speed_ms = state.last_buy_speed_ms.write().take();
+                    let _ = state.event_tx.send(BotEvent::ItemPurchased { item_name, price, buy_speed_ms });
+                }
+            } else if clean_message.contains("Putting coins in escrow") {
+                // "Putting coins in escrow..." — purchase accepted by server.
+                // Calculate buy speed from when BIN Auction View opened (matching TypeScript).
+                if let Some(start) = state.purchase_start_time.write().take() {
+                    let speed_ms = start.elapsed().as_millis() as u64;
+                    *state.last_buy_speed_ms.write() = Some(speed_ms);
+                    let _ = state.event_tx.send(BotEvent::ChatMessage(
+                        format!("§f[§4BAF§f]: §aAuction bought in {}ms", speed_ms)
+                    ));
+                    info!("[AH] Buy speed: {}ms", speed_ms);
                 }
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
@@ -986,12 +1011,16 @@ async fn event_handler(
                             }
                         };
 
+                        // Sign format exactly matching TypeScript bazaarFlipHandler.ts:
+                        // text1: the value (price or amount as plain string)
+                        // text2: "^^^^^^^^^^^^^^^" hint arrows (from JSON extra["^^^^^^^^^^^^^^^"])
+                        // text3, text4: empty
                         let packet = ServerboundSignUpdate {
                             pos,
                             is_front_text: is_front,
                             lines: [
                                 text_to_write,
-                                String::new(),
+                                "^^^^^^^^^^^^^^^".to_string(),
                                 String::new(),
                                 String::new(),
                             ],
@@ -1394,7 +1423,80 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") {
-                if state.confirm_skip {
+                // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
+                *state.purchase_start_time.write() = Some(std::time::Instant::now());
+
+                // Wait up to 500ms for slot 31 to be populated by ContainerSetContent.
+                // Without this wait the click fires ~0.3ms after OpenScreen before the server
+                // has sent the container contents, causing the click to land on an empty slot
+                // and be silently ignored by Hypixel.  TypeScript uses itemLoad() which polls
+                // every 1ms for up to FLIP_ACTION_DELAY*3 ms (default 450ms).
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+                loop {
+                    let slot_populated = {
+                        let menu = bot.menu();
+                        let slots = menu.slots();
+                        slots.get(31).map(|s| !s.is_empty()).unwrap_or(false)
+                    };
+                    if slot_populated || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+                }
+
+                // Check item in slot 31 to decide on purchase strategy.
+                // Matches AutoBuy.initBedSpam() + flipHandler.ts item-switch logic.
+                let slot_31_kind = {
+                    let menu = bot.menu();
+                    let slots = menu.slots();
+                    slots.get(31).map(|s| s.kind().to_string().to_lowercase()).unwrap_or_default()
+                };
+
+                if slot_31_kind.contains("bed") {
+                    // Bed = auction is still in grace period.
+                    // Spam-click every 100ms until gold_nugget appears (grace period ends)
+                    // or 5 consecutive non-gold-nugget responses are seen.
+                    // Matches AutoBuy.initBedSpam() with clickDelay = 100ms and maxFailed = 5.
+                    info!("[AH] Bed detected in slot 31 — starting bed spam ({} ms interval)", 100);
+                    const CLICK_INTERVAL_MS: u64 = 100;
+                    const MAX_FAILED_CLICKS: usize = 5;
+                    let mut failed_clicks: usize = 0;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+
+                        let current_kind = {
+                            let menu = bot.menu();
+                            let slots = menu.slots();
+                            slots.get(31).map(|s| {
+                                if s.is_empty() { "air".to_string() }
+                                else { s.kind().to_string().to_lowercase() }
+                            }).unwrap_or_else(|| "air".to_string())
+                        };
+
+                        if current_kind == "air" || current_kind.contains("air") {
+                            // Window closed — stop spam
+                            info!("[AH] Stopped bed spam — window closed");
+                            *state.bot_state.write() = BotState::Idle;
+                            return;
+                        } else if current_kind.contains("gold_nugget") {
+                            // Grace period ended — buy now
+                            info!("[AH] Bed spam: gold_nugget appeared, buying (slot 31)");
+                            click_window_slot(bot, window_id, 31).await;
+                            click_window_slot(bot, window_id, 31).await;
+                            // Stay in Purchasing so Confirm Purchase handler fires
+                            break;
+                        } else {
+                            // Still in grace period (bed or other slot)
+                            failed_clicks += 1;
+                            debug!("[AH] Bed spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                            if failed_clicks >= MAX_FAILED_CLICKS {
+                                warn!("[AH] Stopped bed spam after {} failed clicks", failed_clicks);
+                                *state.bot_state.write() = BotState::Idle;
+                                return;
+                            }
+                        }
+                    }
+                } else if state.confirm_skip {
                     // Skip mode: click slot 31 twice (primary + redundant packet-loss guard,
                     // matches TypeScript: clickSlot(bot,31,wid,371) + clickWindow(bot,31)),
                     // then immediately pre-click slot 11 on the NEXT window ID so the
@@ -1407,12 +1509,18 @@ async fn handle_window_interaction(
                     // Keep state = Purchasing so the Confirm Purchase handler below acts
                     // as a safety retry if the pre-click packet was dropped.
                 } else {
-                    // Normal flow: single click slot 31 then wait for Confirm Purchase window.
+                    // Normal flow: click slot 31 (hardcoded buy-now button) then wait for
+                    // Confirm Purchase window.  Click twice for reliability (matches TypeScript:
+                    // clickSlot + clickWindow on the same slot).
+                    click_window_slot(bot, window_id, 31).await;
                     click_window_slot(bot, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
                 // Reached in normal flow, and as a safety retry for confirm_skip if the
-                // pre-click packet was dropped.
+                // pre-click packet was dropped.  Click twice with a short gap for reliability,
+                // matching TypeScript's while-loop retry pattern.
+                click_window_slot(bot, window_id, 11).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 click_window_slot(bot, window_id, 11).await;
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -1533,12 +1641,22 @@ async fn handle_window_interaction(
                 return;
             }
 
-            // For the remaining steps, do one initial wait then read slots once.
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            let slots = read_slots();
+            // For steps 3-5: poll for the relevant button (Custom Amount / Custom Price) for up
+            // to 1500ms matching the order-button poll above.  A single fixed sleep is unreliable
+            // because ContainerSetContent may arrive at any time after OpenScreen.
+            let poll_deadline2 = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+            let (amount_slot, price_slot) = loop {
+                let slots = read_slots();
+                let ca = if is_buy_order { find_slot_by_name(&slots, "Custom Amount") } else { None };
+                let cp = find_slot_by_name(&slots, "Custom Price");
+                if ca.is_some() || cp.is_some() || tokio::time::Instant::now() >= poll_deadline2 {
+                    break (ca, cp);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            };
 
             // Step 3: Amount screen (buy orders only)
-            if let (Some(i), true) = (find_slot_by_name(&slots, "Custom Amount"),
+            if let (Some(i), true) = (amount_slot,
                 is_buy_order && current_step == BazaarStep::SelectOrderType)
             {
                 info!("[Bazaar] Amount screen: clicking Custom Amount at slot {}", i);
@@ -1547,7 +1665,7 @@ async fn handle_window_interaction(
                 // Sign response is sent in the OpenSignEditor packet handler
             }
             // Step 4: Price screen
-            else if let (Some(i), true) = (find_slot_by_name(&slots, "Custom Price"),
+            else if let (Some(i), true) = (price_slot,
                 current_step == BazaarStep::SelectOrderType || current_step == BazaarStep::SetAmount)
             {
                 info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);

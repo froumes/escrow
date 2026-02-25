@@ -129,6 +129,14 @@ async fn main() -> Result<()> {
     // buy_price starts at 0 until ItemPurchased fires and sets it to the real price.
     let flip_tracker: FlipTrackerMap = Arc::new(Mutex::new(HashMap::new()));
 
+    // Coflnet connection ID — parsed from "Your connection id is XXXX" chat message.
+    // Included in startup webhooks (matches TypeScript getCoflnetPremiumInfo().connectionId).
+    let cofl_connection_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // Coflnet premium info — parsed from "You have PremiumPlus until ..." writeToChat message.
+    // Tuple: (tier, expires_str) e.g. ("Premium Plus", "2026-Feb-10 08:55 UTC").
+    let cofl_premium: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
         // Check if session is expired
