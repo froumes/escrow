@@ -1720,17 +1720,12 @@ async fn handle_window_interaction(
                 let menu = bot.menu();
                 let slots = menu.slots();
                 let mut found = false;
-                // First look for Claim All cauldron (TypeScript: slot.type === 380 and name includes "Claim" and "All")
-                for (i, item) in slots.iter().enumerate() {
-                    let name = get_item_display_name_from_slot(item).unwrap_or_default().to_lowercase();
-                    let kind_str = item.kind().to_string().to_lowercase();
-                    if kind_str.contains("cauldron") && name.contains("claim") {
-                        info!("[ClaimPurchased] Found Claim All at slot {}", i);
-                        click_window_slot(bot, window_id, i as i16).await;
-                        *state.bot_state.write() = BotState::Idle;
-                        found = true;
-                        break;
-                    }
+                // First look for Claim All by name (most reliable, matches TypeScript pattern)
+                if let Some(i) = find_slot_by_name(&slots, "Claim All") {
+                    info!("[ClaimPurchased] Found Claim All at slot {}", i);
+                    click_window_slot(bot, window_id, i as i16).await;
+                    *state.bot_state.write() = BotState::Idle;
+                    found = true;
                 }
                 if !found {
                     // Look for purchased item with "Status: Sold!" in lore (TypeScript pattern)
