@@ -654,13 +654,27 @@ async fn main() -> Result<()> {
                 }
                 // Handle advanced message types (matching TypeScript BAF.ts)
                 CoflEvent::GetInventory => {
-                    debug!("Processing getInventory request");
-                    // Queue command to upload inventory from event handler where bot is accessible
-                    command_queue_clone.enqueue(
-                        CommandType::UploadInventory,
-                        CommandPriority::Normal,
-                        false,
-                    );
+                    // TypeScript handles getInventory DIRECTLY in the WS message handler,
+                    // calling JSON.stringify(bot.inventory) and sending immediately — no queue.
+                    // Hypixel and COFL are separate entities; inventory upload never needs to
+                    // wait for a Hypixel command slot, so we do the same here.
+                    debug!("Processing getInventory request — sending cached inventory directly");
+                    if let Some(inv_json) = bot_client_for_ws.get_cached_inventory_json() {
+                        let message = serde_json::json!({
+                            "type": "uploadInventory",
+                            "data": inv_json
+                        }).to_string();
+                        let ws = ws_client_clone.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = ws.send_message(&message).await {
+                                error!("Failed to upload inventory to websocket: {}", e);
+                            } else {
+                                info!("Uploaded inventory to COFL successfully");
+                            }
+                        });
+                    } else {
+                        warn!("getInventory received but no cached inventory yet — ignoring");
+                    }
                 }
                 CoflEvent::TradeResponse => {
                     debug!("Processing tradeResponse - clicking accept button");

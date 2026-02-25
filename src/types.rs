@@ -157,7 +157,6 @@ pub enum CommandType {
     AcceptTrade {
         player_name: String,
     },
-    UploadInventory,
 }
 
 /// Window types that can be opened

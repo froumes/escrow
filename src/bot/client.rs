@@ -5,7 +5,9 @@ use azalea_protocol::packets::game::{
     c_set_display_objective::DisplaySlot,
     c_set_player_team::Method as TeamMethod,
     s_sign_update::ServerboundSignUpdate,
+    s_container_close::ServerboundContainerClose,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use bevy_app::AppExit;
@@ -83,6 +85,13 @@ pub struct BotClient {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Cached player-inventory JSON (serialised Window object).
+    /// Updated on every ContainerSetContent / ContainerSetSlot for the player
+    /// inventory window (id 0) so that getInventory can be answered instantly,
+    /// in parallel with any ongoing Hypixel interaction — matching TypeScript
+    /// BAF.ts which calls `JSON.stringify(bot.inventory)` directly without
+    /// waiting for a command-queue slot.
+    cached_inventory_json: Arc<RwLock<Option<String>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -146,6 +155,7 @@ impl BotClient {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
+            cached_inventory_json: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -220,6 +230,8 @@ impl BotClient {
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
+            grace_period_spam_active: Arc::new(AtomicBool::new(false)),
+            cached_inventory_json: self.cached_inventory_json.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -370,6 +382,16 @@ impl BotClient {
             }
         }
         None
+    }
+
+    /// Return the last cached player-inventory JSON, if one has been built yet.
+    ///
+    /// The cache is updated on every `ContainerSetContent` and `ContainerSetSlot`
+    /// packet for the player-inventory window so that it is always available without
+    /// requiring a command-queue slot.  Matching TypeScript BAF.ts `getInventory`
+    /// handler which calls `JSON.stringify(bot.inventory)` directly.
+    pub fn get_cached_inventory_json(&self) -> Option<String> {
+        self.cached_inventory_json.read().clone()
     }
 
     /// Documentation for sending chat messages
@@ -560,6 +582,11 @@ pub struct BotClientState {
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
     pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
+    /// Set to true while a grace-period spam-click loop is running so a second
+    /// chat message does not start a duplicate loop.
+    pub grace_period_spam_active: Arc<AtomicBool>,
+    /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
+    pub cached_inventory_json: Arc<RwLock<Option<String>>>,
 }
 
 impl Default for BotClientState {
@@ -597,6 +624,8 @@ impl Default for BotClientState {
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
+            grace_period_spam_active: Arc::new(AtomicBool::new(false)),
+            cached_inventory_json: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -871,6 +900,55 @@ async fn event_handler(
                         duration_hours: dur,
                     });
                 }
+            } else if clean_message.contains("This BIN sale is still in its grace period!") {
+                // Hypixel rejected the buy click because the BIN is in its grace period.
+                // Spam-click slot 31 every 100 ms until the purchase goes through or the
+                // window closes — identical to AutoBuy.initBedSpam() in TypeScript.
+                if *state.bot_state.read() == BotState::Purchasing {
+                    let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
+                    if !already_active {
+                        let bot_clone = bot.clone();
+                        let window_id = *state.last_window_id.read();
+                        let bot_state = state.bot_state.clone();
+                        let spam_flag = state.grace_period_spam_active.clone();
+                        info!("[AH] Grace period detected — starting bed spam ({} ms interval)", 100);
+                        tokio::spawn(async move {
+                            const CLICK_INTERVAL_MS: u64 = 100;
+                            const MAX_FAILED_CLICKS: usize = 5;
+                            let mut failed_clicks: usize = 0;
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+                                let current_kind = {
+                                    let menu = bot_clone.menu();
+                                    let slots = menu.slots();
+                                    slots.get(31).map(|s| {
+                                        if s.is_empty() { "air".to_string() }
+                                        else { s.kind().to_string().to_lowercase() }
+                                    }).unwrap_or_else(|| "air".to_string())
+                                };
+                                if current_kind.contains("air") {
+                                    info!("[AH] Grace period spam: window closed");
+                                    *bot_state.write() = BotState::Idle;
+                                    break;
+                                } else if current_kind.contains("gold_nugget") {
+                                    // Grace period may still be active — keep clicking.
+                                    // Reset failed counter: slot is correct, just waiting.
+                                    failed_clicks = 0;
+                                    click_window_slot(&bot_clone, window_id, 31).await;
+                                } else {
+                                    failed_clicks += 1;
+                                    debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                                    if failed_clicks >= MAX_FAILED_CLICKS {
+                                        warn!("[AH] Grace period spam stopped after {} failed clicks", failed_clicks);
+                                        *bot_state.write() = BotState::Idle;
+                                        break;
+                                    }
+                                }
+                            }
+                            spam_flag.store(false, Ordering::Relaxed);
+                        });
+                    }
+                }
             }
             
             // Check if we've teleported to island yet
@@ -948,11 +1026,42 @@ async fn event_handler(
                         debug!("Failed to send WindowOpen event - receiver dropped");
                     }
 
+                    // Spawn a 5-second watchdog: if this window is still open in an
+                    // interactive bot state after 5 s it is considered stuck and is
+                    // closed automatically.  Matches user requirement "guis should
+                    // autoclose if not used for over 5 seconds".
+                    {
+                        let wdog_bot   = bot.clone();
+                        let wdog_wid   = window_id as u8;
+                        let wdog_state = state.bot_state.clone();
+                        let wdog_last  = state.last_window_id.clone();
+                        let wdog_spam  = state.grace_period_spam_active.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            let still_open = *wdog_last.read() == wdog_wid;
+                            let cur_state  = *wdog_state.read();
+                            let is_interactive = matches!(cur_state,
+                                BotState::Purchasing | BotState::Bazaar | BotState::Selling
+                                | BotState::ClaimingPurchased | BotState::ClaimingSold
+                            );
+                            if still_open && is_interactive {
+                                warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
+                                wdog_bot.write_packet(ServerboundContainerClose {
+                                    container_id: wdog_wid as i32,
+                                });
+                                *wdog_state.write() = BotState::Idle;
+                                wdog_spam.store(false, Ordering::Relaxed);
+                            }
+                        });
+                    }
+
                     // Handle window interactions based on current state and window title
                     handle_window_interaction(&bot, &state, window_id as u8, &parsed_title).await;
                 }
                 
                 ClientboundGamePacket::ContainerClose(_) => {
+                    // Clear grace-period spam flag so a new BIN Auction View can start fresh.
+                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
                         debug!("Failed to send WindowClose event - receiver dropped");
@@ -960,13 +1069,15 @@ async fn event_handler(
                 }
                 
                 ClientboundGamePacket::ContainerSetSlot(_slot_update) => {
-                    // Track inventory slot updates
-                    debug!("Inventory slot updated");
+                    // Rebuild the cached player-inventory JSON whenever a slot changes.
+                    // This keeps the cache up-to-date for instant getInventory replies
+                    // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
+                    rebuild_cached_inventory_json(&bot, &state);
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
-                    // Track full inventory updates
-                    debug!("Inventory content updated");
+                    // Rebuild the cached player-inventory JSON on full content updates.
+                    rebuild_cached_inventory_json(&bot, &state);
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
@@ -1278,113 +1389,6 @@ async fn execute_command(
             // Open auction house — window handler takes over from here
             bot.write_chat_packet("/ah");
             *state.bot_state.write() = BotState::Selling;
-        }
-        CommandType::UploadInventory => {
-            info!("Uploading inventory to COFL");
-            
-            // Get the bot's current menu (may be a container window if one is open)
-            let menu = bot.menu();
-            let all_slots = menu.slots();
-            
-            // Use player_slots_range() to get only the player's actual inventory slots,
-            // ignoring any open container (e.g. Bazaar GUI) slots.
-            // For a Generic9x6 container: player range is 54..=89 (36 player slots).
-            // For a Player menu: player range is 9..=44 (36 slots, same mineflayer indices).
-            // We map these 36 slots to mineflayer slot indices 9..=44 (main inv + hotbar).
-            let player_range = menu.player_slots_range();
-            let player_range_start = *player_range.start();
-            
-            // Build a 46-slot array (indices 0-45) matching mineflayer's bot.inventory.slots.
-            // Slots 0-8 (crafting/armor) are null; slots 9-44 hold player inventory items;
-            // slot 45 (offhand) is null.
-            let mut slots_array: Vec<serde_json::Value> = vec![serde_json::Value::Null; 46];
-            
-            for (i, item) in all_slots[player_range].iter().enumerate() {
-                // i=0 → mineflayer slot 9 (first main inventory slot)
-                // i=26 → mineflayer slot 35 (last main inventory slot)
-                // i=27 → mineflayer slot 36 (first hotbar slot)
-                // i=35 → mineflayer slot 44 (last hotbar slot)
-                let mineflayer_slot = 9 + i;
-                // Safety: player_slots_range() is always 36 slots (i=0..=35), so this
-                // condition is normally unreachable, but guards against any future menu
-                // changes or unusual window types that might extend the range.
-                if mineflayer_slot > 44 {
-                    break;
-                }
-                
-                if item.is_empty() {
-                    slots_array[mineflayer_slot] = serde_json::Value::Null;
-                } else {
-                    let item_type = item.kind() as u32;
-                    let nbt_data = if let Some(item_data) = item.as_present() {
-                        match serde_json::to_value(item_data) {
-                            Ok(value) => {
-                                value.as_object()
-                                    .and_then(|obj| obj.get("components").cloned())
-                                    .unwrap_or(value)
-                            }
-                            Err(e) => {
-                                warn!("Failed to serialize item component data for player slot {}: {}", mineflayer_slot, e);
-                                serde_json::Value::Null
-                            }
-                        }
-                    } else {
-                        serde_json::Value::Null
-                    };
-                    
-                    slots_array[mineflayer_slot] = serde_json::json!({
-                        "type": item_type,
-                        "count": item.count(),
-                        "metadata": 0,
-                        "nbt": nbt_data,
-                        "name": item.kind().to_string(),
-                        "slot": mineflayer_slot
-                    });
-                }
-            }
-            
-            debug!("Uploading player inventory: player_range_start={}, {} player slots mapped to mineflayer 9-44",
-                player_range_start, 36);
-            
-            // Build the inventory object matching mineflayer's bot.inventory (Window) structure.
-            let inventory_json = serde_json::json!({
-                "id": 0,
-                "type": "SKYBLOCK_MENU",
-                "title": "Inventory",
-                "slots": slots_array,
-                "inventoryStart": 9,
-                "inventoryEnd": 45,
-                "hotbarStart": 36,
-                "craftingResultSlot": 0,
-                "requiresConfirmation": true,
-                "selectedItem": serde_json::Value::Null
-            });
-            
-            // Send to websocket
-            if let Some(ws) = &state.ws_client {
-                match serde_json::to_string(&inventory_json) {
-                    Ok(data_json) => {
-                        let message = serde_json::json!({
-                            "type": "uploadInventory",
-                            "data": data_json
-                        }).to_string();
-                        
-                        let ws_clone = ws.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = ws_clone.send_message(&message).await {
-                                error!("Failed to upload inventory to websocket: {}", e);
-                            } else {
-                                info!("Uploaded inventory to COFL successfully");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize inventory to JSON: {}", e);
-                    }
-                }
-            } else {
-                warn!("WebSocket client not available, cannot upload inventory");
-            }
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
@@ -2112,6 +2116,67 @@ async fn handle_window_interaction(
         _ => {
             // Not in a state that requires window interaction
         }
+    }
+}
+
+/// Rebuild and cache the player-inventory JSON from the bot's current menu.
+///
+/// Called after every ContainerSetContent / ContainerSetSlot so that
+/// `BotClient::get_cached_inventory_json()` always returns fresh data.
+/// The serialised format matches TypeScript `JSON.stringify(bot.inventory)`.
+fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
+    let menu = bot.menu();
+    let all_slots = menu.slots();
+    let player_range = menu.player_slots_range();
+
+    let mut slots_array: Vec<serde_json::Value> = vec![serde_json::Value::Null; 46];
+
+    for (i, item) in all_slots[player_range].iter().enumerate() {
+        let mineflayer_slot = 9 + i;
+        if mineflayer_slot > 44 {
+            break;
+        }
+        if item.is_empty() {
+            slots_array[mineflayer_slot] = serde_json::Value::Null;
+        } else {
+            let item_type = item.kind() as u32;
+            let nbt_data = if let Some(item_data) = item.as_present() {
+                match serde_json::to_value(item_data) {
+                    Ok(value) => value
+                        .as_object()
+                        .and_then(|obj| obj.get("components").cloned())
+                        .unwrap_or(value),
+                    Err(_) => serde_json::Value::Null,
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            slots_array[mineflayer_slot] = serde_json::json!({
+                "type": item_type,
+                "count": item.count(),
+                "metadata": 0,
+                "nbt": nbt_data,
+                "name": item.kind().to_string(),
+                "slot": mineflayer_slot
+            });
+        }
+    }
+
+    let inventory_json = serde_json::json!({
+        "id": 0,
+        "type": "SKYBLOCK_MENU",
+        "title": "Inventory",
+        "slots": slots_array,
+        "inventoryStart": 9,
+        "inventoryEnd": 45,
+        "hotbarStart": 36,
+        "craftingResultSlot": 0,
+        "requiresConfirmation": true,
+        "selectedItem": serde_json::Value::Null
+    });
+
+    if let Ok(json_str) = serde_json::to_string(&inventory_json) {
+        *state.cached_inventory_json.write() = Some(json_str);
     }
 }
 
