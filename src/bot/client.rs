@@ -5,7 +5,9 @@ use azalea_protocol::packets::game::{
     c_set_display_objective::DisplaySlot,
     c_set_player_team::Method as TeamMethod,
     s_sign_update::ServerboundSignUpdate,
+    s_container_close::ServerboundContainerClose,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use bevy_app::AppExit;
@@ -220,6 +222,7 @@ impl BotClient {
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
+            grace_period_spam_active: Arc::new(AtomicBool::new(false)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -560,6 +563,9 @@ pub struct BotClientState {
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
     pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
+    /// Set to true while a grace-period spam-click loop is running so a second
+    /// chat message does not start a duplicate loop.
+    pub grace_period_spam_active: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -597,6 +603,7 @@ impl Default for BotClientState {
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
+            grace_period_spam_active: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -871,6 +878,55 @@ async fn event_handler(
                         duration_hours: dur,
                     });
                 }
+            } else if clean_message.contains("This BIN sale is still in its grace period!") {
+                // Hypixel rejected the buy click because the BIN is in its grace period.
+                // Spam-click slot 31 every 100 ms until the purchase goes through or the
+                // window closes — identical to AutoBuy.initBedSpam() in TypeScript.
+                if *state.bot_state.read() == BotState::Purchasing {
+                    let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
+                    if !already_active {
+                        let bot_clone = bot.clone();
+                        let window_id = *state.last_window_id.read();
+                        let bot_state = state.bot_state.clone();
+                        let spam_flag = state.grace_period_spam_active.clone();
+                        info!("[AH] Grace period detected — starting bed spam ({} ms interval)", 100);
+                        tokio::spawn(async move {
+                            const CLICK_INTERVAL_MS: u64 = 100;
+                            const MAX_FAILED_CLICKS: usize = 5;
+                            let mut failed_clicks: usize = 0;
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+                                let current_kind = {
+                                    let menu = bot_clone.menu();
+                                    let slots = menu.slots();
+                                    slots.get(31).map(|s| {
+                                        if s.is_empty() { "air".to_string() }
+                                        else { s.kind().to_string().to_lowercase() }
+                                    }).unwrap_or_else(|| "air".to_string())
+                                };
+                                if current_kind.contains("air") {
+                                    info!("[AH] Grace period spam: window closed");
+                                    *bot_state.write() = BotState::Idle;
+                                    break;
+                                } else if current_kind.contains("gold_nugget") {
+                                    // Grace period may still be active — keep clicking.
+                                    // Reset failed counter: slot is correct, just waiting.
+                                    failed_clicks = 0;
+                                    click_window_slot(&bot_clone, window_id, 31).await;
+                                } else {
+                                    failed_clicks += 1;
+                                    debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                                    if failed_clicks >= MAX_FAILED_CLICKS {
+                                        warn!("[AH] Grace period spam stopped after {} failed clicks", failed_clicks);
+                                        *bot_state.write() = BotState::Idle;
+                                        break;
+                                    }
+                                }
+                            }
+                            spam_flag.store(false, Ordering::Relaxed);
+                        });
+                    }
+                }
             }
             
             // Check if we've teleported to island yet
@@ -948,11 +1004,42 @@ async fn event_handler(
                         debug!("Failed to send WindowOpen event - receiver dropped");
                     }
 
+                    // Spawn a 5-second watchdog: if this window is still open in an
+                    // interactive bot state after 5 s it is considered stuck and is
+                    // closed automatically.  Matches user requirement "guis should
+                    // autoclose if not used for over 5 seconds".
+                    {
+                        let wdog_bot   = bot.clone();
+                        let wdog_wid   = window_id as u8;
+                        let wdog_state = state.bot_state.clone();
+                        let wdog_last  = state.last_window_id.clone();
+                        let wdog_spam  = state.grace_period_spam_active.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            let still_open = *wdog_last.read() == wdog_wid;
+                            let cur_state  = *wdog_state.read();
+                            let is_interactive = matches!(cur_state,
+                                BotState::Purchasing | BotState::Bazaar | BotState::Selling
+                                | BotState::ClaimingPurchased | BotState::ClaimingSold
+                            );
+                            if still_open && is_interactive {
+                                warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
+                                wdog_bot.write_packet(ServerboundContainerClose {
+                                    container_id: wdog_wid as i32,
+                                });
+                                *wdog_state.write() = BotState::Idle;
+                                wdog_spam.store(false, Ordering::Relaxed);
+                            }
+                        });
+                    }
+
                     // Handle window interactions based on current state and window title
                     handle_window_interaction(&bot, &state, window_id as u8, &parsed_title).await;
                 }
                 
                 ClientboundGamePacket::ContainerClose(_) => {
+                    // Clear grace-period spam flag so a new BIN Auction View can start fresh.
+                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
                         debug!("Failed to send WindowClose event - receiver dropped");

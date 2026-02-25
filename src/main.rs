@@ -655,11 +655,12 @@ async fn main() -> Result<()> {
                 // Handle advanced message types (matching TypeScript BAF.ts)
                 CoflEvent::GetInventory => {
                     debug!("Processing getInventory request");
-                    // Queue command to upload inventory from event handler where bot is accessible
+                    // Use Low priority so AH flips (Normal) are always processed first.
+                    // interruptible=true lets a higher-priority command jump ahead in the queue.
                     command_queue_clone.enqueue(
                         CommandType::UploadInventory,
-                        CommandPriority::Normal,
-                        false,
+                        CommandPriority::Low,
+                        true,
                     );
                 }
                 CoflEvent::TradeResponse => {
@@ -782,6 +783,10 @@ async fn main() -> Result<()> {
                 // For claim commands, poll until the bot leaves the claiming state (up to 30s).
                 // For bazaar commands, poll until the bot leaves the Bazaar state (up to 20s).
                 // For other commands, wait a fixed 5 seconds.
+                let is_upload_inventory = matches!(
+                    cmd.command_type,
+                    frikadellen_baf::types::CommandType::UploadInventory
+                );
                 let is_claim = matches!(
                     cmd.command_type,
                     frikadellen_baf::types::CommandType::ClaimPurchasedItem
@@ -796,7 +801,15 @@ async fn main() -> Result<()> {
                     cmd.command_type,
                     frikadellen_baf::types::CommandType::SellToAuction { .. }
                 );
-                if is_claim {
+                if is_upload_inventory {
+                    // UploadInventory is a fire-and-forget WebSocket send: the actual
+                    // network I/O is already spawned as an independent tokio task inside
+                    // execute_command.  Give the event-handler just 200 ms to pick up the
+                    // command (one Azalea tick), then free the queue so a PurchaseAuction
+                    // that arrives in the same window can run immediately afterward.
+                    // This achieves parallel WS + game actions without a larger refactor.
+                    sleep(Duration::from_millis(200)).await;
+                } else if is_claim {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
                         sleep(Duration::from_millis(250)).await;
