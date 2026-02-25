@@ -44,8 +44,8 @@ pub struct Config {
     pub auto_cookie: u64,
 
     /// Send slot-31 twice on BIN Auction View to skip the Confirm Purchase dialog.
-    /// Defaults to false. Enable with caution — rapid double-click may look suspicious.
-    #[serde(default)]
+    /// Defaults to true for fastest buy speed (window-skip technique).
+    #[serde(default = "default_true")]
     pub confirm_skip: bool,
     
     #[serde(default = "default_true")]
@@ -177,7 +177,7 @@ impl Default for Config {
             bed_spam: false,
             use_cofl_chat: true,
             auto_cookie: 0,
-            confirm_skip: false,
+            confirm_skip: true,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
             skip: SkipConfig::default(),

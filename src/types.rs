@@ -34,7 +34,7 @@ pub struct BazaarFlipRecommendation {
     #[serde(default)]
     pub amount: u64,
     
-    #[serde(rename = "pricePerUnit", alias = "price", alias = "unitPrice")]
+    #[serde(rename = "pricePerUnit", alias = "price", alias = "unitPrice", deserialize_with = "deserialize_price")]
     pub price_per_unit: f64,
     
     #[serde(rename = "totalPrice", default)]
@@ -47,6 +47,21 @@ pub struct BazaarFlipRecommendation {
     /// override `is_buy_order` when only `isSell` is present in the payload.
     #[serde(rename = "isSell", default)]
     pub is_sell: Option<bool>,
+}
+
+/// Deserialize a price value that may be either a JSON number or a comma-formatted string
+/// (e.g. "1,544,775.5" or "333"). Strips commas before parsing.
+fn deserialize_price<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| D::Error::custom("invalid number")),
+        serde_json::Value::String(s) => {
+            let clean: String = s.chars().filter(|&c| c != ',').collect();
+            clean.parse::<f64>().map_err(|e| D::Error::custom(format!("invalid price string: {}", e)))
+        }
+        other => Err(D::Error::custom(format!("expected number or string for price, got {:?}", other))),
+    }
 }
 
 impl BazaarFlipRecommendation {

@@ -833,6 +833,12 @@ async fn main() -> Result<()> {
                             break;
                         }
                     }
+                    // Safety: if the flow got stuck and the bot is still in Bazaar state,
+                    // force it back to Idle so subsequent commands can run.
+                    if bot_client_clone.state() == frikadellen_baf::types::BotState::Bazaar {
+                        warn!("[BazaarOrder] Timed out waiting for bazaar order, resetting state to Idle");
+                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
+                    }
                 } else if is_selling {
                     // Wait up to 15s for the full auction creation flow to complete
                     // (matching TypeScript's 10s sellItem timeout with a small buffer)

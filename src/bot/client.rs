@@ -1458,9 +1458,10 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Spam-click every 100ms until gold_nugget appears (grace period ends)
-                    // or 5 consecutive non-gold-nugget responses are seen.
-                    // Matches AutoBuy.initBedSpam() with clickDelay = 100ms and maxFailed = 5.
+                    // Click slot 31 every 100ms during bed phase (to catch the moment grace
+                    // period ends and gold_nugget appears).  Beds are NOT counted as failures —
+                    // only truly unexpected slot states trigger the failure counter.
+                    // Matches AutoBuy.initBedSpam() intent: keep trying until grace period ends.
                     info!("[AH] Bed detected in slot 31 — starting bed spam ({} ms interval)", 100);
                     const CLICK_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
@@ -1489,8 +1490,13 @@ async fn handle_window_interaction(
                             click_window_slot(bot, window_id, 31).await;
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
+                        } else if current_kind.contains("bed") {
+                            // Still in grace period — click to attempt purchase and stay in loop
+                            debug!("[AH] Bed spam: grace period active, clicking slot 31");
+                            click_window_slot(bot, window_id, 31).await;
+                            // Do NOT increment failed_clicks for beds; grace period is expected
                         } else {
-                            // Still in grace period (bed or other slot)
+                            // Unexpected slot state
                             failed_clicks += 1;
                             debug!("[AH] Bed spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
