@@ -2464,12 +2464,14 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             } else {
                 serde_json::Value::Null
             };
+            let item_kind = item.kind().to_string();
+            let item_name = item_kind.strip_prefix("minecraft:").unwrap_or(&item_kind);
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
                 "metadata": 0,
                 "nbt": nbt_data,
-                "name": item.kind().to_string(),
+                "name": item_name,
                 "slot": mineflayer_slot
             });
         }
