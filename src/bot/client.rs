@@ -92,6 +92,8 @@ pub struct BotClient {
     /// BAF.ts which calls `JSON.stringify(bot.inventory)` directly without
     /// waiting for a command-queue slot.
     cached_inventory_json: Arc<RwLock<Option<String>>>,
+    /// AUTO_COOKIE config value passed through to BotClientState.
+    auto_cookie_hours: Arc<RwLock<u64>>,
 }
 
 /// Events that can be emitted by the bot
@@ -156,6 +158,7 @@ impl BotClient {
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
+            auto_cookie_hours: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -232,6 +235,9 @@ impl BotClient {
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
+            auto_cookie_hours: self.auto_cookie_hours.clone(),
+            cookie_time_secs: Arc::new(RwLock::new(0)),
+            cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -275,6 +281,11 @@ impl BotClient {
         let old_state = *self.state.read();
         *self.state.write() = new_state;
         info!("Bot state changed: {:?} -> {:?}", old_state, new_state);
+    }
+
+    /// Set the AUTO_COOKIE hours threshold. Pass `config.auto_cookie` before calling `connect()`.
+    pub fn set_auto_cookie_hours(&self, hours: u64) {
+        *self.auto_cookie_hours.write() = hours;
     }
 
     /// Get the event handlers
@@ -522,6 +533,16 @@ pub enum BazaarStep {
     Confirm,
 }
 
+/// Sub-steps within the BuyingCookie state.
+/// Matches TypeScript cookieHandler.ts buyCookie() flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CookieStep {
+    #[default]
+    Initial,        // Sent /bz booster cookie, waiting for Bazaar window
+    ItemDetail,     // Clicked cookie item (slot 11), waiting for detail window
+    BuyConfirm,     // Clicked Buy Instantly (slot 10), waiting for confirm window
+}
+
 /// State type for bot client event handler
 #[derive(Clone, Component)]
 pub struct BotClientState {
@@ -587,6 +608,12 @@ pub struct BotClientState {
     pub grace_period_spam_active: Arc<AtomicBool>,
     /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
+    /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
+    pub auto_cookie_hours: Arc<RwLock<u64>>,
+    /// Measured remaining cookie time in seconds (set during CheckingCookie).
+    pub cookie_time_secs: Arc<RwLock<u64>>,
+    /// Sub-step within the BuyingCookie flow.
+    pub cookie_step: Arc<RwLock<CookieStep>>,
 }
 
 impl Default for BotClientState {
@@ -626,7 +653,32 @@ impl Default for BotClientState {
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
+            auto_cookie_hours: Arc::new(RwLock::new(0)),
+            cookie_time_secs: Arc::new(RwLock::new(0)),
+            cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
         }
+    }
+}
+
+impl BotClientState {
+    /// Read the player's current purse from the scoreboard sidebar.
+    /// Mirrors BotClient::get_purse() for use within window/sign handlers.
+    fn get_purse(&self) -> Option<u64> {
+        let sidebar = self.sidebar_objective.read().clone()?;
+        let scores = self.scoreboard_scores.read();
+        let objective = scores.get(&sidebar)?;
+        for (_, (display, _)) in objective.iter() {
+            let clean = remove_mc_colors(display);
+            for prefix in &["Purse: ", "Piggy: "] {
+                if let Some(rest) = clean.trim().strip_prefix(prefix) {
+                    let num = rest.split_whitespace().next().unwrap_or("").replace(',', "");
+                    if let Ok(n) = num.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -794,6 +846,7 @@ async fn event_handler(
                 let bot_wd = bot.clone();
                 let event_tx_wd = state.event_tx.clone();
                 let manage_orders_cancelled_wd = state.manage_orders_cancelled.clone();
+                let auto_cookie_wd = state.auto_cookie_hours.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let already_done = *teleported_wd.read();
@@ -807,7 +860,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd).await;
                     }
                 });
             }
@@ -993,6 +1046,7 @@ async fn event_handler(
                         let bot_state = state.bot_state.clone();
                         let event_tx_startup = state.event_tx.clone();
                         let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
+                        let auto_cookie_startup = state.auto_cookie_hours.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
                             bot_clone.write_chat_packet("/is");
@@ -1000,7 +1054,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup).await;
                         });
                     }
                 }
@@ -1409,7 +1463,19 @@ async fn execute_command(
             bot.write_chat_packet("/ah");
             *state.bot_state.write() = BotState::ClaimingPurchased;
         }
-        CommandType::CheckCookie | CommandType::DiscoverOrders | CommandType::ExecuteOrders => {
+        CommandType::CheckCookie => {
+            let auto_cookie_hours = *state.auto_cookie_hours.read();
+            if auto_cookie_hours == 0 {
+                debug!("[Cookie] AUTO_COOKIE disabled — skipping check");
+                return;
+            }
+            info!("[Cookie] Checking booster cookie status via /sbmenu...");
+            *state.cookie_time_secs.write() = 0;
+            *state.cookie_step.write() = CookieStep::Initial;
+            bot.write_chat_packet("/sbmenu");
+            *state.bot_state.write() = BotState::CheckingCookie;
+        }
+        CommandType::DiscoverOrders | CommandType::ExecuteOrders => {
             info!("Command type not yet fully implemented in execute_command: {:?}", command.command_type);
         }
     }
@@ -1720,17 +1786,12 @@ async fn handle_window_interaction(
                 let menu = bot.menu();
                 let slots = menu.slots();
                 let mut found = false;
-                // First look for Claim All cauldron (TypeScript: slot.type === 380 and name includes "Claim" and "All")
-                for (i, item) in slots.iter().enumerate() {
-                    let name = get_item_display_name_from_slot(item).unwrap_or_default().to_lowercase();
-                    let kind_str = item.kind().to_string().to_lowercase();
-                    if kind_str.contains("cauldron") && name.contains("claim") {
-                        info!("[ClaimPurchased] Found Claim All at slot {}", i);
-                        click_window_slot(bot, window_id, i as i16).await;
-                        *state.bot_state.write() = BotState::Idle;
-                        found = true;
-                        break;
-                    }
+                // First look for Claim All by name (most reliable, matches TypeScript pattern)
+                if let Some(i) = find_slot_by_name(&slots, "Claim All") {
+                    info!("[ClaimPurchased] Found Claim All at slot {}", i);
+                    click_window_slot(bot, window_id, i as i16).await;
+                    *state.bot_state.write() = BotState::Idle;
+                    found = true;
                 }
                 if !found {
                     // Look for purchased item with "Status: Sold!" in lore (TypeScript pattern)
@@ -2086,27 +2147,40 @@ async fn handle_window_interaction(
                             // Click the order to view its detail page
                             click_window_slot(bot, window_id, i as i16).await;
 
-                            // Poll for a "Cancel" button (up to 3 seconds)
+                            // Poll for a "Cancel" or "Collect" button (up to 3 seconds).
                             // In Hypixel, clicking an order slot updates the SAME window in-place
-                            // (no new OpenScreen event) to show the order detail with a Cancel button.
-                            let cancel_deadline =
+                            // (no new OpenScreen event) to show the order detail.
+                            // Filled orders show a "Collect" button; open orders show "Cancel".
+                            // Matches TypeScript bazaarOrderManager.ts manageStartupOrders().
+                            let action_deadline =
                                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
                             let mut cancel_slot: Option<usize> = None;
+                            let mut collect_slot: Option<usize> = None;
                             loop {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 let slots2 = bot.menu().slots();
+                                // Check for Collect first (filled order) then Cancel (open order)
+                                if let Some(cs) = find_slot_by_name(&slots2, "Collect") {
+                                    collect_slot = Some(cs);
+                                    break;
+                                }
                                 // Match "Cancel Order", "Cancel Buy Order", "Cancel Sell Offer", etc.
                                 if let Some(cs) = find_slot_by_name(&slots2, "Cancel") {
                                     cancel_slot = Some(cs);
                                     break;
                                 }
-                                if tokio::time::Instant::now() >= cancel_deadline {
-                                    warn!("[ManageOrders] Cancel button not found for \"{}\", skipping", order_name);
+                                if tokio::time::Instant::now() >= action_deadline {
+                                    warn!("[ManageOrders] No Collect/Cancel button found for \"{}\", skipping", order_name);
                                     break;
                                 }
                             }
 
-                            if let Some(cs) = cancel_slot {
+                            if let Some(cs) = collect_slot {
+                                info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
+                                click_window_slot(bot, window_id, cs as i16).await;
+                                // Wait for the window content to revert to the order list
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            } else if let Some(cs) = cancel_slot {
                                 info!("[ManageOrders] Clicking Cancel at slot {}", cs);
                                 click_window_slot(bot, window_id, cs as i16).await;
                                 cancelled += 1;
@@ -2119,10 +2193,177 @@ async fn handle_window_interaction(
                 }
             }
         }
+        BotState::CheckingCookie => {
+            // Opened by /sbmenu — search every slot for a Booster Cookie buff indicator
+            // (lore contains "Duration:"). Matches TypeScript cookieHandler.ts slot 51 check.
+            info!("[Cookie] /sbmenu window opened — scanning for cookie buff...");
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let menu = bot.menu();
+            let slots = menu.slots();
+            let auto_cookie_hours = *state.auto_cookie_hours.read();
+
+            let mut cookie_time_secs: Option<u64> = None;
+            for item in slots.iter() {
+                let lore = get_item_lore_from_slot(item);
+                let lore_text = lore.join(" ");
+                if lore_text.to_lowercase().contains("duration") {
+                    let secs = parse_cookie_duration_secs(&lore_text);
+                    cookie_time_secs = Some(secs);
+                    break;
+                }
+            }
+
+            // Close the SkyBlock menu before proceeding
+            bot.write_packet(ServerboundContainerClose {
+                container_id: window_id as i32,
+            });
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+            match cookie_time_secs {
+                None => {
+                    // No duration found — either no cookie is active or menu didn't load
+                    info!("[Cookie] Cookie duration not found in /sbmenu — skipping buy");
+                    *state.bot_state.write() = BotState::Idle;
+                }
+                Some(secs) => {
+                    let hours = secs / 3600;
+                    let color = if hours >= auto_cookie_hours { "§a" } else { "§c" };
+                    let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
+                        "§f[§4BAF§f]: §3Cookie time remaining: {}{}h§3 (threshold: {}h)",
+                        color, hours, auto_cookie_hours
+                    )));
+                    info!("[Cookie] Cookie time: {}h, threshold: {}h", hours, auto_cookie_hours);
+                    *state.cookie_time_secs.write() = secs;
+
+                    if hours >= auto_cookie_hours {
+                        info!("[Cookie] Cookie time sufficient — skipping buy");
+                        *state.bot_state.write() = BotState::Idle;
+                    } else {
+                        // Need to buy a cookie — use get_purse() via scoreboard
+                        let purse = state.get_purse().unwrap_or(0);
+                        // Require at least 7.5M coins (1.5× 5M default price) before buying
+                        const MIN_PURSE_FOR_COOKIE: u64 = 7_500_000;
+                        if purse < MIN_PURSE_FOR_COOKIE {
+                            let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
+                                "§f[§4BAF§f]: §c[AutoCookie] Not enough coins to buy cookie (need 7.5M, have {}M)",
+                                purse / 1_000_000
+                            )));
+                            warn!("[Cookie] Insufficient coins ({}) — skipping cookie buy", purse);
+                            *state.bot_state.write() = BotState::Idle;
+                        } else {
+                            info!("[Cookie] Buying cookie ({}h remaining < {}h threshold)...", hours, auto_cookie_hours);
+                            let _ = state.event_tx.send(BotEvent::ChatMessage(
+                                "§f[§4BAF§f]: §6[AutoCookie] Buying booster cookie...".to_string()
+                            ));
+                            *state.cookie_step.write() = CookieStep::Initial;
+                            bot.write_chat_packet("/bz Booster Cookie");
+                            *state.bot_state.write() = BotState::BuyingCookie;
+                        }
+                    }
+                }
+            }
+        }
+        BotState::BuyingCookie => {
+            // Multi-step cookie buy flow matching TypeScript cookieHandler.ts buyCookie().
+            let step = *state.cookie_step.read();
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            if step == CookieStep::Initial && window_title.contains("Bazaar") {
+                // Bazaar search results: click slot 11 (the cookie item)
+                info!("[Cookie] Bazaar opened — clicking cookie item (slot 11)");
+                click_window_slot(bot, window_id, 11).await;
+                *state.cookie_step.write() = CookieStep::ItemDetail;
+            } else if step == CookieStep::ItemDetail {
+                // Cookie item detail: click slot 10 (Buy Instantly)
+                info!("[Cookie] Cookie detail — clicking Buy Instantly (slot 10)");
+                click_window_slot(bot, window_id, 10).await;
+                *state.cookie_step.write() = CookieStep::BuyConfirm;
+            } else if step == CookieStep::BuyConfirm {
+                // Purchase confirmation: click slot 10 again to confirm
+                info!("[Cookie] Buy confirmation — clicking Confirm (slot 10)");
+                click_window_slot(bot, window_id, 10).await;
+                // Purchase accepted — close window and find cookie in inventory to consume
+                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                // Close any open window
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // Find cookie in inventory and consume via right-click + slot 11
+                let menu = bot.menu();
+                let all_slots = menu.slots();
+                let player_range = menu.player_slots_range();
+                let range_start = *player_range.start();
+                let cookie_slot = all_slots[player_range].iter().enumerate().find_map(|(i, item)| {
+                    let name = get_item_display_name_from_slot(item).unwrap_or_default().to_lowercase();
+                    if name.contains("booster cookie") || name.contains("cookie") {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                });
+
+                match cookie_slot {
+                    Some(idx) => {
+                        let current_time = *state.cookie_time_secs.read();
+                        let new_hours = (current_time + 4 * 86400) / 3600;
+                        let old_hours = current_time / 3600;
+                        info!("[Cookie] Found cookie at inventory slot {} — consuming", idx);
+                        // Right-click the cookie to open its GUI, then click slot 11 to consume
+                        let win_slot = range_start + idx;
+                        click_window_slot(bot, window_id, win_slot as i16).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        // After right-clicking, the cookie GUI opens — handled in next window event
+                        // For now mark as Idle; the cookie GUI window will be a new OpenScreen event.
+                        // This is handled below if the cookie GUI opens as a new window.
+                        let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
+                            "§f[§4BAF§f]: §aBought booster cookie! Time: {}h → {}h",
+                            old_hours, new_hours
+                        )));
+                    }
+                    None => {
+                        warn!("[Cookie] Cookie not found in inventory after purchase");
+                        let _ = state.event_tx.send(BotEvent::ChatMessage(
+                            "§f[§4BAF§f]: §c[AutoCookie] Cookie purchased but not found in inventory".to_string()
+                        ));
+                    }
+                }
+                *state.bot_state.write() = BotState::Idle;
+            }
+        }
         _ => {
             // Not in a state that requires window interaction
         }
     }
+}
+
+/// Parse a cookie duration string from lore text and return seconds.
+/// Handles "Duration: Xd Xh Xm" format (matching TypeScript parseCookieDuration).
+fn parse_cookie_duration_secs(lore_text: &str) -> u64 {
+    let clean = remove_mc_colors(lore_text);
+    let mut total: u64 = 0;
+    if let Some(m) = regex_first_u64(&clean, r"(\d+)d") { total += m * 86400; }
+    if let Some(m) = regex_first_u64(&clean, r"(\d+)h") { total += m * 3600; }
+    if let Some(m) = regex_first_u64(&clean, r"(\d+)m") { total += m * 60; }
+    total
+}
+
+/// Helper: extract first captured u64 from a simple regex pattern (no deps on regex crate).
+fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
+    // Simple manual parser for patterns like r"(\d+)d"
+    // We only need to handle "Nd", "Nh", "Nm" patterns.
+    let suffix = pattern.trim_start_matches(r"(\d+)");
+    let suffix = suffix.trim_end_matches(')');
+    for word in text.split_whitespace() {
+        if word.ends_with(suffix) {
+            let num_part = word.trim_end_matches(suffix);
+            if let Ok(n) = num_part.trim_matches(',').parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
@@ -2246,6 +2487,7 @@ async fn run_startup_workflow(
     bot_state: Arc<RwLock<BotState>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
     manage_orders_cancelled: Arc<RwLock<u64>>,
+    auto_cookie_hours: Arc<RwLock<u64>>,
 ) {
     info!("╔══════════════════════════════════════╗");
     info!("║        BAF Startup Workflow          ║");
@@ -2254,8 +2496,36 @@ async fn run_startup_workflow(
     // Set state = Startup to block flips/bazaar during the workflow
     *bot_state.write() = BotState::Startup;
 
-    // Step 1/4: Cookie check — reset counter, log complete (detailed check not needed in Rust)
-    info!("[Startup] Step 1/4: Cookie check ✓");
+    // Step 1/4: Cookie check — send /sbmenu, let window handler parse cookie duration.
+    // Matches TypeScript cookieHandler.ts checkAndBuyCookie().
+    let cookie_hours = *auto_cookie_hours.read();
+    if cookie_hours > 0 {
+        info!("[Startup] Step 1/4: Checking cookie status...");
+        let _ = event_tx.send(BotEvent::ChatMessage(
+            "§f[§4BAF§f]: §7[Startup] §bStep 1/4: §fChecking cookie status...".to_string()
+        ));
+        bot.write_chat_packet("/sbmenu");
+        *bot_state.write() = BotState::CheckingCookie;
+
+        // Wait up to 15 seconds for cookie check to finish (state → Idle when done)
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let cur = *bot_state.read();
+            if matches!(cur, BotState::Idle | BotState::Startup) || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        // Ensure we're not stuck in cookie states
+        *bot_state.write() = BotState::Startup;
+        info!("[Startup] Step 1/4: Cookie check complete");
+        let _ = event_tx.send(BotEvent::ChatMessage(
+            "§f[§4BAF§f]: §a[Startup] Cookie check complete".to_string()
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    } else {
+        info!("[Startup] Step 1/4: Cookie check skipped (AUTO_COOKIE=0)");
+    }
 
     // Step 2/4: Bazaar order management — open /bz, navigate to Manage Orders, cancel all old orders.
     // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
@@ -2278,10 +2548,28 @@ async fn run_startup_workflow(
     let orders_cancelled = *manage_orders_cancelled.read();
     info!("[Startup] Step 2/4: Order management complete — {} order(s) cancelled", orders_cancelled);
 
-    // Step 3/4: Claim sold items
+    // Step 3/4: Claim sold items and purchased items
     info!("[Startup] Step 3/4: Claiming sold items...");
     bot.write_chat_packet("/ah");
     *bot_state.write() = BotState::ClaimingSold;
+
+    // Wait up to 30 seconds for claiming to finish (state → Idle when done)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let cur = *bot_state.read();
+        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    // Ensure Idle before proceeding
+    *bot_state.write() = BotState::Idle;
+
+    // Also claim any purchased items waiting in "Your Bids" (e.g. from a previous session)
+    // Matching TypeScript runStartupWorkflow which claims both sold and purchased items.
+    info!("[Startup] Step 3b/4: Claiming purchased items (Your Bids)...");
+    bot.write_chat_packet("/ah");
+    *bot_state.write() = BotState::ClaimingPurchased;
 
     // Wait up to 30 seconds for claiming to finish (state → Idle when done)
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);

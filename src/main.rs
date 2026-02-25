@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
     
     let mut bot_client = BotClient::new();
     bot_client.confirm_skip = config.confirm_skip;
+    bot_client.set_auto_cookie_hours(config.auto_cookie);
     
     // Connect to Hypixel - Azalea will handle Microsoft OAuth in browser
     match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
@@ -765,10 +766,26 @@ async fn main() -> Result<()> {
                         print_mc_chat("§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips");
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
+                        let ws = ws_client_clone.clone();
+                        let enable_bz = config_clone.enable_bazaar_flips;
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
-                            debug!("Bazaar flips resumed after AH flip window");
+                            // Notify user that bazaar flips are resuming (matching TypeScript bazaarFlipPauser.ts)
+                            print_mc_chat("§f[§4BAF§f]: §aBazaar flips resumed, requesting new recommendations...");
+                            info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
+                            // Re-request bazaar flips to get fresh recommendations after the pause
+                            if enable_bz {
+                                let msg = serde_json::json!({
+                                    "type": "getbazaarflips",
+                                    "data": serde_json::to_string("").unwrap_or_default()
+                                }).to_string();
+                                if let Err(e) = ws.send_message(&msg).await {
+                                    error!("Failed to request bazaar flips after AH flip pause: {}", e);
+                                } else {
+                                    debug!("[BazaarFlips] Requested fresh bazaar flips after AH flip window");
+                                }
+                            }
                         });
                     }
                 }
@@ -809,6 +826,10 @@ async fn main() -> Result<()> {
                 let is_selling = matches!(
                     cmd.command_type,
                     frikadellen_baf::types::CommandType::SellToAuction { .. }
+                );
+                let is_cookie = matches!(
+                    cmd.command_type,
+                    frikadellen_baf::types::CommandType::CheckCookie
                 );
                 if is_claim {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -856,6 +877,26 @@ async fn main() -> Result<()> {
                     // force it back to Idle so subsequent commands can run.
                     if bot_client_clone.state() == frikadellen_baf::types::BotState::Selling {
                         warn!("[SellToAuction] Timed out waiting for auction creation, resetting state to Idle");
+                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
+                    }
+                } else if is_cookie {
+                    // Wait up to 30s for cookie check (and optional buy) to complete
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        sleep(Duration::from_millis(250)).await;
+                        let s = bot_client_clone.state();
+                        if !matches!(s,
+                            frikadellen_baf::types::BotState::CheckingCookie
+                            | frikadellen_baf::types::BotState::BuyingCookie
+                        ) || std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    if matches!(bot_client_clone.state(),
+                        frikadellen_baf::types::BotState::CheckingCookie
+                        | frikadellen_baf::types::BotState::BuyingCookie
+                    ) {
+                        warn!("[Cookie] Timed out waiting for cookie check, resetting state to Idle");
                         bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
                     }
                 } else {
@@ -1035,6 +1076,61 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // Island guard: if "Your Island" is not in the scoreboard, send
+    // /lobby → /play sb → /is to return to the island.
+    // Matching TypeScript AFKHandler.ts tryToTeleportToIsland() logic.
+    {
+        let bot_client_island = bot_client.clone();
+        let command_queue_island = command_queue.clone();
+        tokio::spawn(async move {
+            use frikadellen_baf::types::{CommandType, CommandPriority, BotState};
+
+            // Give the startup workflow time to complete before we start checking.
+            sleep(Duration::from_secs(60)).await;
+
+            loop {
+                sleep(Duration::from_secs(10)).await;
+
+                // Don't interfere during startup / order-management workflows.
+                if matches!(
+                    bot_client_island.state(),
+                    BotState::Startup | BotState::ManagingOrders
+                ) {
+                    continue;
+                }
+
+                let lines = bot_client_island.get_scoreboard_lines();
+
+                // Scoreboard not yet populated — skip until it has data.
+                if lines.is_empty() {
+                    continue;
+                }
+
+                // If "Your Island" is in the sidebar we are home — nothing to do.
+                if lines.iter().any(|l| l.contains("Your Island")) {
+                    continue;
+                }
+
+                // Not on island — send the return sequence.
+                print_mc_chat(
+                    "§f[§4BAF§f]: §eNot detected on island — returning to island...",
+                );
+                info!("[AFKHandler] Not on island — sending /lobby → /play sb → /is");
+
+                for msg in ["/lobby", "/play sb", "/is"] {
+                    command_queue_island.enqueue(
+                        CommandType::SendChat { message: msg.to_string() },
+                        CommandPriority::High,
+                        false,
+                    );
+                }
+
+                // Wait for the navigation to complete before checking again.
+                sleep(Duration::from_secs(30)).await;
             }
         });
     }
