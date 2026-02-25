@@ -42,11 +42,27 @@ pub struct BazaarFlipRecommendation {
     
     #[serde(rename = "isBuyOrder", alias = "isBuy", default)]
     pub is_buy_order: bool,
+
+    /// COFL sends "isSell" (the inverse of isBuyOrder). Captured here so callers can
+    /// override `is_buy_order` when only `isSell` is present in the payload.
+    #[serde(rename = "isSell", default)]
+    pub is_sell: Option<bool>,
 }
 
 impl BazaarFlipRecommendation {
     pub fn calculate_total_price(&self) -> f64 {
         self.total_price.unwrap_or(self.price_per_unit * self.amount as f64)
+    }
+
+    /// Returns the effective buy-order flag, preferring `isSell` (negated) when
+    /// `isBuyOrder`/`isBuy` was not explicitly sent by COFL (i.e. both default to false).
+    /// Matches TypeScript parseBazaarFlipJson: `isBuyOrder = !data.isSell` when `isSell` present.
+    pub fn effective_is_buy_order(&self) -> bool {
+        if let Some(is_sell) = self.is_sell {
+            !is_sell
+        } else {
+            self.is_buy_order
+        }
     }
 }
 

@@ -1566,8 +1566,10 @@ async fn handle_window_interaction(
             let order_btn_name = if is_buy_order { "Create Buy Order" } else { "Create Sell Offer" };
 
             // Step 2: Item-detail page — poll for the order-creation button.
-            // Check this BEFORE the "Bazaar" title check so direct-tag lookups work too.
-            if current_step != BazaarStep::SelectOrderType {
+            // Only relevant when we haven't clicked an order button yet (Initial or SearchResults).
+            // Skipped for SelectOrderType and beyond because order buttons only appear on the
+            // item-detail page, not on price/amount/confirm screens.
+            if current_step == BazaarStep::Initial || current_step == BazaarStep::SearchResults {
                 // Poll until we find either "Create Buy Order" or "Create Sell Offer"
                 let order_button_slot = loop {
                     let slots = read_slots();
@@ -1584,8 +1586,9 @@ async fn handle_window_interaction(
                     if has_custom_amount || has_custom_price {
                         break None;
                     }
-                    // On a plain "Bazaar" search-results page (no "➜"), don't wait for order buttons
-                    if window_title.contains("Bazaar") && !window_title.contains("➜") {
+                    // Any window with "Bazaar" in the title is a search-results / category page —
+                    // those never contain order buttons, so break immediately.
+                    if window_title.contains("Bazaar") {
                         break None;
                     }
                     if tokio::time::Instant::now() >= poll_deadline {

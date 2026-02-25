@@ -530,7 +530,8 @@ async fn main() -> Result<()> {
                     }
 
                     // Print colorful bazaar flip announcement
-                    let (order_color, order_label) = if bazaar_flip.is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
+                    let effective_is_buy = bazaar_flip.effective_is_buy_order();
+                    let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
                     print_mc_chat(&format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
                         order_color, order_label,
@@ -542,12 +543,12 @@ async fn main() -> Result<()> {
                     // Queue the bazaar command.
                     // Matching TypeScript: SELL orders use HIGH priority (free up inventory),
                     // BUY orders use NORMAL priority. Both are interruptible by AH flips.
-                    let priority = if bazaar_flip.is_buy_order {
+                    let priority = if effective_is_buy {
                         CommandPriority::Normal
                     } else {
                         CommandPriority::High
                     };
-                    let command_type = if bazaar_flip.is_buy_order {
+                    let command_type = if effective_is_buy {
                         CommandType::BazaarBuyOrder {
                             item_name: bazaar_flip.item_name.clone(),
                             item_tag: bazaar_flip.item_tag.clone(),

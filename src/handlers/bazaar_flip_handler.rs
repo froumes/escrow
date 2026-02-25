@@ -213,6 +213,7 @@ impl BazaarFlipHandler {
             price_per_unit,
             total_price,
             is_buy_order,
+            is_sell: None,
         })
     }
 
@@ -269,6 +270,7 @@ impl BazaarFlipHandler {
             price_per_unit,
             total_price: Some(total_price),
             is_buy_order,
+            is_sell: None,
         }))
     }
 
