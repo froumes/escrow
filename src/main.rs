@@ -518,9 +518,18 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip if in startup/claiming state - use bot_client state (authoritative source)
-                    if !bot_client_for_ws.state().allows_commands() {
-                        debug!("Skipping bazaar flip — bot busy ({:?}): {}", bot_client_for_ws.state(), bazaar_flip.item_name);
+                    // Only skip during active startup phases (Startup / ManagingOrders).
+                    // During ClaimingSold / ClaimingPurchased the flip is queued and will
+                    // execute once the claim command finishes — matching TypeScript behaviour.
+                    let bot_state = bot_client_for_ws.state();
+                    if matches!(bot_state, frikadellen_baf::types::BotState::Startup | frikadellen_baf::types::BotState::ManagingOrders) {
+                        debug!("Skipping bazaar flip during startup ({:?}): {}", bot_state, bazaar_flip.item_name);
+                        continue;
+                    }
+
+                    // Skip if at the Bazaar order limit (21 orders)
+                    if bot_client_for_ws.is_bazaar_at_limit() {
+                        debug!("Skipping bazaar flip — at order limit: {}", bazaar_flip.item_name);
                         continue;
                     }
 

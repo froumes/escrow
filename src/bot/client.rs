@@ -85,6 +85,9 @@ pub struct BotClient {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Set when "You reached your maximum of XY Bazaar orders!" is received.
+    /// Cleared when an order fills (Claimed message detected).
+    bazaar_at_limit: Arc<AtomicBool>,
     /// Cached player-inventory JSON (serialised Window object).
     /// Updated on every ContainerSetContent / ContainerSetSlot for the player
     /// inventory window (id 0) so that getInventory can be answered instantly,
@@ -157,6 +160,7 @@ impl BotClient {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
+            bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
         }
@@ -231,6 +235,7 @@ impl BotClient {
             scoreboard_teams: self.scoreboard_teams.clone(),
             confirm_skip: self.confirm_skip,
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
+            bazaar_at_limit: self.bazaar_at_limit.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -403,6 +408,11 @@ impl BotClient {
     /// handler which calls `JSON.stringify(bot.inventory)` directly.
     pub fn get_cached_inventory_json(&self) -> Option<String> {
         self.cached_inventory_json.read().clone()
+    }
+
+    /// Returns true if the bazaar order limit has been hit and not yet cleared.
+    pub fn is_bazaar_at_limit(&self) -> bool {
+        self.bazaar_at_limit.load(Ordering::Relaxed)
     }
 
     /// Documentation for sending chat messages
@@ -599,6 +609,9 @@ pub struct BotClientState {
     pub confirm_skip: bool,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
+    /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
+    /// Cleared when an order fills. Prevents placing new orders while at the cap.
+    pub bazaar_at_limit: Arc<AtomicBool>,
     /// Time when BIN Auction View opened — start of buy-speed measurement
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
@@ -649,6 +662,7 @@ impl Default for BotClientState {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             confirm_skip: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
+            bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -1025,7 +1039,20 @@ async fn event_handler(
                     }
                 }
             }
-            
+
+            // Detect bazaar order limit ("You reached your maximum of XY Bazaar orders!")
+            // and clear it when an order fills ("Claimed ... coins from ...").
+            if clean_message.contains("You reached your maximum of") && clean_message.contains("Bazaar orders") {
+                warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
+                state.bazaar_at_limit.store(true, Ordering::Relaxed);
+            } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
+                // An order filled — a slot is now free
+                if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                    info!("[Bazaar] Order filled, clearing order-limit flag");
+                    state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                }
+            }
+
             // Check if we've teleported to island yet
             let teleported = *state.teleported_to_island.read();
             let join_time = *state.skyblock_join_time.read();
@@ -1778,18 +1805,23 @@ async fn handle_window_interaction(
                 *state.bazaar_step.write() = BazaarStep::Confirm;
                 click_window_slot(bot, window_id, 13).await;
 
-                // Order placement complete — emit event and go idle after short wait
+                // Wait briefly for the server to respond (limit message arrives asynchronously)
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let item = item_name.clone();
-                let amount = *state.bazaar_amount.read();
-                let price_per_unit = *state.bazaar_price_per_unit.read();
-                let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
-                    item_name: item,
-                    amount,
-                    price_per_unit,
-                    is_buy_order,
-                });
-                info!("[Bazaar] ===== ORDER COMPLETE =====");
+
+                if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                    warn!("[Bazaar] Order rejected (at limit) — not emitting BazaarOrderPlaced");
+                } else {
+                    let item = item_name.clone();
+                    let amount = *state.bazaar_amount.read();
+                    let price_per_unit = *state.bazaar_price_per_unit.read();
+                    let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
+                        item_name: item,
+                        amount,
+                        price_per_unit,
+                        is_buy_order,
+                    });
+                    info!("[Bazaar] ===== ORDER COMPLETE =====");
+                }
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -1900,9 +1932,16 @@ async fn handle_window_interaction(
                     info!("[ClaimSold] Clicking slot 31");
                     click_window_slot(bot, window_id, 31).await;
                 }
-                // Stay in ClaimingSold — after claiming, Hypixel re-opens Manage Auctions
-                // so the next OpenScreen event will handle more items.
-                // The startup-deadline or a new /ah command will eventually push us to Idle.
+                // Spawn a short watchdog: if Hypixel doesn't re-open Manage Auctions within
+                // 1.5 s, transition to Idle so the command queue can proceed.
+                let claim_state_ref = state.bot_state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                    if *claim_state_ref.read() == BotState::ClaimingSold {
+                        info!("[ClaimSold] No follow-up window after 1.5s, going idle");
+                        *claim_state_ref.write() = BotState::Idle;
+                    }
+                });
             }
         }
         BotState::Selling => {
@@ -2393,6 +2432,51 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
     None
 }
 
+/// Convert a simdnbt-serialised JSON value to prismarine-nbt format.
+///
+/// Prismarine-nbt wraps every value as `{"type": N, "value": V}`.
+/// COFL (written for mineflayer 1.8.9) expects this format when parsing
+/// `ExtraAttributes.id` for SkyBlock item identification.
+fn to_prismarine_nbt(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut prismarine_map = serde_json::Map::new();
+            for (key, val) in map {
+                prismarine_map.insert(key.clone(), to_prismarine_nbt(val));
+            }
+            serde_json::json!({"type": 10, "value": serde_json::Value::Object(prismarine_map)})
+        }
+        serde_json::Value::String(s) => serde_json::json!({"type": 8, "value": s}),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::json!({"type": 3, "value": i})
+            } else {
+                serde_json::json!({"type": 6, "value": n})
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return serde_json::json!({"type": 9, "value": {"type": 0, "value": []}});
+            }
+            let list_type = match &arr[0] {
+                serde_json::Value::String(_) => 8,
+                serde_json::Value::Object(_) => 10,
+                serde_json::Value::Array(_) => 9,
+                serde_json::Value::Number(_) => 3,
+                _ => 8,
+            };
+            let values: Vec<serde_json::Value> = if list_type == 10 {
+                arr.iter().map(to_prismarine_nbt).collect()
+            } else {
+                arr.to_vec()
+            };
+            serde_json::json!({"type": 9, "value": {"type": list_type, "value": values}})
+        }
+        serde_json::Value::Bool(b) => serde_json::json!({"type": 1, "value": if *b { 1i32 } else { 0i32 }}),
+        _ => serde_json::json!({"type": 8, "value": value.to_string()}),
+    }
+}
+
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
 ///
 /// Called after every ContainerSetContent / ContainerSetSlot so that
@@ -2416,21 +2500,34 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             let item_type = item.kind() as u32;
             let nbt_data = if let Some(item_data) = item.as_present() {
                 match serde_json::to_value(item_data) {
-                    Ok(value) => value
-                        .as_object()
-                        .and_then(|obj| obj.get("components").cloned())
-                        .unwrap_or(value),
+                    Ok(value) => {
+                        // Extract minecraft:custom_data from components and convert
+                        // to prismarine-nbt format so COFL can parse ExtraAttributes.
+                        let custom_data = value
+                            .as_object()
+                            .and_then(|obj| obj.get("components"))
+                            .and_then(|comp| comp.as_object())
+                            .and_then(|comp| comp.get("minecraft:custom_data"));
+                        if let Some(cd) = custom_data {
+                            to_prismarine_nbt(cd)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
                     Err(_) => serde_json::Value::Null,
                 }
             } else {
                 serde_json::Value::Null
             };
+            // Strip "minecraft:" namespace prefix to match mineflayer item names
+            let item_name = item.kind().to_string();
+            let item_name = item_name.strip_prefix("minecraft:").unwrap_or(&item_name);
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
                 "metadata": 0,
                 "nbt": nbt_data,
-                "name": item.kind().to_string(),
+                "name": item_name,
                 "slot": mineflayer_slot
             });
         }
