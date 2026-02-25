@@ -765,10 +765,26 @@ async fn main() -> Result<()> {
                         print_mc_chat("§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips");
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
+                        let ws = ws_client_clone.clone();
+                        let enable_bz = config_clone.enable_bazaar_flips;
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
-                            debug!("Bazaar flips resumed after AH flip window");
+                            // Notify user that bazaar flips are resuming (matching TypeScript bazaarFlipPauser.ts)
+                            print_mc_chat("§f[§4BAF§f]: §aBazaar flips resumed, requesting new recommendations...");
+                            info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
+                            // Re-request bazaar flips to get fresh recommendations after the pause
+                            if enable_bz {
+                                let msg = serde_json::json!({
+                                    "type": "getbazaarflips",
+                                    "data": serde_json::to_string("").unwrap_or_default()
+                                }).to_string();
+                                if let Err(e) = ws.send_message(&msg).await {
+                                    error!("Failed to request bazaar flips after AH flip pause: {}", e);
+                                } else {
+                                    debug!("[BazaarFlips] Requested fresh bazaar flips after AH flip window");
+                                }
+                            }
                         });
                     }
                 }

@@ -2086,27 +2086,40 @@ async fn handle_window_interaction(
                             // Click the order to view its detail page
                             click_window_slot(bot, window_id, i as i16).await;
 
-                            // Poll for a "Cancel" button (up to 3 seconds)
+                            // Poll for a "Cancel" or "Collect" button (up to 3 seconds).
                             // In Hypixel, clicking an order slot updates the SAME window in-place
-                            // (no new OpenScreen event) to show the order detail with a Cancel button.
-                            let cancel_deadline =
+                            // (no new OpenScreen event) to show the order detail.
+                            // Filled orders show a "Collect" button; open orders show "Cancel".
+                            // Matches TypeScript bazaarOrderManager.ts manageStartupOrders().
+                            let action_deadline =
                                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
                             let mut cancel_slot: Option<usize> = None;
+                            let mut collect_slot: Option<usize> = None;
                             loop {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 let slots2 = bot.menu().slots();
+                                // Check for Collect first (filled order) then Cancel (open order)
+                                if let Some(cs) = find_slot_by_name(&slots2, "Collect") {
+                                    collect_slot = Some(cs);
+                                    break;
+                                }
                                 // Match "Cancel Order", "Cancel Buy Order", "Cancel Sell Offer", etc.
                                 if let Some(cs) = find_slot_by_name(&slots2, "Cancel") {
                                     cancel_slot = Some(cs);
                                     break;
                                 }
-                                if tokio::time::Instant::now() >= cancel_deadline {
-                                    warn!("[ManageOrders] Cancel button not found for \"{}\", skipping", order_name);
+                                if tokio::time::Instant::now() >= action_deadline {
+                                    warn!("[ManageOrders] No Collect/Cancel button found for \"{}\", skipping", order_name);
                                     break;
                                 }
                             }
 
-                            if let Some(cs) = cancel_slot {
+                            if let Some(cs) = collect_slot {
+                                info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
+                                click_window_slot(bot, window_id, cs as i16).await;
+                                // Wait for the window content to revert to the order list
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            } else if let Some(cs) = cancel_slot {
                                 info!("[ManageOrders] Clicking Cancel at slot {}", cs);
                                 click_window_slot(bot, window_id, cs as i16).await;
                                 cancelled += 1;
@@ -2278,10 +2291,28 @@ async fn run_startup_workflow(
     let orders_cancelled = *manage_orders_cancelled.read();
     info!("[Startup] Step 2/4: Order management complete — {} order(s) cancelled", orders_cancelled);
 
-    // Step 3/4: Claim sold items
+    // Step 3/4: Claim sold items and purchased items
     info!("[Startup] Step 3/4: Claiming sold items...");
     bot.write_chat_packet("/ah");
     *bot_state.write() = BotState::ClaimingSold;
+
+    // Wait up to 30 seconds for claiming to finish (state → Idle when done)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let cur = *bot_state.read();
+        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    // Ensure Idle before proceeding
+    *bot_state.write() = BotState::Idle;
+
+    // Also claim any purchased items waiting in "Your Bids" (e.g. from a previous session)
+    // Matching TypeScript runStartupWorkflow which claims both sold and purchased items.
+    info!("[Startup] Step 3b/4: Claiming purchased items (Your Bids)...");
+    bot.write_chat_packet("/ah");
+    *bot_state.write() = BotState::ClaimingPurchased;
 
     // Wait up to 30 seconds for claiming to finish (state → Idle when done)
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
