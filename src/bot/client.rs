@@ -1611,7 +1611,6 @@ async fn handle_window_interaction(
                             // Grace period ended — buy now
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             click_window_slot(bot, window_id, 31).await;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                             click_window_slot(bot, window_id, 31).await;
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
@@ -1629,34 +1628,14 @@ async fn handle_window_interaction(
                             }
                         }
                     }
-                } else if state.confirm_skip {
-                    // Skip mode: click slot 31 twice (primary + redundant packet-loss guard,
-                    // matches TypeScript: clickSlot(bot,31,wid,371) + clickWindow(bot,31)),
-                    // then pre-click slot 11 on the NEXT window ID so the Confirm Purchase
-                    // is accepted before the GUI is fully rendered.
-                    // Matches TypeScript: clickSlot(bot, 11, nextWindowID, 159)
-                    // Add small delays between clicks so packets are not sent simultaneously —
-                    // three packets within microseconds of each other triggers Watchdog.
-                    click_window_slot(bot, window_id, 31).await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    click_window_slot(bot, window_id, 31).await;
-                    let next_id = if window_id == 100 { 1u8 } else { window_id + 1 };
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    click_window_slot(bot, next_id, 11).await;
-                    // Keep state = Purchasing so the Confirm Purchase handler below acts
-                    // as a safety retry if the pre-click packet was dropped.
                 } else {
-                    // Normal flow: click slot 31 (hardcoded buy-now button) then wait for
-                    // Confirm Purchase window.  Click twice for reliability (matches TypeScript:
+                    // Click slot 31 (buy-now button) twice for reliability (matches TypeScript:
                     // clickSlot + clickWindow on the same slot).
-                    // Add a small delay so both packets are not queued simultaneously.
                     click_window_slot(bot, window_id, 31).await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     click_window_slot(bot, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
-                // Reached in normal flow, and as a safety retry for confirm_skip if the
-                // pre-click packet was dropped.  Click twice with a short gap for reliability,
+                // Click slot 11 twice with a short gap for reliability,
                 // matching TypeScript's while-loop retry pattern.
                 click_window_slot(bot, window_id, 11).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
