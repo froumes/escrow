@@ -1608,9 +1608,8 @@ async fn handle_window_interaction(
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
-                            // Grace period ended — buy now
+                            // Grace period ended — buy now (single click only).
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
-                            click_window_slot(bot, window_id, 31).await;
                             click_window_slot(bot, window_id, 31).await;
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
@@ -1629,17 +1628,33 @@ async fn handle_window_interaction(
                         }
                     }
                 } else {
-                    // Click slot 31 (buy-now button) twice for reliability (matches TypeScript:
-                    // clickSlot + clickWindow on the same slot).
-                    click_window_slot(bot, window_id, 31).await;
+                    // Click slot 31 once (buy-now button).
+                    // Single click only — double-clicking sends a second packet while Hypixel
+                    // is already preparing the Confirm Purchase window, which confuses the server
+                    // and adds ~300ms of unnecessary latency.
                     click_window_slot(bot, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
-                // Click slot 11 twice with a short gap for reliability,
-                // matching TypeScript's while-loop retry pattern.
+                // Click slot 11 immediately — speed is everything on a low-latency VPS.
+                // NO pre-delay (matches TypeScript: "NO delay here — speed is everything").
                 click_window_slot(bot, window_id, 11).await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                click_window_slot(bot, window_id, 11).await;
+
+                // Wait 100ms. On a VPS near Hypixel this is enough for the
+                // server to process the click and close the window.
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                // Safety retry loop: if the window is still open (click was lost or
+                // the server needs more time), keep retrying every 250ms.
+                // Matches TypeScript's while-loop retry pattern in flipHandler.ts.
+                while state.handlers.current_window_title()
+                    .as_deref()
+                    .map(|t| t.contains("Confirm Purchase"))
+                    .unwrap_or(false)
+                {
+                    click_window_slot(bot, window_id, 11).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                }
+
                 *state.bot_state.write() = BotState::Idle;
             }
         }
