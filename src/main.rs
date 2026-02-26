@@ -264,7 +264,9 @@ async fn main() -> Result<()> {
                             let data_json = serde_json::to_string(&scoreboard_lines).unwrap_or_else(|_| "[]".to_string());
                             let scoreboard_msg = serde_json::json!({"type": "uploadScoreboard", "data": data_json}).to_string();
                             let tab_msg = serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
+                            debug!("[Startup] Sending uploadScoreboard to COFL: {:?}", scoreboard_lines);
                             let _ = ws.send_message(&scoreboard_msg).await;
+                            debug!("[Startup] Sending uploadTab to COFL (empty)");
                             let _ = ws.send_message(&tab_msg).await;
                             debug!("[Startup] Uploaded scoreboard ({} lines)", scoreboard_lines.len());
                         });
@@ -302,7 +304,9 @@ async fn main() -> Result<()> {
                         let data_json = serde_json::to_string(&scoreboard_lines).unwrap_or_else(|_| "[]".to_string());
                         let scoreboard_msg = serde_json::json!({"type": "uploadScoreboard", "data": data_json}).to_string();
                         let tab_msg = serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
+                        debug!("[ItemPurchased] Sending uploadScoreboard to COFL: {:?}", scoreboard_lines);
                         let _ = ws.send_message(&scoreboard_msg).await;
+                        debug!("[ItemPurchased] Sending uploadTab to COFL (empty)");
                         let _ = ws.send_message(&tab_msg).await;
                     });
                     // Queue claim at Normal priority so any pending High-priority flip
@@ -668,8 +672,10 @@ async fn main() -> Result<()> {
                     // calling JSON.stringify(bot.inventory) and sending immediately — no queue.
                     // Hypixel and COFL are separate entities; inventory upload never needs to
                     // wait for a Hypixel command slot, so we do the same here.
-                    debug!("Processing getInventory request — sending cached inventory directly");
+                    info!("COFL requested getInventory — sending cached inventory");
                     if let Some(inv_json) = bot_client_for_ws.get_cached_inventory_json() {
+                        let payload_bytes = inv_json.len();
+                        debug!("[Inventory] Uploading to COFL: payload {} bytes", payload_bytes);
                         let message = serde_json::json!({
                             "type": "uploadInventory",
                             "data": inv_json
@@ -679,7 +685,7 @@ async fn main() -> Result<()> {
                             if let Err(e) = ws.send_message(&message).await {
                                 error!("Failed to upload inventory to websocket: {}", e);
                             } else {
-                                info!("Uploaded inventory to COFL successfully");
+                                info!("Uploaded inventory to COFL ({} bytes)", payload_bytes);
                             }
                         });
                     } else {
@@ -1082,6 +1088,8 @@ async fn main() -> Result<()> {
                         let msg = serde_json::json!({"type": "uploadScoreboard", "data": data_json}).to_string();
                         if let Err(e) = ws_client_scoreboard.send_message(&msg).await {
                             debug!("Failed to send periodic scoreboard upload: {}", e);
+                        } else {
+                            debug!("[Scoreboard] Uploaded to COFL: {:?}", scoreboard_lines);
                         }
                     }
                 }
