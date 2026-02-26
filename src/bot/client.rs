@@ -1587,21 +1587,20 @@ async fn handle_window_interaction(
                     // (grace period ended).  Do NOT click during the bed phase —
                     // matches AutoBuy.initBedSpam() which only calls betterClick(31) when
                     // slotName === "gold_nugget" and counts every non-gold_nugget iteration
-                    // as a failure.  We give the grace period up to 60 s to expire before
-                    // giving up (longer than TypeScript's 5-tick limit because we don't have
-                    // the "re-queue" mechanism).
+                    // as a failure.  We give the grace period up to 20 s to expire before
+                    // giving up (Hypixel bed grace periods are at most 20 s).
                     info!("[AH] Bed detected in slot 31 — waiting for grace period to end (polling every 100 ms)");
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
                     const CLICK_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
-                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(20);
                     let mut failed_clicks: usize = 0;
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
 
                         if tokio::time::Instant::now() >= bed_deadline {
-                            warn!("[AH] Bed timing: grace period did not end within 60 s — giving up");
+                            warn!("[AH] Bed timing: grace period did not end within 20 s — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             return;
