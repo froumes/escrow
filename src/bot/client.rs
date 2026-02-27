@@ -1583,13 +1583,12 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Poll slot 31 every 100 ms and click ONLY when gold_nugget appears
-                    // (grace period ended).  Do NOT click during the bed phase —
-                    // matches AutoBuy.initBedSpam() which only calls betterClick(31) when
-                    // slotName === "gold_nugget" and counts every non-gold_nugget iteration
-                    // as a failure.  We give the grace period up to 20 s to expire before
-                    // giving up (Hypixel bed grace periods are at most 20 s).
-                    info!("[AH] Bed detected in slot 31 — waiting for grace period to end (polling every 100 ms)");
+                    // Spam-click slot 31 every 100 ms including during the bed phase so that
+                    // a click packet is in-flight at the exact moment the grace period expires
+                    // on the server side.  Waiting until gold_nugget appears in the client
+                    // menu before sending the first click adds at least one full roundtrip of
+                    // latency after the transition — pre-clicking eliminates that delay.
+                    info!("[AH] Bed detected in slot 31 — starting pre-click spam (100 ms interval)");
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
                     const CLICK_INTERVAL_MS: u64 = 100;
@@ -1622,15 +1621,21 @@ async fn handle_window_interaction(
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
-                            // Grace period ended — buy now (single click only).
+                            // Grace period ended — click to purchase.
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
-                            click_window_slot(bot, window_id, 31).await;
+                            if *state.last_window_id.read() == window_id {
+                                click_window_slot(bot, window_id, 31).await;
+                            }
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
                         } else if current_kind.contains("bed") {
-                            // Still in grace period — wait, do NOT click
-                            debug!("[AH] Bed timing: grace period still active, waiting…");
+                            // Still in grace period — pre-click so a packet arrives at the
+                            // server as close to the transition moment as possible.
+                            debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
+                            if *state.last_window_id.read() == window_id {
+                                click_window_slot(bot, window_id, 31).await;
+                            }
                         } else {
                             // Unexpected slot state
                             failed_clicks += 1;
@@ -2202,6 +2207,16 @@ async fn handle_window_interaction(
                     // Wait for ContainerSetContent to reflect latest state
                     tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
+                    // If a newer window has opened (e.g. Hypixel auto-opened the next
+                    // "Your Bazaar Orders" screen), stop this loop — the new handler will
+                    // take over.  Without this check every concurrent ManageOrders loop
+                    // would see the Cancel button in the newly-opened window and spam
+                    // clicks into stale/closed container IDs.
+                    if *state.last_window_id.read() != window_id {
+                        debug!("[ManageOrders] Window {} superseded by window {}, stopping", window_id, *state.last_window_id.read());
+                        break;
+                    }
+
                     let slots = bot.menu().slots();
 
                     // Find the first order slot (BUY xxx / SELL xxx) not yet processed
@@ -2243,6 +2258,10 @@ async fn handle_window_interaction(
                             let mut collect_slot: Option<usize> = None;
                             loop {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                // Stop if a newer window superseded this one
+                                if *state.last_window_id.read() != window_id {
+                                    break;
+                                }
                                 let slots2 = bot.menu().slots();
                                 // Check for Collect first (filled order) then Cancel (open order)
                                 if let Some(cs) = find_slot_by_name(&slots2, "Collect") {
@@ -2261,16 +2280,20 @@ async fn handle_window_interaction(
                             }
 
                             if let Some(cs) = collect_slot {
-                                info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
-                                click_window_slot(bot, window_id, cs as i16).await;
-                                // Wait for the window content to revert to the order list
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                if *state.last_window_id.read() == window_id {
+                                    info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
+                                    click_window_slot(bot, window_id, cs as i16).await;
+                                    // Wait for the window content to revert to the order list
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                }
                             } else if let Some(cs) = cancel_slot {
-                                info!("[ManageOrders] Clicking Cancel at slot {}", cs);
-                                click_window_slot(bot, window_id, cs as i16).await;
-                                cancelled += 1;
-                                // Wait for the window content to revert to the order list
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                if *state.last_window_id.read() == window_id {
+                                    info!("[ManageOrders] Clicking Cancel at slot {}", cs);
+                                    click_window_slot(bot, window_id, cs as i16).await;
+                                    cancelled += 1;
+                                    // Wait for the window content to revert to the order list
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                }
                             }
                             // Loop continues to find remaining orders
                         }
