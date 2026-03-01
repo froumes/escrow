@@ -99,6 +99,8 @@ pub enum BotState {
     CheckingCookie,
     /// Buying a booster cookie via /bz Booster Cookie → Buy Instantly
     BuyingCookie,
+    /// Instaselling a dominant inventory item via /bz → Sell Instantly to free space
+    InstaSelling,
 }
 
 impl BotState {
@@ -108,7 +110,7 @@ impl BotState {
     /// claiming states block commands (TypeScript: `if (bot.state)` blocks when
     /// state is non-null, which includes 'startup' and 'claiming').
     pub fn allows_commands(&self) -> bool {
-        !matches!(self, BotState::Startup | BotState::ClaimingPurchased | BotState::ClaimingSold | BotState::ManagingOrders | BotState::CheckingCookie | BotState::BuyingCookie)
+        !matches!(self, BotState::Startup | BotState::ClaimingPurchased | BotState::ClaimingSold | BotState::ManagingOrders | BotState::CheckingCookie | BotState::BuyingCookie | BotState::InstaSelling)
     }
 }
 

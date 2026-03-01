@@ -97,6 +97,8 @@ pub struct BotClient {
     cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value passed through to BotClientState.
     auto_cookie_hours: Arc<RwLock<u64>>,
+    /// Item name to sell via bazaar "Sell Instantly" when inventory is full
+    insta_sell_item: Arc<RwLock<Option<String>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -165,6 +167,7 @@ impl BotClient {
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
+            insta_sell_item: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -248,6 +251,7 @@ impl BotClient {
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: Arc::new(AtomicBool::new(false)),
+            insta_sell_item: self.insta_sell_item.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -643,6 +647,9 @@ pub struct BotClientState {
     /// received.  The ManageOrders loop reads this flag to stop trying to collect
     /// and log the remaining orders to pending_claims.log.
     pub inventory_full: Arc<AtomicBool>,
+    /// Item name to instasell via bazaar "Sell Instantly" when inventory is dominated
+    /// by one stackable item type. Set by ManageOrders, consumed by InstaSelling handler.
+    pub insta_sell_item: Arc<RwLock<Option<String>>>,
 }
 
 impl Default for BotClientState {
@@ -689,6 +696,7 @@ impl Default for BotClientState {
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: Arc::new(AtomicBool::new(false)),
+            insta_sell_item: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1868,6 +1876,11 @@ async fn handle_window_interaction(
             if current_step == BazaarStep::Initial || current_step == BazaarStep::SearchResults {
                 // Poll until we find either "Create Buy Order" or "Create Sell Offer"
                 let order_button_slot = loop {
+                    // Guard: if a newer window has opened this handler is stale — bail out.
+                    if *state.last_window_id.read() != window_id {
+                        debug!("[Bazaar] Window {} superseded during order-button poll, aborting", window_id);
+                        return;
+                    }
                     let slots = read_slots();
                     let buy_s  = find_slot_by_name(&slots, "Create Buy Order");
                     let sell_s = find_slot_by_name(&slots, "Create Sell Offer");
@@ -1901,9 +1914,15 @@ async fn handle_window_interaction(
                 };
 
                 if let Some(i) = order_button_slot {
+                    // Final guard before clicking — reject if a newer window has taken over.
+                    if *state.last_window_id.read() != window_id {
+                        debug!("[Bazaar] Window {} superseded before order-button click, aborting", window_id);
+                        return;
+                    }
                     info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", order_btn_name, i);
                     *state.bazaar_step.write() = BazaarStep::SelectOrderType;
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    if *state.last_window_id.read() != window_id { return; }
                     click_window_slot(bot, window_id, i as i16).await;
                     return;
                 }
@@ -1918,6 +1937,7 @@ async fn handle_window_interaction(
 
                 // Poll briefly for the item to appear in search results
                 let found = loop {
+                    if *state.last_window_id.read() != window_id { return; }
                     let slots = read_slots();
                     let f = find_slot_by_name(&slots, &item_name);
                     if f.is_some() || tokio::time::Instant::now() >= poll_deadline {
@@ -1928,8 +1948,10 @@ async fn handle_window_interaction(
 
                 match found {
                     Some(i) => {
+                        if *state.last_window_id.read() != window_id { return; }
                         info!("[Bazaar] Found item at slot {}", i);
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        if *state.last_window_id.read() != window_id { return; }
                         click_window_slot(bot, window_id, i as i16).await;
                     }
                     None => {
@@ -1945,6 +1967,7 @@ async fn handle_window_interaction(
             // because ContainerSetContent may arrive at any time after OpenScreen.
             let poll_deadline2 = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
             let (amount_slot, price_slot) = loop {
+                if *state.last_window_id.read() != window_id { return; }
                 let slots = read_slots();
                 let ca = if is_buy_order { find_slot_by_name(&slots, "Custom Amount") } else { None };
                 let cp = find_slot_by_name(&slots, "Custom Price");
@@ -1958,6 +1981,7 @@ async fn handle_window_interaction(
             if let (Some(i), true) = (amount_slot,
                 is_buy_order && current_step == BazaarStep::SelectOrderType)
             {
+                if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Amount screen: clicking Custom Amount at slot {}", i);
                 *state.bazaar_step.write() = BazaarStep::SetAmount;
                 click_window_slot(bot, window_id, i as i16).await;
@@ -1967,6 +1991,7 @@ async fn handle_window_interaction(
             else if let (Some(i), true) = (price_slot,
                 current_step == BazaarStep::SelectOrderType || current_step == BazaarStep::SetAmount)
             {
+                if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
                 *state.bazaar_step.write() = BazaarStep::SetPrice;
                 click_window_slot(bot, window_id, i as i16).await;
@@ -1974,6 +1999,7 @@ async fn handle_window_interaction(
             }
             // Step 5: Confirm screen — anything that opens after SetPrice
             else if current_step == BazaarStep::SetPrice {
+                if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Confirm screen: clicking slot 13");
                 *state.bazaar_step.write() = BazaarStep::Confirm;
                 click_window_slot(bot, window_id, 13).await;
@@ -1996,6 +2022,125 @@ async fn handle_window_interaction(
                     info!("[Bazaar] ===== ORDER COMPLETE =====");
                 }
                 *state.bot_state.write() = BotState::Idle;
+            }
+        }
+        BotState::InstaSelling => {
+            // Sell a dominant inventory item via /bz → Sell Instantly to free space.
+            // Triggered by ManageOrders when inventory is full and one item type occupies
+            // more than half the player inventory slots.
+            //
+            // Flow (reuses bazaar_step for sub-state):
+            //   Initial       — bazaar search page: find item by name, click it
+            //   SearchResults — item detail page: find "Sell Instantly", click it
+            //   SelectOrderType — confirmation/warning page: wait ≤5 s, confirm
+            //
+            // After confirmation the bot opens /bz and returns to ManagingOrders so the
+            // collect loop can retry now that there is inventory space.
+            let item_name = match state.insta_sell_item.read().clone() {
+                Some(name) => name,
+                None => {
+                    warn!("[InstaSell] No item name stored, going idle");
+                    *state.bot_state.write() = BotState::Idle;
+                    return;
+                }
+            };
+
+            // Abort if this window has already been superseded
+            if *state.last_window_id.read() != window_id {
+                return;
+            }
+
+            let step = *state.bazaar_step.read();
+            info!("[InstaSell] Window: \"{}\" | step: {:?} | item: \"{}\"", window_title, step, item_name);
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            if *state.last_window_id.read() != window_id { return; }
+
+            if step == BazaarStep::Initial && window_title.contains("Bazaar") {
+                // Search results: find the item by name and click it
+                let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+                let item_slot = loop {
+                    if *state.last_window_id.read() != window_id { return; }
+                    let slots = bot.menu().slots();
+                    if let Some(i) = find_slot_by_name(&slots, &item_name) {
+                        break Some(i);
+                    }
+                    if tokio::time::Instant::now() >= poll_deadline { break None; }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                };
+                match item_slot {
+                    Some(i) => {
+                        if *state.last_window_id.read() != window_id { return; }
+                        info!("[InstaSell] Found \"{}\" at slot {}, clicking", item_name, i);
+                        *state.bazaar_step.write() = BazaarStep::SearchResults;
+                        click_window_slot(bot, window_id, i as i16).await;
+                    }
+                    None => {
+                        warn!("[InstaSell] Item \"{}\" not found in bazaar search, going idle", item_name);
+                        *state.insta_sell_item.write() = None;
+                        *state.bot_state.write() = BotState::Idle;
+                    }
+                }
+            } else if step == BazaarStep::SearchResults {
+                // Item detail page: find "Sell Instantly" and click it
+                let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+                let sell_slot = loop {
+                    if *state.last_window_id.read() != window_id { return; }
+                    let slots = bot.menu().slots();
+                    if let Some(i) = find_slot_by_name(&slots, "Sell Instantly") {
+                        break Some(i);
+                    }
+                    if tokio::time::Instant::now() >= poll_deadline { break None; }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                };
+                match sell_slot {
+                    Some(i) => {
+                        if *state.last_window_id.read() != window_id { return; }
+                        info!("[InstaSell] Clicking \"Sell Instantly\" at slot {}", i);
+                        *state.bazaar_step.write() = BazaarStep::SelectOrderType;
+                        click_window_slot(bot, window_id, i as i16).await;
+                    }
+                    None => {
+                        warn!("[InstaSell] \"Sell Instantly\" not found, going idle");
+                        *state.insta_sell_item.write() = None;
+                        *state.bot_state.write() = BotState::Idle;
+                    }
+                }
+            } else if step == BazaarStep::SelectOrderType {
+                // Confirmation page (warning may be present for up to 5 seconds).
+                // Wait up to 5 s for a "Confirm" button, then click it.
+                info!("[InstaSell] Waiting up to 5s for confirm button...");
+                let confirm_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                let confirm_slot = loop {
+                    if *state.last_window_id.read() != window_id { return; }
+                    let slots = bot.menu().slots();
+                    if let Some(i) = find_slot_by_name(&slots, "Confirm") {
+                        break Some(i);
+                    }
+                    if tokio::time::Instant::now() >= confirm_deadline { break None; }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                };
+                if *state.last_window_id.read() != window_id { return; }
+                match confirm_slot {
+                    Some(i) => {
+                        info!("[InstaSell] Clicking Confirm at slot {}", i);
+                        click_window_slot(bot, window_id, i as i16).await;
+                    }
+                    None => {
+                        // Confirm button did not appear within 5 s — the sell may have already
+                        // completed silently (no warning shown) or failed.  Log and continue so
+                        // ManageOrders can retry; avoid clicking a random slot.
+                        warn!("[InstaSell] Confirm button not found after 5s — sell may have completed or failed");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // Reset and return to ManagingOrders so collect can retry
+                info!("[InstaSell] Complete — returning to ManageOrders");
+                *state.insta_sell_item.write() = None;
+                *state.bazaar_step.write() = BazaarStep::Initial;
+                state.inventory_full.store(false, Ordering::Relaxed);
+                *state.bot_state.write() = BotState::ManagingOrders;
+                bot.write_chat_packet("/bz");
             }
         }
         BotState::ClaimingPurchased => {
@@ -2415,6 +2560,12 @@ async fn handle_window_interaction(
                                     cancel_slot = Some(cs);
                                     break;
                                 }
+                                // If inventory just became full from this click (filled BUY order
+                                // rejected by server) the detail view won't appear — break early
+                                // instead of burning the full 3-second timeout.
+                                if state.inventory_full.load(Ordering::Relaxed) && order_name.starts_with("BUY ") {
+                                    break;
+                                }
                                 if tokio::time::Instant::now() >= action_deadline {
                                     warn!("[ManageOrders] No Collect/Cancel button found for \"{}\", skipping", order_name);
                                     break;
@@ -2423,9 +2574,21 @@ async fn handle_window_interaction(
 
                             if let Some(cs) = collect_slot {
                                 if *state.last_window_id.read() == window_id {
-                                    // Check if we already know inventory is full before clicking
-                                    if state.inventory_full.load(Ordering::Relaxed) {
-                                        warn!("[ManageOrders] Inventory full — cannot collect \"{}\", logging to pending_claims.log", order_name);
+                                    // inventory_full only blocks BUY order collection (items need space).
+                                    // SELL offers deliver coins which always fit — always collect those.
+                                    let is_buy = order_name.starts_with("BUY ");
+                                    if is_buy && state.inventory_full.load(Ordering::Relaxed) {
+                                        warn!("[ManageOrders] Inventory full — cannot collect BUY items for \"{}\", checking for instasell", order_name);
+                                        // Check if a single dominant item is taking up >half of inventory —
+                                        // if so, switch to InstaSelling to free space, then retry.
+                                        if let Some(dominant) = find_dominant_inventory_item(bot) {
+                                            info!("[ManageOrders] Dominant item '{}' found (>50% of inventory) — instaselling to free space", dominant);
+                                            *state.insta_sell_item.write() = Some(dominant.clone());
+                                            *state.bazaar_step.write() = BazaarStep::Initial;
+                                            *state.bot_state.write() = BotState::InstaSelling;
+                                            bot.write_chat_packet(&format!("/bz {}", dominant));
+                                            break; // break outer order loop; InstaSelling handler takes over
+                                        }
                                         log_pending_claim(&order_name);
                                         // Still try remaining orders (cancel open ones) but skip collects
                                     } else {
@@ -2433,9 +2596,17 @@ async fn handle_window_interaction(
                                         click_window_slot(bot, window_id, cs as i16).await;
                                         // Wait briefly, then check if inventory became full
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                        if state.inventory_full.load(Ordering::Relaxed) {
-                                            // Collect failed: log remaining unprocessed orders
-                                            warn!("[ManageOrders] Inventory full after collect attempt — logging remaining orders");
+                                        if is_buy && state.inventory_full.load(Ordering::Relaxed) {
+                                            // Collect failed: check for instasell opportunity
+                                            warn!("[ManageOrders] Inventory full after collect attempt for \"{}\"", order_name);
+                                            if let Some(dominant) = find_dominant_inventory_item(bot) {
+                                                info!("[ManageOrders] Dominant item '{}' found — instaselling to free space", dominant);
+                                                *state.insta_sell_item.write() = Some(dominant.clone());
+                                                *state.bazaar_step.write() = BazaarStep::Initial;
+                                                *state.bot_state.write() = BotState::InstaSelling;
+                                                bot.write_chat_packet(&format!("/bz {}", dominant));
+                                                break;
+                                            }
                                             log_pending_claim(&order_name);
                                         }
                                     }
@@ -2448,6 +2619,21 @@ async fn handle_window_interaction(
                                     // Wait for the window content to revert to the order list
                                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 }
+                            } else if collect_slot.is_none() && cancel_slot.is_none()
+                                && state.inventory_full.load(Ordering::Relaxed)
+                                && order_name.starts_with("BUY ")
+                            {
+                                // Clicking the order triggered "inventory full" and no detail view
+                                // opened (server rejected the collect). Try instasell if dominant item.
+                                if let Some(dominant) = find_dominant_inventory_item(bot) {
+                                    info!("[ManageOrders] No button + inventory full + dominant item '{}' — instaselling", dominant);
+                                    *state.insta_sell_item.write() = Some(dominant.clone());
+                                    *state.bazaar_step.write() = BazaarStep::Initial;
+                                    *state.bot_state.write() = BotState::InstaSelling;
+                                    bot.write_chat_packet(&format!("/bz {}", dominant));
+                                    break;
+                                }
+                                log_pending_claim(&order_name);
                             }
                             // Loop continues to find remaining orders
                         }
@@ -2724,6 +2910,33 @@ fn log_pending_claim(order_name: &str) {
         Err(e) => warn!("[ManageOrders] Failed to write pending_claims.log: {}", e),
     }
     warn!("[ManageOrders] Logged unclaimed order \"{}\" to {:?}", order_name, log_path);
+}
+
+/// Returns the display name of the item that occupies more than half of the player's
+/// inventory slots (> half of 36 = 18 slots). Used to detect a dominant stackable item
+/// that should be instasold to free space when inventory is full.
+/// Returns None if no single item type dominates the inventory.
+fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
+    let menu = bot.menu();
+    let all_slots = menu.slots();
+    let player_range = menu.player_slots_range();
+    let player_slots = &all_slots[player_range];
+
+    let total = player_slots.len(); // 36 for a standard player inventory
+    let half = total / 2;
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for slot in player_slots.iter() {
+        if !slot.is_empty() {
+            if let Some(name) = get_item_display_name_from_slot(slot) {
+                *counts.entry(name).or_insert(0) += 1;
+            }
+        }
+    }
+
+    counts.into_iter()
+        .find(|(_, count)| *count > half)
+        .map(|(name, _)| name)
 }
 
 /// Click a window slot
