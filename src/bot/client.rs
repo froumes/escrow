@@ -138,6 +138,8 @@ pub enum BotEvent {
         starting_bid: u64,
         duration_hours: u64,
     },
+    /// A bazaar buy/sell order was fully filled and is ready to collect
+    BazaarOrderFilled,
 }
 
 impl BotClient {
@@ -244,6 +246,8 @@ impl BotClient {
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
+            command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            inventory_full: Arc::new(AtomicBool::new(false)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -631,6 +635,14 @@ pub struct BotClientState {
     pub cookie_time_secs: Arc<RwLock<u64>>,
     /// Sub-step within the BuyingCookie flow.
     pub cookie_step: Arc<RwLock<CookieStep>>,
+    /// Incremented at the start of every execute_command call so the 5-second GUI
+    /// watchdog can detect whether a new command has started since the watched
+    /// window was opened and skip the auto-close if so.
+    pub command_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set when "[Bazaar] You don't have the space required to claim that!" is
+    /// received.  The ManageOrders loop reads this flag to stop trying to collect
+    /// and log the remaining orders to pending_claims.log.
+    pub inventory_full: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -675,6 +687,8 @@ impl Default for BotClientState {
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
+            command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            inventory_full: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -682,12 +696,28 @@ impl Default for BotClientState {
 impl BotClientState {
     /// Read the player's current purse from the scoreboard sidebar.
     /// Mirrors BotClient::get_purse() for use within window/sign handlers.
+    /// Uses team prefix+suffix display text (same as get_scoreboard_lines()) because
+    /// Hypixel SkyBlock stores sidebar text in teams, not in the score display field.
     fn get_purse(&self) -> Option<u64> {
         let sidebar = self.sidebar_objective.read().clone()?;
         let scores = self.scoreboard_scores.read();
         let objective = scores.get(&sidebar)?;
-        for (_, (display, _)) in objective.iter() {
-            let clean = remove_mc_colors(display);
+        // Build member → display text map from teams (prefix+suffix), identical to
+        // get_scoreboard_lines() so that the purse line is found the same way.
+        let teams = self.scoreboard_teams.read();
+        let mut member_display: HashMap<String, String> = HashMap::with_capacity(teams.len());
+        for (_, (prefix, suffix, members)) in teams.iter() {
+            let text = format!("{}{}", prefix, suffix);
+            for member in members {
+                member_display.insert(member.clone(), text.clone());
+            }
+        }
+        drop(teams);
+        for (owner, (display, _)) in objective.iter() {
+            let text = member_display.get(owner.as_str())
+                .cloned()
+                .unwrap_or_else(|| display.clone());
+            let clean = remove_mc_colors(&text);
             for prefix in &["Purse: ", "Piggy: "] {
                 if let Some(rest) = clean.trim().strip_prefix(prefix) {
                     let num = rest.split_whitespace().next().unwrap_or("").replace(',', "");
@@ -817,6 +847,42 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
         if let Some(display) = get_item_display_name_from_slot(item) {
             if display.to_lowercase().contains(&name_lower) {
                 return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Parse the remaining grace-period time in seconds from the bed item displayed in
+/// slot 31 of the BIN Auction View.  Hypixel typically shows the time in the item's
+/// lore as a "M:SS" or "MM:SS" pattern (e.g. "0:45", "1:00").
+/// Returns `None` if no time can be extracted.
+fn parse_bed_remaining_secs(item: &azalea_inventory::ItemStack) -> Option<u64> {
+    let name = get_item_display_name_from_slot(item).unwrap_or_default();
+    let lore = get_item_lore_from_slot(item);
+    let all_text = std::iter::once(name).chain(lore).collect::<Vec<_>>().join(" ");
+    // Match "M:SS" or "MM:SS" — the first such pattern is the time remaining
+    let mut chars = all_text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            let mut minutes = String::from(c);
+            while chars.peek().map(|x| x.is_ascii_digit()).unwrap_or(false) {
+                minutes.push(chars.next().unwrap());
+            }
+            if chars.next() == Some(':') {
+                let mut secs = String::new();
+                for _ in 0..2 {
+                    if let Some(d) = chars.next() {
+                        if d.is_ascii_digit() { secs.push(d); } else { break; }
+                    }
+                }
+                if secs.len() == 2 {
+                    if let (Ok(m), Ok(s)) = (minutes.parse::<u64>(), secs.parse::<u64>()) {
+                        if s < 60 {
+                            return Some(m * 60 + s);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1059,6 +1125,23 @@ async fn event_handler(
                 }
             }
 
+            // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
+            // ManageOrders run so the filled items are collected promptly.
+            if clean_message.contains("[Bazaar]")
+                && clean_message.contains("was filled")
+                && (clean_message.contains("Buy Order") || clean_message.contains("Sell Offer"))
+            {
+                info!("[BazaarOrders] Order fill notification — emitting BazaarOrderFilled");
+                let _ = state.event_tx.send(BotEvent::BazaarOrderFilled);
+            }
+
+            // Detect "You don't have the space required to claim that!" and set the
+            // inventory_full flag so ManageOrders can stop and log remaining orders.
+            if clean_message.contains("don't have the space required to claim") {
+                warn!("[ManageOrders] Inventory full — logging unclaimed orders");
+                state.inventory_full.store(true, Ordering::Relaxed);
+            }
+
             // Check if we've teleported to island yet
             let teleported = *state.teleported_to_island.read();
             let join_time = *state.skyblock_join_time.read();
@@ -1141,6 +1224,8 @@ async fn event_handler(
                     // autoclose if not used for over 5 seconds".
                     // Exception: bed (grace-period) timing — the BIN Auction View must
                     // stay open for up to 60 s while waiting for the grace period to end.
+                    // Also skips if a newer command started since this window was opened
+                    // (prevents a stale watchdog from interrupting a new command).
                     {
                         let wdog_bot   = bot.clone();
                         let wdog_wid   = window_id as u8;
@@ -1148,6 +1233,8 @@ async fn event_handler(
                         let wdog_last  = state.last_window_id.clone();
                         let wdog_spam  = state.grace_period_spam_active.clone();
                         let wdog_bed   = state.bed_timing_active.clone();
+                        let wdog_gen   = state.command_generation.clone();
+                        let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             let still_open  = *wdog_last.read() == wdog_wid;
@@ -1157,7 +1244,9 @@ async fn event_handler(
                                 BotState::Purchasing | BotState::Bazaar | BotState::Selling
                                 | BotState::ClaimingPurchased | BotState::ClaimingSold
                             );
-                            if still_open && is_interactive && !is_bed {
+                            // Only fire if no new command started since this window was opened.
+                            let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
+                            if still_open && is_interactive && !is_bed && gen_unchanged {
                                 warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
                                 wdog_bot.write_packet(ServerboundContainerClose {
                                     container_id: wdog_wid as i32,
@@ -1397,6 +1486,10 @@ async fn execute_command(
 ) {
     use crate::types::CommandType;
 
+    // Increment the command generation counter so the GUI watchdog knows a new
+    // command has started and should not auto-close windows from a previous command.
+    state.command_generation.fetch_add(1, Ordering::SeqCst);
+
     info!("Executing command: {:?}", command.command_type);
 
     match &command.command_type {
@@ -1534,6 +1627,13 @@ async fn execute_command(
             bot.write_chat_packet("/sbmenu");
             *state.bot_state.write() = BotState::CheckingCookie;
         }
+        CommandType::ManageOrders => {
+            info!("[ManageOrders] Triggered by periodic check or order fill — opening /bz");
+            *state.manage_orders_cancelled.write() = 0;
+            state.inventory_full.store(false, Ordering::Relaxed);
+            bot.write_chat_packet("/bz");
+            *state.bot_state.write() = BotState::ManagingOrders;
+        }
         CommandType::DiscoverOrders | CommandType::ExecuteOrders => {
             info!("Command type not yet fully implemented in execute_command: {:?}", command.command_type);
         }
@@ -1583,23 +1683,65 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Spam-click slot 31 every 100 ms including during the bed phase so that
-                    // a click packet is in-flight at the exact moment the grace period expires
-                    // on the server side.  Waiting until gold_nugget appears in the client
-                    // menu before sending the first click adds at least one full roundtrip of
-                    // latency after the transition — pre-clicking eliminates that delay.
-                    info!("[AH] Bed detected in slot 31 — starting pre-click spam (100 ms interval)");
+                    // Strategy: parse the remaining time from the bed item and wait until
+                    // 100ms before expiry before sending the first click.  This avoids
+                    // sending hundreds of ignored clicks during the full grace period and
+                    // ensures the click packet arrives right as the server transitions
+                    // the slot from bed → gold_nugget.  If the time cannot be parsed,
+                    // fall back to clicking every 20ms immediately (was 100ms) which gives
+                    // more coverage regardless.
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
-                    const CLICK_INTERVAL_MS: u64 = 100;
+
+                    // Try to read the remaining seconds from the bed item
+                    let remaining_secs = {
+                        let menu = bot.menu();
+                        let slots = menu.slots();
+                        slots.get(31).and_then(|s| parse_bed_remaining_secs(s))
+                    };
+
+                    const PRE_CLICK_LEAD_MS: u64 = 100; // start clicking this many ms before expiry
+                    const CLICK_INTERVAL_MS: u64 = 20;  // rapid click every 20ms near expiry
                     const MAX_FAILED_CLICKS: usize = 5;
-                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(20);
+
+                    if let Some(secs) = remaining_secs {
+                        // Wait until PRE_CLICK_LEAD_MS before the grace period ends
+                        let wait_ms = (secs * 1000).saturating_sub(PRE_CLICK_LEAD_MS);
+                        if wait_ms > 0 {
+                            info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking", secs, wait_ms);
+                            // While waiting, poll every 200ms to bail early if bed disappears
+                            let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                if tokio::time::Instant::now() >= wait_deadline {
+                                    break;
+                                }
+                                // If the window changed state already, break out early
+                                let kind_now = {
+                                    let menu = bot.menu();
+                                    let slots = menu.slots();
+                                    slots.get(31).map(|s| {
+                                        if s.is_empty() { "air".to_string() }
+                                        else { s.kind().to_string().to_lowercase() }
+                                    }).unwrap_or_else(|| "air".to_string())
+                                };
+                                if !kind_now.contains("bed") {
+                                    break;
+                                }
+                            }
+                        }
+                        info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", PRE_CLICK_LEAD_MS);
+                    } else {
+                        info!("[AH] Bed detected in slot 31 — time unknown, starting rapid pre-click ({}ms interval)", CLICK_INTERVAL_MS);
+                    }
+
+                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
                     let mut failed_clicks: usize = 0;
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
 
                         if tokio::time::Instant::now() >= bed_deadline {
-                            warn!("[AH] Bed timing: grace period did not end within 20 s — giving up");
+                            warn!("[AH] Bed timing: grace period did not end — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             return;
@@ -1631,7 +1773,7 @@ async fn handle_window_interaction(
                             break;
                         } else if current_kind.contains("bed") {
                             // Still in grace period — pre-click so a packet arrives at the
-                            // server as close to the transition moment as possible.
+                            // server right as the transition happens.
                             debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
                             if *state.last_window_id.read() == window_id {
                                 click_window_slot(bot, window_id, 31).await;
@@ -2281,10 +2423,22 @@ async fn handle_window_interaction(
 
                             if let Some(cs) = collect_slot {
                                 if *state.last_window_id.read() == window_id {
-                                    info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
-                                    click_window_slot(bot, window_id, cs as i16).await;
-                                    // Wait for the window content to revert to the order list
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                    // Check if we already know inventory is full before clicking
+                                    if state.inventory_full.load(Ordering::Relaxed) {
+                                        warn!("[ManageOrders] Inventory full — cannot collect \"{}\", logging to pending_claims.log", order_name);
+                                        log_pending_claim(&order_name);
+                                        // Still try remaining orders (cancel open ones) but skip collects
+                                    } else {
+                                        info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
+                                        click_window_slot(bot, window_id, cs as i16).await;
+                                        // Wait briefly, then check if inventory became full
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        if state.inventory_full.load(Ordering::Relaxed) {
+                                            // Collect failed: log remaining unprocessed orders
+                                            warn!("[ManageOrders] Inventory full after collect attempt — logging remaining orders");
+                                            log_pending_claim(&order_name);
+                                        }
+                                    }
                                 }
                             } else if let Some(cs) = cancel_slot {
                                 if *state.last_window_id.read() == window_id {
@@ -2498,10 +2652,22 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             let item_type = item.kind() as u32;
             let nbt_data = if let Some(item_data) = item.as_present() {
                 match serde_json::to_value(item_data) {
-                    Ok(value) => value
-                        .as_object()
-                        .and_then(|obj| obj.get("components").cloned())
-                        .unwrap_or(serde_json::Value::Null),
+                    Ok(value) => {
+                        let mut components = value
+                            .as_object()
+                            .and_then(|obj| obj.get("components").cloned())
+                            .unwrap_or(serde_json::Value::Null);
+                        // Remove minecraft:profile (player-head texture data) from the NBT
+                        // sent to COFL.  Drills and other player_head items carry large base64
+                        // texture payloads in this component; including it can cause COFL's
+                        // inventory parser to reject the slot or the whole inventory, breaking
+                        // listing of other items.  COFL identifies items via
+                        // minecraft:custom_data (ExtraAttributes) which is always retained.
+                        if let Some(obj) = components.as_object_mut() {
+                            obj.remove("minecraft:profile");
+                        }
+                        components
+                    }
                     Err(_) => serde_json::Value::Null,
                 }
             } else {
@@ -2539,6 +2705,25 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     if let Ok(json_str) = serde_json::to_string(&inventory_json) {
         *state.cached_inventory_json.write() = Some(json_str);
     }
+}
+
+/// Append an unclaimed bazaar order to `pending_claims.log` with an RFC 3339 timestamp.
+/// Called when inventory is full and a filled order cannot be collected.
+/// The log can be reviewed later to know which orders need manual collection.
+fn log_pending_claim(order_name: &str) {
+    use std::io::Write;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let line = format!("{} {}\n", timestamp, order_name);
+    let log_path = match std::env::current_exe() {
+        Ok(exe) => exe.parent().map(|p| p.join("pending_claims.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("pending_claims.log")),
+        Err(_) => std::path::PathBuf::from("pending_claims.log"),
+    };
+    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
+        Err(e) => warn!("[ManageOrders] Failed to write pending_claims.log: {}", e),
+    }
+    warn!("[ManageOrders] Logged unclaimed order \"{}\" to {:?}", order_name, log_path);
 }
 
 /// Click a window slot

@@ -166,6 +166,8 @@ pub enum CommandType {
         /// ExtraAttributes.id from COFL for item identity verification
         item_id: Option<String>,
     },
+    /// Trigger a full bazaar order management cycle (open /bz → Manage Orders → collect/cancel).
+    ManageOrders,
     // Advanced commands matching TypeScript BAF.ts
     ClickSlot {
         slot: i16,

@@ -458,6 +458,19 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
+                frikadellen_baf::bot::BotEvent::BazaarOrderFilled => {
+                    // A bazaar buy/sell order was filled — trigger a ManageOrders run
+                    // immediately so the items are collected without waiting for the next
+                    // periodic check.  Only enqueue if bazaar flips are enabled.
+                    if config_for_events.enable_bazaar_flips {
+                        info!("[BazaarOrders] Order filled — queuing ManageOrders");
+                        command_queue_clone.enqueue(
+                            frikadellen_baf::types::CommandType::ManageOrders,
+                            frikadellen_baf::types::CommandPriority::High,
+                            false,
+                        );
+                    }
+                }
             }
         }
     });
@@ -730,17 +743,37 @@ async fn main() -> Result<()> {
                                 (Some(item_raw), Some(price), Some(duration)) => {
                                     // Strip Minecraft color codes (§X) from item name
                                     let item_name = frikadellen_baf::utils::remove_minecraft_colors(item_raw);
-                                    command_queue_clone.enqueue(
-                                        CommandType::SellToAuction {
-                                            item_name,
-                                            starting_bid: price,
-                                            duration_hours: duration,
-                                            item_slot,
-                                            item_id,
-                                        },
-                                        CommandPriority::High,
-                                        false,
-                                    );
+                                    let cmd = CommandType::SellToAuction {
+                                        item_name,
+                                        starting_bid: price,
+                                        duration_hours: duration,
+                                        item_slot,
+                                        item_id,
+                                    };
+                                    // If bazaar flips are paused (AH flip window active), defer
+                                    // listing until the window ends so the listing flow does not
+                                    // race with ongoing AH purchases.
+                                    if bazaar_flips_paused_ws.load(Ordering::Relaxed) {
+                                        info!("[createAuction] AH flip window active — deferring listing until bazaar flips resume");
+                                        let flag = bazaar_flips_paused_ws.clone();
+                                        let queue = command_queue_clone.clone();
+                                        tokio::spawn(async move {
+                                            let deadline = tokio::time::Instant::now()
+                                                + tokio::time::Duration::from_secs(30);
+                                            loop {
+                                                sleep(Duration::from_millis(250)).await;
+                                                if !flag.load(Ordering::Relaxed)
+                                                    || tokio::time::Instant::now() >= deadline
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            info!("[createAuction] Deferral complete — enqueueing SellToAuction");
+                                            queue.enqueue(cmd, CommandPriority::High, false);
+                                        });
+                                    } else {
+                                        command_queue_clone.enqueue(cmd, CommandPriority::High, false);
+                                    }
                                 }
                                 _ => {
                                     warn!("createAuction missing required fields (itemName, price, duration): {}", data);
@@ -846,6 +879,10 @@ async fn main() -> Result<()> {
                     cmd.command_type,
                     frikadellen_baf::types::CommandType::CheckCookie
                 );
+                let is_manage_orders = matches!(
+                    cmd.command_type,
+                    frikadellen_baf::types::CommandType::ManageOrders
+                );
                 if is_claim {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
@@ -912,6 +949,22 @@ async fn main() -> Result<()> {
                         | frikadellen_baf::types::BotState::BuyingCookie
                     ) {
                         warn!("[Cookie] Timed out waiting for cookie check, resetting state to Idle");
+                        bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
+                    }
+                } else if is_manage_orders {
+                    // Wait up to 60s for order management to complete
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    loop {
+                        sleep(Duration::from_millis(250)).await;
+                        let s = bot_client_clone.state();
+                        if s != frikadellen_baf::types::BotState::ManagingOrders
+                            || std::time::Instant::now() >= deadline
+                        {
+                            break;
+                        }
+                    }
+                    if bot_client_clone.state() == frikadellen_baf::types::BotState::ManagingOrders {
+                        warn!("[ManageOrders] Timed out waiting for order management, resetting state to Idle");
                         bot_client_clone.set_state(frikadellen_baf::types::BotState::Idle);
                     }
                 } else {
@@ -1092,6 +1145,30 @@ async fn main() -> Result<()> {
                             debug!("[Scoreboard] Uploaded to COFL: {:?}", scoreboard_lines);
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // Periodic bazaar order check — collect filled orders and cancel stale ones.
+    // Driven by config.bazaar_order_check_interval_seconds (default 30s).
+    if config.enable_bazaar_flips {
+        let bot_client_orders = bot_client.clone();
+        let command_queue_orders = command_queue.clone();
+        let order_interval = config.bazaar_order_check_interval_seconds;
+        tokio::spawn(async move {
+            use frikadellen_baf::types::{CommandType, CommandPriority};
+            // Give startup workflow time to complete before starting periodic checks
+            sleep(Duration::from_secs(120)).await;
+            loop {
+                sleep(Duration::from_secs(order_interval)).await;
+                if bot_client_orders.state().allows_commands() {
+                    debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
+                    command_queue_orders.enqueue(
+                        CommandType::ManageOrders,
+                        CommandPriority::Normal,
+                        false,
+                    );
                 }
             }
         });
