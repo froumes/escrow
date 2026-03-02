@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
     let mut bot_client = BotClient::new();
     bot_client.confirm_skip = config.confirm_skip;
     bot_client.set_auto_cookie_hours(config.auto_cookie);
+    bot_client.freemoney = config.freemoney_enabled();
     
     // Connect to Hypixel - Azalea will handle Microsoft OAuth in browser
     match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {

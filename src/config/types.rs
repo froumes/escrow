@@ -42,6 +42,9 @@ pub struct Config {
     
     #[serde(default)]
     pub bed_spam: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freemoney: Option<bool>,
     
     #[serde(default = "default_true")]
     pub use_cofl_chat: bool,
@@ -186,6 +189,7 @@ impl Default for Config {
             enable_bazaar_flips: true,
             enable_ah_flips: true,
             bed_spam: false,
+            freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
             confirm_skip: true,
@@ -206,8 +210,29 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn freemoney_enabled(&self) -> bool {
+        self.freemoney.unwrap_or(false)
+    }
+
     /// Returns the webhook URL only if it is non-empty.
     pub fn active_webhook_url(&self) -> Option<&str> {
         self.webhook_url.as_deref().filter(|u| !u.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn default_config_does_not_serialize_freemoney() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(!toml.contains("freemoney"));
+    }
+
+    #[test]
+    fn manual_freemoney_true_enables_flag() {
+        let config: Config = toml::from_str("freemoney = true").expect("config should parse");
+        assert!(config.freemoney_enabled());
     }
 }
