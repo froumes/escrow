@@ -1,8 +1,8 @@
-# frikadellen-baf-121
+# Frikadellen BAF
 Frikadellen BAF in the newest minecraft version based on Rust
 
 #if you get banned well you know you risked it its a macro in very early access
-also send me logs of bans thanks
+also send me logs of bans on [Discord](https://discord.gg/42DvX6T9jh) thanks
 
 
 ## Features
