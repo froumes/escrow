@@ -97,6 +97,8 @@ pub struct BotClient {
     cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value passed through to BotClientState.
     auto_cookie_hours: Arc<RwLock<u64>>,
+    /// Hidden config gate for purchaseAt bed timing mode.
+    pub freemoney: bool,
     /// Item name to sell via bazaar "Sell Instantly" when inventory is full
     insta_sell_item: Arc<RwLock<Option<String>>>,
 }
@@ -167,6 +169,7 @@ impl BotClient {
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
+            freemoney: false,
             insta_sell_item: Arc::new(RwLock::new(None)),
         }
     }
@@ -248,6 +251,7 @@ impl BotClient {
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
+            freemoney: self.freemoney,
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -638,6 +642,8 @@ pub struct BotClientState {
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
     pub auto_cookie_hours: Arc<RwLock<u64>>,
+    /// Hidden config gate for purchaseAt bed timing mode.
+    pub freemoney: bool,
     /// Measured remaining cookie time in seconds (set during CheckingCookie).
     pub cookie_time_secs: Arc<RwLock<u64>>,
     /// Sub-step within the BuyingCookie flow.
@@ -696,6 +702,7 @@ impl Default for BotClientState {
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
+            freemoney: false,
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1739,92 +1746,95 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Strategy: parse the remaining time from the bed item and wait until
-                    // 100ms before expiry before sending the first click.  This avoids
-                    // sending hundreds of ignored clicks during the full grace period and
-                    // ensures the click packet arrives right as the server transitions
-                    // the slot from bed → gold_nugget.  If the time cannot be parsed,
-                    // fall back to clicking every 20ms immediately (was 100ms) which gives
-                    // more coverage regardless.
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
-                    // Prefer COFL purchaseAt timing (grace-period end) when available.
-                    let remaining_ms_from_purchase_at = state.purchase_at_instant.read()
-                        .as_ref()
-                        .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
-                        .map(|d| d.as_millis() as u64);
-
-                    // Fallback: parse remaining seconds from the bed item in slot 31.
-                    let remaining_secs = {
-                        let menu = bot.menu();
-                        let slots = menu.slots();
-                        slots.get(31).and_then(|s| parse_bed_remaining_secs(s))
+                    const PRE_CLICK_LEAD_MS: u64 = 100; // start clicking this many ms before expiry
+                    const BED_SPAM_INTERVAL_MS: u64 = 100;
+                    const BED_TIMING_INTERVAL_MS: u64 = 20;
+                    const MAX_FAILED_CLICKS: usize = 5;
+                    let click_interval_ms = if state.freemoney {
+                        BED_TIMING_INTERVAL_MS
+                    } else {
+                        BED_SPAM_INTERVAL_MS
                     };
 
-                    const PRE_CLICK_LEAD_MS: u64 = 100; // start clicking this many ms before expiry
-                    const CLICK_INTERVAL_MS: u64 = 20;  // rapid click every 20ms near expiry
-                    const MAX_FAILED_CLICKS: usize = 5;
+                    if state.freemoney {
+                        // Prefer COFL purchaseAt timing (grace-period end) when available.
+                        let remaining_ms_from_purchase_at = state.purchase_at_instant.read()
+                            .as_ref()
+                            .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
+                            .map(|d| d.as_millis() as u64);
 
-                    if let Some(remaining_ms) = remaining_ms_from_purchase_at {
-                        let wait_ms = remaining_ms.saturating_sub(PRE_CLICK_LEAD_MS);
-                        if wait_ms > 0 {
-                            info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking", wait_ms);
-                            let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                                if tokio::time::Instant::now() >= wait_deadline {
-                                    break;
-                                }
-                                let kind_now = {
-                                    let menu = bot.menu();
-                                    let slots = menu.slots();
-                                    slots.get(31).map(|s| {
-                                        if s.is_empty() { "air".to_string() }
-                                        else { s.kind().to_string().to_lowercase() }
-                                    }).unwrap_or_else(|| "air".to_string())
-                                };
-                                if !kind_now.contains("bed") {
-                                    break;
-                                }
-                            }
-                        }
-                        info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt)", PRE_CLICK_LEAD_MS);
-                    } else if let Some(secs) = remaining_secs {
-                        // Wait until PRE_CLICK_LEAD_MS before the grace period ends
-                        let wait_ms = (secs * 1000).saturating_sub(PRE_CLICK_LEAD_MS);
-                        if wait_ms > 0 {
-                            info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking", secs, wait_ms);
-                            // While waiting, poll every 200ms to bail early if bed disappears
-                            let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                                if tokio::time::Instant::now() >= wait_deadline {
-                                    break;
-                                }
-                                // If the window changed state already, break out early
-                                let kind_now = {
-                                    let menu = bot.menu();
-                                    let slots = menu.slots();
-                                    slots.get(31).map(|s| {
-                                        if s.is_empty() { "air".to_string() }
-                                        else { s.kind().to_string().to_lowercase() }
-                                    }).unwrap_or_else(|| "air".to_string())
-                                };
-                                if !kind_now.contains("bed") {
-                                    break;
+                        // Fallback: parse remaining seconds from the bed item in slot 31.
+                        let remaining_secs = {
+                            let menu = bot.menu();
+                            let slots = menu.slots();
+                            slots.get(31).and_then(|s| parse_bed_remaining_secs(s))
+                        };
+
+                        if let Some(remaining_ms) = remaining_ms_from_purchase_at {
+                            let wait_ms = remaining_ms.saturating_sub(PRE_CLICK_LEAD_MS);
+                            if wait_ms > 0 {
+                                info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking", wait_ms);
+                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                    if tokio::time::Instant::now() >= wait_deadline {
+                                        break;
+                                    }
+                                    let kind_now = {
+                                        let menu = bot.menu();
+                                        let slots = menu.slots();
+                                        slots.get(31).map(|s| {
+                                            if s.is_empty() { "air".to_string() }
+                                            else { s.kind().to_string().to_lowercase() }
+                                        }).unwrap_or_else(|| "air".to_string())
+                                    };
+                                    if !kind_now.contains("bed") {
+                                        break;
+                                    }
                                 }
                             }
+                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt)", PRE_CLICK_LEAD_MS);
+                        } else if let Some(secs) = remaining_secs {
+                            // Wait until PRE_CLICK_LEAD_MS before the grace period ends
+                            let wait_ms = (secs * 1000).saturating_sub(PRE_CLICK_LEAD_MS);
+                            if wait_ms > 0 {
+                                info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking", secs, wait_ms);
+                                // While waiting, poll every 200ms to bail early if bed disappears
+                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                    if tokio::time::Instant::now() >= wait_deadline {
+                                        break;
+                                    }
+                                    // If the window changed state already, break out early
+                                    let kind_now = {
+                                        let menu = bot.menu();
+                                        let slots = menu.slots();
+                                        slots.get(31).map(|s| {
+                                            if s.is_empty() { "air".to_string() }
+                                            else { s.kind().to_string().to_lowercase() }
+                                        }).unwrap_or_else(|| "air".to_string())
+                                    };
+                                    if !kind_now.contains("bed") {
+                                        break;
+                                    }
+                                }
+                            }
+                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", PRE_CLICK_LEAD_MS);
+                        } else {
+                            info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
                         }
-                        info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", PRE_CLICK_LEAD_MS);
                     } else {
-                        info!("[AH] Bed detected in slot 31 — time unknown, starting rapid pre-click ({}ms interval)", CLICK_INTERVAL_MS);
+                        info!("[AH] Bed detected in slot 31 — starting bed spam ({}ms interval)", click_interval_ms);
                     }
 
                     let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
                     let mut failed_clicks: usize = 0;
                     loop {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
 
                         if tokio::time::Instant::now() >= bed_deadline {
                             warn!("[AH] Bed timing: grace period did not end — giving up");
