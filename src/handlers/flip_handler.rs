@@ -580,6 +580,7 @@ mod tests {
             target: 2000,
             finder: None,
             profit_perc: None,
+            purchase_at_ms: None,
             uuid: None,
         };
         assert!(!handler.should_skip_flip(&flip, 1000));
