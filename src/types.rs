@@ -17,9 +17,62 @@ pub struct Flip {
     
     #[serde(rename = "profitPerc", default)]
     pub profit_perc: Option<f64>,
+
+    /// Suggested buy time from COFL (grace-period end). Supports RFC3339 string,
+    /// unix seconds, or unix milliseconds.
+    #[serde(
+        rename = "purchaseAt",
+        default,
+        deserialize_with = "deserialize_optional_timestamp_millis"
+    )]
+    pub purchase_at_ms: Option<i64>,
     
     #[serde(default, alias = "auctionUuid", alias = "auction_uuid", alias = "auctionId", alias = "id")]
     pub uuid: Option<String>,
+}
+
+fn deserialize_optional_timestamp_millis<'de, D>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(v) = n.as_i64() {
+                // Treat values above this as milliseconds; smaller values are unix seconds.
+                if v > 1_000_000_000_000 {
+                    Ok(Some(v))
+                } else {
+                    Ok(Some(v.saturating_mul(1000)))
+                }
+            } else {
+                Err(D::Error::custom("invalid numeric purchaseAt"))
+            }
+        }
+        serde_json::Value::String(s) => {
+            if let Ok(v) = s.parse::<i64>() {
+                // Treat values above this as milliseconds; smaller values are unix seconds.
+                if v > 1_000_000_000_000 {
+                    return Ok(Some(v));
+                }
+                return Ok(Some(v.saturating_mul(1000)));
+            }
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| Some(dt.timestamp_millis()))
+                .map_err(|e| D::Error::custom(format!("invalid purchaseAt timestamp: {}", e)))
+        }
+        other => Err(D::Error::custom(format!(
+            "invalid purchaseAt type: {:?}",
+            other
+        ))),
+    }
 }
 
 /// Represents a bazaar flip recommendation
@@ -78,6 +131,37 @@ impl BazaarFlipRecommendation {
         } else {
             self.is_buy_order
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Flip;
+
+    #[test]
+    fn test_flip_purchase_at_rfc3339_deserialization() {
+        let value = serde_json::json!({
+            "itemName": "Test Item",
+            "startingBid": 1000,
+            "target": 2000,
+            "id": "abc",
+            "purchaseAt": "2026-03-02T13:00:20Z"
+        });
+        let flip: Flip = serde_json::from_value(value).expect("flip should deserialize");
+        assert_eq!(flip.purchase_at_ms, Some(1_772_456_420_000));
+    }
+
+    #[test]
+    fn test_flip_purchase_at_unix_seconds_deserialization() {
+        let value = serde_json::json!({
+            "itemName": "Test Item",
+            "startingBid": 1000,
+            "target": 2000,
+            "id": "abc",
+            "purchaseAt": 1_772_456_420
+        });
+        let flip: Flip = serde_json::from_value(value).expect("flip should deserialize");
+        assert_eq!(flip.purchase_at_ms, Some(1_772_456_420_000));
     }
 }
 

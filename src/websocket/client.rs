@@ -134,10 +134,11 @@ impl CoflWebSocket {
     }
 
     fn handle_message(text: &str, tx: &mpsc::UnboundedSender<CoflEvent>) -> Result<()> {
+        info!("[COFL <-] {}", text);
         let msg: WebSocketMessage = serde_json::from_str(text)
             .context("Failed to parse WebSocket message")?;
 
-        debug!("Received message type: {}", msg.msg_type);
+        info!("[COFL <-] type={} data={}", msg.msg_type, msg.data);
 
         match msg.msg_type.as_str() {
             "flip" => {
@@ -261,6 +262,7 @@ impl CoflWebSocket {
         let mut write = self.write.lock().await;
         write.send(Message::Text(message.to_string())).await
             .context("Failed to send message to WebSocket")?;
+        info!("[COFL ->] {}", message);
         debug!("Sent WS message ({} bytes)", message.len());
         Ok(())
     }

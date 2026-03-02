@@ -244,6 +244,7 @@ impl BotClient {
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
+            purchase_at_instant: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
@@ -628,6 +629,8 @@ pub struct BotClientState {
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
     pub grace_period_spam_active: Arc<AtomicBool>,
+    /// COFL-provided bed end timing (`purchaseAt`) converted to a local instant.
+    pub purchase_at_instant: Arc<RwLock<Option<tokio::time::Instant>>>,
     /// Set to true while the bot is waiting for a bed (grace-period) to expire so
     /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
     pub bed_timing_active: Arc<AtomicBool>,
@@ -689,6 +692,7 @@ impl Default for BotClientState {
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
+            purchase_at_instant: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
@@ -869,6 +873,10 @@ fn parse_bed_remaining_secs(item: &azalea_inventory::ItemStack) -> Option<u64> {
     let name = get_item_display_name_from_slot(item).unwrap_or_default();
     let lore = get_item_lore_from_slot(item);
     let all_text = std::iter::once(name).chain(lore).collect::<Vec<_>>().join(" ");
+    parse_bed_remaining_secs_from_text(&all_text)
+}
+
+fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
     // Match "M:SS" or "MM:SS" — the first such pattern is the time remaining
     let mut chars = all_text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -890,6 +898,30 @@ fn parse_bed_remaining_secs(item: &azalea_inventory::ItemStack) -> Option<u64> {
                             return Some(m * 60 + s);
                         }
                     }
+                }
+            }
+        }
+    }
+    // Match textual variants like "1m 5s"
+    if let Ok(minute_second_re) =
+        regex::Regex::new(r"(?i)\b(\d+)\s*m(?:in(?:ute)?s?)?\s*(\d+)\s*s(?:ec(?:ond)?s?)?\b")
+    {
+        if let Some(caps) = minute_second_re.captures(all_text) {
+            if let (Some(m), Some(s)) = (caps.get(1), caps.get(2)) {
+                if let (Ok(m), Ok(s)) = (m.as_str().parse::<u64>(), s.as_str().parse::<u64>()) {
+                    if s < 60 {
+                        return Some(m * 60 + s);
+                    }
+                }
+            }
+        }
+    }
+    // Match seconds-only variants like "59s" / "59 sec"
+    if let Ok(second_only_re) = regex::Regex::new(r"(?i)\b(\d+)\s*s(?:ec(?:ond)?s?)?\b") {
+        if let Some(caps) = second_only_re.captures(all_text) {
+            if let Some(s) = caps.get(1) {
+                if let Ok(s) = s.as_str().parse::<u64>() {
+                    return Some(s);
                 }
             }
         }
@@ -1273,6 +1305,7 @@ async fn event_handler(
                     // Clear grace-period spam and bed-timing flags so a new BIN Auction View
                     // can start fresh.
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                    *state.purchase_at_instant.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
@@ -1519,6 +1552,21 @@ async fn execute_command(
             
             info!("Sending chat command: {}", chat_command);
             bot.write_chat_packet(&chat_command);
+
+            // Convert COFL purchaseAt to a local instant so bed timing can wait
+            // for the exact grace-period end sent by COFL.
+            let purchase_at_instant = flip.purchase_at_ms.and_then(|purchase_at_ms| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as i64)?;
+                if purchase_at_ms <= now_ms {
+                    return Some(tokio::time::Instant::now());
+                }
+                let wait_ms = (purchase_at_ms - now_ms) as u64;
+                Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms))
+            });
+            *state.purchase_at_instant.write() = purchase_at_instant;
             
             // Set state to purchasing
             *state.bot_state.write() = BotState::Purchasing;
@@ -1701,7 +1749,13 @@ async fn handle_window_interaction(
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
-                    // Try to read the remaining seconds from the bed item
+                    // Prefer COFL purchaseAt timing (grace-period end) when available.
+                    let remaining_ms_from_purchase_at = state.purchase_at_instant.read()
+                        .as_ref()
+                        .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
+                        .map(|d| d.as_millis() as u64);
+
+                    // Fallback: parse remaining seconds from the bed item in slot 31.
                     let remaining_secs = {
                         let menu = bot.menu();
                         let slots = menu.slots();
@@ -1712,7 +1766,31 @@ async fn handle_window_interaction(
                     const CLICK_INTERVAL_MS: u64 = 20;  // rapid click every 20ms near expiry
                     const MAX_FAILED_CLICKS: usize = 5;
 
-                    if let Some(secs) = remaining_secs {
+                    if let Some(remaining_ms) = remaining_ms_from_purchase_at {
+                        let wait_ms = remaining_ms.saturating_sub(PRE_CLICK_LEAD_MS);
+                        if wait_ms > 0 {
+                            info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking", wait_ms);
+                            let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                            loop {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                if tokio::time::Instant::now() >= wait_deadline {
+                                    break;
+                                }
+                                let kind_now = {
+                                    let menu = bot.menu();
+                                    let slots = menu.slots();
+                                    slots.get(31).map(|s| {
+                                        if s.is_empty() { "air".to_string() }
+                                        else { s.kind().to_string().to_lowercase() }
+                                    }).unwrap_or_else(|| "air".to_string())
+                                };
+                                if !kind_now.contains("bed") {
+                                    break;
+                                }
+                            }
+                        }
+                        info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt)", PRE_CLICK_LEAD_MS);
+                    } else if let Some(secs) = remaining_secs {
                         // Wait until PRE_CLICK_LEAD_MS before the grace period ends
                         let wait_ms = (secs * 1000).saturating_sub(PRE_CLICK_LEAD_MS);
                         if wait_ms > 0 {
@@ -3174,5 +3252,13 @@ mod tests {
     fn test_remove_mc_colors() {
         assert_eq!(remove_mc_colors("§aHello §r§bWorld"), "Hello World");
         assert_eq!(remove_mc_colors("No colors"), "No colors");
+    }
+
+    #[test]
+    fn test_parse_bed_remaining_secs_from_text() {
+        assert_eq!(parse_bed_remaining_secs_from_text("Ends in 0:45"), Some(45));
+        assert_eq!(parse_bed_remaining_secs_from_text("Purchase in 1m 05s"), Some(65));
+        assert_eq!(parse_bed_remaining_secs_from_text("Grace period: 59s"), Some(59));
+        assert_eq!(parse_bed_remaining_secs_from_text("No time here"), None);
     }
 }

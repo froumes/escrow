@@ -22,7 +22,7 @@ also send me logs of bans thanks
 4. Complete Microsoft authentication in the browser that opens
 5. The bot will connect to Hypixel and start monitoring for flips
 
-For detailed setup instructions, see [Microsoft Authentication Setup Guide](MICROSOFT_AUTH_SETUP.md)
+Follow the prompts shown in the terminal and browser for Microsoft authentication setup.
 
 ## Configuration
 
@@ -41,7 +41,7 @@ The application creates a `config.toml` file in the same directory as the execut
 
 ## Troubleshooting
 
-See the [Microsoft Authentication Setup Guide](MICROSOFT_AUTH_SETUP.md) for common issues and solutions.
+If authentication fails, rerun the app and complete the Microsoft login flow again in the opened browser window.
 
 ## Building from Source
 

@@ -1,21 +1,18 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub fn init_logger() -> Result<()> {
-    let log_path = get_log_path();
-    
-    // Create log directory if it doesn't exist
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let logs_dir = get_logs_dir();
+    std::fs::create_dir_all(&logs_dir)?;
+    rotate_previous_latest_log(&logs_dir)?;
 
     // Create file appender
     let file_appender = RollingFileAppender::new(
-        Rotation::DAILY,
-        log_path.parent().unwrap_or(&PathBuf::from(".")),
-        "baf.log",
+        Rotation::NEVER,
+        &logs_dir,
+        "latest.log",
     );
 
     // Create filter with specific rules to suppress noise
@@ -44,11 +41,11 @@ pub fn init_logger() -> Result<()> {
         )
         .init();
 
-    tracing::info!("Logger initialized, writing to {:?}", log_path);
+    tracing::info!("Logger initialized, writing to {:?}", logs_dir.join("latest.log"));
     Ok(())
 }
 
-fn get_log_path() -> PathBuf {
+fn get_logs_dir() -> PathBuf {
     // Use executable directory for log file
     // This allows multiple instances to run with separate logs
     let exe_dir = match std::env::current_exe() {
@@ -65,8 +62,35 @@ fn get_log_path() -> PathBuf {
             PathBuf::from(".")
         }
     };
-    
-    exe_dir.join("baf.log")
+
+    exe_dir.join("logs")
+}
+
+fn rotate_previous_latest_log(logs_dir: &Path) -> Result<()> {
+    let latest_log = logs_dir.join("latest.log");
+    if !latest_log.exists() {
+        return Ok(());
+    }
+
+    let session_start = std::fs::metadata(&latest_log)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .unwrap_or_else(chrono::Utc::now);
+
+    let base_name = session_start
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d_%H-%M-%S")
+        .to_string();
+
+    let mut archived_log = logs_dir.join(format!("{}.log", base_name));
+    let mut suffix = 1usize;
+    while archived_log.exists() {
+        archived_log = logs_dir.join(format!("{}_{}.log", base_name, suffix));
+        suffix += 1;
+    }
+    std::fs::rename(latest_log, archived_log)?;
+    Ok(())
 }
 
 /// Remove Minecraft color codes from a string
