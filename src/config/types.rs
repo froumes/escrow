@@ -52,10 +52,10 @@ pub struct Config {
     #[serde(default)]
     pub auto_cookie: u64,
 
-    /// Send slot-31 twice on BIN Auction View to skip the Confirm Purchase dialog.
-    /// Defaults to true for fastest buy speed (window-skip technique).
-    #[serde(default = "default_true")]
-    pub confirm_skip: bool,
+    /// Enable fastbuy (window-skip): click BIN buy (slot 31) and pre-click confirm (slot 11).
+    /// Disabled by default; must be explicitly set to true.
+    #[serde(default, alias = "confirm_skip")]
+    pub fastbuy: bool,
     
     #[serde(default = "default_true")]
     pub enable_console_input: bool,
@@ -192,7 +192,7 @@ impl Default for Config {
             freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
-            confirm_skip: true,
+            fastbuy: false,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
             skip: SkipConfig::default(),
@@ -234,5 +234,16 @@ mod tests {
     fn manual_freemoney_true_enables_flag() {
         let config: Config = toml::from_str("freemoney = true").expect("config should parse");
         assert!(config.freemoney_enabled());
+    }
+
+    #[test]
+    fn fastbuy_defaults_to_false() {
+        assert!(!Config::default().fastbuy);
+    }
+
+    #[test]
+    fn legacy_confirm_skip_maps_to_fastbuy() {
+        let config: Config = toml::from_str("confirm_skip = true").expect("config should parse");
+        assert!(config.fastbuy);
     }
 }

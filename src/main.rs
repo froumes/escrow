@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
     info!("A browser window will open for you to log in");
     
     let mut bot_client = BotClient::new();
-    bot_client.confirm_skip = config.confirm_skip;
+    bot_client.fastbuy = config.fastbuy;
     bot_client.set_auto_cookie_hours(config.auto_cookie);
     bot_client.freemoney = config.freemoney_enabled();
     
