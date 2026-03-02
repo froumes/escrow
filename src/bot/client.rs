@@ -1825,7 +1825,7 @@ async fn handle_window_interaction(
                             }
                             info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", PRE_CLICK_LEAD_MS);
                         } else {
-                            info!("[AH] Bed detected in slot 31 — time unknown, starting rapid pre-click ({}ms interval)", click_interval_ms);
+                            info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
                         }
                     } else {
                         info!("[AH] Bed detected in slot 31 — starting bed spam ({}ms interval)", click_interval_ms);

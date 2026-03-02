@@ -225,7 +225,7 @@ mod tests {
     use super::Config;
 
     #[test]
-    fn default_config_does_not_serialize_freemoney() {
+    fn default_config_omits_freemoney() {
         let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(!toml.contains("freemoney"));
     }
