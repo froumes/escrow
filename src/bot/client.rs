@@ -39,6 +39,9 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 /// Delay before clicking accept button in trade response window (milliseconds)
 /// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
+const FASTBUY_PRECLICK_DELAY_MS: u64 = 35;
+const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
+const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
 
 /// Main bot client wrapper for Azalea
 /// 
@@ -81,8 +84,8 @@ pub struct BotClient {
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Whether to use the confirm-skip technique when purchasing BIN auctions
-    pub confirm_skip: bool,
+    /// Whether to use fastbuy (window-skip) when purchasing BIN auctions
+    pub fastbuy: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
@@ -164,7 +167,7 @@ impl BotClient {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
-            confirm_skip: false,
+            fastbuy: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
@@ -241,7 +244,7 @@ impl BotClient {
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
-            confirm_skip: self.confirm_skip,
+            fastbuy: self.fastbuy,
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
@@ -619,8 +622,8 @@ pub struct BotClientState {
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Whether to use the confirm-skip technique when purchasing BIN auctions
-    pub confirm_skip: bool,
+    /// Whether to use fastbuy (window-skip) when purchasing BIN auctions
+    pub fastbuy: bool,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
@@ -692,7 +695,7 @@ impl Default for BotClientState {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
-            confirm_skip: false,
+            fastbuy: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
@@ -957,6 +960,16 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     has_claimable && !is_active
 }
 
+/// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
+/// and should be aborted immediately instead of waiting for the GUI watchdog timeout.
+fn is_terminal_purchase_failure_message(message: &str) -> bool {
+    message.contains("You didn't participate in this auction!")
+        || message.contains("This auction wasn't found!")
+        || message.contains("The auction wasn't found!")
+        || message.contains("You cannot view this auction!")
+        || message.contains("You cannot afford this auction!")
+}
+
 /// Handle events from the Azalea client
 async fn event_handler(
     bot: Client,
@@ -1001,6 +1014,7 @@ async fn event_handler(
                 let event_tx_wd = state.event_tx.clone();
                 let manage_orders_cancelled_wd = state.manage_orders_cancelled.clone();
                 let auto_cookie_wd = state.auto_cookie_hours.clone();
+                let command_generation_wd = state.command_generation.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let already_done = *teleported_wd.read();
@@ -1014,7 +1028,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_generation_wd).await;
                     }
                 });
             }
@@ -1084,6 +1098,26 @@ async fn event_handler(
                     ));
                     info!("[AH] Buy speed: {}ms", speed_ms);
                 }
+            } else if *state.bot_state.read() == BotState::Purchasing
+                && is_terminal_purchase_failure_message(&clean_message)
+            {
+                // Abort immediately on terminal purchase failure messages so we don't keep a
+                // stale purchasing window open for 5s and overlap the next queued command.
+                let window_id = *state.last_window_id.read();
+                warn!(
+                    "[AH] Terminal purchase failure detected: \"{}\" — closing window {}",
+                    clean_message, window_id
+                );
+                if window_id > 0 {
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                }
+                *state.bot_state.write() = BotState::Idle;
+                state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                *state.purchase_start_time.write() = None;
+                *state.purchase_at_instant.write() = None;
+                state.bed_timing_active.store(false, Ordering::Relaxed);
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
                 if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
@@ -1232,6 +1266,7 @@ async fn event_handler(
                         let event_tx_startup = state.event_tx.clone();
                         let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
                         let auto_cookie_startup = state.auto_cookie_hours.clone();
+                        let command_generation_startup = state.command_generation.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
                             bot_clone.write_chat_packet("/is");
@@ -1239,7 +1274,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_generation_startup).await;
                         });
                     }
                 }
@@ -1892,6 +1927,22 @@ async fn handle_window_interaction(
                     // is already preparing the Confirm Purchase window, which confuses the server
                     // and adds ~300ms of unnecessary latency.
                     click_window_slot(bot, window_id, 31).await;
+
+                    // Optional fastbuy (window-skip): pre-click confirm in the next window.
+                    // If this packet is ignored/lost, the Confirm Purchase handler below still
+                    // performs normal confirm clicks with retries.
+                    if state.fastbuy && slot_31_kind.contains(BIN_PURCHASE_ITEM_KIND) {
+                        // Small pre-click delay to let the slot-31 buy packet reach the server
+                        // before we send the next-window confirm packet.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(FASTBUY_PRECLICK_DELAY_MS)).await;
+                        let observed_window_id = *state.last_window_id.read();
+                        if observed_window_id == window_id {
+                            // Hypixel's confirm GUI for this click is the next container id.
+                            // wrapping_add handles the u8 id rollover safely.
+                            let next_window_id = observed_window_id.wrapping_add(1);
+                            click_window_slot(bot, next_window_id, 11).await;
+                        }
+                    }
                 }
             } else if window_title.contains("Confirm Purchase") {
                 // Click slot 11 immediately — speed is everything on a low-latency VPS.
@@ -3075,7 +3126,32 @@ async fn run_startup_workflow(
     event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
     manage_orders_cancelled: Arc<RwLock<u64>>,
     auto_cookie_hours: Arc<RwLock<u64>>,
+    command_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    // Do not run startup steps while another interactive flow is active.
+    // Wait briefly for idle/grace period; abort if the bot stays busy.
+    let entry_deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(STARTUP_ENTRY_TIMEOUT_SECS);
+    loop {
+        let current_state = *bot_state.read();
+        if matches!(current_state, BotState::GracePeriod | BotState::Idle) {
+            break;
+        }
+        if current_state == BotState::Startup {
+            debug!("[Startup] Workflow already running, skipping duplicate start");
+            return;
+        }
+        if tokio::time::Instant::now() >= entry_deadline {
+            warn!("[Startup] Skipping startup workflow: bot stayed busy in state {:?}", current_state);
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+
+    // Snapshot command generation at workflow entry. If this value changes, execute_command
+    // has started a new queued command and startup must abort to avoid overlapping GUI flows.
+    let startup_generation = command_generation.load(Ordering::SeqCst);
+
     info!("╔══════════════════════════════════════╗");
     info!("║        BAF Startup Workflow          ║");
     info!("╚══════════════════════════════════════╝");
@@ -3098,10 +3174,18 @@ async fn run_startup_workflow(
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if command_generation.load(Ordering::SeqCst) != startup_generation {
+                warn!("[Startup] Aborting workflow: another command started during cookie check");
+                return;
+            }
             let cur = *bot_state.read();
             if matches!(cur, BotState::Idle | BotState::Startup) || tokio::time::Instant::now() >= deadline {
                 break;
             }
+        }
+        if command_generation.load(Ordering::SeqCst) != startup_generation {
+            warn!("[Startup] Aborting workflow: another command started during cookie check");
+            return;
         }
         // Ensure we're not stuck in cookie states
         *bot_state.write() = BotState::Startup;
@@ -3125,10 +3209,18 @@ async fn run_startup_workflow(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if command_generation.load(Ordering::SeqCst) != startup_generation {
+            warn!("[Startup] Aborting workflow: another command started during bazaar order management");
+            return;
+        }
         let cur = *bot_state.read();
         if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
             break;
         }
+    }
+    if command_generation.load(Ordering::SeqCst) != startup_generation {
+        warn!("[Startup] Aborting workflow: another command started during bazaar order management");
+        return;
     }
     // Ensure Idle before proceeding (in case of timeout)
     *bot_state.write() = BotState::Idle;
@@ -3144,10 +3236,18 @@ async fn run_startup_workflow(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if command_generation.load(Ordering::SeqCst) != startup_generation {
+            warn!("[Startup] Aborting workflow: another command started during claim-sold step");
+            return;
+        }
         let cur = *bot_state.read();
         if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
             break;
         }
+    }
+    if command_generation.load(Ordering::SeqCst) != startup_generation {
+        warn!("[Startup] Aborting workflow: another command started during claim-sold step");
+        return;
     }
     // Ensure Idle before proceeding
     *bot_state.write() = BotState::Idle;
@@ -3162,10 +3262,18 @@ async fn run_startup_workflow(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if command_generation.load(Ordering::SeqCst) != startup_generation {
+            warn!("[Startup] Aborting workflow: another command started during claim-purchased step");
+            return;
+        }
         let cur = *bot_state.read();
         if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
             break;
         }
+    }
+    if command_generation.load(Ordering::SeqCst) != startup_generation {
+        warn!("[Startup] Aborting workflow: another command started during claim-purchased step");
+        return;
     }
     // Ensure Idle before proceeding
     *bot_state.write() = BotState::Idle;
@@ -3257,5 +3365,12 @@ mod tests {
         assert_eq!(parse_bed_remaining_secs_from_text("Purchase in 1m 05s"), Some(65));
         assert_eq!(parse_bed_remaining_secs_from_text("Grace period: 59s"), Some(59));
         assert_eq!(parse_bed_remaining_secs_from_text("No time here"), None);
+    }
+
+    #[test]
+    fn test_is_terminal_purchase_failure_message() {
+        assert!(is_terminal_purchase_failure_message("You didn't participate in this auction!"));
+        assert!(is_terminal_purchase_failure_message("This auction wasn't found!"));
+        assert!(!is_terminal_purchase_failure_message("Putting coins in escrow..."));
     }
 }

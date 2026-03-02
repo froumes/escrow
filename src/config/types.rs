@@ -52,10 +52,10 @@ pub struct Config {
     #[serde(default)]
     pub auto_cookie: u64,
 
-    /// Send slot-31 twice on BIN Auction View to skip the Confirm Purchase dialog.
-    /// Defaults to true for fastest buy speed (window-skip technique).
-    #[serde(default = "default_true")]
-    pub confirm_skip: bool,
+    /// Enable fastbuy (window-skip): click BIN buy (slot 31) and pre-click confirm (slot 11).
+    /// Disabled by default and omitted from generated config unless manually added.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "confirm_skip")]
+    pub fastbuy: Option<bool>,
     
     #[serde(default = "default_true")]
     pub enable_console_input: bool,
@@ -192,7 +192,7 @@ impl Default for Config {
             freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
-            confirm_skip: true,
+            fastbuy: None,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
             skip: SkipConfig::default(),
@@ -212,6 +212,10 @@ impl Default for Config {
 impl Config {
     pub fn freemoney_enabled(&self) -> bool {
         self.freemoney.unwrap_or(false)
+    }
+
+    pub fn fastbuy_enabled(&self) -> bool {
+        self.fastbuy.unwrap_or(false)
     }
 
     /// Returns the webhook URL only if it is non-empty.
@@ -234,5 +238,22 @@ mod tests {
     fn manual_freemoney_true_enables_flag() {
         let config: Config = toml::from_str("freemoney = true").expect("config should parse");
         assert!(config.freemoney_enabled());
+    }
+
+    #[test]
+    fn fastbuy_defaults_to_false() {
+        assert!(!Config::default().fastbuy_enabled());
+    }
+
+    #[test]
+    fn default_config_omits_fastbuy() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(!toml.contains("fastbuy"));
+    }
+
+    #[test]
+    fn legacy_confirm_skip_maps_to_fastbuy() {
+        let config: Config = toml::from_str("confirm_skip = true").expect("config should parse");
+        assert!(config.fastbuy_enabled());
     }
 }
