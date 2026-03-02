@@ -46,6 +46,7 @@ where
     match value {
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_i64() {
+                // Treat values above this as milliseconds; smaller values are unix seconds.
                 if v > 1_000_000_000_000 {
                     Ok(Some(v))
                 } else {
@@ -57,6 +58,7 @@ where
         }
         serde_json::Value::String(s) => {
             if let Ok(v) = s.parse::<i64>() {
+                // Treat values above this as milliseconds; smaller values are unix seconds.
                 if v > 1_000_000_000_000 {
                     return Ok(Some(v));
                 }
