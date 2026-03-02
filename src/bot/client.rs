@@ -2944,8 +2944,6 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
 
     let inventory_json = serde_json::json!({
         "id": 0,
-        "type": "minecraft:inventory",
-        "title": "Inventory",
         "slots": slots_array,
         "inventoryStart": 9,
         "inventoryEnd": 45,
