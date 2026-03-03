@@ -1151,6 +1151,7 @@ async fn event_handler(
                     if !already_active {
                         let bot_clone = bot.clone();
                         let window_id = *state.last_window_id.read();
+                        let shared_window_id = state.last_window_id.clone();
                         let bot_state = state.bot_state.clone();
                         let spam_flag = state.grace_period_spam_active.clone();
                         info!("[AH] Grace period detected — starting bed spam ({} ms interval)", 100);
@@ -1160,6 +1161,14 @@ async fn event_handler(
                             let mut failed_clicks: usize = 0;
                             loop {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_INTERVAL_MS)).await;
+                                let current_window_id = *shared_window_id.read();
+                                if current_window_id != window_id {
+                                    info!(
+                                        "[AH] Grace period spam: window changed ({} -> {}), stopping",
+                                        window_id, current_window_id
+                                    );
+                                    break;
+                                }
                                 let current_kind = {
                                     let menu = bot_clone.menu();
                                     let slots = menu.slots();
