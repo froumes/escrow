@@ -1795,7 +1795,7 @@ async fn handle_window_interaction(
 
                     const PRE_CLICK_LEAD_MS: u64 = 100; // start clicking this many ms before expiry
                     const BED_SPAM_INTERVAL_MS: u64 = 100;
-                    const BED_TIMING_INTERVAL_MS: u64 = 20;
+                    const BED_TIMING_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
                     let click_interval_ms = if state.freemoney {
                         BED_TIMING_INTERVAL_MS
