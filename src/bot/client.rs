@@ -1164,7 +1164,6 @@ async fn event_handler(
                         let click_interval_ms = state.bed_spam_click_delay.max(1);
                         info!("[AH] Grace period detected — starting bed spam ({} ms interval)", click_interval_ms);
                         tokio::spawn(async move {
-                            let click_interval_ms = click_interval_ms;
                             const MAX_FAILED_CLICKS: usize = 5;
                             let mut failed_clicks: usize = 0;
                             loop {
