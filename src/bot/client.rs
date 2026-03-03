@@ -1801,8 +1801,13 @@ async fn handle_window_interaction(
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
                     const PRE_CLICK_LEAD_MS: u64 = 100; // start clicking this many ms before expiry
+                    const BED_TIMING_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
-                    let click_interval_ms = state.bed_spam_click_delay.max(1);
+                    let click_interval_ms = if state.freemoney {
+                        BED_TIMING_INTERVAL_MS
+                    } else {
+                        state.bed_spam_click_delay.max(1)
+                    };
 
                     if state.freemoney {
                         // Prefer COFL purchaseAt timing (grace-period end) when available.
