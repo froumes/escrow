@@ -708,6 +708,7 @@ async fn main() -> Result<()> {
                     if let Some(inv_json) = bot_client_for_ws.get_cached_inventory_json() {
                         let payload_bytes = inv_json.len();
                         debug!("[Inventory] Uploading to COFL: payload {} bytes", payload_bytes);
+                        info!("[Inventory] uploadInventory payload: {}", inv_json);
                         append_inventory_upload_log(&format!("[upload_inventory_payload] {}", inv_json));
                         let message = serde_json::json!({
                             "type": "uploadInventory",

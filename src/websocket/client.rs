@@ -274,6 +274,9 @@ impl CoflWebSocket {
 }
 
 fn extract_upload_inventory_payload(message: &str) -> Option<String> {
+    if !message.contains("\"uploadInventory\"") {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_str(message).ok()?;
     if value.get("type")?.as_str()? != "uploadInventory" {
         return None;
