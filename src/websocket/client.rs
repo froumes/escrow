@@ -1,4 +1,5 @@
 use super::messages::{parse_message_data, inject_referral_id, ChatMessage, WebSocketMessage};
+use crate::logging::append_inventory_upload_log;
 use crate::types::{BazaarFlipRecommendation, Flip};
 use anyhow::{Context, Result};
 use futures::{stream::SplitSink, StreamExt, SinkExt};
@@ -259,6 +260,10 @@ impl CoflWebSocket {
 
     /// Send a message to the COFL WebSocket
     pub async fn send_message(&self, message: &str) -> Result<()> {
+        if let Some(payload) = extract_upload_inventory_payload(message) {
+            append_inventory_upload_log(&format!("[upload_inventory_payload/ws_send] {}", payload));
+            info!("[Inventory] uploadInventory payload: {}", payload);
+        }
         let mut write = self.write.lock().await;
         write.send(Message::Text(message.to_string())).await
             .context("Failed to send message to WebSocket")?;
@@ -266,6 +271,14 @@ impl CoflWebSocket {
         debug!("Sent WS message ({} bytes)", message.len());
         Ok(())
     }
+}
+
+fn extract_upload_inventory_payload(message: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(message).ok()?;
+    if value.get("type")?.as_str()? != "uploadInventory" {
+        return None;
+    }
+    Some(value.get("data")?.as_str()?.to_string())
 }
 
 /// Normalize a flip JSON value so that `itemName` and `startingBid` are always
@@ -358,5 +371,28 @@ mod tests {
         assert_eq!(flip.item_name, "Top Level Item");
         assert_eq!(flip.starting_bid, 5000000);
         assert_eq!(flip.uuid.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_extract_upload_inventory_payload_for_upload_inventory() {
+        let message = serde_json::json!({
+            "type": "uploadInventory",
+            "data": "[{\"name\":\"minecraft:stone\"}]"
+        })
+        .to_string();
+
+        let payload = extract_upload_inventory_payload(&message);
+        assert_eq!(payload.as_deref(), Some("[{\"name\":\"minecraft:stone\"}]"));
+    }
+
+    #[test]
+    fn test_extract_upload_inventory_payload_ignores_other_messages() {
+        let message = serde_json::json!({
+            "type": "uploadScoreboard",
+            "data": "[\"www.hypixel.net\"]"
+        })
+        .to_string();
+
+        assert!(extract_upload_inventory_payload(&message).is_none());
     }
 }
