@@ -60,7 +60,9 @@ pub fn append_inventory_upload_log(line: &str) {
 
     match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(mut file) => {
-            let _ = file.write_all(entry.as_bytes());
+            if let Err(e) = file.write_all(entry.as_bytes()) {
+                eprintln!("Failed to write inventory upload log {:?}: {}", log_path, e);
+            }
         }
         Err(e) => {
             eprintln!("Failed to append to inventory upload log {:?}: {}", log_path, e);

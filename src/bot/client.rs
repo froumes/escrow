@@ -2988,7 +2988,7 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
 
     match serde_json::to_value(&item_data.component_patch) {
         Ok(value) => {
-            if value.as_object().is_some_and(|o| o.is_empty()) {
+            if value.as_object().map_or(false, |o| o.is_empty()) {
                 serde_json::Value::Null
             } else {
                 value
@@ -3437,7 +3437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_item_nbt_components_custom_data_present() {
+    fn test_extract_item_nbt_components_with_map_component() {
         let item = ItemStack::from(ItemKind::Map).with_component(MapId { id: 123 });
         let item_data = item.as_present().expect("map item should be present");
 
@@ -3446,7 +3446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_item_nbt_components_empty_patch_returns_null() {
+    fn test_extract_item_nbt_components_with_empty_patch() {
         let item = ItemStackData::from(ItemKind::Stone);
         let nbt = extract_item_nbt_components(&item);
         assert!(nbt.is_null());
