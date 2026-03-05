@@ -2970,22 +2970,6 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
 }
 
 fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Value {
-    match serde_json::to_value(item_data) {
-        Ok(value) => {
-            if let Some(object) = value.as_object() {
-                if let Some(components) = object.get("components") {
-                    return components.clone();
-                }
-                if let Some(components) = object.get("component_patch") {
-                    return components.clone();
-                }
-            }
-        }
-        Err(e) => {
-            warn!("[Inventory] Failed to serialize full item stack for NBT extraction: {}", e);
-        }
-    }
-
     match serde_json::to_value(&item_data.component_patch) {
         Ok(value) => {
             if value.as_object().map_or(false, |o| o.is_empty()) {
@@ -2995,10 +2979,23 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
             }
         }
         Err(e) => {
-            warn!("[Inventory] Failed to serialize component patch for NBT extraction: {}", e);
+            if should_suppress_component_patch_serialization_warning(&e) {
+                debug!(
+                    "[Inventory] Skipping component patch NBT extraction due to expected serialization limitation"
+                );
+            } else {
+                warn!(
+                    "[Inventory] Failed to serialize component patch for NBT extraction: {}",
+                    e
+                );
+            }
             serde_json::Value::Null
         }
     }
+}
+
+fn should_suppress_component_patch_serialization_warning(error: &serde_json::Error) -> bool {
+    error.to_string().contains("key must be a string")
 }
 
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
@@ -3383,9 +3380,9 @@ fn extract_viewauction_uuid(msg: &str) -> Option<String> {
 mod tests {
     use super::*;
     use azalea::registry::builtin::ItemKind;
+    use azalea_inventory::components::MapId;
     use azalea_inventory::ItemStack;
     use azalea_inventory::ItemStackData;
-    use azalea_inventory::components::MapId;
 
     #[test]
     fn test_parse_purchased_message() {
@@ -3450,5 +3447,16 @@ mod tests {
         let item = ItemStackData::from(ItemKind::Stone);
         let nbt = extract_item_nbt_components(&item);
         assert!(nbt.is_null());
+    }
+
+    #[test]
+    fn test_extract_item_nbt_components_suppresses_expected_serialization_warning() {
+        let mut tuple_keys = std::collections::HashMap::new();
+        tuple_keys.insert((1_i32, 2_i32), "value");
+        let err = serde_json::to_value(tuple_keys).expect_err("tuple map keys should fail in JSON");
+        assert!(
+            should_suppress_component_patch_serialization_warning(&err),
+            "unexpected error: {err}"
+        );
     }
 }
