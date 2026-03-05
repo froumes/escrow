@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
 
+use crate::logging::append_inventory_upload_log;
 use crate::types::{BotState, QueuedCommand};
 use crate::websocket::CoflWebSocket;
 use super::handlers::BotEventHandlers;
@@ -2968,6 +2969,38 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
     None
 }
 
+fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Value {
+    match serde_json::to_value(item_data) {
+        Ok(value) => {
+            if let Some(object) = value.as_object() {
+                if let Some(components) = object.get("components") {
+                    return components.clone();
+                }
+                if let Some(components) = object.get("component_patch") {
+                    return components.clone();
+                }
+            }
+        }
+        Err(e) => {
+            warn!("[Inventory] Failed to serialize full item stack for NBT extraction: {}", e);
+        }
+    }
+
+    match serde_json::to_value(&item_data.component_patch) {
+        Ok(value) => {
+            if value.as_object().map_or(false, |o| o.is_empty()) {
+                serde_json::Value::Null
+            } else {
+                value
+            }
+        }
+        Err(e) => {
+            warn!("[Inventory] Failed to serialize component patch for NBT extraction: {}", e);
+            serde_json::Value::Null
+        }
+    }
+}
+
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
 ///
 /// Called after every ContainerSetContent / ContainerSetSlot so that
@@ -2990,21 +3023,30 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             slots_array[mineflayer_slot] = serde_json::Value::Null;
         } else {
             let item_type = item.kind() as u32;
+            let mut raw_item_for_log = String::from("null");
             let nbt_data = if let Some(item_data) = item.as_present() {
-                match serde_json::to_value(item_data) {
-                    Ok(value) => {
-                        value
-                            .as_object()
-                            .and_then(|obj| obj.get("components").cloned())
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                    Err(_) => serde_json::Value::Null,
-                }
+                raw_item_for_log = match serde_json::to_string(item_data) {
+                    Ok(raw) => raw,
+                    Err(e) => format!("{{\"serialization_error\":\"{}\"}}", e),
+                };
+                extract_item_nbt_components(item_data)
             } else {
                 serde_json::Value::Null
             };
             let item_name = item.kind().to_string();
             slot_descriptions.push(format!("slot {}: {}x {}", mineflayer_slot, item.count(), item_name));
+            let parsed_nbt_for_log = match serde_json::to_string(&nbt_data) {
+                Ok(v) => v,
+                Err(e) => format!("{{\"serialization_error\":\"{}\"}}", e),
+            };
+            append_inventory_upload_log(&format!(
+                "[parsed_slot] slot={} item={} count={} raw_item={} parsed_nbt={}",
+                mineflayer_slot,
+                item_name,
+                item.count(),
+                raw_item_for_log,
+                parsed_nbt_for_log
+            ));
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
@@ -3030,6 +3072,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     });
 
     if let Ok(json_str) = serde_json::to_string(&inventory_json) {
+        append_inventory_upload_log(&format!("[parsed_inventory_cache] {}", json_str));
         *state.cached_inventory_json.write() = Some(json_str);
     }
 }
@@ -3339,6 +3382,10 @@ fn extract_viewauction_uuid(msg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use azalea::registry::builtin::ItemKind;
+    use azalea_inventory::ItemStack;
+    use azalea_inventory::ItemStackData;
+    use azalea_inventory::components::MapId;
 
     #[test]
     fn test_parse_purchased_message() {
@@ -3387,5 +3434,21 @@ mod tests {
         assert!(is_terminal_purchase_failure_message("You didn't participate in this auction!"));
         assert!(is_terminal_purchase_failure_message("This auction wasn't found!"));
         assert!(!is_terminal_purchase_failure_message("Putting coins in escrow..."));
+    }
+
+    #[test]
+    fn test_extract_item_nbt_components_with_map_component() {
+        let item = ItemStack::from(ItemKind::Map).with_component(MapId { id: 123 });
+        let item_data = item.as_present().expect("map item should be present");
+
+        let nbt = extract_item_nbt_components(item_data);
+        assert!(nbt.get("minecraft:map_id").is_some());
+    }
+
+    #[test]
+    fn test_extract_item_nbt_components_with_empty_patch() {
+        let item = ItemStackData::from(ItemKind::Stone);
+        let nbt = extract_item_nbt_components(&item);
+        assert!(nbt.is_null());
     }
 }
