@@ -2970,22 +2970,6 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
 }
 
 fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Value {
-    match serde_json::to_value(item_data) {
-        Ok(value) => {
-            if let Some(object) = value.as_object() {
-                if let Some(components) = object.get("components") {
-                    return components.clone();
-                }
-                if let Some(components) = object.get("component_patch") {
-                    return components.clone();
-                }
-            }
-        }
-        Err(e) => {
-            warn!("[Inventory] Failed to serialize full item stack for NBT extraction: {}", e);
-        }
-    }
-
     match serde_json::to_value(&item_data.component_patch) {
         Ok(value) => {
             if value.as_object().map_or(false, |o| o.is_empty()) {
@@ -2995,10 +2979,23 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
             }
         }
         Err(e) => {
-            warn!("[Inventory] Failed to serialize component patch for NBT extraction: {}", e);
+            if is_non_string_key_json_error(&e) {
+                debug!(
+                    "[Inventory] Skipping component patch NBT extraction with non-string map keys"
+                );
+            } else {
+                warn!(
+                    "[Inventory] Failed to serialize component patch for NBT extraction: {}",
+                    e
+                );
+            }
             serde_json::Value::Null
         }
     }
+}
+
+fn is_non_string_key_json_error(error: &serde_json::Error) -> bool {
+    error.to_string().contains("key must be a string")
 }
 
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
@@ -3450,5 +3447,11 @@ mod tests {
         let item = ItemStackData::from(ItemKind::Stone);
         let nbt = extract_item_nbt_components(&item);
         assert!(nbt.is_null());
+    }
+
+    #[test]
+    fn test_extract_item_nbt_components_suppresses_non_string_key_warnings() {
+        let err = serde_json::Error::io(std::io::Error::other("key must be a string"));
+        assert!(is_non_string_key_json_error(&err));
     }
 }
