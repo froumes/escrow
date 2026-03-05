@@ -2979,9 +2979,9 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
             }
         }
         Err(e) => {
-            if is_non_string_key_json_error(&e) {
+            if should_suppress_component_patch_serialization_warning(&e) {
                 debug!(
-                    "[Inventory] Skipping component patch NBT extraction with non-string map keys"
+                    "[Inventory] Skipping component patch NBT extraction due to expected serialization limitation"
                 );
             } else {
                 warn!(
@@ -2994,7 +2994,7 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
     }
 }
 
-fn is_non_string_key_json_error(error: &serde_json::Error) -> bool {
+fn should_suppress_component_patch_serialization_warning(error: &serde_json::Error) -> bool {
     error.to_string().contains("key must be a string")
 }
 
@@ -3380,9 +3380,9 @@ fn extract_viewauction_uuid(msg: &str) -> Option<String> {
 mod tests {
     use super::*;
     use azalea::registry::builtin::ItemKind;
+    use azalea_inventory::components::MapId;
     use azalea_inventory::ItemStack;
     use azalea_inventory::ItemStackData;
-    use azalea_inventory::components::MapId;
 
     #[test]
     fn test_parse_purchased_message() {
@@ -3450,8 +3450,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_item_nbt_components_suppresses_non_string_key_warnings() {
-        let err = serde_json::Error::io(std::io::Error::other("key must be a string"));
-        assert!(is_non_string_key_json_error(&err));
+    fn test_extract_item_nbt_components_suppresses_expected_serialization_warning() {
+        let mut tuple_keys = std::collections::HashMap::new();
+        tuple_keys.insert((1_i32, 2_i32), "value");
+        let err = serde_json::to_value(tuple_keys).expect_err("tuple map keys should fail in JSON");
+        assert!(
+            should_suppress_component_patch_serialization_warning(&err),
+            "unexpected error: {err}"
+        );
     }
 }
