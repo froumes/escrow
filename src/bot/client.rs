@@ -17,7 +17,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
 
-use crate::logging::append_inventory_upload_log;
 use crate::types::{BotState, QueuedCommand};
 use crate::websocket::CoflWebSocket;
 use super::handlers::BotEventHandlers;
@@ -3020,30 +3019,13 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             slots_array[mineflayer_slot] = serde_json::Value::Null;
         } else {
             let item_type = item.kind() as u32;
-            let mut raw_item_for_log = String::from("null");
             let nbt_data = if let Some(item_data) = item.as_present() {
-                raw_item_for_log = match serde_json::to_string(item_data) {
-                    Ok(raw) => raw,
-                    Err(e) => format!("{{\"serialization_error\":\"{}\"}}", e),
-                };
                 extract_item_nbt_components(item_data)
             } else {
                 serde_json::Value::Null
             };
             let item_name = item.kind().to_string();
             slot_descriptions.push(format!("slot {}: {}x {}", mineflayer_slot, item.count(), item_name));
-            let parsed_nbt_for_log = match serde_json::to_string(&nbt_data) {
-                Ok(v) => v,
-                Err(e) => format!("{{\"serialization_error\":\"{}\"}}", e),
-            };
-            append_inventory_upload_log(&format!(
-                "[parsed_slot] slot={} item={} count={} raw_item={} parsed_nbt={}",
-                mineflayer_slot,
-                item_name,
-                item.count(),
-                raw_item_for_log,
-                parsed_nbt_for_log
-            ));
             slots_array[mineflayer_slot] = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
@@ -3069,7 +3051,6 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     });
 
     if let Ok(json_str) = serde_json::to_string(&inventory_json) {
-        append_inventory_upload_log(&format!("[parsed_inventory_cache] {}", json_str));
         *state.cached_inventory_json.write() = Some(json_str);
     }
 }

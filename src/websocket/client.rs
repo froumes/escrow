@@ -1,5 +1,4 @@
 use super::messages::{parse_message_data, inject_referral_id, ChatMessage, WebSocketMessage};
-use crate::logging::append_inventory_upload_log;
 use crate::types::{BazaarFlipRecommendation, Flip};
 use anyhow::{Context, Result};
 use futures::{stream::SplitSink, StreamExt, SinkExt};
@@ -261,8 +260,8 @@ impl CoflWebSocket {
     /// Send a message to the COFL WebSocket
     pub async fn send_message(&self, message: &str) -> Result<()> {
         if let Some(payload) = extract_upload_inventory_payload(message) {
-            append_inventory_upload_log(&format!("[upload_inventory_payload/ws_send] {}", payload));
             info!("[Inventory] uploadInventory payload: {}", payload);
+            info!("[Inventory] uploadInventory ws message: {}", message);
         }
         let mut write = self.write.lock().await;
         write.send(Message::Text(message.to_string())).await
@@ -281,7 +280,11 @@ fn extract_upload_inventory_payload(message: &str) -> Option<String> {
     if value.get("type")?.as_str()? != "uploadInventory" {
         return None;
     }
-    Some(value.get("data")?.as_str()?.to_string())
+    let data = value.get("data")?;
+    Some(match data {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
 }
 
 /// Normalize a flip JSON value so that `itemName` and `startingBid` are always
@@ -397,5 +400,20 @@ mod tests {
         .to_string();
 
         assert!(extract_upload_inventory_payload(&message).is_none());
+    }
+
+    #[test]
+    fn test_extract_upload_inventory_payload_handles_non_string_data() {
+        let message = serde_json::json!({
+            "type": "uploadInventory",
+            "data": [{"name":"minecraft:stone","count":1}]
+        })
+        .to_string();
+
+        let payload = extract_upload_inventory_payload(&message);
+        assert_eq!(
+            payload.as_deref(),
+            Some("[{\"count\":1,\"name\":\"minecraft:stone\"}]")
+        );
     }
 }
