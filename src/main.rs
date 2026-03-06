@@ -2,7 +2,7 @@ use anyhow::Result;
 use dialoguer::{Input, Confirm};
 use frikadellen_baf::{
     config::ConfigLoader,
-    logging::{append_inventory_upload_log, init_logger, print_mc_chat},
+    logging::{init_logger, print_mc_chat},
     state::CommandQueue,
     websocket::CoflWebSocket,
     bot::BotClient,
@@ -709,7 +709,6 @@ async fn main() -> Result<()> {
                         let payload_bytes = inv_json.len();
                         debug!("[Inventory] Uploading to COFL: payload {} bytes", payload_bytes);
                         info!("[Inventory] uploadInventory payload: {}", inv_json);
-                        append_inventory_upload_log(&format!("[upload_inventory_payload] {}", inv_json));
                         let message = serde_json::json!({
                             "type": "uploadInventory",
                             "data": inv_json

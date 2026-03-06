@@ -1,5 +1,4 @@
 use super::messages::{parse_message_data, inject_referral_id, ChatMessage, WebSocketMessage};
-use crate::logging::append_inventory_upload_log;
 use crate::types::{BazaarFlipRecommendation, Flip};
 use anyhow::{Context, Result};
 use futures::{stream::SplitSink, StreamExt, SinkExt};
@@ -261,8 +260,6 @@ impl CoflWebSocket {
     /// Send a message to the COFL WebSocket
     pub async fn send_message(&self, message: &str) -> Result<()> {
         if let Some(payload) = extract_upload_inventory_payload(message) {
-            append_inventory_upload_log(&format!("[upload_inventory_payload/ws_send] {}", payload));
-            append_inventory_upload_log(&format!("[upload_inventory_ws_message/ws_send] {}", message));
             info!("[Inventory] uploadInventory payload: {}", payload);
             info!("[Inventory] uploadInventory ws message: {}", message);
         }
