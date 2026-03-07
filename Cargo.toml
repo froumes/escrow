@@ -6,6 +6,14 @@ authors = ["TreXito"]
 description = "Frikadellen BAF (Bazaar Auction Flipper) for Hypixel Skyblock - Rust port using Azalea"
 license = "MIT"
 
+[[bin]]
+name = "frikadellen_baf"
+path = "src/main.rs"
+
+[[bin]]
+name = "FrikadellenBAF-loader"
+path = "src/loader.rs"
+
 [dependencies]
 # Azalea Minecraft bot framework
 azalea = "0.15"
@@ -22,7 +30,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures = "0.3"
 
 # Networking
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

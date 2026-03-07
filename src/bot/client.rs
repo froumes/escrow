@@ -1824,12 +1824,12 @@ async fn handle_window_interaction(
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // Wait up to 500ms for slot 31 to be populated by ContainerSetContent.
+                // Wait up to 200ms for slot 31 to be populated by ContainerSetContent.
                 // Without this wait the click fires ~0.3ms after OpenScreen before the server
                 // has sent the container contents, causing the click to land on an empty slot
                 // and be silently ignored by Hypixel.  TypeScript uses itemLoad() which polls
                 // every 1ms for up to FLIP_ACTION_DELAY*3 ms (default 450ms).
-                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
                 loop {
                     let slot_populated = {
                         let menu = bot.menu();
@@ -1839,7 +1839,7 @@ async fn handle_window_interaction(
                     if slot_populated || tokio::time::Instant::now() >= deadline {
                         break;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
 
                 // Check item in slot 31 to decide on purchase strategy.
@@ -1999,12 +1999,11 @@ async fn handle_window_interaction(
                 // NO pre-delay (matches TypeScript: "NO delay here — speed is everything").
                 click_window_slot(bot, window_id, 11).await;
 
-                // Wait 100ms. On a VPS near Hypixel this is enough for the
-                // server to process the click and close the window.
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // Wait 50ms for the server to process and close the window.
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
                 // Safety retry loop: if the window is still open (click was lost or
-                // the server needs more time), keep retrying every 250ms.
+                // the server needs more time), keep retrying every 100ms.
                 // Matches TypeScript's while-loop retry pattern in flipHandler.ts.
                 while state.handlers.current_window_title()
                     .as_deref()
@@ -2012,7 +2011,7 @@ async fn handle_window_interaction(
                     .unwrap_or(false)
                 {
                     click_window_slot(bot, window_id, 11).await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
 
                 *state.bot_state.write() = BotState::Idle;

@@ -30,24 +30,32 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: frikadellen_baf
             asset_name: frikadellen_baf-linux-x86_64
+            loader_artifact_name: FrikadellenBAF-loader
+            loader_asset_name: FrikadellenBAF-loader-linux-x86_64
             
           # macOS x86_64 (Intel)
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: frikadellen_baf
             asset_name: frikadellen_baf-macos-x86_64
+            loader_artifact_name: FrikadellenBAF-loader
+            loader_asset_name: FrikadellenBAF-loader-macos-x86_64
             
           # macOS ARM64 (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: frikadellen_baf
             asset_name: frikadellen_baf-macos-arm64
+            loader_artifact_name: FrikadellenBAF-loader
+            loader_asset_name: FrikadellenBAF-loader-macos-arm64
             
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: frikadellen_baf.exe
             asset_name: frikadellen_baf-windows-x86_64.exe
+            loader_artifact_name: FrikadellenBAF-loader.exe
+            loader_asset_name: FrikadellenBAF-loader-windows-x86_64.exe
 
     steps:
       - name: Checkout code
@@ -76,28 +84,33 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary
+      - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binary (Linux and macOS)
+      - name: Strip binaries (Linux and macOS)
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        run: |
+          strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          strip target/${{ matrix.target }}/release/${{ matrix.loader_artifact_name }}
 
-      - name: Rename binary
+      - name: Rename binaries
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
-          else
-            mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
-          fi
+          mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+          mv ${{ matrix.loader_artifact_name }} ${{ matrix.loader_asset_name }}
 
-      - name: Upload artifact
+      - name: Upload main artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+
+      - name: Upload loader artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.loader_asset_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.loader_asset_name }}
 
   release:
     name: Create Release
@@ -145,7 +158,16 @@ jobs:
             
             Automated build from commit ${{ github.sha }}
             
-            ### Downloads
+            ### FrikadellenBAF-loader (Recommended)
+            The loader automatically checks for updates on startup and downloads the latest version.
+            Just run the loader instead of the main binary.
+            
+            - **Linux (x86_64)**: `FrikadellenBAF-loader-linux-x86_64`
+            - **macOS (Intel)**: `FrikadellenBAF-loader-macos-x86_64`
+            - **macOS (Apple Silicon)**: `FrikadellenBAF-loader-macos-arm64`
+            - **Windows (x86_64)**: `FrikadellenBAF-loader-windows-x86_64.exe`
+            
+            ### Manual Downloads (main binary)
             - **Linux (x86_64)**: `frikadellen_baf-linux-x86_64`
             - **macOS (Intel)**: `frikadellen_baf-macos-x86_64`
             - **macOS (Apple Silicon)**: `frikadellen_baf-macos-arm64`
@@ -153,15 +175,18 @@ jobs:
             
             ### Installation
             
-            **Linux/macOS:**
+            **Linux/macOS (using loader):**
             ```bash
+            chmod +x FrikadellenBAF-loader-*
             chmod +x frikadellen_baf-*
-            ./frikadellen_baf-*
+            # Place both files in the same directory, then run:
+            ./FrikadellenBAF-loader-*
             ```
             
-            **Windows:**
+            **Windows (using loader):**
             ```
-            frikadellen_baf-windows-x86_64.exe
+            # Place both .exe files in the same directory, then run:
+            FrikadellenBAF-loader-windows-x86_64.exe
             ```
             
             See [README_RUST.md](https://github.com/TreXito/frikadellen-baf-121/blob/main/README_RUST.md) for usage instructions.
@@ -171,3 +196,4 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
