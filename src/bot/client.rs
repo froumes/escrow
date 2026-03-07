@@ -1855,41 +1855,33 @@ async fn handle_window_interaction(
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
-                    // Use configurable pre-click lead time
-                    let pre_click_lead_ms = state.bed_pre_click_ms;
-                    // 20ms between clicks matches the user-requested "20ms between clicks" for
-                    // freemoney mode. Using a tighter interval gives more packets in flight
-                    // right as the bed grace-period expires.
-                    const BED_TIMING_INTERVAL_MS: u64 = 20;
-                    // Poll interval for the pre-click wait loop. Keeping it small (20ms) ensures
-                    // we start clicking very close to (pre_click_lead_ms before) the deadline
-                    // without overshooting by a coarse sleep increment.
+                    // Freemoney mode: click every 20ms, starting bed_pre_click_ms before purchaseAt.
+                    // Default mode: immediate bed spam at bed_spam_click_delay interval.
+                    const BED_FREEMONEY_CLICK_INTERVAL_MS: u64 = 20;
+                    // Poll granularity for the purchaseAt wait loop (check-before-sleep).
                     const BED_WAIT_POLL_MS: u64 = 20;
                     const MAX_FAILED_CLICKS: usize = 5;
                     let click_interval_ms = if state.freemoney {
-                        BED_TIMING_INTERVAL_MS
+                        BED_FREEMONEY_CLICK_INTERVAL_MS
                     } else {
                         state.bed_spam_click_delay.max(1)
                     };
 
                     if state.freemoney {
-                        // Prefer COFL purchaseAt timing (grace-period end) when available.
+                        // Freemoney mode: use COFL purchaseAt exclusively.
+                        // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
+                        // If purchaseAt is not available, fall through to immediate bed spam.
+                        let pre_click_lead_ms = state.bed_pre_click_ms;
                         let remaining_ms_from_purchase_at = state.purchase_at_instant.read()
                             .as_ref()
                             .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
                             .map(|d| d.as_millis() as u64);
 
-                        // Fallback: parse remaining seconds from the bed item in slot 31.
-                        let remaining_secs = {
-                            let menu = bot.menu();
-                            let slots = menu.slots();
-                            slots.get(31).and_then(|s| parse_bed_remaining_secs(s))
-                        };
-
                         if let Some(remaining_ms) = remaining_ms_from_purchase_at {
                             let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
                             if wait_ms > 0 {
-                                info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking (lead: {}ms)", wait_ms, pre_click_lead_ms);
+                                info!("[AH] Bed timing (freemoney): purchaseAt in {}ms — waiting {}ms, then clicking at {}ms intervals (lead: {}ms)",
+                                    remaining_ms, wait_ms, click_interval_ms, pre_click_lead_ms);
                                 let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
                                 loop {
                                     // Check BEFORE sleeping so we don't overshoot the deadline
@@ -1909,40 +1901,19 @@ async fn handle_window_interaction(
                                     }
                                     tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
                                 }
+                                info!("[AH] Bed timing (freemoney): entering rapid-click phase ({}ms interval)", click_interval_ms);
+                            } else {
+                                // purchaseAt is already past or imminent — start clicking immediately
+                                info!("[AH] Bed timing (freemoney): purchaseAt imminent — starting clicks at {}ms interval", click_interval_ms);
                             }
-                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt, {}ms interval)", pre_click_lead_ms, click_interval_ms);
-                        } else if let Some(secs) = remaining_secs {
-                            // Wait until pre_click_lead_ms before the grace period ends
-                            let wait_ms = (secs * 1000).saturating_sub(pre_click_lead_ms);
-                            if wait_ms > 0 {
-                                info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking (lead: {}ms)", secs, wait_ms, pre_click_lead_ms);
-                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
-                                loop {
-                                    if tokio::time::Instant::now() >= wait_deadline {
-                                        break;
-                                    }
-                                    let kind_now = {
-                                        let menu = bot.menu();
-                                        let slots = menu.slots();
-                                        slots.get(31).map(|s| {
-                                            if s.is_empty() { "air".to_string() }
-                                            else { s.kind().to_string().to_lowercase() }
-                                        }).unwrap_or_else(|| "air".to_string())
-                                    };
-                                    if !kind_now.contains("bed") {
-                                        break;
-                                    }
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
-                                }
-                            }
-                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry, {}ms interval)", pre_click_lead_ms, click_interval_ms);
                         } else {
-                            info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
+                            // No purchaseAt available — fall back to immediate bed spam
+                            info!("[AH] Bed timing (freemoney): no purchaseAt — starting immediate bed spam at {}ms interval", click_interval_ms);
                         }
                     } else {
-                        // Non-freemoney mode: just do simple bed spam at the configured delay.
-                        // No pre-click timing — immediately start clicking slot 31.
-                        info!("[AH] Bed detected in slot 31 — starting bed spam ({}ms interval)", click_interval_ms);
+                        // Default mode: simple immediate bed spam at bed_spam_click_delay.
+                        // No pre-click timing or purchaseAt calculation.
+                        info!("[AH] Bed detected in slot 31 — starting bed spam at {}ms interval", click_interval_ms);
                     }
 
                     let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
