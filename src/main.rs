@@ -712,6 +712,8 @@ async fn main() -> Result<()> {
                         let payload_bytes = inv_json.len();
                         debug!("[Inventory] Uploading to COFL: payload {} bytes", payload_bytes);
                         info!("[Inventory] uploadInventory payload: {}", inv_json);
+                        // Log to inventory_upload.log for debugging
+                        frikadellen_baf::logging::append_inventory_upload_log(&format!("uploadInventory payload ({} bytes): {}", payload_bytes, inv_json));
                         let message = serde_json::json!({
                             "type": "uploadInventory",
                             "data": inv_json
@@ -762,7 +764,43 @@ async fn main() -> Result<()> {
                             // Also extract slot (mineflayer inventory slot 9-44) and id
                             let item_slot = auction_data.get("slot").and_then(|v| v.as_u64());
                             let item_id = auction_data.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            match (item_raw, price, duration) {
+
+                            // If itemName is null/absent, fall back to looking up the display
+                            // name from the bot's cached inventory at the given slot.
+                            // COFL sends null itemName in some protocol versions.
+                            let item_raw_resolved: Option<String> = item_raw
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    let slot = item_slot?;
+                                    // Mineflayer inventory slots are 9-44 (player inventory).
+                                    // Reject values outside this range to avoid silent OOB access.
+                                    if !(9..=44).contains(&slot) {
+                                        warn!("[createAuction] slot {} is out of valid inventory range 9-44", slot);
+                                        return None;
+                                    }
+                                    let inv_json = bot_client_for_ws.get_cached_inventory_json()?;
+                                    let inv: serde_json::Value = serde_json::from_str(&inv_json).ok()?;
+                                    let slots = inv.get("slots")?.as_array()?;
+                                    let item = slots.get(slot as usize)?;
+                                    if item.is_null() {
+                                        return None;
+                                    }
+                                    // Prefer displayName (human-readable), then registry name
+                                    item.get("displayName")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| item.get("name").and_then(|v| v.as_str()))
+                                        .map(|s| s.to_string())
+                                });
+
+                            if item_raw.is_none() {
+                                if let Some(ref resolved) = item_raw_resolved {
+                                    info!("[createAuction] Resolved null itemName from inventory slot {:?}: {}", item_slot, resolved);
+                                } else {
+                                    warn!("[createAuction] itemName is null and could not be resolved from inventory slot {:?}", item_slot);
+                                }
+                            }
+
+                            match (item_raw_resolved.as_deref(), price, duration) {
                                 (Some(item_raw), Some(price), Some(duration)) => {
                                     // Strip Minecraft color codes (§X) from item name
                                     let item_name = frikadellen_baf::utils::remove_minecraft_colors(item_raw);
@@ -983,7 +1021,9 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(rustyline::error::ReadlineError::Interrupted) => {
-                        // Ctrl-C: ignore silently
+                        // Ctrl-C in readline: forward as a shutdown signal
+                        let _ = line_tx.send("__SHUTDOWN__".to_string());
+                        break;
                     }
                     Err(rustyline::error::ReadlineError::Eof) => {
                         // Ctrl-D / end of stdin
@@ -999,6 +1039,10 @@ async fn main() -> Result<()> {
 
         while let Some(line) = line_rx.recv().await {
             let input = line.trim();
+            if input == "__SHUTDOWN__" {
+                info!("Received Ctrl+C — shutting down BAF...");
+                std::process::exit(0);
+            }
             if input.is_empty() {
                 continue;
             }
@@ -1228,11 +1272,10 @@ async fn main() -> Result<()> {
     // Keep the application running
     info!("BAF is now running. Type commands below or press Ctrl+C to exit.");
     
-    // Wait indefinitely
-    loop {
-        sleep(Duration::from_secs(60)).await;
-        debug!("Status: {} commands in queue", command_queue.len());
-    }
+    // Wait until Ctrl+C (SIGINT) is received
+    tokio::signal::ctrl_c().await?;
+    info!("Received Ctrl+C — shutting down BAF...");
+    std::process::exit(0);
 }
 
 #[cfg(test)]
