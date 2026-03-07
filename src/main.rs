@@ -1,5 +1,6 @@
 use anyhow::Result;
 use dialoguer::{Input, Confirm};
+use rustyline;
 use frikadellen_baf::{
     config::ConfigLoader,
     logging::{init_logger, print_mc_chat},
@@ -484,9 +485,9 @@ async fn main() -> Result<()> {
                     // immediately so the items are collected without waiting for the next
                     // periodic check.  Only enqueue if bazaar flips are enabled.
                     if config_for_events.enable_bazaar_flips {
-                        info!("[BazaarOrders] Order filled — queuing ManageOrders");
+                         info!("[BazaarOrders] Order filled — queuing ManageOrders");
                         command_queue_clone.enqueue(
-                            frikadellen_baf::types::CommandType::ManageOrders,
+                            frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
                             frikadellen_baf::types::CommandPriority::High,
                             false,
                         );
@@ -884,7 +885,7 @@ async fn main() -> Result<()> {
                     cmd.command_type,
                     frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                     | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
-                    | frikadellen_baf::types::CommandType::ManageOrders
+                    | frikadellen_baf::types::CommandType::ManageOrders { .. }
                 );
                 if is_bazaar_related && bazaar_flips_paused_proc.load(Ordering::Relaxed) {
                     debug!("[Queue] Dropping bazaar command {:?} — AH flip window active", cmd.command_type);
@@ -904,7 +905,7 @@ async fn main() -> Result<()> {
                     frikadellen_baf::types::CommandType::ClaimPurchasedItem
                     | frikadellen_baf::types::CommandType::ClaimSoldItem
                     | frikadellen_baf::types::CommandType::CheckCookie
-                    | frikadellen_baf::types::CommandType::ManageOrders => 60,
+                    | frikadellen_baf::types::CommandType::ManageOrders { .. } => 60,
                     frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                     | frikadellen_baf::types::CommandType::BazaarSellOrder { .. } => 20,
                     frikadellen_baf::types::CommandType::SellToAuction { .. } => 15,
@@ -961,14 +962,42 @@ async fn main() -> Result<()> {
     let command_queue_for_console = command_queue.clone();
     
     tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::io::stdin;
-        
-        let stdin = stdin();
-        let reader = BufReader::new(stdin);
-        let mut lines = reader.lines();
-        
-        while let Ok(Some(line)) = lines.next_line().await {
+        // Rustyline provides readline with history (up/down arrow key navigation) and
+        // proper terminal handling. Since it's a blocking API we drive it in a
+        // dedicated blocking task and send each line over an mpsc channel.
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::task::spawn_blocking(move || {
+            let mut rl = match rustyline::DefaultEditor::new() {
+                Ok(ed) => ed,
+                Err(e) => {
+                    eprintln!("[Console] Failed to initialize readline: {}", e);
+                    return;
+                }
+            };
+            loop {
+                match rl.readline("") {
+                    Ok(line) => {
+                        let _ = rl.add_history_entry(line.as_str());
+                        if line_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(rustyline::error::ReadlineError::Interrupted) => {
+                        // Ctrl-C: ignore silently
+                    }
+                    Err(rustyline::error::ReadlineError::Eof) => {
+                        // Ctrl-D / end of stdin
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[Console] Readline error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        while let Some(line) = line_rx.recv().await {
             let input = line.trim();
             if input.is_empty() {
                 continue;
@@ -1132,7 +1161,7 @@ async fn main() -> Result<()> {
                 if bot_client_orders.state().allows_commands() {
                     debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
                     command_queue_orders.enqueue(
-                        CommandType::ManageOrders,
+                        CommandType::ManageOrders { cancel_open: false },
                         CommandPriority::Normal,
                         false,
                     );

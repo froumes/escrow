@@ -116,6 +116,8 @@ pub struct BotClient {
     active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
+    /// When true, the ManagingOrders handler also cancels open orders (startup mode).
+    manage_orders_cancel_open: Arc<AtomicBool>,
 }
 
 /// Events that can be emitted by the bot
@@ -190,6 +192,7 @@ impl BotClient {
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
+            manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -280,6 +283,7 @@ impl BotClient {
             bed_pre_click_ms: self.bed_pre_click_ms,
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
+            manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -693,6 +697,9 @@ pub struct BotClientState {
     pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
+    /// When true, the ManagingOrders handler also cancels open orders (startup mode).
+    /// When false, it only collects filled orders and leaves open orders untouched.
+    pub manage_orders_cancel_open: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -746,6 +753,7 @@ impl Default for BotClientState {
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
+            manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1048,6 +1056,7 @@ async fn event_handler(
                 let bot_wd = bot.clone();
                 let event_tx_wd = state.event_tx.clone();
                 let manage_orders_cancelled_wd = state.manage_orders_cancelled.clone();
+                let manage_orders_cancel_open_wd = state.manage_orders_cancel_open.clone();
                 let auto_cookie_wd = state.auto_cookie_hours.clone();
                 let command_generation_wd = state.command_generation.clone();
                 tokio::spawn(async move {
@@ -1063,7 +1072,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_generation_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, manage_orders_cancel_open_wd, auto_cookie_wd, command_generation_wd).await;
                     }
                 });
             }
@@ -1324,6 +1333,7 @@ async fn event_handler(
                         let bot_state = state.bot_state.clone();
                         let event_tx_startup = state.event_tx.clone();
                         let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
+                        let manage_orders_cancel_open_startup = state.manage_orders_cancel_open.clone();
                         let auto_cookie_startup = state.auto_cookie_hours.clone();
                         let command_generation_startup = state.command_generation.clone();
                         tokio::spawn(async move {
@@ -1333,7 +1343,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_generation_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, manage_orders_cancel_open_startup, auto_cookie_startup, command_generation_startup).await;
                         });
                     }
                 }
@@ -1784,10 +1794,12 @@ async fn execute_command(
             bot.write_chat_packet("/sbmenu");
             *state.bot_state.write() = BotState::CheckingCookie;
         }
-        CommandType::ManageOrders => {
-            info!("[ManageOrders] Triggered by periodic check or order fill — opening /bz");
+        CommandType::ManageOrders { cancel_open } => {
+            let mode = if *cancel_open { "startup (cancel+collect)" } else { "collect-only" };
+            info!("[ManageOrders] Triggered ({}) — opening /bz", mode);
             *state.manage_orders_cancelled.write() = 0;
             state.inventory_full.store(false, Ordering::Relaxed);
+            state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             bot.write_chat_packet("/bz");
             *state.bot_state.write() = BotState::ManagingOrders;
         }
@@ -1845,7 +1857,14 @@ async fn handle_window_interaction(
 
                     // Use configurable pre-click lead time
                     let pre_click_lead_ms = state.bed_pre_click_ms;
-                    const BED_TIMING_INTERVAL_MS: u64 = 100;
+                    // 20ms between clicks matches the user-requested "20ms between clicks" for
+                    // freemoney mode. Using a tighter interval gives more packets in flight
+                    // right as the bed grace-period expires.
+                    const BED_TIMING_INTERVAL_MS: u64 = 20;
+                    // Poll interval for the pre-click wait loop. Keeping it small (20ms) ensures
+                    // we start clicking very close to (pre_click_lead_ms before) the deadline
+                    // without overshooting by a coarse sleep increment.
+                    const BED_WAIT_POLL_MS: u64 = 20;
                     const MAX_FAILED_CLICKS: usize = 5;
                     let click_interval_ms = if state.freemoney {
                         BED_TIMING_INTERVAL_MS
@@ -1870,10 +1889,10 @@ async fn handle_window_interaction(
                         if let Some(remaining_ms) = remaining_ms_from_purchase_at {
                             let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
                             if wait_ms > 0 {
-                                info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking", wait_ms);
+                                info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking (lead: {}ms)", wait_ms, pre_click_lead_ms);
                                 let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
                                 loop {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                    // Check BEFORE sleeping so we don't overshoot the deadline
                                     if tokio::time::Instant::now() >= wait_deadline {
                                         break;
                                     }
@@ -1888,22 +1907,21 @@ async fn handle_window_interaction(
                                     if !kind_now.contains("bed") {
                                         break;
                                     }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
                                 }
                             }
-                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt)", pre_click_lead_ms);
+                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt, {}ms interval)", pre_click_lead_ms, click_interval_ms);
                         } else if let Some(secs) = remaining_secs {
                             // Wait until pre_click_lead_ms before the grace period ends
                             let wait_ms = (secs * 1000).saturating_sub(pre_click_lead_ms);
                             if wait_ms > 0 {
-                                info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking", secs, wait_ms);
-                                // While waiting, poll every 200ms to bail early if bed disappears
+                                info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking (lead: {}ms)", secs, wait_ms, pre_click_lead_ms);
                                 let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
                                 loop {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                    // Check BEFORE sleeping to avoid overshooting the deadline
                                     if tokio::time::Instant::now() >= wait_deadline {
                                         break;
                                     }
-                                    // If the window changed state already, break out early
                                     let kind_now = {
                                         let menu = bot.menu();
                                         let slots = menu.slots();
@@ -1915,9 +1933,10 @@ async fn handle_window_interaction(
                                     if !kind_now.contains("bed") {
                                         break;
                                     }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
                                 }
                             }
-                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", pre_click_lead_ms);
+                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry, {}ms interval)", pre_click_lead_ms, click_interval_ms);
                         } else {
                             info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
                         }
@@ -2682,19 +2701,22 @@ async fn handle_window_interaction(
             }
         }
         BotState::ManagingOrders => {
-            // Step 2/4 of startup: cancel all existing bazaar orders.
-            // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
-            // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → cancel each.
+            // Bazaar order management. In startup mode (cancel_open=true) all existing orders
+            // are cancelled after collecting filled ones. In collect-only mode (cancel_open=false,
+            // used when triggered by BazaarOrderFilled or periodic checks) only filled orders
+            // are collected and open orders are left untouched.
+            // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → handle each.
+            let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
             if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") && !window_title.contains("Bazaar Orders") {
                 // Main bazaar page — click "Manage Orders" at slot 50
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 click_window_slot(bot, window_id, 50).await;
             } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") || window_title.contains("Bazaar Orders") {
-                // Manage Orders window — cancel all existing orders one by one
-                info!("[ManageOrders] Processing existing orders...");
+                let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
+                info!("[ManageOrders] Processing existing orders ({})...", mode_str);
                 let mut cancelled: u64 = 0;
-                // processed_items tracks items already cancelled so we don't loop forever
+                // processed_items tracks items already processed so we don't loop forever
                 let mut processed_items: std::collections::HashSet<String> = std::collections::HashSet::new();
 
                 loop {
@@ -2819,12 +2841,17 @@ async fn handle_window_interaction(
                                     }
                                 }
                             } else if let Some(cs) = cancel_slot {
-                                if *state.last_window_id.read() == window_id {
-                                    info!("[ManageOrders] Clicking Cancel at slot {}", cs);
-                                    click_window_slot(bot, window_id, cs as i16).await;
-                                    cancelled += 1;
-                                    // Wait for the window content to revert to the order list
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                if cancel_open {
+                                    if *state.last_window_id.read() == window_id {
+                                        info!("[ManageOrders] Clicking Cancel at slot {} (startup mode)", cs);
+                                        click_window_slot(bot, window_id, cs as i16).await;
+                                        cancelled += 1;
+                                        // Wait for the window content to revert to the order list
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                    }
+                                } else {
+                                    // Collect-only mode: skip open orders
+                                    debug!("[ManageOrders] Skipping open order \"{}\" (collect-only mode)", order_name);
                                 }
                             } else if collect_slot.is_none() && cancel_slot.is_none()
                                 && state.inventory_full.load(Ordering::Relaxed)
@@ -3128,6 +3155,25 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
         }
         Err(e) => {
             if should_suppress_component_patch_serialization_warning(&e) {
+                // Full component_patch failed to serialize (e.g. HashMap<Enchantment, i32>
+                // keys don't pass serde_json's strict map-key check). Fall back to
+                // extracting just the minecraft:custom_data component which contains the
+                // Hypixel SkyBlock ExtraAttributes (item ID, etc.) that COFL needs to
+                // identify the item. Other components (enchantments, attributes, etc.)
+                // are not needed by COFL for inventory identification.
+                if let Some(custom_data) = item_data.component_patch
+                    .get::<azalea_inventory::components::CustomData>()
+                {
+                    match serde_json::to_value(&custom_data.nbt) {
+                        Ok(nbt_val) if !nbt_val.is_null() => {
+                            debug!("[Inventory] Full component_patch failed; using minecraft:custom_data fallback");
+                            let mut obj = serde_json::Map::new();
+                            obj.insert("minecraft:custom_data".to_string(), nbt_val);
+                            return serde_json::Value::Object(obj);
+                        }
+                        _ => {}
+                    }
+                }
                 debug!(
                     "[Inventory] Skipping component patch NBT extraction due to expected serialization limitation"
                 );
@@ -3321,6 +3367,7 @@ async fn run_startup_workflow(
     bot_state: Arc<RwLock<BotState>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
     manage_orders_cancelled: Arc<RwLock<u64>>,
+    manage_orders_cancel_open: Arc<AtomicBool>,
     auto_cookie_hours: Arc<RwLock<u64>>,
     command_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -3396,8 +3443,10 @@ async fn run_startup_workflow(
 
     // Step 2/4: Bazaar order management — open /bz, navigate to Manage Orders, cancel all old orders.
     // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
-    info!("[Startup] Step 2/4: Managing bazaar orders...");
+    info!("[Startup] Step 2/4: Managing bazaar orders (startup: cancel + collect)...");
     *manage_orders_cancelled.write() = 0;
+    // Startup mode: cancel all open orders in addition to collecting filled ones
+    manage_orders_cancel_open.store(true, Ordering::Relaxed);
     bot.write_chat_packet("/bz");
     *bot_state.write() = BotState::ManagingOrders;
 
