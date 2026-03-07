@@ -28,8 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub bed_multiple_clicks_delay: u64,
     
-    /// How many ms before bed timer expiry to start pre-clicking (default: 100).
-    /// Higher values mean more aggressive pre-clicking before the grace period ends.
+    /// How many ms before the COFL "best time to buy" to start pre-clicking (default: 100).
+    /// Only used when freemoney is enabled. Without freemoney, bed spam uses bed_spam_click_delay.
     #[serde(default = "default_bed_pre_click_ms")]
     pub bed_pre_click_ms: u64,
     

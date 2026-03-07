@@ -1921,40 +1921,9 @@ async fn handle_window_interaction(
                             info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
                         }
                     } else {
-                        // Non-freemoney mode: also use bed-time pre-clicking if available.
-                        // Parse remaining seconds from the bed item to wait before clicking.
-                        let remaining_secs = {
-                            let menu = bot.menu();
-                            let slots = menu.slots();
-                            slots.get(31).and_then(|s| parse_bed_remaining_secs(s))
-                        };
-                        if let Some(secs) = remaining_secs {
-                            let wait_ms = (secs * 1000).saturating_sub(pre_click_lead_ms);
-                            if wait_ms > 0 {
-                                info!("[AH] Bed timing (non-freemoney): {}s remaining — waiting {}ms before clicking (pre-click {}ms)", secs, wait_ms, pre_click_lead_ms);
-                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
-                                loop {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                                    if tokio::time::Instant::now() >= wait_deadline {
-                                        break;
-                                    }
-                                    let kind_now = {
-                                        let menu = bot.menu();
-                                        let slots = menu.slots();
-                                        slots.get(31).map(|s| {
-                                            if s.is_empty() { "air".to_string() }
-                                            else { s.kind().to_string().to_lowercase() }
-                                        }).unwrap_or_else(|| "air".to_string())
-                                    };
-                                    if !kind_now.contains("bed") {
-                                        break;
-                                    }
-                                }
-                            }
-                            info!("[AH] Bed timing (non-freemoney): entering rapid-click phase (~{}ms before expiry)", pre_click_lead_ms);
-                        } else {
-                            info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
-                        }
+                        // Non-freemoney mode: just do simple bed spam at the configured delay.
+                        // No pre-click timing — immediately start clicking slot 31.
+                        info!("[AH] Bed detected in slot 31 — starting bed spam ({}ms interval)", click_interval_ms);
                     }
 
                     let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
