@@ -216,6 +216,8 @@ async fn main() -> Result<()> {
     bot_client.set_auto_cookie_hours(config.auto_cookie);
     bot_client.freemoney = config.freemoney_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
+    bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
+    *bot_client.ingame_name.write() = ingame_name.clone();
     
     // Connect to Hypixel - Azalea will handle Microsoft OAuth in browser
     match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
