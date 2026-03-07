@@ -260,8 +260,13 @@ pub enum CommandType {
         /// ExtraAttributes.id from COFL for item identity verification
         item_id: Option<String>,
     },
-    /// Trigger a full bazaar order management cycle (open /bz → Manage Orders → collect/cancel).
-    ManageOrders,
+    /// Trigger a bazaar order management cycle.
+    /// When `cancel_open` is true (startup), all open orders are cancelled in addition
+    /// to collecting filled ones. When false (order-fill triggered), only filled orders
+    /// are collected and open orders are left untouched.
+    ManageOrders {
+        cancel_open: bool,
+    },
     // Advanced commands matching TypeScript BAF.ts
     ClickSlot {
         slot: i16,

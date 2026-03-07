@@ -28,8 +28,9 @@ pub struct Config {
     #[serde(default)]
     pub bed_multiple_clicks_delay: u64,
     
-    /// How many ms before the COFL "best time to buy" to start pre-clicking (default: 100).
-    /// Only used when freemoney is enabled. Without freemoney, bed spam uses bed_spam_click_delay.
+    /// How many ms before the COFL `purchaseAt` deadline to start clicking (default: 30).
+    /// Only used when `freemoney = true`. Without freemoney, bed spam starts immediately
+    /// using `bed_spam_click_delay` and this value is ignored.
     #[serde(default = "default_bed_pre_click_ms")]
     pub bed_pre_click_ms: u64,
     
@@ -152,7 +153,7 @@ fn default_bed_spam_click_delay() -> u64 {
 }
 
 fn default_bed_pre_click_ms() -> u64 {
-    100
+    30
 }
 
 fn default_bazaar_order_check_interval_seconds() -> u64 {
@@ -276,7 +277,7 @@ mod tests {
     #[test]
     fn default_bed_pre_click_ms() {
         let config = Config::default();
-        assert_eq!(config.bed_pre_click_ms, 100);
+        assert_eq!(config.bed_pre_click_ms, 30);
     }
 
     #[test]
