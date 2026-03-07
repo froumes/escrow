@@ -2152,7 +2152,7 @@ async fn handle_window_interaction(
                     info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", order_btn_name, i);
                     *state.bazaar_step.write() = BazaarStep::SelectOrderType;
                     // Add randomized human-like delay before clicking (200-500ms)
-                    let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() % 300) as u64;
+                    let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 300) as u64;
                     tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                     if *state.last_window_id.read() != window_id { return; }
                     click_window_slot(bot, window_id, i as i16).await;
@@ -2183,7 +2183,7 @@ async fn handle_window_interaction(
                         if *state.last_window_id.read() != window_id { return; }
                         info!("[Bazaar] Found item at slot {}", i);
                         // Add randomized human-like delay (200-450ms)
-                        let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() % 250) as u64;
+                        let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 250) as u64;
                         tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                         if *state.last_window_id.read() != window_id { return; }
                         click_window_slot(bot, window_id, i as i16).await;
@@ -2237,7 +2237,7 @@ async fn handle_window_interaction(
                 info!("[Bazaar] Confirm screen: clicking slot 13");
                 *state.bazaar_step.write() = BazaarStep::Confirm;
                 // Add randomized human-like delay before confirming (300-700ms)
-                let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() % 400) as u64;
+                let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 400) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                 click_window_slot(bot, window_id, 13).await;
 
@@ -3167,7 +3167,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                 "slot": mineflayer_slot
             });
             if !display_name.is_empty() {
-                slot_obj.as_object_mut().unwrap().insert(
+                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
                     "displayName".to_string(),
                     serde_json::Value::String(display_name),
                 );
