@@ -1918,7 +1918,6 @@ async fn handle_window_interaction(
                                 info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking (lead: {}ms)", secs, wait_ms, pre_click_lead_ms);
                                 let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
                                 loop {
-                                    // Check BEFORE sleeping to avoid overshooting the deadline
                                     if tokio::time::Instant::now() >= wait_deadline {
                                         break;
                                     }
