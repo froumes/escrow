@@ -6,6 +6,9 @@ use azalea_protocol::packets::game::{
     c_set_player_team::Method as TeamMethod,
     s_sign_update::ServerboundSignUpdate,
     s_container_close::ServerboundContainerClose,
+    s_use_item::ServerboundUseItem,
+    s_set_carried_item::ServerboundSetCarriedItem,
+    s_interact::InteractionHand,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
@@ -106,6 +109,13 @@ pub struct BotClient {
     pub bed_spam_click_delay: u64,
     /// Item name to sell via bazaar "Sell Instantly" when inventory is full
     insta_sell_item: Arc<RwLock<Option<String>>>,
+    /// How many ms before bed timer expiry to start pre-clicking (default: 100).
+    pub bed_pre_click_ms: u64,
+    /// Items the bot has listed on the AH (by lowercase item name).
+    /// Used to filter out coop member sales from our own sales.
+    active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// The bot's in-game name, used for coop sale filtering.
+    pub ingame_name: Arc<RwLock<String>>,
 }
 
 /// Events that can be emitted by the bot
@@ -177,6 +187,9 @@ impl BotClient {
             freemoney: false,
             bed_spam_click_delay: 100,
             insta_sell_item: Arc::new(RwLock::new(None)),
+            bed_pre_click_ms: 100,
+            active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            ingame_name: Arc::new(RwLock::new(String::new())),
         }
     }
 
@@ -264,6 +277,9 @@ impl BotClient {
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: Arc::new(AtomicBool::new(false)),
             insta_sell_item: self.insta_sell_item.clone(),
+            bed_pre_click_ms: self.bed_pre_click_ms,
+            active_auction_listings: self.active_auction_listings.clone(),
+            ingame_name: self.ingame_name.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -572,6 +588,7 @@ pub enum CookieStep {
     Initial,        // Sent /bz booster cookie, waiting for Bazaar window
     ItemDetail,     // Clicked cookie item (slot 11), waiting for detail window
     BuyConfirm,     // Clicked Buy Instantly (slot 10), waiting for confirm window
+    ConsumingCookie, // Purchased, right-clicked cookie, waiting for cookie GUI window
 }
 
 /// State type for bot client event handler
@@ -668,6 +685,13 @@ pub struct BotClientState {
     /// Item name to instasell via bazaar "Sell Instantly" when inventory is dominated
     /// by one stackable item type. Set by ManageOrders, consumed by InstaSelling handler.
     pub insta_sell_item: Arc<RwLock<Option<String>>>,
+    /// How many ms before bed timer expiry to start pre-clicking (default: 100).
+    pub bed_pre_click_ms: u64,
+    /// Items the bot has listed on the AH (by lowercase item name).
+    /// Used to filter out coop member sales from our own sales.
+    pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// The bot's in-game name, used for coop sale filtering.
+    pub ingame_name: Arc<RwLock<String>>,
 }
 
 impl Default for BotClientState {
@@ -718,6 +742,9 @@ impl Default for BotClientState {
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: Arc::new(AtomicBool::new(false)),
             insta_sell_item: Arc::new(RwLock::new(None)),
+            bed_pre_click_ms: 100,
+            active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            ingame_name: Arc::new(RwLock::new(String::new())),
         }
     }
 }
@@ -1127,11 +1154,21 @@ async fn event_handler(
                 state.bed_timing_active.store(false, Ordering::Relaxed);
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
+                // In a coop, ALL members receive this for any coop member's sale.
+                // Only treat it as our sale if we listed the item.
                 if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
-                    // Extract UUID if present
-                    let uuid = extract_viewauction_uuid(&clean_message);
-                    *state.claim_sold_uuid.write() = uuid;
-                    let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
+                    let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+                    let is_our_listing = state.active_auction_listings.read().contains(&item_key);
+                    if is_our_listing {
+                        // Remove from active listings since it's been sold
+                        state.active_auction_listings.write().remove(&item_key);
+                        // Extract UUID if present
+                        let uuid = extract_viewauction_uuid(&clean_message);
+                        *state.claim_sold_uuid.write() = uuid;
+                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
+                    } else {
+                        info!("[AH] Ignoring coop member sale: {} bought {} for {} coins (not our listing)", buyer, item_name, price);
+                    }
                 }
             } else if clean_message.contains("BIN Auction started for") {
                 // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
@@ -1140,6 +1177,11 @@ async fn event_handler(
                 let item = state.auction_item_name.read().clone();
                 let bid  = *state.auction_starting_bid.read();
                 let dur  = *state.auction_duration_hours.read();
+                // Track this as our active listing for coop sale filtering
+                if !item.is_empty() {
+                    let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
+                    state.active_auction_listings.write().insert(item_key);
+                }
                 if !item.is_empty() {
                     info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
                     let _ = state.event_tx.send(BotEvent::AuctionListed {
@@ -1800,7 +1842,8 @@ async fn handle_window_interaction(
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
-                    const PRE_CLICK_LEAD_MS: u64 = 100; // start clicking this many ms before expiry
+                    // Use configurable pre-click lead time
+                    let pre_click_lead_ms = state.bed_pre_click_ms;
                     const BED_TIMING_INTERVAL_MS: u64 = 100;
                     const MAX_FAILED_CLICKS: usize = 5;
                     let click_interval_ms = if state.freemoney {
@@ -1824,7 +1867,7 @@ async fn handle_window_interaction(
                         };
 
                         if let Some(remaining_ms) = remaining_ms_from_purchase_at {
-                            let wait_ms = remaining_ms.saturating_sub(PRE_CLICK_LEAD_MS);
+                            let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
                             if wait_ms > 0 {
                                 info!("[AH] Bed timing: using COFL purchaseAt — waiting {}ms before clicking", wait_ms);
                                 let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
@@ -1846,10 +1889,10 @@ async fn handle_window_interaction(
                                     }
                                 }
                             }
-                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt)", PRE_CLICK_LEAD_MS);
+                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before purchaseAt)", pre_click_lead_ms);
                         } else if let Some(secs) = remaining_secs {
-                            // Wait until PRE_CLICK_LEAD_MS before the grace period ends
-                            let wait_ms = (secs * 1000).saturating_sub(PRE_CLICK_LEAD_MS);
+                            // Wait until pre_click_lead_ms before the grace period ends
+                            let wait_ms = (secs * 1000).saturating_sub(pre_click_lead_ms);
                             if wait_ms > 0 {
                                 info!("[AH] Bed timing: {}s remaining — waiting {}ms before clicking", secs, wait_ms);
                                 // While waiting, poll every 200ms to bail early if bed disappears
@@ -1873,12 +1916,45 @@ async fn handle_window_interaction(
                                     }
                                 }
                             }
-                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", PRE_CLICK_LEAD_MS);
+                            info!("[AH] Bed timing: entering rapid-click phase (~{}ms before expiry)", pre_click_lead_ms);
                         } else {
                             info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
                         }
                     } else {
-                        info!("[AH] Bed detected in slot 31 — starting bed spam ({}ms interval)", click_interval_ms);
+                        // Non-freemoney mode: also use bed-time pre-clicking if available.
+                        // Parse remaining seconds from the bed item to wait before clicking.
+                        let remaining_secs = {
+                            let menu = bot.menu();
+                            let slots = menu.slots();
+                            slots.get(31).and_then(|s| parse_bed_remaining_secs(s))
+                        };
+                        if let Some(secs) = remaining_secs {
+                            let wait_ms = (secs * 1000).saturating_sub(pre_click_lead_ms);
+                            if wait_ms > 0 {
+                                info!("[AH] Bed timing (non-freemoney): {}s remaining — waiting {}ms before clicking (pre-click {}ms)", secs, wait_ms, pre_click_lead_ms);
+                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                    if tokio::time::Instant::now() >= wait_deadline {
+                                        break;
+                                    }
+                                    let kind_now = {
+                                        let menu = bot.menu();
+                                        let slots = menu.slots();
+                                        slots.get(31).map(|s| {
+                                            if s.is_empty() { "air".to_string() }
+                                            else { s.kind().to_string().to_lowercase() }
+                                        }).unwrap_or_else(|| "air".to_string())
+                                    };
+                                    if !kind_now.contains("bed") {
+                                        break;
+                                    }
+                                }
+                            }
+                            info!("[AH] Bed timing (non-freemoney): entering rapid-click phase (~{}ms before expiry)", pre_click_lead_ms);
+                        } else {
+                            info!("[AH] Bed detected in slot 31 — time unknown, starting clicks ({}ms interval)", click_interval_ms);
+                        }
                     }
 
                     let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
@@ -2075,7 +2151,9 @@ async fn handle_window_interaction(
                     }
                     info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", order_btn_name, i);
                     *state.bazaar_step.write() = BazaarStep::SelectOrderType;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    // Add randomized human-like delay before clicking (200-500ms)
+                    let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() % 300) as u64;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                     if *state.last_window_id.read() != window_id { return; }
                     click_window_slot(bot, window_id, i as i16).await;
                     return;
@@ -2104,7 +2182,9 @@ async fn handle_window_interaction(
                     Some(i) => {
                         if *state.last_window_id.read() != window_id { return; }
                         info!("[Bazaar] Found item at slot {}", i);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        // Add randomized human-like delay (200-450ms)
+                        let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() % 250) as u64;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                         if *state.last_window_id.read() != window_id { return; }
                         click_window_slot(bot, window_id, i as i16).await;
                     }
@@ -2156,6 +2236,9 @@ async fn handle_window_interaction(
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Confirm screen: clicking slot 13");
                 *state.bazaar_step.write() = BazaarStep::Confirm;
+                // Add randomized human-like delay before confirming (300-700ms)
+                let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() % 400) as u64;
+                tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                 click_window_slot(bot, window_id, 13).await;
 
                 // Wait briefly for the server to respond (limit message arrives asynchronously)
@@ -2886,18 +2969,18 @@ async fn handle_window_interaction(
                 click_window_slot(bot, window_id, 10).await;
                 // Purchase accepted — close window and find cookie in inventory to consume
                 tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                // Close any open window
+                // Close the purchase window
                 bot.write_packet(ServerboundContainerClose {
                     container_id: window_id as i32,
                 });
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-                // Find cookie in inventory and consume via right-click + slot 11
+                // Find cookie in inventory and consume it by right-clicking.
+                // Matches TypeScript: bot.equip(item, 'hand') → bot.activateItem() → click slot 11.
                 let menu = bot.menu();
                 let all_slots = menu.slots();
                 let player_range = menu.player_slots_range();
-                let range_start = *player_range.start();
-                let cookie_slot = all_slots[player_range].iter().enumerate().find_map(|(i, item)| {
+                let cookie_slot = all_slots[player_range.clone()].iter().enumerate().find_map(|(i, item)| {
                     let name = get_item_display_name_from_slot(item).unwrap_or_default().to_lowercase();
                     if name.contains("booster cookie") || name.contains("cookie") {
                         Some(i)
@@ -2908,29 +2991,74 @@ async fn handle_window_interaction(
 
                 match cookie_slot {
                     Some(idx) => {
-                        let current_time = *state.cookie_time_secs.read();
-                        let new_hours = (current_time + 4 * 86400) / 3600;
-                        let old_hours = current_time / 3600;
-                        info!("[Cookie] Found cookie at inventory slot {} — consuming", idx);
-                        // Right-click the cookie to open its GUI, then click slot 11 to consume
-                        let win_slot = range_start + idx;
-                        click_window_slot(bot, window_id, win_slot as i16).await;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                        // After right-clicking, the cookie GUI opens — handled in next window event
-                        // For now mark as Idle; the cookie GUI window will be a new OpenScreen event.
-                        // This is handled below if the cookie GUI opens as a new window.
-                        let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
-                            "§f[§4BAF§f]: §aBought booster cookie! Time: {}h → {}h",
-                            old_hours, new_hours
-                        )));
+                        info!("[Cookie] Found cookie at player inventory index {} — equipping and consuming", idx);
+                        // Convert player-range-relative index to hotbar slot (0-8).
+                        // Player slots: 0-26 = main inventory, 27-35 = hotbar (slots 36-44 in menu).
+                        // If cookie is already in hotbar (idx >= 27), select that hotbar slot.
+                        // Otherwise, move it to hotbar slot 0 first.
+                        let hotbar_slot: u16 = if idx >= 27 {
+                            // Already in hotbar — map to hotbar index 0-8
+                            (idx - 27) as u16
+                        } else {
+                            // Cookie is in main inventory — need to swap it to hotbar.
+                            // Open player inventory (container 0), click cookie slot, then hotbar slot 0.
+                            let inv_slot = (*player_range.start() + idx) as i16;
+                            // Pick up cookie
+                            click_window_slot(bot, 0, inv_slot).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            // Place in hotbar slot 0 (slot 36 in player inventory container)
+                            click_window_slot(bot, 0, 36).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            0
+                        };
+
+                        // Select the hotbar slot
+                        bot.write_packet(ServerboundSetCarriedItem { slot: hotbar_slot });
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                        // Right-click to open the cookie GUI
+                        bot.write_packet(ServerboundUseItem {
+                            hand: InteractionHand::MainHand,
+                            seq: 0,
+                            y_rot: 0.0,
+                            x_rot: 0.0,
+                        });
+                        info!("[Cookie] Right-clicked cookie — waiting for cookie GUI");
+
+                        // Transition to ConsumingCookie state so the next OpenScreen
+                        // event will click slot 11 to consume
+                        *state.cookie_step.write() = CookieStep::ConsumingCookie;
+                        // Stay in BuyingCookie state — the ConsumingCookie sub-step handles
+                        // the GUI window in the next OpenScreen event.
                     }
                     None => {
                         warn!("[Cookie] Cookie not found in inventory after purchase");
                         let _ = state.event_tx.send(BotEvent::ChatMessage(
                             "§f[§4BAF§f]: §c[AutoCookie] Cookie purchased but not found in inventory".to_string()
                         ));
+                        *state.bot_state.write() = BotState::Idle;
                     }
                 }
+            } else if step == CookieStep::ConsumingCookie {
+                // Cookie GUI opened — click slot 11 to consume the cookie
+                info!("[Cookie] Cookie GUI opened — clicking slot 11 to consume");
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                click_window_slot(bot, window_id, 11).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+                // Close the cookie GUI
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
+
+                let current_time = *state.cookie_time_secs.read();
+                let new_hours = (current_time + 4 * 86400) / 3600;
+                let old_hours = current_time / 3600;
+                let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
+                    "§f[§4BAF§f]: §aBought and consumed booster cookie! Time: {}h → {}h",
+                    old_hours, new_hours
+                )));
+                info!("[Cookie] Cookie consumed successfully! Time: {}h → {}h", old_hours, new_hours);
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3024,9 +3152,13 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             } else {
                 serde_json::Value::Null
             };
+            // Use minecraft registry ID (e.g. "minecraft:player_head")
+            // COFL expects registry IDs. ItemKind::to_string() already includes the prefix.
             let item_name = item.kind().to_string();
+            // Also include the display name for COFL item identification
+            let display_name = get_item_display_name_from_slot(item).unwrap_or_default();
             slot_descriptions.push(format!("slot {}: {}x {}", mineflayer_slot, item.count(), item_name));
-            slots_array[mineflayer_slot] = serde_json::json!({
+            let mut slot_obj = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
                 "metadata": 0,
@@ -3034,6 +3166,13 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                 "name": item_name,
                 "slot": mineflayer_slot
             });
+            if !display_name.is_empty() {
+                slot_obj.as_object_mut().unwrap().insert(
+                    "displayName".to_string(),
+                    serde_json::Value::String(display_name),
+                );
+            }
+            slots_array[mineflayer_slot] = slot_obj;
         }
     }
 
@@ -3439,5 +3578,73 @@ mod tests {
             should_suppress_component_patch_serialization_warning(&err),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_cookie_step_enum_has_consuming_cookie() {
+        // Verify the ConsumingCookie step exists and is distinct from other steps
+        let step = CookieStep::ConsumingCookie;
+        assert_ne!(step, CookieStep::Initial);
+        assert_ne!(step, CookieStep::ItemDetail);
+        assert_ne!(step, CookieStep::BuyConfirm);
+    }
+
+    #[test]
+    fn test_inventory_item_name_uses_minecraft_prefix() {
+        // Verify that ItemKind::to_string() produces minecraft: prefixed names
+        let kind = ItemKind::PlayerHead;
+        let name = kind.to_string();
+        assert!(name.starts_with("minecraft:"), "Expected minecraft: prefix, got: {}", name);
+        assert_eq!(name, "minecraft:player_head");
+    }
+
+    #[test]
+    fn test_inventory_item_name_stone() {
+        let kind = ItemKind::Stone;
+        let name = kind.to_string();
+        assert_eq!(name, "minecraft:stone");
+    }
+
+    #[test]
+    fn test_coop_sale_filtering_our_listing() {
+        // Simulate tracking an active listing
+        let listings: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            set.insert("gemstone fuel tank".to_string());
+            set
+        };
+
+        let msg = "[Auction] SomePlayer bought Gemstone Fuel Tank for 45,000,000 coins!";
+        let result = parse_sold_message(msg);
+        assert!(result.is_some());
+        let (_, item_name, _) = result.unwrap();
+        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+        assert!(listings.contains(&item_key), "Our listing should be detected");
+    }
+
+    #[test]
+    fn test_coop_sale_filtering_not_our_listing() {
+        // Simulate tracking active listings (we didn't list "Golden Pickaxe")
+        let listings: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            set.insert("gemstone fuel tank".to_string());
+            set
+        };
+
+        let msg = "[Auction] OtherPlayer bought Golden Pickaxe for 1,000,000 coins!";
+        let result = parse_sold_message(msg);
+        assert!(result.is_some());
+        let (_, item_name, _) = result.unwrap();
+        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+        assert!(!listings.contains(&item_key), "Coop member's listing should not match");
+    }
+
+    #[test]
+    fn test_parse_cookie_duration_various_formats() {
+        // Test various duration formats
+        assert_eq!(parse_cookie_duration_secs("Duration: 3d 5h"), 3 * 86400 + 5 * 3600);
+        assert_eq!(parse_cookie_duration_secs("Duration: 23h 45m"), 23 * 3600 + 45 * 60);
+        assert_eq!(parse_cookie_duration_secs("Duration: 1h 30m"), 1 * 3600 + 30 * 60);
+        assert_eq!(parse_cookie_duration_secs("Duration: 0d 0h 0m"), 0);
     }
 }
