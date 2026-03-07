@@ -585,10 +585,11 @@ pub enum BazaarStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CookieStep {
     #[default]
-    Initial,        // Sent /bz booster cookie, waiting for Bazaar window
-    ItemDetail,     // Clicked cookie item (slot 11), waiting for detail window
-    BuyConfirm,     // Clicked Buy Instantly (slot 10), waiting for confirm window
-    ConsumingCookie, // Purchased, right-clicked cookie, waiting for cookie GUI window
+    Initial,         // Sent /bz booster cookie, waiting for Bazaar window
+    ItemDetail,      // Clicked cookie item (slot 11), waiting for detail window
+    BuyConfirm,      // Clicked Buy Instantly (slot 10), waiting for confirm window
+    WaitingForCookie, // Clicked Confirm, waiting for cookie to appear in inventory
+    ConsumingCookie, // Right-clicked cookie, waiting for cookie GUI window
 }
 
 /// State type for bot client event handler
@@ -2933,12 +2934,36 @@ async fn handle_window_interaction(
                 click_window_slot(bot, window_id, 10).await;
                 *state.cookie_step.write() = CookieStep::BuyConfirm;
             } else if step == CookieStep::BuyConfirm {
-                // Purchase confirmation: click slot 10 again to confirm
+                // Atomically advance to WaitingForCookie before any sleeps.
+                // This prevents concurrent window events (e.g. the Bazaar re-opening the
+                // item-detail page after purchase) from triggering additional buys.
+                // Lock is acquired, checked, updated, then released before any I/O.
+                let claimed = {
+                    let mut step_write = state.cookie_step.write();
+                    if *step_write == CookieStep::BuyConfirm {
+                        *step_write = CookieStep::WaitingForCookie;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !claimed {
+                    // Another concurrent handler already processed this step — close
+                    // any stale window and bail out.
+                    info!("[Cookie] BuyConfirm already handled by another task — closing window");
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    return;
+                }
+
+                // Purchase confirmation: click slot 10 to confirm
                 info!("[Cookie] Buy confirmation — clicking Confirm (slot 10)");
                 click_window_slot(bot, window_id, 10).await;
-                // Purchase accepted — close window and find cookie in inventory to consume
+                // Let the purchase process; the Bazaar may re-open the item-detail window
+                // after purchase — that is handled by the WaitingForCookie branch below.
                 tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                // Close the purchase window
+                // Close the purchase/item-detail window if still open
                 bot.write_packet(ServerboundContainerClose {
                     container_id: window_id as i32,
                 });
@@ -2994,11 +3019,9 @@ async fn handle_window_interaction(
                         });
                         info!("[Cookie] Right-clicked cookie — waiting for cookie GUI");
 
-                        // Transition to ConsumingCookie state so the next OpenScreen
-                        // event will click slot 11 to consume
+                        // Transition to ConsumingCookie so the next OpenScreen event
+                        // (the cookie activation GUI) is handled correctly.
                         *state.cookie_step.write() = CookieStep::ConsumingCookie;
-                        // Stay in BuyingCookie state — the ConsumingCookie sub-step handles
-                        // the GUI window in the next OpenScreen event.
                     }
                     None => {
                         warn!("[Cookie] Cookie not found in inventory after purchase");
@@ -3008,7 +3031,36 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
+            } else if step == CookieStep::WaitingForCookie {
+                // Between clicking Confirm and right-clicking the cookie in inventory.
+                // Any window that opens here (e.g. Bazaar re-opening item detail) is
+                // unexpected — close it immediately and do nothing else.
+                info!("[Cookie] Unexpected window while waiting for cookie in inventory — closing");
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
             } else if step == CookieStep::ConsumingCookie {
+                // Atomically claim the consume step so only one concurrent handler fires.
+                // Lock is acquired, checked, updated, then released before any I/O.
+                let claimed = {
+                    let mut step_write = state.cookie_step.write();
+                    if *step_write == CookieStep::ConsumingCookie {
+                        // Advance past ConsumingCookie to prevent re-entry.
+                        *step_write = CookieStep::Initial;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !claimed {
+                    // Already handled — close stale window and bail.
+                    info!("[Cookie] ConsumingCookie already handled by another task — closing window");
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    return;
+                }
+
                 // Cookie GUI opened — click slot 11 to consume the cookie
                 info!("[Cookie] Cookie GUI opened — clicking slot 11 to consume");
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -3556,6 +3608,18 @@ mod tests {
         assert_ne!(step, CookieStep::Initial);
         assert_ne!(step, CookieStep::ItemDetail);
         assert_ne!(step, CookieStep::BuyConfirm);
+        assert_ne!(step, CookieStep::WaitingForCookie);
+    }
+
+    #[test]
+    fn test_cookie_step_waiting_for_cookie_is_distinct() {
+        // WaitingForCookie must be distinct from all other steps so the atomic
+        // check-and-advance in BuyConfirm and ConsumingCookie works correctly.
+        let step = CookieStep::WaitingForCookie;
+        assert_ne!(step, CookieStep::Initial);
+        assert_ne!(step, CookieStep::ItemDetail);
+        assert_ne!(step, CookieStep::BuyConfirm);
+        assert_ne!(step, CookieStep::ConsumingCookie);
     }
 
     #[test]
