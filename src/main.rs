@@ -677,7 +677,29 @@ async fn main() -> Result<()> {
                             
                             // Send to websocket with command as type (JSON-stringified data)
                             let ws = ws_client_clone.clone();
+                            let inv_client = bot_client_for_ws.clone();
+                            let is_sellinventory = command == "sellinventory";
                             tokio::spawn(async move {
+                                // For sellinventory: upload the current inventory first so COFL
+                                // has fresh data before processing the sell command.
+                                if is_sellinventory {
+                                    if let Some(inv_json) = inv_client.get_cached_inventory_json() {
+                                        info!("[Inventory] sellinventory: uploading inventory first ({} bytes)", inv_json.len());
+                                        frikadellen_baf::logging::append_inventory_upload_log(
+                                            &format!("sellinventory pre-upload ({} bytes): {}", inv_json.len(), inv_json)
+                                        );
+                                        let upload_msg = serde_json::json!({
+                                            "type": "uploadInventory",
+                                            "data": inv_json
+                                        }).to_string();
+                                        if let Err(e) = ws.send_message(&upload_msg).await {
+                                            error!("[Inventory] sellinventory: failed to pre-upload inventory: {}", e);
+                                        }
+                                    } else {
+                                        warn!("[Inventory] sellinventory: no cached inventory to upload");
+                                    }
+                                }
+
                                 let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
                                 let message = serde_json::json!({
                                     "type": command,

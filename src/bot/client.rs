@@ -835,6 +835,18 @@ fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option
                 };
                 return Some(plain);
             }
+        } else {
+            // Full item_data serialization failed (e.g., enchantment HashMap keys).
+            // Fall back to direct component access for the display name.
+            use azalea_inventory::components::CustomName;
+            if let Some(cn) = item_data.component_patch.get::<CustomName>() {
+                if let Ok(cn_val) = serde_json::to_value(cn) {
+                    let plain = extract_text_from_chat_component(&cn_val);
+                    if !plain.is_empty() {
+                        return Some(plain);
+                    }
+                }
+            }
         }
     }
     None
@@ -3126,35 +3138,79 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
             if should_suppress_component_patch_serialization_warning(&e) {
                 // Full component_patch failed to serialize (e.g. HashMap<Enchantment, i32>
                 // keys don't pass serde_json's strict map-key check). Fall back to
-                // extracting just the minecraft:custom_data component which contains the
-                // Hypixel SkyBlock ExtraAttributes (item ID, etc.) that COFL needs to
-                // identify the item. Other components (enchantments, attributes, etc.)
-                // are not needed by COFL for inventory identification.
-                if let Some(custom_data) = item_data.component_patch
-                    .get::<azalea_inventory::components::CustomData>()
-                {
-                    match serde_json::to_value(&custom_data.nbt) {
-                        Ok(nbt_val) if !nbt_val.is_null() => {
-                            debug!("[Inventory] Full component_patch failed; using minecraft:custom_data fallback");
-                            let mut obj = serde_json::Map::new();
-                            obj.insert("minecraft:custom_data".to_string(), nbt_val);
-                            return serde_json::Value::Object(obj);
-                        }
-                        _ => {}
-                    }
+                // extracting individual components that serialize cleanly.
+                // This preserves COFL-critical data: ExtraAttributes (custom_data),
+                // display name (custom_name), lore, head texture (profile), and
+                // tooltip visibility (tooltip_display).
+                let obj = extract_serializable_components(item_data);
+                if obj.is_empty() {
+                    debug!(
+                        "[Inventory] Skipping component patch NBT extraction due to expected serialization limitation"
+                    );
+                    serde_json::Value::Null
+                } else {
+                    debug!("[Inventory] Full component_patch failed; extracted {} individual components", obj.len());
+                    serde_json::Value::Object(obj)
                 }
-                debug!(
-                    "[Inventory] Skipping component patch NBT extraction due to expected serialization limitation"
-                );
             } else {
                 warn!(
                     "[Inventory] Failed to serialize component patch for NBT extraction: {}",
                     e
                 );
+                serde_json::Value::Null
             }
-            serde_json::Value::Null
         }
     }
+}
+
+/// Extract individual item components that are known to serialize without errors.
+/// Used as a fallback when the full component_patch serialization fails (e.g., due to
+/// HashMap<Enchantment, i32> non-string map keys in enchanted items).
+fn extract_serializable_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Map<String, serde_json::Value> {
+    use azalea_inventory::components::{CustomData, CustomName, Lore, Profile, TooltipDisplay};
+    let mut obj = serde_json::Map::new();
+
+    // minecraft:custom_data — Hypixel SkyBlock ExtraAttributes (item id, uuid, etc.)
+    if let Some(custom_data) = item_data.component_patch.get::<CustomData>() {
+        if let Ok(nbt_val) = serde_json::to_value(&custom_data.nbt) {
+            if !nbt_val.is_null() {
+                obj.insert("minecraft:custom_data".to_string(), nbt_val);
+            }
+        }
+    }
+    // minecraft:custom_name — human-readable display name (e.g. "Stellar Mithril Drill SX-R326")
+    if let Some(cn) = item_data.component_patch.get::<CustomName>() {
+        if let Ok(val) = serde_json::to_value(cn) {
+            if !val.is_null() {
+                obj.insert("minecraft:custom_name".to_string(), val);
+            }
+        }
+    }
+    // minecraft:lore — item description lines shown in tooltip
+    if let Some(lore) = item_data.component_patch.get::<Lore>() {
+        if let Ok(val) = serde_json::to_value(lore) {
+            if !val.is_null() {
+                obj.insert("minecraft:lore".to_string(), val);
+            }
+        }
+    }
+    // minecraft:profile — skull/player-head skin (critical for drills and pets)
+    if let Some(profile) = item_data.component_patch.get::<Profile>() {
+        if let Ok(val) = serde_json::to_value(profile) {
+            if !val.is_null() {
+                obj.insert("minecraft:profile".to_string(), val);
+            }
+        }
+    }
+    // minecraft:tooltip_display — hidden_components list
+    if let Some(tooltip) = item_data.component_patch.get::<TooltipDisplay>() {
+        if let Ok(val) = serde_json::to_value(tooltip) {
+            if !val.is_null() {
+                obj.insert("minecraft:tooltip_display".to_string(), val);
+            }
+        }
+    }
+    obj
 }
 
 fn should_suppress_component_patch_serialization_warning(error: &serde_json::Error) -> bool {
@@ -3193,7 +3249,16 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             let item_name = item.kind().to_string();
             // Also include the display name for COFL item identification
             let display_name = get_item_display_name_from_slot(item).unwrap_or_default();
-            slot_descriptions.push(format!("slot {}: {}x {}", mineflayer_slot, item.count(), item_name));
+            // Log display name status for debugging; items without a displayName will fall
+            // back to the registry name (e.g. minecraft:prismarine_shard) in createAuction.
+            if display_name.is_empty() {
+                debug!("[Inventory] slot {}: {}x {} — no displayName (NBT keys: {})",
+                    mineflayer_slot, item.count(), item_name,
+                    nbt_data.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default()
+                );
+            }
+            let display_label = if display_name.is_empty() { "no-name" } else { &display_name };
+            slot_descriptions.push(format!("slot {}: {}x {} ({})", mineflayer_slot, item.count(), item_name, display_label));
             let mut slot_obj = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
@@ -3700,14 +3765,29 @@ mod tests {
     }
 
     #[test]
-    fn test_component_type_names() {
-        use azalea_inventory::components::{CustomData, CustomName, Lore, Profile, TooltipDisplay};
+    fn test_extract_serializable_components_empty() {
+        use azalea::registry::builtin::ItemKind;
+        use azalea_inventory::ItemStackData;
+        // An item with no extra components should return an empty map
+        let item_data = ItemStackData::from(ItemKind::Stone);
+        let result = extract_serializable_components(&item_data);
+        assert!(result.is_empty(), "Stone with no components should have empty serializable components");
+    }
 
-        // Verify these component types are accessible
-        let _ = std::mem::size_of::<CustomData>();
-        let _ = std::mem::size_of::<CustomName>();
-        let _ = std::mem::size_of::<Lore>();
-        let _ = std::mem::size_of::<Profile>();
-        let _ = std::mem::size_of::<TooltipDisplay>();
+    #[test]
+    fn test_extract_serializable_components_with_map_id() {
+        use azalea::registry::builtin::ItemKind;
+        use azalea_inventory::{ItemStack, components::MapId};
+        // An item with MapId only — no custom_data, custom_name, lore, profile, tooltip_display
+        // should return an empty map (since we only extract those 5 specific components).
+        let item = ItemStack::from(ItemKind::Map).with_component(MapId { id: 42 });
+        let item_data = item.as_present().expect("map item should be present");
+        let result = extract_serializable_components(item_data);
+        // MapId is not in our extraction list; result should be empty
+        assert!(!result.contains_key("minecraft:custom_data"));
+        assert!(!result.contains_key("minecraft:custom_name"));
+        assert!(!result.contains_key("minecraft:lore"));
+        assert!(!result.contains_key("minecraft:profile"));
+        assert!(!result.contains_key("minecraft:tooltip_display"));
     }
 }
