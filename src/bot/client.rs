@@ -3698,4 +3698,16 @@ mod tests {
         assert_eq!(parse_cookie_duration_secs("Duration: 1h 30m"), 1 * 3600 + 30 * 60);
         assert_eq!(parse_cookie_duration_secs("Duration: 0d 0h 0m"), 0);
     }
+
+    #[test]
+    fn test_component_type_names() {
+        use azalea_inventory::components::{CustomData, CustomName, Lore, Profile, TooltipDisplay};
+
+        // Verify these component types are accessible
+        let _ = std::mem::size_of::<CustomData>();
+        let _ = std::mem::size_of::<CustomName>();
+        let _ = std::mem::size_of::<Lore>();
+        let _ = std::mem::size_of::<Profile>();
+        let _ = std::mem::size_of::<TooltipDisplay>();
+    }
 }
