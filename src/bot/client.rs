@@ -1015,6 +1015,46 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     has_claimable && !is_active
 }
 
+fn is_my_auctions_window_title(window_title: &str) -> bool {
+    window_title.contains("Manage Auctions") || window_title.contains("My Auctions")
+}
+
+fn is_bazaar_orders_window_title(window_title: &str) -> bool {
+    let lower = window_title.to_lowercase();
+    lower.contains("manage orders")
+        || lower.contains("your orders")
+        || lower.contains("bazaar orders")
+}
+
+fn starts_with_phrase_delimited(text: &str, phrase: &str) -> bool {
+    if !text.starts_with(phrase) {
+        return false;
+    }
+    match text[phrase.len()..].chars().next() {
+        None => true,
+        Some(c) => !c.is_ascii_alphanumeric(),
+    }
+}
+
+fn is_bazaar_order_entry_name(name: &str) -> bool {
+    let lower = name.trim_start().to_lowercase();
+    if starts_with_phrase_delimited(&lower, "buy order") {
+        return true;
+    }
+    if starts_with_phrase_delimited(&lower, "sell offer") {
+        return true;
+    }
+    // Legacy order-list entries are usually "BUY <item>" / "SELL <item>".
+    // Avoid matching malformed "buy orderX"/"sell offerY" labels.
+    if lower.starts_with("buy ") && !lower.starts_with("buy order") {
+        return true;
+    }
+    if lower.starts_with("sell ") && !lower.starts_with("sell offer") {
+        return true;
+    }
+    false
+}
+
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
 /// and should be aborted immediately instead of waiting for the GUI watchdog timeout.
 fn is_terminal_purchase_failure_message(message: &str) -> bool {
@@ -1777,7 +1817,7 @@ async fn execute_command(
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
-            let uuid = state.claim_sold_uuid.read().clone();
+            let uuid = state.claim_sold_uuid.write().take();
             if let Some(uuid) = uuid {
                 info!("Claiming sold item via direct /viewauction {}", uuid);
                 bot.write_chat_packet(&format!("/viewauction {}", uuid));
@@ -2397,20 +2437,22 @@ async fn handle_window_interaction(
         }
         BotState::ClaimingSold => {
             if window_title.contains("Auction House") {
-                info!("[ClaimSold] Auction House opened - looking for Manage Auctions");
+                info!("[ClaimSold] Auction House opened - looking for My/Manage Auctions");
                 // Wait for ContainerSetContent to arrive and populate slots
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions") {
-                    info!("[ClaimSold] Clicking Manage Auctions at slot {}", i);
+                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
+                    .or_else(|| find_slot_by_name(&slots, "My Auctions"))
+                {
+                    info!("[ClaimSold] Clicking My/Manage Auctions at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    warn!("[ClaimSold] Manage Auctions not found, going idle");
+                    warn!("[ClaimSold] My/Manage Auctions not found, going idle");
                     *state.bot_state.write() = BotState::Idle;
                 }
-            } else if window_title.contains("Manage Auctions") {
-                info!("[ClaimSold] Manage Auctions opened - looking for claimable items");
+            } else if is_my_auctions_window_title(window_title) {
+                info!("[ClaimSold] My/Manage Auctions opened - looking for claimable items");
                 // Wait for ContainerSetContent to arrive and populate slots
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
@@ -2688,12 +2730,12 @@ async fn handle_window_interaction(
             // are collected and open orders are left untouched.
             // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → handle each.
             let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
-            if window_title.contains("Bazaar") && !window_title.contains("Manage Orders") && !window_title.contains("Bazaar Orders") {
+            if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
                 // Main bazaar page — click "Manage Orders" at slot 50
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 click_window_slot(bot, window_id, 50).await;
-            } else if window_title.contains("Manage Orders") || window_title.contains("Your Orders") || window_title.contains("Bazaar Orders") {
+            } else if is_bazaar_orders_window_title(window_title) {
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
                 info!("[ManageOrders] Processing existing orders ({})...", mode_str);
                 let mut cancelled: u64 = 0;
@@ -2719,7 +2761,7 @@ async fn handle_window_interaction(
                     // Find the first order slot (BUY xxx / SELL xxx) not yet processed
                     let order_slot = slots.iter().enumerate().find_map(|(i, item)| {
                         if let Some(name) = get_item_display_name_from_slot(item) {
-                            if (name.starts_with("BUY ") || name.starts_with("SELL "))
+                            if is_bazaar_order_entry_name(&name)
                                 && !processed_items.contains(&name)
                             {
                                 return Some((i, name));
@@ -2762,6 +2804,10 @@ async fn handle_window_interaction(
                                 let slots2 = bot.menu().slots();
                                 // Check for Collect first (filled order) then Cancel (open order)
                                 if let Some(cs) = find_slot_by_name(&slots2, "Collect") {
+                                    collect_slot = Some(cs);
+                                    break;
+                                }
+                                if let Some(cs) = find_slot_by_name(&slots2, "Claim") {
                                     collect_slot = Some(cs);
                                     break;
                                 }
@@ -3655,6 +3701,34 @@ mod tests {
         assert!(is_terminal_purchase_failure_message("You didn't participate in this auction!"));
         assert!(is_terminal_purchase_failure_message("This auction wasn't found!"));
         assert!(!is_terminal_purchase_failure_message("Putting coins in escrow..."));
+    }
+
+    #[test]
+    fn test_is_my_auctions_window_title() {
+        assert!(is_my_auctions_window_title("Manage Auctions"));
+        assert!(is_my_auctions_window_title("My Auctions"));
+        assert!(!is_my_auctions_window_title("Auction House"));
+    }
+
+    #[test]
+    fn test_bazaar_orders_window_title_variants() {
+        assert!(is_bazaar_orders_window_title("Manage Orders"));
+        assert!(is_bazaar_orders_window_title("Your Orders"));
+        assert!(is_bazaar_orders_window_title("Your Bazaar Orders"));
+        assert!(!is_bazaar_orders_window_title("Bazaar"));
+    }
+
+    #[test]
+    fn test_bazaar_order_entry_name_variants() {
+        assert!(is_bazaar_order_entry_name("BUY ENCHANTED DIAMOND"));
+        assert!(is_bazaar_order_entry_name("SELL ENCHANTED DIAMOND"));
+        assert!(is_bazaar_order_entry_name("Buy Order: ENCHANTED DIAMOND"));
+        assert!(is_bazaar_order_entry_name("Sell Offer: ENCHANTED DIAMOND"));
+        assert!(is_bazaar_order_entry_name("buy order: enchanted diamond"));
+        assert!(is_bazaar_order_entry_name("sell offer: enchanted diamond"));
+        assert!(!is_bazaar_order_entry_name("Buy OrderX ENCHANTED DIAMOND"));
+        assert!(!is_bazaar_order_entry_name("Sell OfferY ENCHANTED DIAMOND"));
+        assert!(!is_bazaar_order_entry_name("Booster Cookie"));
     }
 
     #[test]

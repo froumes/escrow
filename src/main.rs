@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 const VERSION: &str = "af-3.0";
+const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -54,6 +55,13 @@ fn is_ban_disconnect(reason: &str) -> bool {
     lower.contains("temporarily banned")
         || lower.contains("permanently banned")
         || lower.contains("ban id:")
+}
+
+fn should_enqueue_periodic_auction_claim(
+    bot_state: frikadellen_baf::types::BotState,
+    queue_empty: bool,
+) -> bool {
+    bot_state.allows_commands() && queue_empty
 }
 
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
@@ -1266,6 +1274,33 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Periodic "My Auctions" check to claim sold/expired auctions that don't emit chat events.
+    if config.enable_ah_flips {
+        let bot_client_ah_claim = bot_client.clone();
+        let command_queue_ah_claim = command_queue.clone();
+        tokio::spawn(async move {
+            use frikadellen_baf::types::{CommandPriority, CommandType};
+            // Give startup workflow time to complete before periodic checks.
+            sleep(Duration::from_secs(120)).await;
+            loop {
+                sleep(Duration::from_secs(PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS)).await;
+                let bot_state = bot_client_ah_claim.state();
+                let queue_empty = command_queue_ah_claim.is_empty();
+                if should_enqueue_periodic_auction_claim(bot_state, queue_empty) {
+                    debug!(
+                        "[ClaimSold] Periodic My Auctions check triggered (every {}s)",
+                        PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS
+                    );
+                    command_queue_ah_claim.enqueue(
+                        CommandType::ClaimSoldItem,
+                        CommandPriority::Normal,
+                        false,
+                    );
+                }
+            }
+        });
+    }
+
     // Island guard: if "Your Island" is not in the scoreboard, send
     // /lobby → /play sb → /is to return to the island.
     // Matching TypeScript AFKHandler.ts tryToTeleportToIsland() logic.
@@ -1366,7 +1401,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_ban_disconnect;
+    use super::{is_ban_disconnect, should_enqueue_periodic_auction_claim};
+    use frikadellen_baf::types::BotState;
 
     #[test]
     fn detects_temporary_ban_disconnect() {
@@ -1386,5 +1422,12 @@ mod tests {
     #[test]
     fn ignores_non_ban_disconnect() {
         assert!(!is_ban_disconnect("Disconnected: Timed out"));
+    }
+
+    #[test]
+    fn periodic_auction_claim_requires_idle_and_empty_queue() {
+        assert!(should_enqueue_periodic_auction_claim(BotState::Idle, true));
+        assert!(!should_enqueue_periodic_auction_claim(BotState::ClaimingSold, true));
+        assert!(!should_enqueue_periodic_auction_claim(BotState::Idle, false));
     }
 }
