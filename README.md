@@ -18,6 +18,11 @@ also send me logs of bans on [Discord](https://discord.gg/42DvX6T9jh) thanks
 wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/frikadellen_baf-linux-x86_64 && chmod +x frikadellen_baf-linux-x86_64
 then you can run it everytime with ./frikadellen_baf-linux-x86_64
 
+OR the loader:
+
+wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/FrikadellenBAF-loader-linux-x86_64  && chmod +x FrikadellenBAF-loader-linux-x86_64
+
+
 ## Quick Start
 
 1. Download the latest release for your platform from the [Releases](../../releases) page
