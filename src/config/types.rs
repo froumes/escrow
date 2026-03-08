@@ -4,17 +4,23 @@ use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Ingame Minecraft username(s). Supports multiple comma-separated accounts:
+    /// `ingame_name = "Account1"` for a single account, or
+    /// `ingame_name = "Account1,Account2"` for automatic switching.
     #[serde(default)]
     pub ingame_name: Option<String>,
+
+    /// Time in hours after which the bot switches to the next account in `ingame_name`.
+    /// Only used when multiple accounts are specified. E.g. `multi_switch_time = 12.0`
+    /// means switch accounts every 12 hours.
+    #[serde(default)]
+    pub multi_switch_time: Option<f64>,
     
     #[serde(default = "default_websocket_url")]
     pub websocket_url: String,
     
     #[serde(default = "default_web_gui_port")]
     pub web_gui_port: u16,
-    
-    #[serde(default = "default_flip_action_delay")]
-    pub flip_action_delay: u64,
 
     /// Minimum delay between consecutive queued commands in milliseconds.
     /// Prevents back-to-back Hypixel interactions from overlapping.
@@ -69,20 +75,19 @@ pub struct Config {
     #[serde(default = "default_auction_duration_hours")]
     pub auction_duration_hours: u64,
     
-    #[serde(default)]
-    pub skip: SkipConfig,
-    
+    /// Enable proxy for both the Minecraft and WebSocket connections.
     #[serde(default)]
     pub proxy_enabled: bool,
     
+    /// Proxy server address in `host:port` format, e.g. `"121.124.241.211:3313"`.
+    /// Only used when `proxy_enabled = true`.
     #[serde(default)]
-    pub proxy: Option<String>,
+    pub proxy_address: Option<String>,
     
+    /// Proxy credentials in `username:password` format, e.g. `"myuser:mypassword"`.
+    /// Leave unset if the proxy requires no authentication.
     #[serde(default)]
-    pub proxy_username: Option<String>,
-    
-    #[serde(default)]
-    pub proxy_password: Option<String>,
+    pub proxy_credentials: Option<String>,
     
     #[serde(default)]
     /// Discord webhook URL for notifications.
@@ -95,34 +100,7 @@ pub struct Config {
     pub web_gui_password: Option<String>,
     
     #[serde(default)]
-    pub accounts: Option<String>,
-    
-    #[serde(default)]
-    pub auto_switching: Option<String>,
-    
-    #[serde(default)]
     pub sessions: HashMap<String, CoflSession>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SkipConfig {
-    #[serde(default)]
-    pub always: bool,
-    
-    #[serde(default = "default_min_profit")]
-    pub min_profit: u64,
-    
-    #[serde(default)]
-    pub user_finder: bool,
-    
-    #[serde(default)]
-    pub skins: bool,
-    
-    #[serde(default = "default_profit_percentage")]
-    pub profit_percentage: f64,
-    
-    #[serde(default = "default_min_price")]
-    pub min_price: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,10 +116,6 @@ fn default_websocket_url() -> String {
 
 fn default_web_gui_port() -> u16 {
     8080
-}
-
-fn default_flip_action_delay() -> u64 {
-    150 // TypeScript FLIP_ACTION_DELAY
 }
 
 fn default_command_delay_ms() -> u64 {
@@ -172,25 +146,13 @@ fn default_true() -> bool {
     true
 }
 
-fn default_min_profit() -> u64 {
-    1_000_000
-}
-
-fn default_profit_percentage() -> f64 {
-    50.0
-}
-
-fn default_min_price() -> u64 {
-    10_000_000
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             ingame_name: None,
+            multi_switch_time: None,
             websocket_url: default_websocket_url(),
             web_gui_port: default_web_gui_port(),
-            flip_action_delay: default_flip_action_delay(),
             command_delay_ms: default_command_delay_ms(),
             bed_spam_click_delay: default_bed_spam_click_delay(),
             bed_multiple_clicks_delay: 0,
@@ -206,15 +168,11 @@ impl Default for Config {
             fastbuy: None,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
-            skip: SkipConfig::default(),
             proxy_enabled: false,
-            proxy: None,
-            proxy_username: None,
-            proxy_password: None,
+            proxy_address: None,
+            proxy_credentials: None,
             webhook_url: None,
             web_gui_password: None,
-            accounts: None,
-            auto_switching: None,
             sessions: HashMap::new(),
         }
     }
@@ -232,6 +190,33 @@ impl Config {
     /// Returns the webhook URL only if it is non-empty.
     pub fn active_webhook_url(&self) -> Option<&str> {
         self.webhook_url.as_deref().filter(|u| !u.is_empty())
+    }
+
+    /// Returns all ingame names parsed from the (comma-separated) `ingame_name` field.
+    /// `"Account1,Account2"` → `["Account1", "Account2"]`
+    pub fn ingame_names(&self) -> Vec<String> {
+        match &self.ingame_name {
+            None => vec![],
+            Some(s) => s
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Returns the proxy username parsed from `proxy_credentials` (`"user:pass"` → `"user"`).
+    pub fn proxy_username(&self) -> Option<&str> {
+        let creds = self.proxy_credentials.as_deref()?;
+        // splitn(2, ':').next() always returns Some for non-empty iterators
+        Some(creds.splitn(2, ':').next().unwrap())
+    }
+
+    /// Returns the proxy password parsed from `proxy_credentials` (`"user:pass"` → `"pass"`).
+    pub fn proxy_password(&self) -> Option<&str> {
+        let creds = self.proxy_credentials.as_deref()?;
+        let colon_pos = creds.find(':')?;
+        Some(&creds[colon_pos + 1..])
     }
 }
 
@@ -284,5 +269,76 @@ mod tests {
     fn parses_bed_pre_click_ms() {
         let config: Config = toml::from_str("bed_pre_click_ms = 300").expect("config should parse");
         assert_eq!(config.bed_pre_click_ms, 300);
+    }
+
+    #[test]
+    fn single_ingame_name() {
+        let config: Config = toml::from_str(r#"ingame_name = "Player1""#).expect("config should parse");
+        assert_eq!(config.ingame_names(), vec!["Player1"]);
+    }
+
+    #[test]
+    fn multiple_ingame_names() {
+        let config: Config = toml::from_str(r#"ingame_name = "Player1,Player2,Player3""#)
+            .expect("config should parse");
+        assert_eq!(config.ingame_names(), vec!["Player1", "Player2", "Player3"]);
+    }
+
+    #[test]
+    fn multiple_ingame_names_with_spaces() {
+        let config: Config = toml::from_str(r#"ingame_name = "Player1, Player2 , Player3""#)
+            .expect("config should parse");
+        assert_eq!(config.ingame_names(), vec!["Player1", "Player2", "Player3"]);
+    }
+
+    #[test]
+    fn no_ingame_name() {
+        let config = Config::default();
+        assert!(config.ingame_names().is_empty());
+    }
+
+    #[test]
+    fn parses_multi_switch_time() {
+        let config: Config = toml::from_str("multi_switch_time = 12.0").expect("config should parse");
+        assert_eq!(config.multi_switch_time, Some(12.0));
+    }
+
+    #[test]
+    fn proxy_credentials_parsing() {
+        let config: Config =
+            toml::from_str(r#"proxy_credentials = "myuser:mypassword""#).expect("config should parse");
+        assert_eq!(config.proxy_username(), Some("myuser"));
+        assert_eq!(config.proxy_password(), Some("mypassword"));
+    }
+
+    #[test]
+    fn proxy_credentials_password_with_colon() {
+        let config: Config =
+            toml::from_str(r#"proxy_credentials = "user:pass:word""#).expect("config should parse");
+        assert_eq!(config.proxy_username(), Some("user"));
+        assert_eq!(config.proxy_password(), Some("pass:word"));
+    }
+
+    #[test]
+    fn proxy_fields_use_new_names() {
+        let config: Config = toml::from_str(
+            r#"
+proxy_enabled = true
+proxy_address = "121.124.241.211:3313"
+proxy_credentials = "myuser:mypassword"
+"#,
+        )
+        .expect("config should parse");
+        assert!(config.proxy_enabled);
+        assert_eq!(config.proxy_address.as_deref(), Some("121.124.241.211:3313"));
+        assert_eq!(config.proxy_username(), Some("myuser"));
+        assert_eq!(config.proxy_password(), Some("mypassword"));
+    }
+
+    #[test]
+    fn default_config_has_no_skip_field() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(!toml.contains("[skip]"));
+        assert!(!toml.contains("min_profit"));
     }
 }

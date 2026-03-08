@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
     // Prompt for username if not set
     if config.ingame_name.is_none() {
         let name: String = Input::new()
-            .with_prompt("Enter your ingame name")
+            .with_prompt("Enter your ingame name(s) (comma-separated for multiple accounts)")
             .interact_text()?;
         config.ingame_name = Some(name);
         config_loader.save(&config)?;
@@ -118,12 +118,42 @@ async fn main() -> Result<()> {
         config_loader.save(&config)?;
     }
 
-    let ingame_name = config.ingame_name.clone().unwrap();
-    
-    info!("Configuration loaded for player: {}", ingame_name);
+    // Resolve the active ingame name.
+    // When multiple names are configured, the account index is advanced at runtime by the
+    // account-switching timer (see below) and the process restarts with exit(0) so that an
+    // external supervisor (systemd, a shell loop, etc.) launches the next iteration.
+    // We persist the current index in a small sidecar file next to the config so the next
+    // invocation knows which account to start with.
+    let ingame_names = config.ingame_names();
+    if ingame_names.is_empty() {
+        anyhow::bail!("No ingame name configured — please set ingame_name in config.toml");
+    }
+
+    // Read and advance the stored account index (wraps around the list).
+    let account_index_path = match std::env::current_exe() {
+        Ok(p) => p.parent().map(|d| d.join("account_index")).unwrap_or_else(|| std::path::PathBuf::from("account_index")),
+        Err(_) => std::path::PathBuf::from("account_index"),
+    };
+
+    let current_account_index: usize = if ingame_names.len() > 1 {
+        match std::fs::read_to_string(&account_index_path) {
+            Ok(s) => s.trim().parse::<usize>().unwrap_or(0) % ingame_names.len(),
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
+    let ingame_name = ingame_names[current_account_index].clone();
+
+    info!("Configuration loaded for player: {} (account {}/{})", ingame_name, current_account_index + 1, ingame_names.len());
     info!("AH Flips: {}", if config.enable_ah_flips { "ENABLED" } else { "DISABLED" });
     info!("Bazaar Flips: {}", if config.enable_bazaar_flips { "ENABLED" } else { "DISABLED" });
     info!("Web GUI Port: {}", config.web_gui_port);
+
+    if config.proxy_enabled {
+        info!("Proxy: ENABLED — address: {:?}", config.proxy_address);
+    }
 
     // Initialize command queue
     let command_queue = CommandQueue::new();
@@ -1289,6 +1319,40 @@ async fn main() -> Result<()> {
                 sleep(Duration::from_secs(30)).await;
             }
         });
+    }
+
+    // Automatic account switching timer.
+    // When multiple accounts are configured and `multi_switch_time` is set, switch to the
+    // next account after the specified number of hours by persisting the next account index
+    // and exiting so an external supervisor (systemd, a loop script, etc.) restarts the process.
+    if ingame_names.len() > 1 {
+        if let Some(switch_hours) = config.multi_switch_time {
+            let switch_secs = (switch_hours * 3600.0) as u64;
+            let next_index = (current_account_index + 1) % ingame_names.len();
+            let next_name = ingame_names[next_index].clone();
+            let index_path = account_index_path.clone();
+            info!(
+                "[AccountSwitch] Will switch from {} to {} in {:.1}h",
+                ingame_name, next_name, switch_hours
+            );
+            tokio::spawn(async move {
+                sleep(Duration::from_secs(switch_secs)).await;
+                info!(
+                    "[AccountSwitch] Switch time reached — switching to account {} ({})",
+                    next_index + 1, next_name
+                );
+                // Persist the next account index so the next process invocation picks it up.
+                if let Err(e) = std::fs::write(&index_path, next_index.to_string()) {
+                    warn!("[AccountSwitch] Failed to write account index: {}", e);
+                }
+                print_mc_chat(&format!(
+                    "§f[§4BAF§f]: §eSwitching to account §b{}§e...",
+                    next_name
+                ));
+                info!("[AccountSwitch] Exiting for supervisor restart with next account");
+                std::process::exit(0);
+            });
+        }
     }
 
     // Keep the application running
