@@ -23,6 +23,9 @@ pub fn init_logger() -> Result<()> {
                 // Suppress Azalea chunk entity warnings (they're just noise)
                 .add_directive("azalea_world=error".parse().unwrap())
                 .add_directive("azalea_entity=error".parse().unwrap())
+                // Suppress Azalea packet-handling errors (e.g. set_equipment
+                // "Unexpected enum variant" on some accounts – harmless noise)
+                .add_directive("azalea_client=warn".parse().unwrap())
         });
 
     // Set up subscriber with both console and file output
