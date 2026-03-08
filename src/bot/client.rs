@@ -1015,6 +1015,10 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     has_claimable && !is_active
 }
 
+fn is_my_auctions_window_title(window_title: &str) -> bool {
+    window_title.contains("Manage Auctions") || window_title.contains("My Auctions")
+}
+
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
 /// and should be aborted immediately instead of waiting for the GUI watchdog timeout.
 fn is_terminal_purchase_failure_message(message: &str) -> bool {
@@ -1777,7 +1781,7 @@ async fn execute_command(
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
-            let uuid = state.claim_sold_uuid.read().clone();
+            let uuid = state.claim_sold_uuid.write().take();
             if let Some(uuid) = uuid {
                 info!("Claiming sold item via direct /viewauction {}", uuid);
                 bot.write_chat_packet(&format!("/viewauction {}", uuid));
@@ -2397,20 +2401,22 @@ async fn handle_window_interaction(
         }
         BotState::ClaimingSold => {
             if window_title.contains("Auction House") {
-                info!("[ClaimSold] Auction House opened - looking for Manage Auctions");
+                info!("[ClaimSold] Auction House opened - looking for My/Manage Auctions");
                 // Wait for ContainerSetContent to arrive and populate slots
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions") {
-                    info!("[ClaimSold] Clicking Manage Auctions at slot {}", i);
+                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
+                    .or_else(|| find_slot_by_name(&slots, "My Auctions"))
+                {
+                    info!("[ClaimSold] Clicking My/Manage Auctions at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    warn!("[ClaimSold] Manage Auctions not found, going idle");
+                    warn!("[ClaimSold] My/Manage Auctions not found, going idle");
                     *state.bot_state.write() = BotState::Idle;
                 }
-            } else if window_title.contains("Manage Auctions") {
-                info!("[ClaimSold] Manage Auctions opened - looking for claimable items");
+            } else if is_my_auctions_window_title(window_title) {
+                info!("[ClaimSold] My/Manage Auctions opened - looking for claimable items");
                 // Wait for ContainerSetContent to arrive and populate slots
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
@@ -3655,6 +3661,13 @@ mod tests {
         assert!(is_terminal_purchase_failure_message("You didn't participate in this auction!"));
         assert!(is_terminal_purchase_failure_message("This auction wasn't found!"));
         assert!(!is_terminal_purchase_failure_message("Putting coins in escrow..."));
+    }
+
+    #[test]
+    fn test_is_my_auctions_window_title() {
+        assert!(is_my_auctions_window_title("Manage Auctions"));
+        assert!(is_my_auctions_window_title("My Auctions"));
+        assert!(!is_my_auctions_window_title("Auction House"));
     }
 
     #[test]
