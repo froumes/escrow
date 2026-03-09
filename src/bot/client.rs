@@ -950,15 +950,16 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
     None
 }
 
-fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
+fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
     let needle_lower = needle.to_lowercase();
+    lore.iter()
+        .any(|line| remove_mc_colors(line).to_lowercase().contains(&needle_lower))
+}
+
+fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
     slots.iter().enumerate().find_map(|(i, item)| {
         let lore = get_item_lore_from_slot(item);
-        if lore.iter().any(|line| remove_mc_colors(line).to_lowercase().contains(&needle_lower)) {
-            Some(i)
-        } else {
-            None
-        }
+        lore_contains_phrase(&lore, needle).then_some(i)
     })
 }
 
@@ -1159,8 +1160,8 @@ fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, Str
         .or_else(|| parse_bazaar_order_identity_from_lore(lore))
 }
 
-fn should_treat_as_bazaar_order_slot(name: &str, lore: &[String]) -> bool {
-    is_bazaar_order_entry_name(name) || parse_bazaar_order_identity(name, lore).is_some()
+fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String)>) -> bool {
+    is_bazaar_order_entry_name(name) || identity.is_some()
 }
 
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
@@ -2892,11 +2893,11 @@ async fn handle_window_interaction(
                         if let Some(name) = get_item_display_name_from_slot(item) {
                             let lore = get_item_lore_from_slot(item);
                             let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
-                            let identity = parse_bazaar_order_identity(&name, &lore);
-                            if should_treat_as_bazaar_order_slot(&name, &lore)
-                                && !processed_orders.contains(&order_key)
-                            {
-                                return Some((i, name, identity, order_key));
+                            if !processed_orders.contains(&order_key) {
+                                let identity = parse_bazaar_order_identity(&name, &lore);
+                                if should_treat_as_bazaar_order_slot(&name, identity.as_ref()) {
+                                    return Some((i, name, identity, order_key));
+                                }
                             }
                         }
                         None
@@ -4084,7 +4085,32 @@ mod tests {
             "§7Sell Offer".to_string(),
             "§7Product: Booster Cookie".to_string(),
         ];
-        assert!(should_treat_as_bazaar_order_slot("Booster Cookie", &lore));
+        let identity = parse_bazaar_order_identity("Booster Cookie", &lore);
+        assert!(should_treat_as_bazaar_order_slot("Booster Cookie", identity.as_ref()));
+    }
+
+    #[test]
+    fn test_should_treat_as_bazaar_order_slot_variants() {
+        let lore_only = vec![
+            "Status: Open".to_string(),
+            "Buy Order".to_string(),
+            "Product: Enchanted Diamond".to_string(),
+        ];
+        let lore_identity = parse_bazaar_order_identity("Enchanted Diamond", &lore_only);
+        assert!(should_treat_as_bazaar_order_slot("Enchanted Diamond", lore_identity.as_ref()));
+        assert!(should_treat_as_bazaar_order_slot("Buy Order: Enchanted Diamond", None));
+        assert!(!should_treat_as_bazaar_order_slot("Booster Cookie", None));
+    }
+
+    #[test]
+    fn test_lore_contains_phrase_case_insensitive() {
+        let lore = vec![
+            "§7Click to Cancel Order".to_string(),
+            "§7Status: §aOpen".to_string(),
+        ];
+        assert!(lore_contains_phrase(&lore, "click to cancel"));
+        assert!(lore_contains_phrase(&lore, "CANCEL ORDER"));
+        assert!(!lore_contains_phrase(&lore, "collect"));
     }
 
     #[test]
