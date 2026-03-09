@@ -46,6 +46,7 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const FASTBUY_PRECLICK_DELAY_MS: u64 = 35;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
+const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
 static SOLD_BUYER_RE: Lazy<regex::Regex> =
@@ -1138,7 +1139,7 @@ fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, Strin
 fn is_buy_bazaar_order_name(name: &str) -> bool {
     let lower = name.trim_start().to_lowercase();
     starts_with_phrase_delimited(&lower, "buy order")
-        || (lower.starts_with("buy ") && !lower.starts_with("buy order"))
+        || lower.starts_with("buy ")
 }
 
 fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
@@ -1328,7 +1329,10 @@ async fn event_handler(
                         if let Some(ref u) = uuid {
                             info!("[AH] Extracted viewauction UUID for claim: {}", u);
                             let mut sold_queue = state.claim_sold_uuid_queue.write();
-                            if sold_queue.back().map(String::as_str) != Some(u.as_str()) {
+                            if !sold_queue.iter().any(|queued| queued == u) {
+                                if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
+                                    sold_queue.pop_front();
+                                }
                                 sold_queue.push_back(u.clone());
                             }
                         }
