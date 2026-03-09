@@ -3060,7 +3060,6 @@ async fn handle_window_interaction(
                 // Look for Cancel/Collect buttons here and act accordingly.
                 // Mirrors upstream TypeScript bazaarOrderManager.ts pollForCancelButton().
                 info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
                 let mut cancel_slot: Option<usize> = None;
