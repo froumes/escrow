@@ -123,6 +123,9 @@ pub struct BotClient {
     pub ingame_name: Arc<RwLock<String>>,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     manage_orders_cancel_open: Arc<AtomicBool>,
+    /// Cancel open bazaar orders when they are older than this many minutes.
+    /// 0 disables age-based cancellation in periodic ManageOrders runs.
+    pub bazaar_order_cancel_minutes: u64,
 }
 
 /// Events that can be emitted by the bot
@@ -198,6 +201,7 @@ impl BotClient {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
+            bazaar_order_cancel_minutes: 5,
         }
     }
 
@@ -289,6 +293,7 @@ impl BotClient {
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
+            bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -705,6 +710,9 @@ pub struct BotClientState {
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     /// When false, it only collects filled orders and leaves open orders untouched.
     pub manage_orders_cancel_open: Arc<AtomicBool>,
+    /// Cancel open bazaar orders when they are older than this many minutes.
+    /// 0 disables age-based cancellation in periodic ManageOrders runs.
+    pub bazaar_order_cancel_minutes: u64,
 }
 
 impl Default for BotClientState {
@@ -759,6 +767,7 @@ impl Default for BotClientState {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
+            bazaar_order_cancel_minutes: 5,
         }
     }
 }
@@ -1058,6 +1067,72 @@ fn is_bazaar_order_entry_name(name: &str) -> bool {
         return true;
     }
     false
+}
+
+fn normalize_bazaar_order_text(text: &str) -> String {
+    remove_mc_colors(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn parse_bazaar_order_identity_from_name(name: &str) -> Option<(bool, String)> {
+    let normalized = normalize_bazaar_order_text(name);
+    if let Some(item) = normalized.strip_prefix("buy order: ") {
+        return Some((true, item.trim().to_string()));
+    }
+    if let Some(item) = normalized.strip_prefix("sell offer: ") {
+        return Some((false, item.trim().to_string()));
+    }
+    if let Some(item) = normalized.strip_prefix("buy ") {
+        if !item.starts_with("order") {
+            return Some((true, item.trim().to_string()));
+        }
+    }
+    if let Some(item) = normalized.strip_prefix("sell ") {
+        if !item.starts_with("offer") {
+            return Some((false, item.trim().to_string()));
+        }
+    }
+    None
+}
+
+fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, String)> {
+    let mut side: Option<bool> = None;
+    let mut item_name: Option<String> = None;
+
+    for line in lore {
+        let clean = normalize_bazaar_order_text(line);
+        if side.is_none() {
+            if clean.contains("buy order") {
+                side = Some(true);
+            } else if clean.contains("sell offer") {
+                side = Some(false);
+            }
+        }
+        if item_name.is_none() {
+            for prefix in ["item:", "product:", "commodity:"] {
+                if let Some(rest) = clean.strip_prefix(prefix) {
+                    let candidate = rest.trim();
+                    if !candidate.is_empty() {
+                        item_name = Some(candidate.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    match (side, item_name) {
+        (Some(is_buy), Some(item)) => Some((is_buy, item)),
+        _ => None,
+    }
+}
+
+fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
+    parse_bazaar_order_identity_from_name(name)
+        .or_else(|| parse_bazaar_order_identity_from_lore(lore))
 }
 
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
@@ -2250,6 +2325,7 @@ async fn handle_window_interaction(
                     let item = item_name.clone();
                     let amount = *state.bazaar_amount.read();
                     let price_per_unit = *state.bazaar_price_per_unit.read();
+                    log_bazaar_order_placed(is_buy_order, &item);
                     let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
                         item_name: item,
                         amount,
@@ -2432,14 +2508,20 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
+                // Prefer fixed slot 15 (Hypixel AH navigation); use name matching as fallback.
+                let slot_15_name = slots.get(15).and_then(get_item_display_name_from_slot).unwrap_or_default();
+                let slot_15_lower = remove_mc_colors(&slot_15_name).to_lowercase();
+                if slot_15_lower.contains("manage auctions") || slot_15_lower.contains("my auctions") {
+                    info!("[ClaimSold] Clicking My/Manage Auctions at preferred slot 15");
+                    click_window_slot(bot, window_id, 15).await;
+                } else if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
                     .or_else(|| find_slot_by_name(&slots, "My Auctions"))
                 {
-                    info!("[ClaimSold] Clicking My/Manage Auctions at slot {}", i);
+                    info!("[ClaimSold] Slot 15 was not My/Manage Auctions, falling back to name match at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    warn!("[ClaimSold] My/Manage Auctions not found, going idle");
-                    *state.bot_state.write() = BotState::Idle;
+                    warn!("[ClaimSold] My/Manage Auctions not found by slot/name, clicking slot 15 last-resort fallback");
+                    click_window_slot(bot, window_id, 15).await;
                 }
             } else if is_my_auctions_window_title(window_title) {
                 info!("[ClaimSold] My/Manage Auctions opened - looking for claimable items");
@@ -2483,11 +2565,17 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Claim") {
-                    info!("[ClaimSold] Clicking Claim at slot {}", i);
+                // Prefer fixed slot 31 in auction detail; use name matching only as fallback.
+                let slot_31_name = slots.get(31).and_then(get_item_display_name_from_slot).unwrap_or_default();
+                let slot_31_lower = remove_mc_colors(&slot_31_name).to_lowercase();
+                if slot_31_lower.contains("claim") {
+                    info!("[ClaimSold] Clicking preferred Claim slot 31");
+                    click_window_slot(bot, window_id, 31).await;
+                } else if let Some(i) = find_slot_by_name(&slots, "Claim") {
+                    info!("[ClaimSold] Slot 31 not claimable, falling back to Claim name match at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    info!("[ClaimSold] Clicking slot 31");
+                    info!("[ClaimSold] Claim button not found, clicking slot 31 fallback");
                     click_window_slot(bot, window_id, 31).await;
                 }
                 // Spawn a short watchdog: if Hypixel doesn't re-open Manage Auctions within
@@ -2737,8 +2825,9 @@ async fn handle_window_interaction(
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
                 info!("[ManageOrders] Processing existing orders ({})...", mode_str);
                 let mut cancelled: u64 = 0;
-                // processed_items tracks items already processed so we don't loop forever
-                let mut processed_items: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // processed_orders tracks skipped open orders in collect-only mode so we don't loop forever.
+                // Include slot index to avoid collisions between multiple generic "Buy Order"/"Sell Offer" entries.
+                let mut processed_orders: std::collections::HashSet<String> = std::collections::HashSet::new();
 
                 loop {
                     // Wait for ContainerSetContent to reflect latest state
@@ -2759,10 +2848,13 @@ async fn handle_window_interaction(
                     // Find the first order slot (BUY xxx / SELL xxx) not yet processed
                     let order_slot = slots.iter().enumerate().find_map(|(i, item)| {
                         if let Some(name) = get_item_display_name_from_slot(item) {
+                            let lore = get_item_lore_from_slot(item);
+                            let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
                             if is_bazaar_order_entry_name(&name)
-                                && !processed_items.contains(&name)
+                                && !processed_orders.contains(&order_key)
                             {
-                                return Some((i, name));
+                                let identity = parse_bazaar_order_identity(&name, &lore);
+                                return Some((i, name, identity, order_key));
                             }
                         }
                         None
@@ -2776,9 +2868,7 @@ async fn handle_window_interaction(
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
-                        Some((i, order_name)) => {
-                            // Mark as processed before clicking (prevents re-processing after cancel)
-                            processed_items.insert(order_name.clone());
+                        Some((i, order_name, order_identity, processed_key)) => {
                             info!("[ManageOrders] Found order at slot {}: \"{}\"", i, order_name);
 
                             // Click the order to view its detail page
@@ -2800,18 +2890,11 @@ async fn handle_window_interaction(
                                     break;
                                 }
                                 let slots2 = bot.menu().slots();
-                                // Check for Collect first (filled order) then Cancel (open order)
-                                if let Some(cs) = find_slot_by_name(&slots2, "Collect") {
-                                    collect_slot = Some(cs);
-                                    break;
-                                }
-                                if let Some(cs) = find_slot_by_name(&slots2, "Claim") {
-                                    collect_slot = Some(cs);
-                                    break;
-                                }
-                                // Match "Cancel Order", "Cancel Buy Order", "Cancel Sell Offer", etc.
-                                if let Some(cs) = find_slot_by_name(&slots2, "Cancel") {
-                                    cancel_slot = Some(cs);
+                                // Match "Collect", "Claim", and "Cancel ..." buttons.
+                                collect_slot = find_slot_by_name(&slots2, "Collect")
+                                    .or_else(|| find_slot_by_name(&slots2, "Claim"));
+                                cancel_slot = find_slot_by_name(&slots2, "Cancel");
+                                if collect_slot.is_some() || cancel_slot.is_some() {
                                     break;
                                 }
                                 // If inventory just became full from this click (filled BUY order
@@ -2824,6 +2907,16 @@ async fn handle_window_interaction(
                                     warn!("[ManageOrders] No Collect/Cancel button found for \"{}\", skipping", order_name);
                                     break;
                                 }
+                            }
+
+                            let cancel_due_to_age = !cancel_open
+                                && cancel_slot.is_some()
+                                && should_cancel_open_order_due_to_age(order_identity.clone(), state.bazaar_order_cancel_minutes);
+                            if cancel_due_to_age {
+                                info!(
+                                    "[ManageOrders] Open order \"{}\" is older than {} minute(s) — will cancel",
+                                    order_name, state.bazaar_order_cancel_minutes
+                                );
                             }
 
                             if let Some(cs) = collect_slot {
@@ -2863,20 +2956,31 @@ async fn handle_window_interaction(
                                             }
                                             log_pending_claim(&order_name);
                                         }
+                                        if cancel_open || cancel_due_to_age {
+                                            if let Some(cancel_after_collect) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
+                                                info!("[ManageOrders] Clicking Cancel at slot {} after collecting \"{}\"", cancel_after_collect, order_name);
+                                                click_window_slot(bot, window_id, cancel_after_collect as i16).await;
+                                                cancelled += 1;
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                            }
+                                        }
                                     }
                                 }
+                                processed_orders.clear();
                             } else if let Some(cs) = cancel_slot {
-                                if cancel_open {
+                                if cancel_open || cancel_due_to_age {
                                     if *state.last_window_id.read() == window_id {
-                                        info!("[ManageOrders] Clicking Cancel at slot {} (startup mode)", cs);
+                                        info!("[ManageOrders] Clicking Cancel at slot {}", cs);
                                         click_window_slot(bot, window_id, cs as i16).await;
                                         cancelled += 1;
                                         // Wait for the window content to revert to the order list
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                     }
+                                    processed_orders.clear();
                                 } else {
                                     // Collect-only mode: skip open orders
                                     debug!("[ManageOrders] Skipping open order \"{}\" (collect-only mode)", order_name);
+                                    processed_orders.insert(processed_key);
                                 }
                             } else if collect_slot.is_none() && cancel_slot.is_none()
                                 && state.inventory_full.load(Ordering::Relaxed)
@@ -2893,6 +2997,9 @@ async fn handle_window_interaction(
                                     break;
                                 }
                                 log_pending_claim(&order_name);
+                                processed_orders.clear();
+                            } else {
+                                processed_orders.insert(processed_key);
                             }
                             // Loop continues to find remaining orders
                         }
@@ -3337,6 +3444,74 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     if let Ok(json_str) = serde_json::to_string(&inventory_json) {
         *state.cached_inventory_json.write() = Some(json_str);
     }
+}
+
+fn bazaar_order_log_path() -> std::path::PathBuf {
+    match std::env::current_exe() {
+        Ok(exe) => exe.parent().map(|p| p.join("bazaar_orders.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("bazaar_orders.log")),
+        Err(_) => std::path::PathBuf::from("bazaar_orders.log"),
+    }
+}
+
+/// Persist a placed bazaar order for later stale-order checks in ManageOrders.
+fn log_bazaar_order_placed(is_buy: bool, item_name: &str) {
+    use std::io::Write;
+    let side = if is_buy { "buy" } else { "sell" };
+    let normalized_item = normalize_bazaar_order_text(item_name);
+    if normalized_item.is_empty() {
+        return;
+    }
+    let line = format!("{}|{}|{}\n", chrono::Utc::now().timestamp(), side, normalized_item);
+    let log_path = bazaar_order_log_path();
+    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                warn!("[ManageOrders] Failed to append bazaar_orders.log: {}", e);
+            }
+        }
+        Err(e) => warn!("[ManageOrders] Failed to open bazaar_orders.log: {}", e),
+    }
+}
+
+fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
+    let target_side = if is_buy { "buy" } else { "sell" };
+    let target_item = normalize_bazaar_order_text(item_name);
+    if target_item.is_empty() {
+        return None;
+    }
+    let content = std::fs::read_to_string(bazaar_order_log_path()).ok()?;
+    for line in content.lines().rev() {
+        let mut parts = line.splitn(3, '|');
+        let ts = parts.next()?.parse::<i64>().ok()?;
+        let side = parts.next()?.trim();
+        let item = parts.next()?.trim();
+        if side == target_side && item == target_item {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes: u64) -> bool {
+    if cancel_minutes == 0 {
+        return false;
+    }
+    let (is_buy, item_name) = match order_identity {
+        Some(identity) => identity,
+        None => return false,
+    };
+    let last_logged = match last_logged_order_timestamp(is_buy, &item_name) {
+        Some(ts) => ts,
+        None => return false,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let age_secs = if now > last_logged {
+        (now - last_logged) as u64
+    } else {
+        0
+    };
+    age_secs >= cancel_minutes.saturating_mul(60)
 }
 
 /// Append an unclaimed bazaar order to `pending_claims.log` with an RFC 3339 timestamp.
@@ -3796,6 +3971,46 @@ mod tests {
         assert!(!is_bazaar_order_entry_name("Buy OrderX ENCHANTED DIAMOND"));
         assert!(!is_bazaar_order_entry_name("Sell OfferY ENCHANTED DIAMOND"));
         assert!(!is_bazaar_order_entry_name("Booster Cookie"));
+    }
+
+    #[test]
+    fn test_parse_bazaar_order_identity_from_name_variants() {
+        assert_eq!(
+            parse_bazaar_order_identity_from_name("BUY Enchanted Diamond"),
+            Some((true, "enchanted diamond".to_string()))
+        );
+        assert_eq!(
+            parse_bazaar_order_identity_from_name("Sell Offer: Hyper Catalyst"),
+            Some((false, "hyper catalyst".to_string()))
+        );
+        assert_eq!(parse_bazaar_order_identity_from_name("Buy Order"), None);
+    }
+
+    #[test]
+    fn test_parse_bazaar_order_identity_from_lore() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Product: Enchanted Diamond".to_string(),
+            "Amount: 1,024".to_string(),
+        ];
+        assert_eq!(
+            parse_bazaar_order_identity("Buy Order", &lore),
+            Some((true, "enchanted diamond".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_bazaar_order_placed_log_roundtrip() {
+        let item_name = format!(
+            "unit_test_item_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        log_bazaar_order_placed(true, &item_name);
+        let last = last_logged_order_timestamp(true, &item_name);
+        assert!(last.is_some(), "placed order should be present in bazaar_orders.log");
     }
 
     #[test]
