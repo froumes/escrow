@@ -2520,8 +2520,8 @@ async fn handle_window_interaction(
                     info!("[ClaimSold] Slot 15 was not My/Manage Auctions, falling back to name match at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    warn!("[ClaimSold] My/Manage Auctions not found (slot 15 or name fallback), going idle");
-                    *state.bot_state.write() = BotState::Idle;
+                    warn!("[ClaimSold] My/Manage Auctions not found by slot/name, clicking slot 15 last-resort fallback");
+                    click_window_slot(bot, window_id, 15).await;
                 }
             } else if is_my_auctions_window_title(window_title) {
                 info!("[ClaimSold] My/Manage Auctions opened - looking for claimable items");
