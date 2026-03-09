@@ -2839,11 +2839,12 @@ async fn handle_window_interaction(
                     let order_slot = slots.iter().enumerate().find_map(|(i, item)| {
                         if let Some(name) = get_item_display_name_from_slot(item) {
                             let lore = get_item_lore_from_slot(item);
+                            let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
                             if is_bazaar_order_entry_name(&name)
-                                && !processed_orders.contains(&format!("{}::{}", i, normalize_bazaar_order_text(&name)))
+                                && !processed_orders.contains(&order_key)
                             {
                                 let identity = parse_bazaar_order_identity(&name, &lore);
-                                return Some((i, name, identity));
+                                return Some((i, name, identity, order_key));
                             }
                         }
                         None
@@ -2857,8 +2858,7 @@ async fn handle_window_interaction(
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
-                        Some((i, order_name, order_identity)) => {
-                            let processed_key = format!("{}::{}", i, normalize_bazaar_order_text(&order_name));
+                        Some((i, order_name, order_identity, processed_key)) => {
                             info!("[ManageOrders] Found order at slot {}: \"{}\"", i, order_name);
 
                             // Click the order to view its detail page
@@ -3495,7 +3495,12 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
         Some(ts) => ts,
         None => return false,
     };
-    let age_secs = chrono::Utc::now().timestamp().saturating_sub(last_logged) as u64;
+    let now = chrono::Utc::now().timestamp();
+    let age_secs = if now > last_logged {
+        (now - last_logged) as u64
+    } else {
+        0
+    };
     age_secs >= cancel_minutes.saturating_mul(60)
 }
 
