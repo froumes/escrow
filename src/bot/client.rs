@@ -43,7 +43,7 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 /// Delay before clicking accept button in trade response window (milliseconds)
 /// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
-const FASTBUY_PRECLICK_DELAY_MS: u64 = 35;
+const FASTBUY_PRECLICK_DELAY_MS: u64 = 10;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
@@ -1325,39 +1325,38 @@ async fn event_handler(
                 state.bed_timing_active.store(false, Ordering::Relaxed);
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
-                // In a coop, ALL members receive this for any coop member's sale.
-                // Only treat it as our sale if we listed the item.
+                // Always claim sold auctions. The active_auction_listings filter was
+                // previously used for coop filtering but it is an in-memory set that
+                // is lost on restart and does not track items listed manually or via
+                // /cofl sell — causing sold auctions like the Hyperion to be silently
+                // skipped. Attempting to claim a coop member's sale is harmless
+                // (the AH UI simply won't show a claim button).
                 if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
                     let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
-                    let is_our_listing = state.active_auction_listings.read().contains(&item_key);
-                    if is_our_listing {
-                        // Remove from active listings since it's been sold
-                        state.active_auction_listings.write().remove(&item_key);
-                        // Try to extract the auction UUID from the JSON representation of the
-                        // chat message first — Hypixel embeds "/viewauction <UUID>" in the
-                        // clickEvent of the "CLICK" component, which is invisible in plain text
-                        // but present in the serialised FormattedText JSON.  We try the JSON
-                        // path first because for Hypixel sold messages the UUID is *only* in
-                        // the click event, so trying plain text first would always fail.
-                        let uuid = serde_json::to_string(&chat.message()).ok()
-                            .as_deref()
-                            .and_then(extract_viewauction_uuid)
-                            .or_else(|| extract_viewauction_uuid(&clean_message));
-                        if let Some(ref u) = uuid {
-                            info!("[AH] Extracted viewauction UUID for claim: {}", u);
-                            let mut sold_queue = state.claim_sold_uuid_queue.write();
-                            if !sold_queue.iter().any(|queued| queued == u) {
-                                if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
-                                    sold_queue.pop_front();
-                                }
-                                sold_queue.push_back(u.clone());
+                    // Housekeeping: remove from active listings if present
+                    state.active_auction_listings.write().remove(&item_key);
+                    // Try to extract the auction UUID from the JSON representation of the
+                    // chat message first — Hypixel embeds "/viewauction <UUID>" in the
+                    // clickEvent of the "CLICK" component, which is invisible in plain text
+                    // but present in the serialised FormattedText JSON.  We try the JSON
+                    // path first because for Hypixel sold messages the UUID is *only* in
+                    // the click event, so trying plain text first would always fail.
+                    let uuid = serde_json::to_string(&chat.message()).ok()
+                        .as_deref()
+                        .and_then(extract_viewauction_uuid)
+                        .or_else(|| extract_viewauction_uuid(&clean_message));
+                    if let Some(ref u) = uuid {
+                        info!("[AH] Extracted viewauction UUID for claim: {}", u);
+                        let mut sold_queue = state.claim_sold_uuid_queue.write();
+                        if !sold_queue.iter().any(|queued| queued == u) {
+                            if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
+                                sold_queue.pop_front();
                             }
+                            sold_queue.push_back(u.clone());
                         }
-                        *state.claim_sold_uuid.write() = uuid;
-                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
-                    } else {
-                        info!("[AH] Ignoring coop member sale: {} bought {} for {} coins (not our listing)", buyer, item_name, price);
                     }
+                    *state.claim_sold_uuid.write() = uuid;
+                    let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                 }
             } else if clean_message.contains("BIN Auction started for") {
                 // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
@@ -2149,13 +2148,13 @@ async fn handle_window_interaction(
                         // Small pre-click delay to let the slot-31 buy packet reach the server
                         // before we send the next-window confirm packet.
                         tokio::time::sleep(tokio::time::Duration::from_millis(FASTBUY_PRECLICK_DELAY_MS)).await;
-                        let observed_window_id = *state.last_window_id.read();
-                        if observed_window_id == window_id {
-                            // Hypixel's confirm GUI for this click is the next container id.
-                            // wrapping_add handles the u8 id rollover safely.
-                            let next_window_id = observed_window_id.wrapping_add(1);
-                            click_window_slot(bot, next_window_id, 11).await;
-                        }
+                        // Hypixel's confirm GUI for this click is the next container id.
+                        // Use the known window_id directly instead of re-reading last_window_id
+                        // which may have already changed if the Confirm Purchase window arrived
+                        // during the pre-click delay — that race condition would skip the
+                        // pre-click entirely and add an extra round-trip (~200ms).
+                        let next_window_id = window_id.wrapping_add(1);
+                        click_window_slot(bot, next_window_id, 11).await;
                     }
                 }
             } else if window_title.contains("Confirm Purchase") {

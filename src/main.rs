@@ -73,7 +73,6 @@ fn should_drop_bazaar_command_during_ah_pause(
             command_type,
             frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                 | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
-                | frikadellen_baf::types::CommandType::ManageOrders { .. }
         )
 }
 
@@ -990,8 +989,8 @@ async fn main() -> Result<()> {
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);
 
-                // During AH pause, only drop incoming bazaar recommendation orders.
-                // Keep ManageOrders so filled orders can still be collected/cancelled.
+                // During AH pause, drop incoming bazaar buy/sell recommendation orders.
+                // ManageOrders is preserved so filled orders can still be collected/cancelled.
                 if should_drop_bazaar_command_during_ah_pause(
                     &cmd.command_type,
                     bazaar_flips_paused_proc.load(Ordering::Relaxed),
@@ -1466,11 +1465,13 @@ mod tests {
             &CommandType::ClaimSoldItem,
             paused,
         ));
-        assert!(should_drop_bazaar_command_during_ah_pause(
+        // ManageOrders must NOT be dropped during AH pause — filled orders still
+        // need to be collected and stale orders cancelled.
+        assert!(!should_drop_bazaar_command_during_ah_pause(
             &CommandType::ManageOrders { cancel_open: false },
             paused,
         ));
-        assert!(should_drop_bazaar_command_during_ah_pause(
+        assert!(!should_drop_bazaar_command_during_ah_pause(
             &CommandType::ManageOrders { cancel_open: true },
             paused,
         ));
