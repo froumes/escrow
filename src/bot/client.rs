@@ -1304,8 +1304,19 @@ async fn event_handler(
                     if is_our_listing {
                         // Remove from active listings since it's been sold
                         state.active_auction_listings.write().remove(&item_key);
-                        // Extract UUID if present
-                        let uuid = extract_viewauction_uuid(&clean_message);
+                        // Try to extract the auction UUID from the JSON representation of the
+                        // chat message first — Hypixel embeds "/viewauction <UUID>" in the
+                        // clickEvent of the "CLICK" component, which is invisible in plain text
+                        // but present in the serialised FormattedText JSON.  We try the JSON
+                        // path first because for Hypixel sold messages the UUID is *only* in
+                        // the click event, so trying plain text first would always fail.
+                        let uuid = serde_json::to_string(&chat.message()).ok()
+                            .as_deref()
+                            .and_then(extract_viewauction_uuid)
+                            .or_else(|| extract_viewauction_uuid(&clean_message));
+                        if let Some(ref u) = uuid {
+                            info!("[AH] Extracted viewauction UUID for claim: {}", u);
+                        }
                         *state.claim_sold_uuid.write() = uuid;
                         let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                     } else {
@@ -1956,11 +1967,9 @@ async fn handle_window_interaction(
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // Keep BIN buy clicks on a fixed 2-tick cadence (100ms) before reading slot 31.
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
                 // Check item in slot 31 to decide on purchase strategy.
-                // Matches AutoBuy.initBedSpam() + flipHandler.ts item-switch logic.
+                // No pre-delay — slot 31 is always fixed (gold_nugget for normal BIN,
+                // bed during grace period). Click immediately for minimum latency.
                 let slot_31_kind = {
                     let menu = bot.menu();
                     let slots = menu.slots();
@@ -2503,24 +2512,20 @@ async fn handle_window_interaction(
         }
         BotState::ClaimingSold => {
             if window_title.contains("Auction House") {
-                info!("[ClaimSold] Auction House opened - looking for My/Manage Auctions");
+                info!("[ClaimSold] Auction House opened - navigating to Manage Auctions (slot 15)");
                 // Wait for ContainerSetContent to arrive and populate slots
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                // Prefer fixed slot 15 (Hypixel AH navigation); use name matching as fallback.
-                let slot_15_name = slots.get(15).and_then(get_item_display_name_from_slot).unwrap_or_default();
-                let slot_15_lower = remove_mc_colors(&slot_15_name).to_lowercase();
-                if slot_15_lower.contains("manage auctions") || slot_15_lower.contains("my auctions") {
-                    info!("[ClaimSold] Clicking My/Manage Auctions at preferred slot 15");
-                    click_window_slot(bot, window_id, 15).await;
-                } else if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
+                // Prefer name-based match so a Hypixel UI shift is handled automatically;
+                // fall back to the well-known slot 15 (same fixed slot the Selling flow uses).
+                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
                     .or_else(|| find_slot_by_name(&slots, "My Auctions"))
                 {
-                    info!("[ClaimSold] Slot 15 was not My/Manage Auctions, falling back to name match at slot {}", i);
+                    info!("[ClaimSold] Clicking Manage/My Auctions at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    warn!("[ClaimSold] My/Manage Auctions not found by slot/name, clicking slot 15 last-resort fallback");
+                    info!("[ClaimSold] Manage/My Auctions not found by name, clicking slot 15");
                     click_window_slot(bot, window_id, 15).await;
                 }
             } else if is_my_auctions_window_title(window_title) {
@@ -3841,11 +3846,15 @@ fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Optio
     Some((item_name.to_string(), price, buyer))
 }
 
-/// Extract UUID from a message that might contain "/viewauction <UUID>"
+/// Extract UUID from a message that might contain "/viewauction <UUID>".
+/// Works in both plain-text context (UUID ends at whitespace) and JSON context
+/// (UUID ends at `"` after the value string, e.g. from a serialized clickEvent).
+/// Minecraft UUIDs consist only of hex digits and dashes, so `"` is never a valid
+/// UUID character — using it as a terminator is unconditionally safe.
 fn extract_viewauction_uuid(msg: &str) -> Option<String> {
     let idx = msg.find("/viewauction ")?;
     let rest = &msg[idx + 13..];
-    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
     let uuid = rest[..end].trim().to_string();
     if uuid.is_empty() { None } else { Some(uuid) }
 }
@@ -3922,6 +3931,23 @@ mod tests {
         let msg = "click /viewauction 26e353e9556a4b9791f5e03710ddc505 to view";
         let result = extract_viewauction_uuid(msg);
         assert_eq!(result, Some("26e353e9556a4b9791f5e03710ddc505".to_string()));
+    }
+
+    #[test]
+    fn test_extract_viewauction_uuid_json_context() {
+        // Simulates the JSON representation of a Hypixel sold-auction chat message where
+        // the UUID sits inside a clickEvent value string, terminated by a JSON quote.
+        let json = r#"{"text":"[Auction] Buyer bought Item for 1,000 coins ","extra":[{"text":"CLICK","clickEvent":{"action":"run_command","value":"/viewauction abc123def456"}}]}"#;
+        let result = extract_viewauction_uuid(json);
+        assert_eq!(result, Some("abc123def456".to_string()));
+    }
+
+    #[test]
+    fn test_extract_viewauction_uuid_end_of_string() {
+        // UUID at the very end of the string (no trailing delimiter)
+        let msg = "/viewauction myuuid";
+        let result = extract_viewauction_uuid(msg);
+        assert_eq!(result, Some("myuuid".to_string()));
     }
 
     #[test]
