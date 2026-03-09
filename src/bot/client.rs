@@ -2905,8 +2905,8 @@ async fn handle_window_interaction(
                     match order_slot {
                         None => {
                             // No more unprocessed orders — done
-                            info!("[ManageOrders] Done — cancelled {} order(s)", cancelled);
-                            *state.manage_orders_cancelled.write() = cancelled;
+                            *state.manage_orders_cancelled.write() += cancelled;
+                            info!("[ManageOrders] Done — cancelled {} order(s)", *state.manage_orders_cancelled.read());
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
@@ -3054,6 +3054,71 @@ async fn handle_window_interaction(
                         }
                     }
                 }
+            } else if window_title.to_lowercase().contains("order options") {
+                // Hypixel opened a separate "Order options" window after clicking
+                // an order in the Manage Orders list (instead of updating in-place).
+                // Look for Cancel/Collect buttons here and act accordingly.
+                // Mirrors upstream TypeScript bazaarOrderManager.ts pollForCancelButton().
+                info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let action_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+                let mut cancel_slot: Option<usize> = None;
+                let mut collect_slot: Option<usize> = None;
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if *state.last_window_id.read() != window_id {
+                        break;
+                    }
+                    let slots2 = bot.menu().slots();
+                    collect_slot = find_slot_by_name(&slots2, "Collect")
+                        .or_else(|| find_slot_by_name(&slots2, "Claim"))
+                        .or_else(|| find_slot_by_lore_contains(&slots2, "click to collect"))
+                        .or_else(|| find_slot_by_lore_contains(&slots2, "claim your"));
+                    cancel_slot = find_slot_by_name(&slots2, "Cancel")
+                        .or_else(|| find_slot_by_lore_contains(&slots2, "click to cancel"))
+                        .or_else(|| find_slot_by_lore_contains(&slots2, "cancel order"));
+                    if collect_slot.is_some() || cancel_slot.is_some() {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= action_deadline {
+                        warn!("[ManageOrders] No Collect/Cancel button found in Order options window");
+                        break;
+                    }
+                }
+
+                if let Some(cs) = collect_slot {
+                    if *state.last_window_id.read() == window_id {
+                        info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
+                        click_window_slot(bot, window_id, cs as i16).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        // After collecting, also cancel if in startup mode
+                        if cancel_open {
+                            if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
+                                if *state.last_window_id.read() == window_id {
+                                    info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
+                                    click_window_slot(bot, window_id, cancel_after as i16).await;
+                                    *state.manage_orders_cancelled.write() += 1;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(cs) = cancel_slot {
+                    if cancel_open {
+                        if *state.last_window_id.read() == window_id {
+                            info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
+                            click_window_slot(bot, window_id, cs as i16).await;
+                            *state.manage_orders_cancelled.write() += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+                    } else {
+                        debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode)");
+                    }
+                }
+                // After clicking Cancel/Collect, Hypixel should reopen "Your Bazaar Orders"
+                // as a new window. The ManagingOrders handler will be called again to continue
+                // processing remaining orders.
             }
         }
         BotState::CheckingCookie => {
