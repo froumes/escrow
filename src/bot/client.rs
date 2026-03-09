@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use bevy_app::AppExit;
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const FASTBUY_PRECLICK_DELAY_MS: u64 = 35;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
+static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
+static SOLD_BUYER_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)").expect("valid sold-buyer regex"));
 
 /// Main bot client wrapper for Azalea
 /// 
@@ -3648,14 +3653,12 @@ fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Optio
         return None;
     }
 
-    let price_re = regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").ok()?;
-    let price_caps = price_re.captures(&combined)?;
+    let price_caps = SOLD_FOR_PRICE_RE.captures(&combined)?;
     let price_match = price_caps.get(1)?;
     let price: u64 = price_match.as_str().replace(',', "").trim().parse().ok()?;
 
-    let buyer = regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)")
-        .ok()
-        .and_then(|re| re.captures(&combined))
+    let buyer = SOLD_BUYER_RE
+        .captures(&combined)
         .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "Unknown".to_string());
