@@ -73,6 +73,7 @@ fn should_drop_bazaar_command_during_ah_pause(
             command_type,
             frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                 | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
+                | frikadellen_baf::types::CommandType::ManageOrders { .. }
         )
 }
 
@@ -1441,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn ah_pause_drops_only_bazaar_recommendation_orders() {
+    fn ah_pause_drops_bazaar_and_manage_orders_commands() {
         let paused = true;
         assert!(should_drop_bazaar_command_during_ah_pause(
             &CommandType::BazaarBuyOrder {
@@ -1462,10 +1463,14 @@ mod tests {
             paused,
         ));
         assert!(!should_drop_bazaar_command_during_ah_pause(
+            &CommandType::ClaimSoldItem,
+            paused,
+        ));
+        assert!(should_drop_bazaar_command_during_ah_pause(
             &CommandType::ManageOrders { cancel_open: false },
             paused,
         ));
-        assert!(!should_drop_bazaar_command_during_ah_pause(
+        assert!(should_drop_bazaar_command_during_ah_pause(
             &CommandType::ManageOrders { cancel_open: true },
             paused,
         ));

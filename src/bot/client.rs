@@ -950,6 +950,18 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
     None
 }
 
+fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
+    let needle_lower = needle.to_lowercase();
+    slots.iter().enumerate().find_map(|(i, item)| {
+        let lore = get_item_lore_from_slot(item);
+        if lore.iter().any(|line| remove_mc_colors(line).to_lowercase().contains(&needle_lower)) {
+            Some(i)
+        } else {
+            None
+        }
+    })
+}
+
 /// Parse the remaining grace-period time in seconds from the bed item displayed in
 /// slot 31 of the BIN Auction View.  Hypixel typically shows the time in the item's
 /// lore as a "M:SS" or "MM:SS" pattern (e.g. "0:45", "1:00").
@@ -1145,6 +1157,10 @@ fn is_buy_bazaar_order_name(name: &str) -> bool {
 fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
     parse_bazaar_order_identity_from_name(name)
         .or_else(|| parse_bazaar_order_identity_from_lore(lore))
+}
+
+fn should_treat_as_bazaar_order_slot(name: &str, lore: &[String]) -> bool {
+    is_bazaar_order_entry_name(name) || parse_bazaar_order_identity(name, lore).is_some()
 }
 
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
@@ -2876,10 +2892,10 @@ async fn handle_window_interaction(
                         if let Some(name) = get_item_display_name_from_slot(item) {
                             let lore = get_item_lore_from_slot(item);
                             let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
-                            if is_bazaar_order_entry_name(&name)
+                            let identity = parse_bazaar_order_identity(&name, &lore);
+                            if should_treat_as_bazaar_order_slot(&name, &lore)
                                 && !processed_orders.contains(&order_key)
                             {
-                                let identity = parse_bazaar_order_identity(&name, &lore);
                                 return Some((i, name, identity, order_key));
                             }
                         }
@@ -2922,8 +2938,12 @@ async fn handle_window_interaction(
                                 let slots2 = bot.menu().slots();
                                 // Match "Collect", "Claim", and "Cancel ..." buttons.
                                 collect_slot = find_slot_by_name(&slots2, "Collect")
-                                    .or_else(|| find_slot_by_name(&slots2, "Claim"));
-                                cancel_slot = find_slot_by_name(&slots2, "Cancel");
+                                    .or_else(|| find_slot_by_name(&slots2, "Claim"))
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "click to collect"))
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "claim your"));
+                                cancel_slot = find_slot_by_name(&slots2, "Cancel")
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "click to cancel"))
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "cancel order"));
                                 if collect_slot.is_some() || cancel_slot.is_some() {
                                     break;
                                 }
@@ -4055,6 +4075,16 @@ mod tests {
             parse_bazaar_order_identity("Buy Order", &lore),
             Some((true, "enchanted diamond".to_string()))
         );
+    }
+
+    #[test]
+    fn test_should_treat_as_bazaar_order_slot_with_lore_identity_only() {
+        let lore = vec![
+            "§7Status: §aOpen".to_string(),
+            "§7Sell Offer".to_string(),
+            "§7Product: Booster Cookie".to_string(),
+        ];
+        assert!(should_treat_as_bazaar_order_slot("Booster Cookie", &lore));
     }
 
     #[test]
