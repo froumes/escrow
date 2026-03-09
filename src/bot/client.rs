@@ -1876,23 +1876,8 @@ async fn handle_window_interaction(
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // Wait up to 200ms for slot 31 to be populated by ContainerSetContent.
-                // Without this wait the click fires ~0.3ms after OpenScreen before the server
-                // has sent the container contents, causing the click to land on an empty slot
-                // and be silently ignored by Hypixel.  TypeScript uses itemLoad() which polls
-                // every 1ms for up to FLIP_ACTION_DELAY*3 ms (default 450ms).
-                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
-                loop {
-                    let slot_populated = {
-                        let menu = bot.menu();
-                        let slots = menu.slots();
-                        slots.get(31).map(|s| !s.is_empty()).unwrap_or(false)
-                    };
-                    if slot_populated || tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
+                // Keep BIN buy clicks on a fixed 2-tick cadence (100ms) before reading slot 31.
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Check item in slot 31 to decide on purchase strategy.
                 // Matches AutoBuy.initBedSpam() + flipHandler.ts item-switch logic.
@@ -2459,6 +2444,11 @@ async fn handle_window_interaction(
                 let slots = menu.slots();
                 // Look for Claim All first
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
+                    for item in &slots {
+                        if let Some((item_name, price, buyer)) = parse_claimed_sold_event(item) {
+                            let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
+                        }
+                    }
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                     // Claim All finishes everything — go idle
@@ -2468,6 +2458,9 @@ async fn handle_window_interaction(
                     let mut found = false;
                     for (i, item) in slots.iter().enumerate() {
                         if is_claimable_auction_slot(item) {
+                            if let Some((item_name, price, buyer)) = parse_claimed_sold_event(item) {
+                                let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
+                            }
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
                             click_window_slot(bot, window_id, i as i16).await;
                             // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
@@ -3637,6 +3630,39 @@ fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
     Some((buyer, item_name, price))
 }
 
+fn parse_claimed_sold_event(item: &azalea_inventory::ItemStack) -> Option<(String, u64, String)> {
+    let item_name = get_item_display_name_from_slot(item)?;
+    let lore = get_item_lore_from_slot(item);
+    parse_claimed_sold_event_from_lore(&item_name, &lore)
+}
+
+fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Option<(String, u64, String)> {
+    if lore.is_empty() {
+        return None;
+    }
+    let combined = lore.join("\n");
+    let combined_lower = combined.to_lowercase();
+    let sold_status = (combined_lower.contains("status:") && combined_lower.contains("sold"))
+        || combined_lower.contains("sold for");
+    if !sold_status {
+        return None;
+    }
+
+    let price_re = regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").ok()?;
+    let price_caps = price_re.captures(&combined)?;
+    let price_match = price_caps.get(1)?;
+    let price: u64 = price_match.as_str().replace(',', "").trim().parse().ok()?;
+
+    let buyer = regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)")
+        .ok()
+        .and_then(|re| re.captures(&combined))
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    Some((item_name.to_string(), price, buyer))
+}
+
 /// Extract UUID from a message that might contain "/viewauction <UUID>"
 fn extract_viewauction_uuid(msg: &str) -> Option<String> {
     let idx = msg.find("/viewauction ")?;
@@ -3673,6 +3699,44 @@ mod tests {
         let msg = "[Auction] SomePlayer bought Gemstone Fuel Tank for 45,000,000 coins!";
         let result = parse_sold_message(msg);
         assert_eq!(result, Some(("SomePlayer".to_string(), "Gemstone Fuel Tank".to_string(), 45_000_000)));
+    }
+
+    #[test]
+    fn test_parse_claimed_sold_event_from_lore_with_buyer() {
+        let lore = vec![
+            "Status: Sold!".to_string(),
+            "Sold for: 45,000,000 coins".to_string(),
+            "Buyer: SomePlayer".to_string(),
+            "Click to claim".to_string(),
+        ];
+        let result = parse_claimed_sold_event_from_lore("Gemstone Fuel Tank", &lore);
+        assert_eq!(
+            result,
+            Some(("Gemstone Fuel Tank".to_string(), 45_000_000, "SomePlayer".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_claimed_sold_event_from_lore_without_buyer() {
+        let lore = vec![
+            "Status: Sold!".to_string(),
+            "Sold for 1,000,000 coins".to_string(),
+        ];
+        let result = parse_claimed_sold_event_from_lore("Golden Pickaxe", &lore);
+        assert_eq!(
+            result,
+            Some(("Golden Pickaxe".to_string(), 1_000_000, "Unknown".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_claimed_sold_event_from_lore_non_sold() {
+        let lore = vec![
+            "Status: Active".to_string(),
+            "Ends in: 5m".to_string(),
+        ];
+        let result = parse_claimed_sold_event_from_lore("Golden Pickaxe", &lore);
+        assert!(result.is_none());
     }
 
     #[test]
