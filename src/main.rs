@@ -64,6 +64,19 @@ fn should_enqueue_periodic_auction_claim(
     bot_state.allows_commands() && queue_empty
 }
 
+fn should_drop_bazaar_command_during_ah_pause(
+    command_type: &frikadellen_baf::types::CommandType,
+    bazaar_flips_paused: bool,
+) -> bool {
+    bazaar_flips_paused
+        && matches!(
+            command_type,
+            frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
+                | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
+                | frikadellen_baf::types::CommandType::ManageOrders { .. }
+        )
+}
+
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
@@ -977,16 +990,12 @@ async fn main() -> Result<()> {
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);
 
-                // Bazaar-related commands are silently dropped while the AH flip window
-                // is active (bazaar_flips_paused = true). This covers BazaarBuyOrder,
-                // BazaarSellOrder, and ManageOrders.
-                let is_bazaar_related = matches!(
-                    cmd.command_type,
-                    frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
-                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
-                    | frikadellen_baf::types::CommandType::ManageOrders { .. }
-                );
-                if is_bazaar_related && bazaar_flips_paused_proc.load(Ordering::Relaxed) {
+                // During AH pause, only drop incoming bazaar recommendation orders.
+                // Keep ManageOrders so filled orders can still be collected/cancelled.
+                if should_drop_bazaar_command_during_ah_pause(
+                    &cmd.command_type,
+                    bazaar_flips_paused_proc.load(Ordering::Relaxed),
+                ) {
                     debug!("[Queue] Dropping bazaar command {:?} — AH flip window active", cmd.command_type);
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
@@ -1402,8 +1411,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, should_enqueue_periodic_auction_claim};
-    use frikadellen_baf::types::BotState;
+    use super::{is_ban_disconnect, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use frikadellen_baf::types::{BotState, CommandType};
 
     #[test]
     fn detects_temporary_ban_disconnect() {
@@ -1430,5 +1439,40 @@ mod tests {
         assert!(should_enqueue_periodic_auction_claim(BotState::Idle, true));
         assert!(!should_enqueue_periodic_auction_claim(BotState::ClaimingSold, true));
         assert!(!should_enqueue_periodic_auction_claim(BotState::Idle, false));
+    }
+
+    #[test]
+    fn ah_pause_drops_bazaar_and_manage_orders_commands() {
+        let paused = true;
+        assert!(should_drop_bazaar_command_during_ah_pause(
+            &CommandType::BazaarBuyOrder {
+                item_name: "Booster Cookie".into(),
+                item_tag: None,
+                amount: 1,
+                price_per_unit: 1.0,
+            },
+            paused,
+        ));
+        assert!(should_drop_bazaar_command_during_ah_pause(
+            &CommandType::BazaarSellOrder {
+                item_name: "Booster Cookie".into(),
+                item_tag: None,
+                amount: 1,
+                price_per_unit: 1.0,
+            },
+            paused,
+        ));
+        assert!(!should_drop_bazaar_command_during_ah_pause(
+            &CommandType::ClaimSoldItem,
+            paused,
+        ));
+        assert!(should_drop_bazaar_command_during_ah_pause(
+            &CommandType::ManageOrders { cancel_open: false },
+            paused,
+        ));
+        assert!(should_drop_bazaar_command_during_ah_pause(
+            &CommandType::ManageOrders { cancel_open: true },
+            paused,
+        ));
     }
 }

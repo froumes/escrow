@@ -16,7 +16,7 @@ use azalea_client::chat::ChatPacket;
 use bevy_app::AppExit;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
@@ -46,6 +46,7 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const FASTBUY_PRECLICK_DELAY_MS: u64 = 35;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
+const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
 static SOLD_BUYER_RE: Lazy<regex::Regex> =
@@ -258,6 +259,7 @@ impl BotClient {
             ws_client,
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
+            claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
             bazaar_item_name: Arc::new(RwLock::new(String::new())),
             bazaar_amount: Arc::new(RwLock::new(0)),
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
@@ -626,8 +628,11 @@ pub struct BotClientState {
     pub ws_client: Option<CoflWebSocket>,
     /// true = claiming purchased item, false = claiming sold item
     pub claiming_purchased: Arc<RwLock<bool>>,
-    /// UUID for direct ClaimSoldItem flow
+    /// UUID for direct ClaimSoldItem flow (legacy single-value fallback)
     pub claim_sold_uuid: Arc<RwLock<Option<String>>>,
+    /// Queue of sold-auction UUIDs extracted from chat clickEvent (/viewauction <uuid>).
+    /// Keeps claim order stable when multiple auctions sell close together.
+    pub claim_sold_uuid_queue: Arc<RwLock<VecDeque<String>>>,
     // ---- Bazaar order context (set in execute_command, read in window/sign handlers) ----
     /// Item name for current bazaar order
     pub bazaar_item_name: Arc<RwLock<String>>,
@@ -732,6 +737,7 @@ impl Default for BotClientState {
             ws_client: None,
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
+            claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
             bazaar_item_name: Arc::new(RwLock::new(String::new())),
             bazaar_amount: Arc::new(RwLock::new(0)),
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
@@ -944,6 +950,19 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
     None
 }
 
+fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
+    let needle_lower = needle.to_lowercase();
+    lore.iter()
+        .any(|line| remove_mc_colors(line).to_lowercase().contains(&needle_lower))
+}
+
+fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
+    slots.iter().enumerate().find_map(|(i, item)| {
+        let lore = get_item_lore_from_slot(item);
+        lore_contains_phrase(&lore, needle).then_some(i)
+    })
+}
+
 /// Parse the remaining grace-period time in seconds from the bed item displayed in
 /// slot 31 of the BIN Auction View.  Hypixel typically shows the time in the item's
 /// lore as a "M:SS" or "MM:SS" pattern (e.g. "0:45", "1:00").
@@ -1130,9 +1149,19 @@ fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, Strin
     }
 }
 
+fn is_buy_bazaar_order_name(name: &str) -> bool {
+    let lower = name.trim_start().to_lowercase();
+    starts_with_phrase_delimited(&lower, "buy order")
+        || lower.starts_with("buy ")
+}
+
 fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
     parse_bazaar_order_identity_from_name(name)
         .or_else(|| parse_bazaar_order_identity_from_lore(lore))
+}
+
+fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String)>) -> bool {
+    is_bazaar_order_entry_name(name) || identity.is_some()
 }
 
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
@@ -1316,6 +1345,13 @@ async fn event_handler(
                             .or_else(|| extract_viewauction_uuid(&clean_message));
                         if let Some(ref u) = uuid {
                             info!("[AH] Extracted viewauction UUID for claim: {}", u);
+                            let mut sold_queue = state.claim_sold_uuid_queue.write();
+                            if !sold_queue.iter().any(|queued| queued == u) {
+                                if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
+                                    sold_queue.pop_front();
+                                }
+                                sold_queue.push_back(u.clone());
+                            }
                         }
                         *state.claim_sold_uuid.write() = uuid;
                         let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
@@ -1908,7 +1944,8 @@ async fn execute_command(
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
-            let uuid = state.claim_sold_uuid.write().take();
+            let uuid = state.claim_sold_uuid_queue.write().pop_front()
+                .or_else(|| state.claim_sold_uuid.write().take());
             if let Some(uuid) = uuid {
                 info!("Claiming sold item via direct /viewauction {}", uuid);
                 bot.write_chat_packet(&format!("/viewauction {}", uuid));
@@ -1921,6 +1958,7 @@ async fn execute_command(
         CommandType::ClaimPurchasedItem => {
             *state.claiming_purchased.write() = true;
             *state.claim_sold_uuid.write() = None;
+            state.claim_sold_uuid_queue.write().clear();
             info!("Claiming purchased item via /ah");
             bot.write_chat_packet("/ah");
             *state.bot_state.write() = BotState::ClaimingPurchased;
@@ -2855,11 +2893,11 @@ async fn handle_window_interaction(
                         if let Some(name) = get_item_display_name_from_slot(item) {
                             let lore = get_item_lore_from_slot(item);
                             let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
-                            if is_bazaar_order_entry_name(&name)
-                                && !processed_orders.contains(&order_key)
-                            {
+                            if !processed_orders.contains(&order_key) {
                                 let identity = parse_bazaar_order_identity(&name, &lore);
-                                return Some((i, name, identity, order_key));
+                                if should_treat_as_bazaar_order_slot(&name, identity.as_ref()) {
+                                    return Some((i, name, identity, order_key));
+                                }
                             }
                         }
                         None
@@ -2875,6 +2913,10 @@ async fn handle_window_interaction(
                         }
                         Some((i, order_name, order_identity, processed_key)) => {
                             info!("[ManageOrders] Found order at slot {}: \"{}\"", i, order_name);
+                            let order_is_buy = order_identity
+                                .as_ref()
+                                .map(|(is_buy, _)| *is_buy)
+                                .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
                             // Click the order to view its detail page
                             click_window_slot(bot, window_id, i as i16).await;
@@ -2897,15 +2939,19 @@ async fn handle_window_interaction(
                                 let slots2 = bot.menu().slots();
                                 // Match "Collect", "Claim", and "Cancel ..." buttons.
                                 collect_slot = find_slot_by_name(&slots2, "Collect")
-                                    .or_else(|| find_slot_by_name(&slots2, "Claim"));
-                                cancel_slot = find_slot_by_name(&slots2, "Cancel");
+                                    .or_else(|| find_slot_by_name(&slots2, "Claim"))
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "click to collect"))
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "claim your"));
+                                cancel_slot = find_slot_by_name(&slots2, "Cancel")
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "click to cancel"))
+                                    .or_else(|| find_slot_by_lore_contains(&slots2, "cancel order"));
                                 if collect_slot.is_some() || cancel_slot.is_some() {
                                     break;
                                 }
                                 // If inventory just became full from this click (filled BUY order
                                 // rejected by server) the detail view won't appear — break early
                                 // instead of burning the full 3-second timeout.
-                                if state.inventory_full.load(Ordering::Relaxed) && order_name.starts_with("BUY ") {
+                                if state.inventory_full.load(Ordering::Relaxed) && order_is_buy {
                                     break;
                                 }
                                 if tokio::time::Instant::now() >= action_deadline {
@@ -2928,8 +2974,7 @@ async fn handle_window_interaction(
                                 if *state.last_window_id.read() == window_id {
                                     // inventory_full only blocks BUY order collection (items need space).
                                     // SELL offers deliver coins which always fit — always collect those.
-                                    let is_buy = order_name.starts_with("BUY ");
-                                    if is_buy && state.inventory_full.load(Ordering::Relaxed) {
+                                    if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
                                         warn!("[ManageOrders] Inventory full — cannot collect BUY items for \"{}\", checking for instasell", order_name);
                                         // Check if a single dominant item is taking up >half of inventory —
                                         // if so, switch to InstaSelling to free space, then retry.
@@ -2948,7 +2993,7 @@ async fn handle_window_interaction(
                                         click_window_slot(bot, window_id, cs as i16).await;
                                         // Wait briefly, then check if inventory became full
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                        if is_buy && state.inventory_full.load(Ordering::Relaxed) {
+                                        if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
                                             // Collect failed: check for instasell opportunity
                                             warn!("[ManageOrders] Inventory full after collect attempt for \"{}\"", order_name);
                                             if let Some(dominant) = find_dominant_inventory_item(bot) {
@@ -2989,7 +3034,7 @@ async fn handle_window_interaction(
                                 }
                             } else if collect_slot.is_none() && cancel_slot.is_none()
                                 && state.inventory_full.load(Ordering::Relaxed)
-                                && order_name.starts_with("BUY ")
+                                && order_is_buy
                             {
                                 // Clicking the order triggered "inventory full" and no detail view
                                 // opened (server rejected the collect). Try instasell if dominant item.
@@ -4000,6 +4045,14 @@ mod tests {
     }
 
     #[test]
+    fn test_is_buy_bazaar_order_name_variants() {
+        assert!(is_buy_bazaar_order_name("BUY ENCHANTED DIAMOND"));
+        assert!(is_buy_bazaar_order_name("Buy Order: ENCHANTED DIAMOND"));
+        assert!(!is_buy_bazaar_order_name("SELL ENCHANTED DIAMOND"));
+        assert!(!is_buy_bazaar_order_name("Sell Offer: ENCHANTED DIAMOND"));
+    }
+
+    #[test]
     fn test_parse_bazaar_order_identity_from_name_variants() {
         assert_eq!(
             parse_bazaar_order_identity_from_name("BUY Enchanted Diamond"),
@@ -4023,6 +4076,41 @@ mod tests {
             parse_bazaar_order_identity("Buy Order", &lore),
             Some((true, "enchanted diamond".to_string()))
         );
+    }
+
+    #[test]
+    fn test_should_treat_as_bazaar_order_slot_with_lore_identity_only() {
+        let lore = vec![
+            "§7Status: §aOpen".to_string(),
+            "§7Sell Offer".to_string(),
+            "§7Product: Booster Cookie".to_string(),
+        ];
+        let identity = parse_bazaar_order_identity("Booster Cookie", &lore);
+        assert!(should_treat_as_bazaar_order_slot("Booster Cookie", identity.as_ref()));
+    }
+
+    #[test]
+    fn test_should_treat_as_bazaar_order_slot_variants() {
+        let lore_only = vec![
+            "Status: Open".to_string(),
+            "Buy Order".to_string(),
+            "Product: Enchanted Diamond".to_string(),
+        ];
+        let lore_identity = parse_bazaar_order_identity("Enchanted Diamond", &lore_only);
+        assert!(should_treat_as_bazaar_order_slot("Enchanted Diamond", lore_identity.as_ref()));
+        assert!(should_treat_as_bazaar_order_slot("Buy Order: Enchanted Diamond", None));
+        assert!(!should_treat_as_bazaar_order_slot("Booster Cookie", None));
+    }
+
+    #[test]
+    fn test_lore_contains_phrase_case_insensitive() {
+        let lore = vec![
+            "§7Click to Cancel Order".to_string(),
+            "§7Status: §aOpen".to_string(),
+        ];
+        assert!(lore_contains_phrase(&lore, "click to cancel"));
+        assert!(lore_contains_phrase(&lore, "CANCEL ORDER"));
+        assert!(!lore_contains_phrase(&lore, "collect"));
     }
 
     #[test]
