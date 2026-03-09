@@ -184,7 +184,7 @@ impl Config {
     }
 
     pub fn fastbuy_enabled(&self) -> bool {
-        self.fastbuy.unwrap_or(false)
+        self.fastbuy.unwrap_or(true)
     }
 
     /// Returns the webhook URL only if it is non-empty.
@@ -237,8 +237,8 @@ mod tests {
     }
 
     #[test]
-    fn fastbuy_defaults_to_false() {
-        assert!(!Config::default().fastbuy_enabled());
+    fn fastbuy_defaults_to_true() {
+        assert!(Config::default().fastbuy_enabled());
     }
 
     #[test]
@@ -248,8 +248,12 @@ mod tests {
     }
 
     #[test]
-    fn confirm_skip_does_not_enable_fastbuy() {
+    fn confirm_skip_does_not_affect_fastbuy() {
+        // confirm_skip is a separate setting; fastbuy defaults to true
         let config: Config = toml::from_str("confirm_skip = true").expect("config should parse");
+        assert!(config.fastbuy_enabled());
+        // Explicit fastbuy = false still overrides the default
+        let config: Config = toml::from_str("fastbuy = false\nconfirm_skip = true").expect("config should parse");
         assert!(!config.fastbuy_enabled());
     }
 
