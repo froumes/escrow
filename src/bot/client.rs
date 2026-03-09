@@ -2508,16 +2508,20 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
+                // Prefer fixed slot 15 (Hypixel AH navigation); use name matching as fallback.
+                let slot_15_name = slots.get(15).and_then(get_item_display_name_from_slot).unwrap_or_default();
+                let slot_15_lower = remove_mc_colors(&slot_15_name).to_lowercase();
+                if slot_15_lower.contains("manage auctions") || slot_15_lower.contains("my auctions") {
+                    info!("[ClaimSold] Clicking My/Manage Auctions at preferred slot 15");
+                    click_window_slot(bot, window_id, 15).await;
+                } else if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
                     .or_else(|| find_slot_by_name(&slots, "My Auctions"))
                 {
-                    info!("[ClaimSold] Clicking My/Manage Auctions at slot {}", i);
+                    info!("[ClaimSold] Slot 15 was not My/Manage Auctions, falling back to name match at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    // Fallback to the standard Hypixel slot to reduce missed claims when
-                    // display names/lore are slow to load.
-                    warn!("[ClaimSold] My/Manage Auctions not found by name, falling back to slot 15");
-                    click_window_slot(bot, window_id, 15).await;
+                    warn!("[ClaimSold] My/Manage Auctions not found (slot 15 or name fallback), going idle");
+                    *state.bot_state.write() = BotState::Idle;
                 }
             } else if is_my_auctions_window_title(window_title) {
                 info!("[ClaimSold] My/Manage Auctions opened - looking for claimable items");
@@ -2561,11 +2565,17 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
-                if let Some(i) = find_slot_by_name(&slots, "Claim") {
-                    info!("[ClaimSold] Clicking Claim at slot {}", i);
+                // Prefer fixed slot 31 in auction detail; use name matching only as fallback.
+                let slot_31_name = slots.get(31).and_then(get_item_display_name_from_slot).unwrap_or_default();
+                let slot_31_lower = remove_mc_colors(&slot_31_name).to_lowercase();
+                if slot_31_lower.contains("claim") {
+                    info!("[ClaimSold] Clicking preferred Claim slot 31");
+                    click_window_slot(bot, window_id, 31).await;
+                } else if let Some(i) = find_slot_by_name(&slots, "Claim") {
+                    info!("[ClaimSold] Slot 31 not claimable, falling back to Claim name match at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                 } else {
-                    info!("[ClaimSold] Clicking slot 31");
+                    info!("[ClaimSold] Claim button not found, clicking slot 31 fallback");
                     click_window_slot(bot, window_id, 31).await;
                 }
                 // Spawn a short watchdog: if Hypixel doesn't re-open Manage Auctions within
