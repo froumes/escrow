@@ -3010,7 +3010,14 @@ async fn handle_window_interaction(
                                         }
                                     }
                                 }
-                                processed_orders.clear();
+                                // Track this order as processed so it cannot be re-collected if
+                                // the server is slow to remove it from the window.  Clearing the
+                                // set (the previous behaviour) erased this guard and allowed the
+                                // bot to click Collect twice on the same slot — an "impossible
+                                // action" that triggers Hypixel's anti-cheat (ban).
+                                // Mirrors the TypeScript reference: processedItems.add(itemName)
+                                // is never cleared within a session.
+                                processed_orders.insert(processed_key);
                             } else if let Some(cs) = cancel_slot {
                                 if cancel_open || cancel_due_to_age {
                                     if *state.last_window_id.read() == window_id {
@@ -3020,7 +3027,9 @@ async fn handle_window_interaction(
                                         // Wait for the window content to revert to the order list
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                     }
-                                    processed_orders.clear();
+                                    // Track this order as processed so it cannot be re-cancelled
+                                    // if the server is slow to remove it from the window.
+                                    processed_orders.insert(processed_key);
                                 } else {
                                     // Collect-only mode: skip open orders
                                     debug!("[ManageOrders] Skipping open order \"{}\" (collect-only mode)", order_name);
