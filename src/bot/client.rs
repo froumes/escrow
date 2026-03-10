@@ -2573,11 +2573,6 @@ async fn handle_window_interaction(
                 let slots = menu.slots();
                 // Look for Claim All first
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
-                    for item in &slots {
-                        if let Some((item_name, price, buyer)) = parse_claimed_sold_event(item) {
-                            let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
-                        }
-                    }
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                     // Claim All finishes everything — go idle
@@ -2587,9 +2582,6 @@ async fn handle_window_interaction(
                     let mut found = false;
                     for (i, item) in slots.iter().enumerate() {
                         if is_claimable_auction_slot(item) {
-                            if let Some((item_name, price, buyer)) = parse_claimed_sold_event(item) {
-                                let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
-                            }
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
                             click_window_slot(bot, window_id, i as i16).await;
                             // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
