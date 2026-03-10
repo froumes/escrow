@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use bevy_app::AppExit;
+#[cfg(test)]
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
@@ -47,8 +48,10 @@ const FASTBUY_PRECLICK_DELAY_MS: u64 = 10;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
+#[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
+#[cfg(test)]
 static SOLD_BUYER_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)").expect("valid sold-buyer regex"));
 
@@ -2573,11 +2576,6 @@ async fn handle_window_interaction(
                 let slots = menu.slots();
                 // Look for Claim All first
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
-                    for item in &slots {
-                        if let Some((item_name, price, buyer)) = parse_claimed_sold_event(item) {
-                            let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
-                        }
-                    }
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, window_id, i as i16).await;
                     // Claim All finishes everything — go idle
@@ -2587,9 +2585,6 @@ async fn handle_window_interaction(
                     let mut found = false;
                     for (i, item) in slots.iter().enumerate() {
                         if is_claimable_auction_slot(item) {
-                            if let Some((item_name, price, buyer)) = parse_claimed_sold_event(item) {
-                                let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
-                            }
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
                             click_window_slot(bot, window_id, i as i16).await;
                             // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
@@ -3102,6 +3097,13 @@ async fn handle_window_interaction(
                                 }
                             }
                         }
+                        // If Hypixel closed all bazaar windows without reopening "Your Bazaar
+                        // Orders" (e.g. last order was processed), re-navigate to /bz so the
+                        // ManagingOrders flow continues and correctly reaches Idle when empty.
+                        if *state.last_window_id.read() == window_id {
+                            info!("[ManageOrders] No new window after collect in Order options — re-opening /bz");
+                            bot.write_chat_packet("/bz");
+                        }
                     }
                 } else if let Some(cs) = cancel_slot {
                     if cancel_open {
@@ -3110,6 +3112,13 @@ async fn handle_window_interaction(
                             click_window_slot(bot, window_id, cs as i16).await;
                             *state.manage_orders_cancelled.write() += 1;
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            // If Hypixel closed all bazaar windows without reopening "Your Bazaar
+                            // Orders" (e.g. last order was cancelled), re-navigate to /bz so the
+                            // ManagingOrders flow continues and correctly reaches Idle when empty.
+                            if *state.last_window_id.read() == window_id {
+                                info!("[ManageOrders] No new window after cancel in Order options — re-opening /bz");
+                                bot.write_chat_packet("/bz");
+                            }
                         }
                     } else {
                         debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode)");
@@ -3117,7 +3126,8 @@ async fn handle_window_interaction(
                 }
                 // After clicking Cancel/Collect, Hypixel should reopen "Your Bazaar Orders"
                 // as a new window. The ManagingOrders handler will be called again to continue
-                // processing remaining orders.
+                // processing remaining orders. If Hypixel closed all windows instead (last
+                // order processed), the /bz re-navigation above keeps the flow running.
             }
         }
         BotState::CheckingCookie => {
@@ -3923,12 +3933,7 @@ fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
     Some((buyer, item_name, price))
 }
 
-fn parse_claimed_sold_event(item: &azalea_inventory::ItemStack) -> Option<(String, u64, String)> {
-    let item_name = get_item_display_name_from_slot(item)?;
-    let lore = get_item_lore_from_slot(item);
-    parse_claimed_sold_event_from_lore(&item_name, &lore)
-}
-
+#[cfg(test)]
 fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Option<(String, u64, String)> {
     if lore.is_empty() {
         return None;
