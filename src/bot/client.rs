@@ -1425,7 +1425,7 @@ async fn event_handler(
                                     // Grace period may still be active — keep clicking.
                                     // Reset failed counter: slot is correct, just waiting.
                                     failed_clicks = 0;
-                                    click_window_slot(&bot_clone, window_id, 31).await;
+                                    click_window_slot(&bot_clone, &shared_window_id, window_id, 31).await;
                                 } else {
                                     failed_clicks += 1;
                                     debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
@@ -1912,7 +1912,7 @@ async fn execute_command(
             tokio::time::sleep(tokio::time::Duration::from_millis(TRADE_RESPONSE_DELAY_MS)).await;
             let window_id = *state.last_window_id.read();
             if window_id > 0 {
-                click_window_slot(bot, window_id, *slot).await;
+                click_window_slot(bot, &state.last_window_id, window_id, *slot).await;
             } else {
                 warn!("No window open (window_id=0), cannot click slot {}", slot);
             }
@@ -2114,7 +2114,7 @@ async fn handle_window_interaction(
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             if *state.last_window_id.read() == window_id {
-                                click_window_slot(bot, window_id, 31).await;
+                                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                             }
                             // Stay in Purchasing so Confirm Purchase handler fires
                             break;
@@ -2123,7 +2123,7 @@ async fn handle_window_interaction(
                             // server right as the transition happens.
                             debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
                             if *state.last_window_id.read() == window_id {
-                                click_window_slot(bot, window_id, 31).await;
+                                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                             }
                         } else {
                             // Unexpected slot state
@@ -2142,7 +2142,7 @@ async fn handle_window_interaction(
                     // Single click only — double-clicking sends a second packet while Hypixel
                     // is already preparing the Confirm Purchase window, which confuses the server
                     // and adds ~300ms of unnecessary latency.
-                    click_window_slot(bot, window_id, 31).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
 
                     // Optional fastbuy (window-skip): pre-click confirm in the next window.
                     // If this packet is ignored/lost, the Confirm Purchase handler below still
@@ -2157,13 +2157,31 @@ async fn handle_window_interaction(
                         // during the pre-click delay — that race condition would skip the
                         // pre-click entirely and add an extra round-trip (~200ms).
                         let next_window_id = window_id.wrapping_add(1);
-                        click_window_slot(bot, next_window_id, 11).await;
+                        // Fastbuy pre-click: deliberately targets next_window_id before it
+                        // opens (optimistic latency cut). Bypasses click_window_slot's
+                        // stale-window guard because the guard only allows the *current*
+                        // window — use the raw packet path here instead.
+                        {
+                            use azalea_protocol::packets::game::s_container_click::{
+                                ServerboundContainerClick, HashedStack,
+                            };
+                            bot.write_packet(ServerboundContainerClick {
+                                container_id: next_window_id as i32,
+                                state_id: 0,
+                                slot_num: 11,
+                                button_num: 0,
+                                click_type: ClickType::Pickup,
+                                changed_slots: Default::default(),
+                                carried_item: HashedStack(None),
+                            });
+                            info!("Clicked slot 11 in window {} (fastbuy pre-click)", next_window_id);
+                        }
                     }
                 }
             } else if window_title.contains("Confirm Purchase") {
                 // Click slot 11 immediately — speed is everything on a low-latency VPS.
                 // NO pre-delay (matches TypeScript: "NO delay here — speed is everything").
-                click_window_slot(bot, window_id, 11).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
 
                 // Wait 50ms for the server to process and close the window.
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -2176,7 +2194,7 @@ async fn handle_window_interaction(
                     .map(|t| t.contains("Confirm Purchase"))
                     .unwrap_or(false)
                 {
-                    click_window_slot(bot, window_id, 11).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
 
@@ -2279,7 +2297,7 @@ async fn handle_window_interaction(
                     let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 300) as u64;
                     tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                     if *state.last_window_id.read() != window_id { return; }
-                    click_window_slot(bot, window_id, i as i16).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     return;
                 }
             }
@@ -2310,7 +2328,7 @@ async fn handle_window_interaction(
                         let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 250) as u64;
                         tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                         if *state.last_window_id.read() != window_id { return; }
-                        click_window_slot(bot, window_id, i as i16).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
                         warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
@@ -2342,7 +2360,7 @@ async fn handle_window_interaction(
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Amount screen: clicking Custom Amount at slot {}", i);
                 *state.bazaar_step.write() = BazaarStep::SetAmount;
-                click_window_slot(bot, window_id, i as i16).await;
+                click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
             }
             // Step 4: Price screen
@@ -2352,7 +2370,7 @@ async fn handle_window_interaction(
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
                 *state.bazaar_step.write() = BazaarStep::SetPrice;
-                click_window_slot(bot, window_id, i as i16).await;
+                click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
             }
             // Step 5: Confirm screen — anything that opens after SetPrice
@@ -2363,7 +2381,7 @@ async fn handle_window_interaction(
                 // Add randomized human-like delay before confirming (300-700ms)
                 let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 400) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
-                click_window_slot(bot, window_id, 13).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 13).await;
 
                 // Wait briefly for the server to respond (limit message arrives asynchronously)
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2435,7 +2453,7 @@ async fn handle_window_interaction(
                         if *state.last_window_id.read() != window_id { return; }
                         info!("[InstaSell] Found \"{}\" at slot {}, clicking", item_name, i);
                         *state.bazaar_step.write() = BazaarStep::SearchResults;
-                        click_window_slot(bot, window_id, i as i16).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
                         warn!("[InstaSell] Item \"{}\" not found in bazaar search, going idle", item_name);
@@ -2460,7 +2478,7 @@ async fn handle_window_interaction(
                         if *state.last_window_id.read() != window_id { return; }
                         info!("[InstaSell] Clicking \"Sell Instantly\" at slot {}", i);
                         *state.bazaar_step.write() = BazaarStep::SelectOrderType;
-                        click_window_slot(bot, window_id, i as i16).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
                         warn!("[InstaSell] \"Sell Instantly\" not found, going idle");
@@ -2486,7 +2504,7 @@ async fn handle_window_interaction(
                 match confirm_slot {
                     Some(i) => {
                         info!("[InstaSell] Clicking Confirm at slot {}", i);
-                        click_window_slot(bot, window_id, i as i16).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
                         // Confirm button did not appear within 5 s — the sell may have already
@@ -2510,7 +2528,7 @@ async fn handle_window_interaction(
                 // Hardcoded slot 13 for "Your Bids" navigation — matches TypeScript clickWindow(bot, 13)
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 info!("[ClaimPurchased] Auction House opened - clicking slot 13 (Your Bids)");
-                click_window_slot(bot, window_id, 13).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 13).await;
             } else if window_title.contains("Your Bids") {
                 info!("[ClaimPurchased] Your Bids opened - looking for Claim All or Sold item");
                 // Wait for ContainerSetContent to arrive and populate slots
@@ -2521,7 +2539,7 @@ async fn handle_window_interaction(
                 // First look for Claim All by name (most reliable, matches TypeScript pattern)
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimPurchased] Found Claim All at slot {}", i);
-                    click_window_slot(bot, window_id, i as i16).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     *state.bot_state.write() = BotState::Idle;
                     found = true;
                 }
@@ -2532,7 +2550,7 @@ async fn handle_window_interaction(
                         let lore_lower = lore.join("\n").to_lowercase();
                         if lore_lower.contains("status:") && lore_lower.contains("sold") {
                             info!("[ClaimPurchased] Found purchased item with Sold status at slot {}", i);
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             // Stay in ClaimingPurchased — next window should be BIN Auction View
                             found = true;
                             break;
@@ -2546,7 +2564,7 @@ async fn handle_window_interaction(
             } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                click_window_slot(bot, window_id, 31).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -2563,10 +2581,10 @@ async fn handle_window_interaction(
                     .or_else(|| find_slot_by_name(&slots, "My Auctions"))
                 {
                     info!("[ClaimSold] Clicking Manage/My Auctions at slot {}", i);
-                    click_window_slot(bot, window_id, i as i16).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 } else {
                     info!("[ClaimSold] Manage/My Auctions not found by name, clicking slot 15");
-                    click_window_slot(bot, window_id, 15).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, 15).await;
                 }
             } else if is_my_auctions_window_title(window_title) {
                 info!("[ClaimSold] My/Manage Auctions opened - looking for claimable items");
@@ -2577,7 +2595,7 @@ async fn handle_window_interaction(
                 // Look for Claim All first
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
-                    click_window_slot(bot, window_id, i as i16).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     // Claim All finishes everything — go idle
                     *state.bot_state.write() = BotState::Idle;
                 } else {
@@ -2586,7 +2604,7 @@ async fn handle_window_interaction(
                     for (i, item) in slots.iter().enumerate() {
                         if is_claimable_auction_slot(item) {
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
                             found = true;
                             break;
@@ -2607,13 +2625,13 @@ async fn handle_window_interaction(
                 let slot_31_lower = remove_mc_colors(&slot_31_name).to_lowercase();
                 if slot_31_lower.contains("claim") {
                     info!("[ClaimSold] Clicking preferred Claim slot 31");
-                    click_window_slot(bot, window_id, 31).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 } else if let Some(i) = find_slot_by_name(&slots, "Claim") {
                     info!("[ClaimSold] Slot 31 not claimable, falling back to Claim name match at slot {}", i);
-                    click_window_slot(bot, window_id, i as i16).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 } else {
                     info!("[ClaimSold] Claim button not found, clicking slot 31 fallback");
-                    click_window_slot(bot, window_id, 31).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 }
                 // Spawn a short watchdog: if Hypixel doesn't re-open Manage Auctions within
                 // 1.5 s, transition to Idle so the command queue can proceed.
@@ -2650,7 +2668,7 @@ async fn handle_window_interaction(
                         info!("[Auction] AH opened, clicking slot 15 (Manage Auctions nav)");
                         *state.auction_step.write() = AuctionStep::OpenManage;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 15).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 15).await;
                     }
                 }
                 AuctionStep::OpenManage => {
@@ -2668,7 +2686,7 @@ async fn handle_window_interaction(
                             info!("[Auction] Clicking Create Auction at slot {}", i);
                             *state.auction_step.write() = AuctionStep::ClickCreate;
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                         } else {
                             warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
                             *state.bot_state.write() = BotState::Idle;
@@ -2678,7 +2696,7 @@ async fn handle_window_interaction(
                         info!("[Auction] Skipped Manage Auctions, in Create Auction — clicking slot 48 (BIN)");
                         *state.auction_step.write() = AuctionStep::SelectBIN;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 48).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 48).await;
                     } else if window_title.contains("Create BIN Auction") {
                         // Co-op AH opened "Create BIN Auction" directly (skipping Manage Auctions).
                         // Run the SelectBIN logic inline.
@@ -2703,11 +2721,11 @@ async fn handle_window_interaction(
                             info!("[Auction] Co-op AH: clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Co-op AH: clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot_carrying(bot, window_id, 31, &item_to_carry).await;
+                            click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
                             *state.bot_state.write() = BotState::Idle;
@@ -2720,7 +2738,7 @@ async fn handle_window_interaction(
                         info!("[Auction] Create Auction window opened, clicking slot 48 (BIN)");
                         *state.auction_step.write() = AuctionStep::SelectBIN;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 48).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 48).await;
                     } else if window_title.contains("Create BIN Auction") {
                         // Hypixel sometimes opens "Create BIN Auction" directly after clicking
                         // "Create Auction" in Manage Auctions (skipping the type-select step).
@@ -2746,11 +2764,11 @@ async fn handle_window_interaction(
                             info!("[Auction] ClickCreate→SelectBIN: clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] ClickCreate→SelectBIN: clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot_carrying(bot, window_id, 31, &item_to_carry).await;
+                            click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
                             *state.bot_state.write() = BotState::Idle;
@@ -2788,12 +2806,12 @@ async fn handle_window_interaction(
                             info!("[Auction] Clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             // Click slot 31 (price setter) — sign will open, handled in OpenSignEditor
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot_carrying(bot, window_id, 31, &item_to_carry).await;
+                            click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
                             *state.bot_state.write() = BotState::Idle;
@@ -2807,7 +2825,7 @@ async fn handle_window_interaction(
                         info!("[Auction] Price set, clicking slot 33 (duration)");
                         *state.auction_step.write() = AuctionStep::DurationSign;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 33).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 33).await;
                     }
                 }
                 AuctionStep::DurationSign => {
@@ -2816,7 +2834,7 @@ async fn handle_window_interaction(
                         info!("[Auction] Auction Duration window opened, clicking slot 16 (sign trigger)");
                         // Sign handler (OpenSignEditor) will fire and advance step to ConfirmSell
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 16).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 16).await;
                     }
                 }
                 AuctionStep::ConfirmSell => {
@@ -2826,7 +2844,7 @@ async fn handle_window_interaction(
                         info!("[Auction] Both price and duration set, clicking slot 29 (confirm item)");
                         *state.auction_step.write() = AuctionStep::FinalConfirm;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 29).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 29).await;
                     }
                 }
                 AuctionStep::FinalConfirm => {
@@ -2836,7 +2854,7 @@ async fn handle_window_interaction(
                     if window_title.contains("Confirm BIN Auction") || window_title.contains("Confirm") {
                         info!("[Auction] Confirm BIN Auction window, clicking slot 11 (final confirm)");
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                        click_window_slot(bot, window_id, 11).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         info!("[Auction] ===== AUCTION CREATED =====");
                         *state.bot_state.write() = BotState::Idle;
@@ -2857,7 +2875,7 @@ async fn handle_window_interaction(
                 // Main bazaar page — click "Manage Orders" at slot 50
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                click_window_slot(bot, window_id, 50).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 50).await;
             } else if is_bazaar_orders_window_title(window_title) {
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
                 info!("[ManageOrders] Processing existing orders ({})...", mode_str);
@@ -2913,7 +2931,7 @@ async fn handle_window_interaction(
                                 .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
                             // Click the order to view its detail page
-                            click_window_slot(bot, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
 
                             // Poll for a "Cancel" or "Collect" button (up to 3 seconds).
                             // In Hypixel, clicking an order slot updates the SAME window in-place
@@ -2984,7 +3002,7 @@ async fn handle_window_interaction(
                                         // Still try remaining orders (cancel open ones) but skip collects
                                     } else {
                                         info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
-                                        click_window_slot(bot, window_id, cs as i16).await;
+                                        click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                                         // Wait briefly, then check if inventory became full
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
@@ -3003,7 +3021,7 @@ async fn handle_window_interaction(
                                         if (cancel_open || cancel_due_to_age) && *state.last_window_id.read() == window_id {
                                             if let Some(cancel_after_collect) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                                 info!("[ManageOrders] Clicking Cancel at slot {} after collecting \"{}\"", cancel_after_collect, order_name);
-                                                click_window_slot(bot, window_id, cancel_after_collect as i16).await;
+                                                click_window_slot(bot, &state.last_window_id, window_id, cancel_after_collect as i16).await;
                                                 cancelled += 1;
                                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                             }
@@ -3022,7 +3040,7 @@ async fn handle_window_interaction(
                                 if cancel_open || cancel_due_to_age {
                                     if *state.last_window_id.read() == window_id {
                                         info!("[ManageOrders] Clicking Cancel at slot {}", cs);
-                                        click_window_slot(bot, window_id, cs as i16).await;
+                                        click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                                         cancelled += 1;
                                         // Wait for the window content to revert to the order list
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -3093,14 +3111,14 @@ async fn handle_window_interaction(
                 if let Some(cs) = collect_slot {
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
-                        click_window_slot(bot, window_id, cs as i16).await;
+                        click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         // After collecting, also cancel if in startup mode
                         if cancel_open {
                             if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                 if *state.last_window_id.read() == window_id {
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
-                                    click_window_slot(bot, window_id, cancel_after as i16).await;
+                                    click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
                                     *state.manage_orders_cancelled.write() += 1;
                                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 }
@@ -3118,7 +3136,7 @@ async fn handle_window_interaction(
                     if cancel_open {
                         if *state.last_window_id.read() == window_id {
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
-                            click_window_slot(bot, window_id, cs as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                             *state.manage_orders_cancelled.write() += 1;
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             // If Hypixel closed all bazaar windows without reopening "Your Bazaar
@@ -3217,12 +3235,12 @@ async fn handle_window_interaction(
             if step == CookieStep::Initial && window_title.contains("Bazaar") {
                 // Bazaar search results: click slot 11 (the cookie item)
                 info!("[Cookie] Bazaar opened — clicking cookie item (slot 11)");
-                click_window_slot(bot, window_id, 11).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 *state.cookie_step.write() = CookieStep::ItemDetail;
             } else if step == CookieStep::ItemDetail {
                 // Cookie item detail: click slot 10 (Buy Instantly)
                 info!("[Cookie] Cookie detail — clicking Buy Instantly (slot 10)");
-                click_window_slot(bot, window_id, 10).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 10).await;
                 *state.cookie_step.write() = CookieStep::BuyConfirm;
             } else if step == CookieStep::BuyConfirm {
                 // Atomically advance to WaitingForCookie before any sleeps.
@@ -3250,7 +3268,7 @@ async fn handle_window_interaction(
 
                 // Purchase confirmation: click slot 10 to confirm
                 info!("[Cookie] Buy confirmation — clicking Confirm (slot 10)");
-                click_window_slot(bot, window_id, 10).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 10).await;
                 // Let the purchase process; the Bazaar may re-open the item-detail window
                 // after purchase — that is handled by the WaitingForCookie branch below.
                 tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
@@ -3289,10 +3307,10 @@ async fn handle_window_interaction(
                             // Open player inventory (container 0), click cookie slot, then hotbar slot 0.
                             let inv_slot = (*player_range.start() + idx) as i16;
                             // Pick up cookie
-                            click_window_slot(bot, 0, inv_slot).await;
+                            click_window_slot(bot, &state.last_window_id, 0, inv_slot).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                             // Place in hotbar slot 0 (slot 36 in player inventory container)
-                            click_window_slot(bot, 0, 36).await;
+                            click_window_slot(bot, &state.last_window_id, 0, 36).await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                             0
                         };
@@ -3355,7 +3373,7 @@ async fn handle_window_interaction(
                 // Cookie GUI opened — click slot 11 to consume the cookie
                 info!("[Cookie] Cookie GUI opened — clicking slot 11 to consume");
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                click_window_slot(bot, window_id, 11).await;
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
                 // Close the cookie GUI
@@ -3693,7 +3711,18 @@ fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
 }
 
 /// Click a window slot
-async fn click_window_slot(bot: &Client, window_id: u8, slot: i16) {
+async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, window_id: u8, slot: i16) {
+    // Window 0 is the player's own inventory — always valid, no container guard.
+    // For all GUI containers, refuse to click if a newer window has replaced this one;
+    // clicking a closed/stale container is physically impossible for a real player and
+    // is a known Hypixel anti-cheat trigger.
+    if window_id != 0 && *last_window_id.read() != window_id {
+        warn!(
+            "Blocked stale window click: attempted slot {} in window {} but current window is {}",
+            slot, window_id, *last_window_id.read()
+        );
+        return;
+    }
     use azalea_protocol::packets::game::s_container_click::{
         ServerboundContainerClick,
         HashedStack,
@@ -3719,10 +3748,19 @@ async fn click_window_slot(bot: &Client, window_id: u8, slot: i16) {
 /// (e.g. placing the item in the auction item-slot to trigger the price sign).
 async fn click_window_slot_carrying(
     bot: &Client,
+    last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
     slot: i16,
     carried: &azalea_inventory::ItemStack,
 ) {
+    // Same stale-window guard as click_window_slot.
+    if window_id != 0 && *last_window_id.read() != window_id {
+        warn!(
+            "Blocked stale window click (carrying): attempted slot {} in window {} but current window is {}",
+            slot, window_id, *last_window_id.read()
+        );
+        return;
+    }
     use azalea_protocol::packets::game::s_container_click::{
         ServerboundContainerClick,
         HashedStack,
