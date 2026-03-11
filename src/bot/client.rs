@@ -3000,7 +3000,7 @@ async fn handle_window_interaction(
                                             }
                                             log_pending_claim(&order_name);
                                         }
-                                        if cancel_open || cancel_due_to_age {
+                                        if (cancel_open || cancel_due_to_age) && *state.last_window_id.read() == window_id {
                                             if let Some(cancel_after_collect) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                                 info!("[ManageOrders] Clicking Cancel at slot {} after collecting \"{}\"", cancel_after_collect, order_name);
                                                 click_window_slot(bot, window_id, cancel_after_collect as i16).await;
