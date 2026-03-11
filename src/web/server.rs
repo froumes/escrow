@@ -234,7 +234,15 @@ async fn login(
         }
     };
 
-    if payload.password != *expected {
+    // Constant-time password comparison to prevent timing attacks
+    if payload.password.len() != expected.len()
+        || payload
+            .password
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            != 0
+    {
         info!("[WebGUI] Failed login attempt from web panel");
         return (
             StatusCode::UNAUTHORIZED,
@@ -243,9 +251,18 @@ async fn login(
             .into_response();
     }
 
-    // Generate a random session token
+    // Generate a random session token and cap the number of active sessions
     let token = uuid::Uuid::new_v4().to_string();
-    s.valid_sessions.lock().unwrap().insert(token.clone());
+    {
+        let mut sessions = s.valid_sessions.lock().unwrap();
+        // Limit to 64 active sessions; evict oldest when full
+        if sessions.len() >= 64 {
+            if let Some(oldest) = sessions.iter().next().cloned() {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions.insert(token.clone());
+    }
 
     info!("[WebGUI] Successful login via web panel");
 
