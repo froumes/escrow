@@ -99,7 +99,7 @@ pub struct Config {
     #[serde(default)]
     pub web_gui_password: Option<String>,
     
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
 }
 

@@ -48,11 +48,10 @@ impl ConfigLoader {
         
         let config = Self::parse_config(&contents)?;
         
-        // Merge any missing fields from defaults into the loaded config
-        // (matches TypeScript initConfigHelper: "add new default values to existing config
-        //  if new property was added in newer version").
-        // Currently there are no programmatic merges to perform here —
-        // main.rs prompts the user for any missing interactive fields (e.g. webhook_url).
+        // Re-save after every load so that newly added config fields
+        // appear in the file with their default values (matches TypeScript
+        // initConfigHelper: "add new default values to existing config").
+        self.save(&config)?;
         
         info!("Loaded configuration from {:?}", self.config_path);
         Ok(config)
