@@ -8,9 +8,11 @@ use frikadellen_baf::{
     websocket::CoflWebSocket,
     bot::BotClient,
     types::Flip,
+    web::{start_web_server, WebSharedState},
 };
 use tracing::{debug, error, info, warn};
 use tokio::time::{sleep, Duration};
+use tokio::sync::broadcast;
 use serde_json;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::HashMap;
@@ -182,6 +184,16 @@ async fn main() -> Result<()> {
     // Set to true for 20 seconds when a `countdown` message arrives (AH flips incoming).
     let bazaar_flips_paused = Arc::new(AtomicBool::new(false));
 
+    // Master macro pause — web panel can set this to pause all command processing.
+    let macro_paused = Arc::new(AtomicBool::new(false));
+
+    // Shared enable flags — web panel can toggle these at runtime.
+    let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
+    let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
+
+    // Broadcast channel for chat messages → web panel clients.
+    let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
+
     // Flip tracker: stores pending/active AH flips for profit reporting in webhooks.
     // Key = clean item_name (lowercase), value = (flip, actual_buy_price, purchase_time).
     // buy_price starts at 0 until ItemPurchased fires and sets it to the real price.
@@ -283,6 +295,27 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Start web control panel server
+    {
+        let web_state = WebSharedState {
+            bot_client: bot_client.clone(),
+            command_queue: command_queue.clone(),
+            ws_client: ws_client.clone(),
+            bazaar_flips_paused: bazaar_flips_paused.clone(),
+            macro_paused: macro_paused.clone(),
+            enable_ah_flips: enable_ah_flips.clone(),
+            enable_bazaar_flips: enable_bazaar_flips.clone(),
+            ingame_names: ingame_names.clone(),
+            current_account_index,
+            account_index_path: account_index_path.clone(),
+            chat_tx: chat_tx.clone(),
+        };
+        let web_port = config.web_gui_port;
+        tokio::spawn(async move {
+            start_web_server(web_state, web_port).await;
+        });
+    }
+
     // Spawn bot event handler
     let bot_client_clone = bot_client.clone();
     let ws_client_for_events = ws_client.clone();
@@ -292,6 +325,8 @@ async fn main() -> Result<()> {
     let flip_tracker_events = flip_tracker.clone();
     let cofl_connection_id_events = cofl_connection_id.clone();
     let cofl_premium_events = cofl_premium.clone();
+    let chat_tx_events = chat_tx.clone();
+    let enable_bazaar_flips_events = enable_bazaar_flips.clone();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -304,6 +339,8 @@ async fn main() -> Result<()> {
                 frikadellen_baf::bot::BotEvent::ChatMessage(msg) => {
                     // Print Minecraft chat with color codes converted to ANSI
                     print_mc_chat(&msg);
+                    // Broadcast to web panel clients
+                    let _ = chat_tx_events.send(msg.clone());
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
                     debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
@@ -536,7 +573,7 @@ async fn main() -> Result<()> {
                     // A bazaar buy/sell order was filled — trigger a ManageOrders run
                     // immediately so the items are collected without waiting for the next
                     // periodic check.  Only enqueue if bazaar flips are enabled.
-                    if config_for_events.enable_bazaar_flips {
+                    if enable_bazaar_flips_events.load(Ordering::Relaxed) {
                          info!("[BazaarOrders] Order filled — queuing ManageOrders");
                         command_queue_clone.enqueue(
                             frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
@@ -558,6 +595,9 @@ async fn main() -> Result<()> {
     let flip_tracker_ws = flip_tracker.clone();
     let cofl_connection_id_ws = cofl_connection_id.clone();
     let cofl_premium_ws = cofl_premium.clone();
+    let enable_ah_flips_ws = enable_ah_flips.clone();
+    let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
+    let chat_tx_ws = chat_tx.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -567,7 +607,7 @@ async fn main() -> Result<()> {
             match event {
                 CoflEvent::AuctionFlip(flip) => {
                     // Skip if AH flips are disabled
-                    if !config_clone.enable_ah_flips {
+                    if !enable_ah_flips_ws.load(Ordering::Relaxed) {
                         continue;
                     }
 
@@ -605,7 +645,7 @@ async fn main() -> Result<()> {
                 }
                 CoflEvent::BazaarFlip(bazaar_flip) => {
                     // Skip if bazaar flips are disabled
-                    if !config_clone.enable_bazaar_flips {
+                    if !enable_bazaar_flips_ws.load(Ordering::Relaxed) {
                         continue;
                     }
 
@@ -713,6 +753,8 @@ async fn main() -> Result<()> {
                         // Still show in debug mode but without color formatting
                         debug!("[COFL Chat] {}", msg);
                     }
+                    // Broadcast to web panel clients
+                    let _ = chat_tx_ws.send(msg);
                 }
                 CoflEvent::Command(cmd) => {
                     info!("Received command from Coflnet: {}", cmd);
@@ -945,12 +987,13 @@ async fn main() -> Result<()> {
                     // COFL sends this ~10 seconds before AH flips arrive.
                     // Matching TypeScript bazaarFlipPauser.ts: pause bazaar flips for 20 seconds
                     // when both AH flips and bazaar flips are enabled.
-                    if config_clone.enable_bazaar_flips && config_clone.enable_ah_flips {
+                    if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
                         print_mc_chat("§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips");
+                        let _ = chat_tx_ws.send("[Coflnet]: Flips in 10 seconds".to_string());
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
                         let ws = ws_client_clone.clone();
-                        let enable_bz = config_clone.enable_bazaar_flips;
+                        let enable_bz = enable_bazaar_flips_ws.clone();
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
@@ -958,7 +1001,7 @@ async fn main() -> Result<()> {
                             print_mc_chat("§f[§4BAF§f]: §aBazaar flips resumed, requesting new recommendations...");
                             info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
                             // Re-request bazaar flips to get fresh recommendations after the pause
-                            if enable_bz {
+                            if enable_bz.load(Ordering::Relaxed) {
                                 let msg = serde_json::json!({
                                     "type": "getbazaarflips",
                                     "data": serde_json::to_string("").unwrap_or_default()
@@ -982,10 +1025,17 @@ async fn main() -> Result<()> {
     let command_queue_processor = command_queue.clone();
     let bot_client_clone = bot_client.clone();
     let bazaar_flips_paused_proc = bazaar_flips_paused.clone();
+    let macro_paused_proc = macro_paused.clone();
     let command_delay_ms = config.command_delay_ms;
     tokio::spawn(async move {
         use frikadellen_baf::types::BotState;
         loop {
+            // When macro is paused via web panel, skip command processing entirely.
+            if macro_paused_proc.load(Ordering::Relaxed) {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+
             // Process commands from queue
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);

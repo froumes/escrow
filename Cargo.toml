@@ -4,7 +4,7 @@ version = "3.0.0"
 edition = "2021"
 authors = ["TreXito"]
 description = "Frikadellen BAF (Bazaar Auction Flipper) for Hypixel Skyblock - Rust port using Azalea"
-license = "MIT"
+license = "AGPL-3.0"
 
 [[bin]]
 name = "frikadellen_baf"
@@ -55,6 +55,10 @@ dirs = "5.0"
 # CLI interaction
 dialoguer = "0.11"
 rustyline = "15.0"
+
+# Web server for control panel
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 [profile.release]
 opt-level = 3

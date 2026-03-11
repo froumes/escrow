@@ -12,8 +12,10 @@ pub mod logging;
 pub mod state;
 pub mod types;
 pub mod utils;
+pub mod web;
 pub mod websocket;
 pub mod webhook;
 
 pub use bot::{BotClient, BotEvent, BotEventHandlers};
 pub use types::{BotState, CommandPriority, CommandType, Flip, BazaarFlipRecommendation};
+pub use web::{start_web_server, WebSharedState};

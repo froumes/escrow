@@ -16,16 +16,18 @@ pub fn init_logger() -> Result<()> {
         "latest.log",
     );
 
-    // Create filter with specific rules to suppress noise
+    // Create filter with specific rules to suppress noise.
+    // Azalea library crates emit harmless errors & warnings (e.g. set_equipment
+    // "Unexpected enum variant 7", chunk entity warnings) that spam the console.
+    // We suppress them entirely – any important azalea error will surface through
+    // our own logging when we handle the event.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
             EnvFilter::new("info")
-                // Suppress Azalea chunk entity warnings (they're just noise)
-                .add_directive("azalea_world=error".parse().unwrap())
-                .add_directive("azalea_entity=error".parse().unwrap())
-                // Suppress Azalea packet-handling errors (e.g. set_equipment
-                // "Unexpected enum variant" on some accounts – harmless noise)
-                .add_directive("azalea_client=warn".parse().unwrap())
+                .add_directive("azalea_world=off".parse().unwrap())
+                .add_directive("azalea_entity=off".parse().unwrap())
+                .add_directive("azalea_client=off".parse().unwrap())
+                .add_directive("azalea_protocol=off".parse().unwrap())
         });
 
     // Set up subscriber with both console and file output
