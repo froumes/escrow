@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use axum::{
@@ -8,8 +9,9 @@ use axum::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{header, Request, StatusCode},
+    middleware::Next,
+    response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
