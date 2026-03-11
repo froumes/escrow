@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Frikadellen BAF — Bazaar &amp; Auction Flipper</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍔</text></svg>">
+</head>
+<body>
+
+<!-- ── Navigation ─────────────────────────────────────────────── -->
+<nav id="navbar">
+    <div class="nav-container">
+        <a href="#" class="logo">🍔 <span>Frikadellen</span> BAF</a>
+        <button type="button" class="nav-toggle" aria-label="Toggle menu">
+            <span></span><span></span><span></span>
+        </button>
+        <ul class="nav-links">
+            <li><a href="#features">Features</a></li>
+            <li><a href="#how-it-works">How It Works</a></li>
+            <li><a href="#config">Configuration</a></li>
+            <li><a href="#install">Install</a></li>
+            <li><a href="https://discord.gg/42DvX6T9jh" class="btn-nav" target="_blank" rel="noopener">Discord</a></li>
+        </ul>
+    </div>
+</nav>
+
+<!-- ── Hero ────────────────────────────────────────────────────── -->
+<header id="hero">
+    <div class="hero-bg"></div>
+    <div class="hero-content">
+        <h1>Frikadellen <span class="accent">BAF</span></h1>
+        <p class="tagline">The fastest Bazaar &amp; Auction Flipper for Hypixel SkyBlock — built in Rust&nbsp;🦀</p>
+        <div class="hero-buttons">
+            <a href="#install" class="btn btn-primary">Get Started</a>
+            <a href="https://github.com/TreXito/frikadellen-baf-121" class="btn btn-outline" target="_blank" rel="noopener">GitHub</a>
+        </div>
+        <div class="hero-stats">
+            <div class="stat"><span class="stat-value">v3.0</span><span class="stat-label">Latest</span></div>
+            <div class="stat"><span class="stat-value">Rust</span><span class="stat-label">Powered</span></div>
+            <div class="stat"><span class="stat-value">MIT</span><span class="stat-label">License</span></div>
+        </div>
+    </div>
+    <div class="scroll-hint" aria-hidden="true">
+        <span>↓</span>
+    </div>
+</header>
+
+<!-- ── Features ────────────────────────────────────────────────── -->
+<section id="features">
+    <div class="container">
+        <h2 class="section-title">Features</h2>
+        <p class="section-subtitle">Everything you need to flip smarter, faster, and safer.</p>
+
+        <div class="features-grid">
+
+            <div class="feature-card">
+                <div class="feature-icon">⚡</div>
+                <h3>Auction House Flips</h3>
+                <p>Monitors and instantly executes profitable BIN auctions using real-time Coflnet sniper data with sub-second reaction times.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">📊</div>
+                <h3>Bazaar Trading</h3>
+                <p>Automated bazaar buy &amp; sell order management — places, tracks, and cancels stale orders to maximize margins.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🔍</div>
+                <h3>Smart Finder</h3>
+                <p>Identifies the flip source (SNIPER, SNIPER_MEDIAN, USER, etc.) so you always know which algorithm found each deal.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🔔</div>
+                <h3>Discord Webhooks</h3>
+                <p>Rich Discord embed notifications for every purchase, sale, and profit update — complete with item names, prices, and finder info.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🔐</div>
+                <h3>Microsoft Auth</h3>
+                <p>Secure OAuth2 login flow via your Microsoft account. No passwords stored — tokens are cached and auto-refreshed.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🌐</div>
+                <h3>WebSocket Streaming</h3>
+                <p>Persistent connection to Coflnet's live flip feed with automatic reconnection, heartbeat, and session management.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">⚙️</div>
+                <h3>Highly Configurable</h3>
+                <p>Fine-tune every parameter — click delays, order intervals, auction duration, proxy settings, and more via <code>config.toml</code>.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🔄</div>
+                <h3>Multi-Account</h3>
+                <p>Supports multiple Minecraft accounts with automatic timed switching. Just comma-separate your usernames.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🛡️</div>
+                <h3>Proxy Support</h3>
+                <p>Route both Minecraft and WebSocket traffic through SOCKS5/HTTP proxies for added privacy and IP rotation.</p>
+            </div>
+
+        </div>
+    </div>
+</section>
+
+<!-- ── How It Works ────────────────────────────────────────────── -->
+<section id="how-it-works">
+    <div class="container">
+        <h2 class="section-title">How It Works</h2>
+        <p class="section-subtitle">From flip detection to profit in milliseconds.</p>
+
+        <div class="steps">
+            <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-content">
+                    <h3>Connect</h3>
+                    <p>Log in with your Microsoft account. The bot connects to Hypixel SkyBlock and opens a WebSocket to Coflnet's flip feed.</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-content">
+                    <h3>Detect</h3>
+                    <p>Coflnet streams underpriced auctions in real-time. Each flip includes finder type, target price, and profit percentage.</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-content">
+                    <h3>Purchase</h3>
+                    <p>The bot opens the auction, clicks BIN, and confirms — optionally with fastbuy (window-skip) for maximum speed.</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <h3>Relist &amp; Profit</h3>
+                    <p>Items are automatically relisted at the target price. Discord webhooks notify you of every purchase and sale.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ── Configuration ───────────────────────────────────────────── -->
+<section id="config">
+    <div class="container">
+        <h2 class="section-title">Configuration</h2>
+        <p class="section-subtitle">Customize everything in <code>config.toml</code>.</p>
+
+        <div class="config-block">
+            <pre><code><span class="c"># Minecraft account(s) — comma-separated for multi-account</span>
+<span class="k">ingame_name</span> = <span class="s">"YourUsername"</span>
+
+<span class="c"># Flip modules</span>
+<span class="k">enable_ah_flips</span>     = <span class="b">true</span>
+<span class="k">enable_bazaar_flips</span> = <span class="b">true</span>
+
+<span class="c"># Speed tuning</span>
+<span class="k">command_delay_ms</span>       = <span class="n">500</span>
+<span class="k">bed_spam_click_delay</span>   = <span class="n">100</span>
+<span class="k">bed_pre_click_ms</span>       = <span class="n">30</span>
+
+<span class="c"># Bazaar order management</span>
+<span class="k">bazaar_order_check_interval_seconds</span> = <span class="n">30</span>
+<span class="k">bazaar_order_cancel_minutes</span>         = <span class="n">5</span>
+
+<span class="c"># Discord notifications</span>
+<span class="k">webhook_url</span> = <span class="s">"https://discord.com/api/webhooks/..."</span>
+
+<span class="c"># Proxy (optional)</span>
+<span class="k">proxy_enabled</span>     = <span class="b">false</span>
+<span class="k">proxy_address</span>     = <span class="s">"host:port"</span>
+<span class="k">proxy_credentials</span> = <span class="s">"user:pass"</span></code></pre>
+        </div>
+    </div>
+</section>
+
+<!-- ── Install ─────────────────────────────────────────────────── -->
+<section id="install">
+    <div class="container">
+        <h2 class="section-title">Installation</h2>
+        <p class="section-subtitle">Up and running in under a minute.</p>
+
+        <div class="install-tabs">
+            <button type="button" class="tab active" data-tab="linux">Linux VPS</button>
+            <button type="button" class="tab" data-tab="source">From Source</button>
+        </div>
+
+        <div class="install-content active" id="tab-linux">
+            <div class="terminal">
+                <div class="terminal-header">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                    <span class="terminal-title">bash</span>
+                </div>
+                <div class="terminal-body">
+                    <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/frikadellen_baf-linux-x86_64</p>
+                    <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x frikadellen_baf-linux-x86_64</p>
+                    <p><span class="prompt">$</span> <span class="cmd">./frikadellen_baf-linux-x86_64</span></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="install-content" id="tab-source">
+            <div class="terminal">
+                <div class="terminal-header">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                    <span class="terminal-title">bash</span>
+                </div>
+                <div class="terminal-body">
+                    <p><span class="prompt">$</span> <span class="cmd">rustup</span> install nightly</p>
+                    <p><span class="prompt">$</span> <span class="cmd">rustup</span> default nightly</p>
+                    <p><span class="prompt">$</span> <span class="cmd">cargo</span> build --release</p>
+                    <p><span class="prompt">$</span> <span class="cmd">./target/release/frikadellen_baf</span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ── Footer ──────────────────────────────────────────────────── -->
+<footer>
+    <div class="container footer-content">
+        <div class="footer-brand">
+            <span class="logo">🍔 Frikadellen BAF</span>
+            <p>Bazaar &amp; Auction Flipper for Hypixel SkyBlock</p>
+        </div>
+        <div class="footer-links">
+            <a href="https://github.com/TreXito/frikadellen-baf-121" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://discord.gg/42DvX6T9jh" target="_blank" rel="noopener">Discord</a>
+            <a href="https://github.com/TreXito/frikadellen-baf-121/releases" target="_blank" rel="noopener">Releases</a>
+        </div>
+        <p class="footer-copy">&copy; 2026 TreXito &middot; MIT License</p>
+    </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
