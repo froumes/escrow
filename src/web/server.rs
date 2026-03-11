@@ -1,15 +1,17 @@
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        Request, State, WebSocketUpgrade,
     },
     http::StatusCode,
-    response::{Html, IntoResponse},
+    middleware::Next,
+    response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -41,6 +43,10 @@ pub struct WebSharedState {
     pub account_index_path: std::path::PathBuf,
     /// Broadcast channel for chat messages flowing to web clients.
     pub chat_tx: broadcast::Sender<String>,
+    /// Password required to access the web panel (`None` = no auth).
+    pub web_gui_password: Option<String>,
+    /// Set of valid session tokens for authenticated clients.
+    pub valid_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -53,7 +59,8 @@ struct StatusResponse {
     enable_bazaar_flips: bool,
     queue_depth: usize,
     current_account: String,
-    account_count: usize,
+    current_account_index: usize,
+    accounts: Vec<String>,
     purse: Option<u64>,
 }
 
@@ -72,11 +79,102 @@ struct SwitchPayload {
     index: usize,
 }
 
+#[derive(Deserialize)]
+struct LoginPayload {
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    success: bool,
+}
+
+// ── Authentication middleware ─────────────────────────────────
+
+/// Extract the `baf_session` cookie value from a request.
+fn extract_session_cookie(req: &Request) -> Option<String> {
+    req.headers()
+        .get("cookie")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|c| {
+            let c = c.trim();
+            c.strip_prefix("baf_session=").map(|v| v.to_string())
+        })
+}
+
+/// Middleware logic that enforces authentication when a password is configured.
+/// Allows unauthenticated access to `GET /` (panel HTML) and `POST /api/login`.
+async fn check_auth(
+    s: WebSharedState,
+    req: Request,
+    next: Next,
+) -> Response {
+    // No password configured → skip auth entirely
+    if s.web_gui_password.as_ref().map_or(true, |p| p.is_empty()) {
+        return next.run(req).await;
+    }
+
+    let path = req.uri().path().to_string();
+
+    // Always allow the panel page and the login endpoint without auth
+    if path == "/" || path == "/api/login" {
+        return next.run(req).await;
+    }
+
+    // Collect all tokens to check
+    let mut tokens_to_check: Vec<String> = Vec::new();
+
+    // Session cookie
+    if let Some(token) = extract_session_cookie(&req) {
+        tokens_to_check.push(token);
+    }
+
+    // Authorization: Bearer <token> header
+    if let Some(auth) = req.headers().get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                tokens_to_check.push(token.to_string());
+            }
+        }
+    }
+
+    // Query parameter `token=` (for WebSocket connections)
+    if let Some(query) = req.uri().query() {
+        for pair in query.split('&') {
+            if let Some(token) = pair.strip_prefix("token=") {
+                tokens_to_check.push(token.to_string());
+            }
+        }
+    }
+
+    // Check all tokens against valid sessions (lock + release before await)
+    let is_valid = {
+        let sessions = s.valid_sessions.lock().unwrap();
+        tokens_to_check.iter().any(|t| sessions.contains(t))
+    };
+
+    if is_valid {
+        return next.run(req).await;
+    }
+
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
 // ── Start the web server ─────────────────────────────────────
 
 pub async fn start_web_server(state: WebSharedState, port: u16) {
+    let has_password = state
+        .web_gui_password
+        .as_ref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+
+    let auth_state = state.clone();
     let app = Router::new()
         .route("/", get(index_page))
+        .route("/api/login", axum::routing::post(login))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -86,10 +184,24 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/chat/send", axum::routing::post(send_chat))
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
+        .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+            let s = auth_state.clone();
+            async move { check_auth(s, req, next).await }
+        }))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
-    info!("Web control panel starting on http://{}", addr);
+    if has_password {
+        info!(
+            "Web control panel starting on http://{} (password protected)",
+            addr
+        );
+    } else {
+        info!(
+            "Web control panel starting on http://{} (no password — set web_gui_password in config.toml to protect)",
+            addr
+        );
+    }
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -110,6 +222,62 @@ async fn index_page() -> Html<&'static str> {
     Html(include_str!("panel.html"))
 }
 
+async fn login(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<LoginPayload>,
+) -> impl IntoResponse {
+    let expected = match &s.web_gui_password {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            // No password configured — login always succeeds (no cookie needed)
+            return (StatusCode::OK, Json(LoginResponse { success: true })).into_response();
+        }
+    };
+
+    // Constant-time password comparison to prevent timing attacks
+    if payload.password.len() != expected.len()
+        || payload
+            .password
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            != 0
+    {
+        info!("[WebGUI] Failed login attempt from web panel");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(LoginResponse { success: false }),
+        )
+            .into_response();
+    }
+
+    // Generate a random session token and cap the number of active sessions
+    let token = uuid::Uuid::new_v4().to_string();
+    {
+        let mut sessions = s.valid_sessions.lock().unwrap();
+        // Limit to 64 active sessions; evict oldest when full
+        if sessions.len() >= 64 {
+            if let Some(oldest) = sessions.iter().next().cloned() {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions.insert(token.clone());
+    }
+
+    info!("[WebGUI] Successful login via web panel");
+
+    let cookie = format!(
+        "baf_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800",
+        token
+    );
+    (
+        StatusCode::OK,
+        [("set-cookie", cookie)],
+        Json(LoginResponse { success: true }),
+    )
+        .into_response()
+}
+
 async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         state: format!("{:?}", s.bot_client.state()),
@@ -118,7 +286,8 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
         enable_bazaar_flips: s.enable_bazaar_flips.load(Ordering::Relaxed),
         queue_depth: s.command_queue.len(),
         current_account: s.ingame_names.get(s.current_account_index).cloned().unwrap_or_default(),
-        account_count: s.ingame_names.len(),
+        current_account_index: s.current_account_index,
+        accounts: s.ingame_names.clone(),
         purse: s.bot_client.get_purse(),
     })
 }

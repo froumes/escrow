@@ -309,6 +309,10 @@ async fn main() -> Result<()> {
             current_account_index,
             account_index_path: account_index_path.clone(),
             chat_tx: chat_tx.clone(),
+            web_gui_password: config.web_gui_password.clone(),
+            valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {

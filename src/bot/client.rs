@@ -3574,6 +3574,13 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     serde_json::Value::String(display_name),
                 );
             }
+            // Extract SkyBlock item tag for icon lookup
+            if let Some(tag) = nbt_data.get("ExtraAttributes").and_then(|ea| ea.get("id")).and_then(|id| id.as_str()) {
+                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
+                    "tag".to_string(),
+                    serde_json::Value::String(tag.to_string()),
+                );
+            }
             slots_array[mineflayer_slot] = slot_obj;
         }
     }
