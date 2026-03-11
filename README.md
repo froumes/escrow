@@ -77,5 +77,4 @@ The launcher script will:
 - Run the application with any arguments you provide
 
 ## License
-
-MIT
+AGPLv3
