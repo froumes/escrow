@@ -68,6 +68,19 @@ a{color:var(--accent2);text-decoration:none}
 .inv-slot .item-icon{width:80%;height:80%;object-fit:contain;image-rendering:pixelated}
 .tooltip{display:none;position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:.72rem;white-space:nowrap;z-index:20;color:var(--heading);pointer-events:none}
 
+/* Auctions */
+.auction-table{width:100%;border-collapse:collapse;font-size:.82rem}
+.auction-table th{text-align:left;color:var(--text-dim);font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;padding:4px 8px;border-bottom:1px solid var(--border)}
+.auction-table td{padding:8px;border-bottom:1px solid rgba(30,34,64,.5);vertical-align:middle}
+.auction-table tr:last-child td{border-bottom:none}
+.auction-table tr:hover td{background:rgba(108,92,231,.05)}
+.auction-icon{width:28px;height:28px;image-rendering:pixelated;border-radius:4px;vertical-align:middle}
+.auction-bid{color:var(--warn);font-weight:700}
+.auction-bin{display:inline-block;background:var(--success);color:#000;font-size:.65rem;font-weight:700;padding:1px 5px;border-radius:4px;margin-left:4px}
+.auction-time{font-family:'JetBrains Mono','Fira Code',monospace;font-size:.78rem;color:var(--text-dim)}
+.auction-time.urgent{color:var(--danger)}
+.auction-empty{color:var(--text-dim);font-size:.85rem;text-align:center;padding:16px 0}
+
 /* Chat */
 .chat-box{background:#0a0c14;border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;height:340px}
 .chat-messages{flex:1;overflow-y:auto;padding:12px 14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.78rem;line-height:1.7;color:var(--text)}
@@ -165,7 +178,15 @@ a{color:var(--accent2);text-decoration:none}
     </div>
 </div>
 
-<!-- Row 3: Chat (full width) -->
+<!-- Row 3: Active Auctions (full width) -->
+<div class="card">
+    <h2>Active Auctions</h2>
+    <div id="auction-container">
+        <p class="auction-empty">Loading...</p>
+    </div>
+</div>
+
+<!-- Row 4: Chat (full width) -->
 <div class="card">
     <h2>Chat</h2>
     <div class="chat-box">
@@ -352,6 +373,58 @@ async function fetchInventory() {
     } catch(e) { console.error('Inventory fetch failed', e); }
 }
 
+async function fetchAuctions() {
+    try {
+        const r = await fetch('/api/auctions');
+        if (r.status === 401) return;
+        const d = await r.json();
+        renderAuctions(Array.isArray(d) ? d : []);
+    } catch(e) { console.error('Auctions fetch failed', e); }
+}
+
+/** Format seconds remaining into a human-readable string */
+function formatTimeRemaining(secs) {
+    if (secs <= 0) return 'Expired';
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm ' + (secs % 60) + 's';
+}
+
+function renderAuctions(auctions) {
+    const container = $('auction-container');
+    if (auctions.length === 0) {
+        container.innerHTML = '<p class="auction-empty">No active auctions</p>';
+        return;
+    }
+    const table = document.createElement('table');
+    table.className = 'auction-table';
+    table.innerHTML = '<thead><tr><th></th><th>Item</th><th>Bid</th><th>Type</th><th>Time Left</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    auctions.forEach(a => {
+        const tr = document.createElement('tr');
+        const iconUrl = a.tag
+            ? 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(a.tag)
+            : null;
+        const bid = a.highest_bid > 0 ? a.highest_bid : a.starting_bid;
+        const urgent = a.time_remaining_seconds < 3600;
+        tr.innerHTML =
+            '<td style="width:36px">' +
+                (iconUrl ? '<img class="auction-icon" src="' + iconUrl + '" alt="' + a.item_name + '" loading="lazy" onerror="this.style.display=\'none\'">' : '') +
+            '</td>' +
+            '<td>' + a.item_name + '</td>' +
+            '<td class="auction-bid"><span title="coins">' + bid.toLocaleString() + ' ✦</span></td>' +
+            '<td>' + (a.bin ? '<span class="auction-bin">BIN</span>' : 'Auction') + '</td>' +
+            '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>';
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    container.innerHTML = '';
+    container.appendChild(table);
+}
+
 /** Get an icon URL for an inventory item */
 function getItemIconUrl(slot) {
     // SkyBlock items: use Coflnet icon by tag
@@ -453,9 +526,11 @@ $('chat-input').addEventListener('keydown', e => {
 // ── Init ─────────────────────────────────────────────────────
 fetchStatus();
 fetchInventory();
+fetchAuctions();
 connectChat();
 setInterval(fetchStatus, 3000);
 setInterval(fetchInventory, 10000);
+setInterval(fetchAuctions, 30000);
 </script>
 </body>
 </html>

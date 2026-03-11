@@ -3574,8 +3574,24 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     serde_json::Value::String(display_name),
                 );
             }
-            // Extract SkyBlock item tag for icon lookup
-            if let Some(tag) = nbt_data.get("ExtraAttributes").and_then(|ea| ea.get("id")).and_then(|id| id.as_str()) {
+            // Extract SkyBlock item tag for icon lookup.
+            // The NBT path differs between the two extraction paths:
+            //   full component_patch: nbt["minecraft:custom_data"]["nbt"]["ExtraAttributes"]["id"]
+            //   fallback (individual components): nbt["minecraft:custom_data"]["ExtraAttributes"]["id"]
+            if let Some(tag) = nbt_data.get("minecraft:custom_data")
+                .and_then(|cd| {
+                    // Try full component_patch path first (has extra "nbt" wrapper)
+                    cd.get("nbt")
+                        .and_then(|n| n.get("ExtraAttributes"))
+                        .and_then(|ea| ea.get("id"))
+                        .and_then(|id| id.as_str())
+                        // Fallback path puts ExtraAttributes directly under custom_data
+                        .or_else(|| {
+                            cd.get("ExtraAttributes")
+                                .and_then(|ea| ea.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
+                }) {
                 slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
                     "tag".to_string(),
                     serde_json::Value::String(tag.to_string()),

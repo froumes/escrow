@@ -2,6 +2,50 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
+/// Serde helpers that serialize `None` as `""` and deserialize `""` as `None`.
+/// This ensures optional string config fields always appear in the saved TOML file
+/// so users can see and edit them without needing to know the field names.
+mod opt_string_as_empty {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(value.as_deref().unwrap_or(""))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(if s.is_empty() { None } else { Some(s) })
+    }
+}
+
+/// Serde helpers that serialize `None` as `0.0` and deserialize `0.0` (or any non-positive value) as `None`.
+/// Used for `multi_switch_time` so the field appears in config.toml with a clear "disabled" value.
+/// Note: negative values are also treated as `None` (disabled) since negative hours make no sense.
+mod opt_f64_as_zero {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(value.unwrap_or(0.0))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let f = f64::deserialize(deserializer)?;
+        Ok(if f <= 0.0 { None } else { Some(f) })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Ingame Minecraft username(s). Supports multiple comma-separated accounts:
@@ -12,8 +56,8 @@ pub struct Config {
 
     /// Time in hours after which the bot switches to the next account in `ingame_name`.
     /// Only used when multiple accounts are specified. E.g. `multi_switch_time = 12.0`
-    /// means switch accounts every 12 hours.
-    #[serde(default)]
+    /// means switch accounts every 12 hours. Set to `0` to disable automatic switching.
+    #[serde(default, with = "opt_f64_as_zero")]
     pub multi_switch_time: Option<f64>,
     
     #[serde(default = "default_websocket_url")]
@@ -80,13 +124,13 @@ pub struct Config {
     pub proxy_enabled: bool,
     
     /// Proxy server address in `host:port` format, e.g. `"121.124.241.211:3313"`.
-    /// Only used when `proxy_enabled = true`.
-    #[serde(default)]
+    /// Only used when `proxy_enabled = true`. Leave empty to disable.
+    #[serde(default, with = "opt_string_as_empty")]
     pub proxy_address: Option<String>,
     
     /// Proxy credentials in `username:password` format, e.g. `"myuser:mypassword"`.
-    /// Leave unset if the proxy requires no authentication.
-    #[serde(default)]
+    /// Leave empty if the proxy requires no authentication.
+    #[serde(default, with = "opt_string_as_empty")]
     pub proxy_credentials: Option<String>,
     
     #[serde(default)]
@@ -96,7 +140,8 @@ pub struct Config {
     /// `Some(url)` = active webhook.
     pub webhook_url: Option<String>,
     
-    #[serde(default)]
+    /// Password to protect the web control panel. Leave empty to disable authentication.
+    #[serde(default, with = "opt_string_as_empty")]
     pub web_gui_password: Option<String>,
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -308,6 +353,18 @@ mod tests {
     }
 
     #[test]
+    fn multi_switch_time_zero_is_none() {
+        let config: Config = toml::from_str("multi_switch_time = 0.0").expect("config should parse");
+        assert_eq!(config.multi_switch_time, None);
+    }
+
+    #[test]
+    fn multi_switch_time_default_serializes_as_zero() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(toml.contains("multi_switch_time = 0.0"));
+    }
+
+    #[test]
     fn proxy_credentials_parsing() {
         let config: Config =
             toml::from_str(r#"proxy_credentials = "myuser:mypassword""#).expect("config should parse");
@@ -321,6 +378,27 @@ mod tests {
             toml::from_str(r#"proxy_credentials = "user:pass:word""#).expect("config should parse");
         assert_eq!(config.proxy_username(), Some("user"));
         assert_eq!(config.proxy_password(), Some("pass:word"));
+    }
+
+    #[test]
+    fn proxy_empty_string_is_none() {
+        let config: Config = toml::from_str(r#"proxy_address = """#).expect("config should parse");
+        assert_eq!(config.proxy_address, None);
+    }
+
+    #[test]
+    fn web_gui_password_empty_string_is_none() {
+        let config: Config = toml::from_str(r#"web_gui_password = """#).expect("config should parse");
+        assert_eq!(config.web_gui_password, None);
+    }
+
+    #[test]
+    fn optional_fields_appear_in_default_config() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(toml.contains("web_gui_password"), "web_gui_password should appear in default config");
+        assert!(toml.contains("proxy_address"), "proxy_address should appear in default config");
+        assert!(toml.contains("proxy_credentials"), "proxy_credentials should appear in default config");
+        assert!(toml.contains("multi_switch_time"), "multi_switch_time should appear in default config");
     }
 
     #[test]
