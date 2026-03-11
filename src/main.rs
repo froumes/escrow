@@ -987,6 +987,8 @@ async fn main() -> Result<()> {
                     // COFL sends this ~10 seconds before AH flips arrive.
                     // Matching TypeScript bazaarFlipPauser.ts: pause bazaar flips for 20 seconds
                     // when both AH flips and bazaar flips are enabled.
+                    // Relaxed ordering is fine here — these are simple toggle flags where
+                    // eventual visibility across threads is sufficient.
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
                         print_mc_chat("§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips");
                         let _ = chat_tx_ws.send("[Coflnet]: Flips in 10 seconds".to_string());

@@ -166,18 +166,16 @@ async fn toggle_bazaar(
     StatusCode::OK
 }
 
-async fn send_chat(
-    State(s): State<WebSharedState>,
-    Json(payload): Json<ChatMessage>,
-) -> impl IntoResponse {
-    let input = payload.message.trim().to_string();
-    if input.is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
+// ── Shared chat input processor ───────────────────────────────
 
-    let lowercase_input = input.to_lowercase();
+/// Process a chat input string the same way the console does:
+/// - `/cofl <cmd>` or `/baf <cmd>` → send to Coflnet WebSocket
+/// - `/<command>` → queue as Minecraft SendChat command
+/// - plain text → send to Coflnet as "chat" type
+async fn process_chat_input(input: &str, state: &WebSharedState) {
+    let lowercase = input.to_lowercase();
 
-    if lowercase_input.starts_with("/cofl") || lowercase_input.starts_with("/baf") {
+    if lowercase.starts_with("/cofl") || lowercase.starts_with("/baf") {
         let parts: Vec<&str> = input.split_whitespace().collect();
         if parts.len() > 1 {
             let command = parts[1];
@@ -188,14 +186,14 @@ async fn send_chat(
                 "data": data_json
             })
             .to_string();
-            if let Err(e) = s.ws_client.send_message(&message).await {
+            if let Err(e) = state.ws_client.send_message(&message).await {
                 error!("[WebGUI] Failed to send command to websocket: {}", e);
             }
         }
     } else if input.starts_with('/') {
-        s.command_queue.enqueue(
+        state.command_queue.enqueue(
             CommandType::SendChat {
-                message: input.clone(),
+                message: input.to_string(),
             },
             CommandPriority::High,
             false,
@@ -207,12 +205,24 @@ async fn send_chat(
             "data": data_json
         })
         .to_string();
-        if let Err(e) = s.ws_client.send_message(&message).await {
+        if let Err(e) = state.ws_client.send_message(&message).await {
             error!("[WebGUI] Failed to send chat to websocket: {}", e);
         }
     }
 
-    let _ = s.chat_tx.send(format!("> {}", input));
+    let _ = state.chat_tx.send(format!("> {}", input));
+}
+
+async fn send_chat(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<ChatMessage>,
+) -> impl IntoResponse {
+    let input = payload.message.trim().to_string();
+    if input.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    process_chat_input(&input, &s).await;
     StatusCode::OK
 }
 
@@ -275,38 +285,9 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
             Some(Ok(msg)) = socket.recv() => {
                 if let Message::Text(text) = msg {
                     let input = text.trim().to_string();
-                    if input.is_empty() {
-                        continue;
+                    if !input.is_empty() {
+                        process_chat_input(&input, &state).await;
                     }
-                    // Process the same way as the REST chat endpoint
-                    let lowercase_input = input.to_lowercase();
-                    if lowercase_input.starts_with("/cofl") || lowercase_input.starts_with("/baf") {
-                        let parts: Vec<&str> = input.split_whitespace().collect();
-                        if parts.len() > 1 {
-                            let command = parts[1];
-                            let args = parts[2..].join(" ");
-                            let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
-                            let message = serde_json::json!({
-                                "type": command,
-                                "data": data_json
-                            }).to_string();
-                            let _ = state.ws_client.send_message(&message).await;
-                        }
-                    } else if input.starts_with('/') {
-                        state.command_queue.enqueue(
-                            CommandType::SendChat { message: input.clone() },
-                            CommandPriority::High,
-                            false,
-                        );
-                    } else {
-                        let data_json = serde_json::to_string(&input).unwrap_or_else(|_| "\"\"".to_string());
-                        let message = serde_json::json!({
-                            "type": "chat",
-                            "data": data_json
-                        }).to_string();
-                        let _ = state.ws_client.send_message(&message).await;
-                    }
-                    let _ = state.chat_tx.send(format!("> {}", input));
                 }
             }
             else => break,
