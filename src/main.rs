@@ -313,6 +313,7 @@ async fn main() -> Result<()> {
             valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {

@@ -47,6 +47,9 @@ pub struct WebSharedState {
     pub web_gui_password: Option<String>,
     /// Set of valid session tokens for authenticated clients.
     pub valid_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Cached Minecraft UUID for the current account (dashes format).
+    /// Resolved lazily from the Mojang API on first `/api/auctions` request.
+    pub player_uuid: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -87,6 +90,21 @@ struct LoginPayload {
 #[derive(Serialize)]
 struct LoginResponse {
     success: bool,
+}
+
+#[derive(Serialize)]
+struct AuctionEntry {
+    uuid: String,
+    item_name: String,
+    /// SkyBlock item tag for icon lookup (e.g. "MITHRIL_DRILL_2")
+    tag: Option<String>,
+    highest_bid: i64,
+    starting_bid: i64,
+    bin: bool,
+    /// ISO 8601 end timestamp
+    end: String,
+    /// Seconds remaining until auction expires (negative = expired)
+    time_remaining_seconds: i64,
 }
 
 // ── Authentication middleware ─────────────────────────────────
@@ -184,6 +202,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/chat/send", axum::routing::post(send_chat))
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
+        .route("/api/auctions", get(get_auctions))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -428,6 +447,185 @@ async fn switch_account(
     });
 
     (StatusCode::OK, "Switching account — process will restart")
+}
+
+// ── Active auctions ───────────────────────────────────────────
+
+/// Resolve a Minecraft username to a UUID (with dashes) using the Mojang API.
+/// Returns `None` if the lookup fails.
+async fn fetch_player_uuid(username: &str) -> Option<String> {
+    let url = format!(
+        "https://api.mojang.com/users/profiles/minecraft/{}",
+        username
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let raw_id = json.get("id")?.as_str()?;
+    // Insert dashes into the raw 32-char hex UUID: 8-4-4-4-12
+    if raw_id.len() != 32 {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &raw_id[0..8],
+        &raw_id[8..12],
+        &raw_id[12..16],
+        &raw_id[16..20],
+        &raw_id[20..32]
+    ))
+}
+
+async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
+    // Resolve UUID — use cache if available, otherwise fetch from Mojang
+    let uuid = {
+        let cached = s.player_uuid.read().await.clone();
+        if let Some(u) = cached {
+            u
+        } else {
+            let name = s
+                .ingame_names
+                .get(s.current_account_index)
+                .cloned()
+                .unwrap_or_default();
+            if name.is_empty() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "No player name configured"})),
+                )
+                    .into_response();
+            }
+            match fetch_player_uuid(&name).await {
+                Some(u) => {
+                    *s.player_uuid.write().await = Some(u.clone());
+                    u
+                }
+                None => {
+                    warn!("[WebGUI] Could not resolve UUID for player '{}'", name);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "Could not resolve player UUID"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // Fetch auctions from Coflnet
+    let url = format!(
+        "https://sky.coflnet.com/api/player/{}/auctions",
+        uuid
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("[WebGUI] Failed to build HTTP client for auctions: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[WebGUI] Failed to fetch auctions from Coflnet: {}", e);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Failed to fetch auctions"})),
+            )
+                .into_response();
+        }
+    };
+
+    let raw: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[WebGUI] Failed to parse auctions response: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to parse auction data"})),
+            )
+                .into_response();
+        }
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|e| {
+            warn!("[WebGUI] System clock appears to be before Unix epoch: {}", e);
+            0
+        });
+
+    let entries: Vec<AuctionEntry> = raw
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|auction| {
+            let end_str = auction.get("end")?.as_str()?;
+            // Parse ISO 8601 end timestamp into epoch seconds; skip entries with invalid timestamps
+            let end_secs = match chrono::DateTime::parse_from_rfc3339(end_str) {
+                Ok(dt) => dt.timestamp(),
+                Err(e) => {
+                    warn!("[WebGUI] Skipping auction with invalid end timestamp '{}': {}", end_str, e);
+                    return None;
+                }
+            };
+            let time_remaining = end_secs - now_secs;
+            // Only include auctions that are still active
+            if time_remaining <= 0 {
+                return None;
+            }
+            let item_name = auction
+                .get("itemName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let tag = auction
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let highest_bid = auction
+                .get("highestBid")
+                .or_else(|| auction.get("highestBidAmount"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let starting_bid = auction
+                .get("startingBid")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let bin = auction
+                .get("bin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let uuid = auction
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AuctionEntry {
+                uuid,
+                item_name,
+                tag,
+                highest_bid,
+                starting_bid,
+                bin,
+                end: end_str.to_string(),
+                time_remaining_seconds: time_remaining,
+            })
+        })
+        .collect();
+
+    Json(entries).into_response()
 }
 
 // ── WebSocket handler for live chat ──────────────────────────
