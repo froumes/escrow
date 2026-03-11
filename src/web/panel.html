@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frikadellen BAF — Control Panel</title>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0b0d17;--bg-card:#111425;--surface:#171a2e;--border:#1e2240;--text:#c9cde8;--text-dim:#7b82a8;--heading:#eaedf9;--accent:#6c5ce7;--accent2:#a29bfe;--success:#00cec9;--danger:#ff5f56;--warn:#ffbd2e;--radius:10px}
+html{font-size:16px}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh}
+a{color:var(--accent2);text-decoration:none}
+
+/* Layout */
+.header{background:var(--bg-card);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.header h1{font-size:1.15rem;color:var(--heading);font-weight:700}
+.header h1 span{color:var(--accent2)}
+.header .links{display:flex;gap:14px;font-size:.82rem}
+.main{max-width:1100px;margin:0 auto;padding:24px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}
+@media(max-width:768px){.grid{grid-template-columns:1fr}}
+
+/* Cards */
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px 22px}
+.card h2{font-size:1rem;color:var(--heading);margin-bottom:14px;font-weight:700}
+
+/* Status */
+.status-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.status-item{background:var(--surface);border-radius:8px;padding:10px 14px}
+.status-item .label{font-size:.72rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px}
+.status-item .value{font-size:1rem;color:var(--heading);font-weight:600;margin-top:2px}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:8px;font-weight:600;font-size:.88rem;border:none;cursor:pointer;transition:background .2s,transform .15s}
+.btn:hover{transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn-pause{background:var(--warn);color:#1a1a1a}
+.btn-resume{background:var(--success);color:#1a1a1a}
+.btn-sm{padding:6px 14px;font-size:.8rem}
+
+/* Toggles */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.toggle-row:last-child{border-bottom:none}
+.toggle-label{font-size:.92rem}
+.toggle{position:relative;width:44px;height:24px;cursor:pointer}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;inset:0;background:var(--surface);border-radius:24px;border:1px solid var(--border);transition:background .2s}
+.toggle .slider::before{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;left:2px;top:2px;transition:transform .2s}
+.toggle input:checked+.slider{background:var(--accent);border-color:var(--accent)}
+.toggle input:checked+.slider::before{transform:translateX(20px)}
+
+/* Accounts */
+.account-list{display:flex;flex-direction:column;gap:8px}
+.account-item{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border-radius:8px;padding:8px 14px}
+.account-item.active{border:1px solid var(--accent)}
+.account-name{font-size:.9rem;font-weight:500}
+.account-badge{font-size:.7rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.5px}
+
+/* Inventory */
+.inv-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:4px}
+.inv-slot{aspect-ratio:1;background:var(--surface);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:.65rem;text-align:center;padding:2px;overflow:hidden;cursor:default;position:relative}
+.inv-slot.has-item{border-color:var(--accent);background:rgba(108,92,231,.08)}
+.inv-slot .count{position:absolute;bottom:1px;right:3px;font-size:.6rem;color:var(--warn);font-weight:700}
+.inv-slot:hover .tooltip{display:block}
+.tooltip{display:none;position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:.72rem;white-space:nowrap;z-index:20;color:var(--heading);pointer-events:none}
+
+/* Chat */
+.chat-box{background:#0a0c14;border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;height:340px}
+.chat-messages{flex:1;overflow-y:auto;padding:12px 14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.78rem;line-height:1.7;color:var(--text)}
+.chat-messages .msg{margin-bottom:2px;word-break:break-word}
+.chat-input-row{display:flex;border-top:1px solid var(--border)}
+.chat-input-row input{flex:1;background:transparent;border:none;color:var(--text);padding:10px 14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;outline:none}
+.chat-input-row button{background:var(--accent);color:#fff;border:none;padding:10px 18px;cursor:pointer;font-weight:600;font-size:.82rem}
+.chat-input-row button:hover{background:var(--accent2)}
+
+/* MC color codes → CSS */
+.mc-0{color:#000}.mc-1{color:#0000AA}.mc-2{color:#00AA00}.mc-3{color:#00AAAA}
+.mc-4{color:#AA0000}.mc-5{color:#AA00AA}.mc-6{color:#FFAA00}.mc-7{color:#AAAAAA}
+.mc-8{color:#555555}.mc-9{color:#5555FF}.mc-a{color:#55FF55}.mc-b{color:#55FFFF}
+.mc-c{color:#FF5555}.mc-d{color:#FF55FF}.mc-e{color:#FFFF55}.mc-f{color:#FFFFFF}
+.mc-l{font-weight:bold}.mc-o{font-style:italic}.mc-n{text-decoration:underline}
+.mc-m{text-decoration:line-through}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1><span>Frikadellen</span> BAF — Control Panel</h1>
+    <div class="links">
+        <a href="https://trexito.com" target="_blank">trexito.com</a>
+        <a href="https://github.com/TreXito/frikadellen-baf-121" target="_blank">GitHub</a>
+    </div>
+</div>
+
+<div class="main">
+
+<!-- Row 1: Status + Controls -->
+<div class="grid">
+    <div class="card">
+        <h2>Status</h2>
+        <div class="status-grid">
+            <div class="status-item"><div class="label">State</div><div class="value" id="s-state">—</div></div>
+            <div class="status-item"><div class="label">Queue</div><div class="value" id="s-queue">—</div></div>
+            <div class="status-item"><div class="label">Account</div><div class="value" id="s-account">—</div></div>
+            <div class="status-item"><div class="label">Purse</div><div class="value" id="s-purse">—</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Controls</h2>
+        <div style="display:flex;gap:10px;margin-bottom:16px">
+            <button class="btn btn-pause" id="btn-pause" onclick="pauseMacro()">⏸ Pause</button>
+            <button class="btn btn-resume" id="btn-resume" onclick="resumeMacro()">▶ Resume</button>
+        </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Auction House Flips</span>
+            <label class="toggle"><input type="checkbox" id="tog-ah" onchange="toggleAH(this.checked)"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Bazaar Flips</span>
+            <label class="toggle"><input type="checkbox" id="tog-bz" onchange="toggleBZ(this.checked)"><span class="slider"></span></label>
+        </div>
+    </div>
+</div>
+
+<!-- Row 2: Accounts + Inventory -->
+<div class="grid">
+    <div class="card">
+        <h2>Accounts</h2>
+        <div class="account-list" id="account-list">
+            <p style="color:var(--text-dim);font-size:.85rem">Loading...</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Inventory</h2>
+        <div class="inv-grid" id="inv-grid"></div>
+    </div>
+</div>
+
+<!-- Row 3: Chat (full width) -->
+<div class="card">
+    <h2>Chat</h2>
+    <div class="chat-box">
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-input-row">
+            <input type="text" id="chat-input" placeholder="Type a message or /command..." autocomplete="off">
+            <button onclick="sendChat()">Send</button>
+        </div>
+    </div>
+</div>
+
+</div><!-- .main -->
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function formatCoins(n) {
+    if (n == null) return '—';
+    return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/** Convert Minecraft §-codes to HTML spans */
+function mcToHtml(text) {
+    // Replace §<code> with spans
+    let result = '';
+    let open = 0;
+    const codeMap = {
+        '0':'mc-0','1':'mc-1','2':'mc-2','3':'mc-3','4':'mc-4','5':'mc-5',
+        '6':'mc-6','7':'mc-7','8':'mc-8','9':'mc-9','a':'mc-a','b':'mc-b',
+        'c':'mc-c','d':'mc-d','e':'mc-e','f':'mc-f','l':'mc-l','m':'mc-m',
+        'n':'mc-n','o':'mc-o'
+    };
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] === '§' && i + 1 < text.length) {
+            const code = text[i+1].toLowerCase();
+            if (code === 'r') {
+                // Reset: close all open spans
+                for (let j = 0; j < open; j++) result += '</span>';
+                open = 0;
+            } else if (codeMap[code]) {
+                result += '<span class="' + codeMap[code] + '">';
+                open++;
+            }
+            i += 2;
+        } else {
+            // Escape HTML
+            const c = text[i];
+            if (c === '<') result += '&lt;';
+            else if (c === '>') result += '&gt;';
+            else if (c === '&') result += '&amp;';
+            else result += c;
+            i++;
+        }
+    }
+    for (let j = 0; j < open; j++) result += '</span>';
+    return result;
+}
+
+/** Strip §-codes for plain text */
+function stripMC(text) {
+    return text.replace(/§[0-9a-fk-or]/gi, '');
+}
+
+// ── State ────────────────────────────────────────────────────
+let accounts = [];
+let currentIndex = 0;
+
+// ── API calls ────────────────────────────────────────────────
+async function fetchStatus() {
+    try {
+        const r = await fetch('/api/status');
+        const d = await r.json();
+        $('s-state').textContent = d.state;
+        $('s-queue').textContent = d.queue_depth;
+        $('s-account').textContent = d.current_account || '—';
+        $('s-purse').textContent = formatCoins(d.purse);
+        $('tog-ah').checked = d.enable_ah_flips;
+        $('tog-bz').checked = d.enable_bazaar_flips;
+        $('btn-pause').style.display = d.macro_paused ? 'none' : '';
+        $('btn-resume').style.display = d.macro_paused ? '' : 'none';
+        currentIndex = 0; // will be set by account name match
+        if (accounts.length === 0 && d.account_count > 0) {
+            // We don't get the full list from status, but we can show current
+        }
+    } catch(e) { console.error('Status fetch failed', e); }
+}
+
+async function pauseMacro() { await fetch('/api/pause', {method:'POST'}); fetchStatus(); }
+async function resumeMacro() { await fetch('/api/resume', {method:'POST'}); fetchStatus(); }
+
+async function toggleAH(enabled) {
+    await fetch('/api/toggle_ah', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+}
+async function toggleBZ(enabled) {
+    await fetch('/api/toggle_bazaar', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+}
+
+async function switchAccount(index) {
+    if (!confirm('Switch account? The process will restart.')) return;
+    await fetch('/api/switch_account', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index})});
+}
+
+async function fetchInventory() {
+    try {
+        const r = await fetch('/api/inventory');
+        const d = await r.json();
+        renderInventory(d);
+    } catch(e) { console.error('Inventory fetch failed', e); }
+}
+
+function renderInventory(inv) {
+    const grid = $('inv-grid');
+    grid.innerHTML = '';
+    // Player inventory slots 9-44 (36 slots: 9 hotbar + 27 main)
+    const slots = inv.slots || [];
+    for (let i = 9; i < 45; i++) {
+        const slot = slots[i];
+        const div = document.createElement('div');
+        div.className = 'inv-slot' + (slot ? ' has-item' : '');
+        if (slot) {
+            const name = slot.displayName || slot.name || '?';
+            div.textContent = stripMC(name).substring(0, 8);
+            if (slot.count > 1) {
+                const countEl = document.createElement('span');
+                countEl.className = 'count';
+                countEl.textContent = slot.count;
+                div.appendChild(countEl);
+            }
+            const tip = document.createElement('div');
+            tip.className = 'tooltip';
+            tip.textContent = stripMC(name) + (slot.count > 1 ? ' x' + slot.count : '');
+            div.appendChild(tip);
+        }
+        grid.appendChild(div);
+    }
+}
+
+// ── Chat WebSocket ───────────────────────────────────────────
+let chatWs = null;
+function connectChat() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    chatWs = new WebSocket(proto + '//' + location.host + '/api/chat/ws');
+    chatWs.onmessage = (e) => {
+        appendChat(e.data);
+    };
+    chatWs.onclose = () => {
+        setTimeout(connectChat, 2000);
+    };
+    chatWs.onerror = () => {
+        chatWs.close();
+    };
+}
+
+function appendChat(text) {
+    const box = $('chat-messages');
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.innerHTML = mcToHtml(text);
+    box.appendChild(div);
+    // Keep last 500 messages
+    while (box.children.length > 500) box.removeChild(box.firstChild);
+    box.scrollTop = box.scrollHeight;
+}
+
+function sendChat() {
+    const input = $('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+    if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+        chatWs.send(msg);
+    } else {
+        fetch('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
+    }
+    input.value = '';
+    input.focus();
+}
+
+$('chat-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') sendChat();
+});
+
+// ── Init ─────────────────────────────────────────────────────
+fetchStatus();
+fetchInventory();
+connectChat();
+setInterval(fetchStatus, 3000);
+setInterval(fetchInventory, 10000);
+</script>
+</body>
+</html>

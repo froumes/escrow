@@ -108,24 +108,6 @@ code {
 }
 .btn-nav:hover { background: var(--accent2); }
 
-/* Hamburger */
-.nav-toggle {
-    display: none;
-    background: none;
-    border: none;
-    cursor: pointer;
-    flex-direction: column;
-    gap: 5px;
-}
-.nav-toggle span {
-    display: block;
-    width: 24px;
-    height: 2px;
-    background: var(--text);
-    border-radius: 2px;
-    transition: transform var(--transition), opacity var(--transition);
-}
-
 /* ── Hero ─────────────────────────────────────────────────── */
 #hero {
     position: relative;
@@ -364,6 +346,13 @@ section:nth-child(even) { background: var(--surface); }
 .install-content { display: none; max-width: 720px; margin: 0 auto; }
 .install-content.active { display: block; }
 
+.loader-note {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: .85rem;
+    margin-top: 12px;
+}
+
 /* Terminal */
 .terminal {
     background: #1a1d2e;
@@ -415,35 +404,11 @@ footer {
 
 /* ── Mobile ───────────────────────────────────────────────── */
 @media (max-width: 768px) {
-    .nav-toggle { display: flex; }
-
     .nav-links {
-        position: fixed;
-        top: 64px;
-        left: 0;
-        right: 0;
-        background: var(--bg-nav);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        flex-direction: column;
-        gap: 0;
-        padding: 8px 0;
-        border-bottom: 1px solid var(--border);
-        transform: translateY(-120%);
-        opacity: 0;
-        transition: transform var(--transition), opacity var(--transition);
+        gap: 16px;
+        flex-wrap: wrap;
+        justify-content: center;
     }
-    .nav-links.open {
-        transform: translateY(0);
-        opacity: 1;
-    }
-    .nav-links li { width: 100%; }
-    .nav-links a {
-        display: block;
-        padding: 14px 24px;
-        border-bottom: 1px solid var(--border);
-    }
-    .btn-nav { text-align: center; margin: 8px 24px; border-radius: 8px; }
 
     section { padding: 64px 0; }
 

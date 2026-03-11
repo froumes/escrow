@@ -1,22 +1,3 @@
-// ── Mobile Nav Toggle ─────────────────────────────────────
-const toggle = document.querySelector('.nav-toggle');
-const navLinks = document.querySelector('.nav-links');
-
-if (toggle && navLinks) {
-    toggle.addEventListener('click', () => {
-        navLinks.classList.toggle('open');
-        toggle.classList.toggle('active');
-    });
-
-    // Close menu when a link is clicked
-    navLinks.querySelectorAll('a').forEach(link => {
-        link.addEventListener('click', () => {
-            navLinks.classList.remove('open');
-            toggle.classList.remove('active');
-        });
-    });
-}
-
 // ── Install Tabs ──────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
