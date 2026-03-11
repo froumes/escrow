@@ -51,10 +51,13 @@ a{color:var(--accent2);text-decoration:none}
 
 /* Accounts */
 .account-list{display:flex;flex-direction:column;gap:8px}
-.account-item{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border-radius:8px;padding:8px 14px}
-.account-item.active{border:1px solid var(--accent)}
-.account-name{font-size:.9rem;font-weight:500}
-.account-badge{font-size:.7rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.5px}
+.account-item{display:flex;align-items:center;gap:12px;background:var(--surface);border-radius:8px;padding:10px 14px;cursor:pointer;border:1px solid transparent;transition:border-color .2s,background .2s}
+.account-item:hover{background:rgba(108,92,231,.1);border-color:var(--accent2)}
+.account-item.active{border-color:var(--accent);background:rgba(108,92,231,.12)}
+.account-head{width:32px;height:32px;border-radius:4px;image-rendering:pixelated;flex-shrink:0}
+.account-info{display:flex;flex-direction:column}
+.account-name{font-size:.9rem;font-weight:600;color:var(--heading)}
+.account-badge{font-size:.68rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.5px}
 
 /* Inventory */
 .inv-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:4px}
@@ -62,6 +65,7 @@ a{color:var(--accent2);text-decoration:none}
 .inv-slot.has-item{border-color:var(--accent);background:rgba(108,92,231,.08)}
 .inv-slot .count{position:absolute;bottom:1px;right:3px;font-size:.6rem;color:var(--warn);font-weight:700}
 .inv-slot:hover .tooltip{display:block}
+.inv-slot .item-icon{width:80%;height:80%;object-fit:contain;image-rendering:pixelated}
 .tooltip{display:none;position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:.72rem;white-space:nowrap;z-index:20;color:var(--heading);pointer-events:none}
 
 /* Chat */
@@ -80,19 +84,42 @@ a{color:var(--accent2);text-decoration:none}
 .mc-c{color:#FF5555}.mc-d{color:#FF55FF}.mc-e{color:#FFFF55}.mc-f{color:#FFFFFF}
 .mc-l{font-weight:bold}.mc-o{font-style:italic}.mc-n{text-decoration:underline}
 .mc-m{text-decoration:line-through}
+
+/* Login overlay */
+.login-overlay{position:fixed;inset:0;background:rgba(11,13,23,.95);z-index:100;display:flex;align-items:center;justify-content:center}
+.login-overlay.hidden{display:none}
+.login-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:32px 36px;width:360px;max-width:90vw;text-align:center}
+.login-box h2{color:var(--heading);margin-bottom:6px;font-size:1.2rem}
+.login-box p{color:var(--text-dim);font-size:.85rem;margin-bottom:20px}
+.login-box input{width:100%;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.92rem;outline:none;margin-bottom:12px}
+.login-box input:focus{border-color:var(--accent)}
+.login-box button{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-weight:600;font-size:.92rem;cursor:pointer}
+.login-box button:hover{background:var(--accent2)}
+.login-error{color:var(--danger);font-size:.82rem;margin-bottom:10px;display:none}
 </style>
 </head>
 <body>
 
+<!-- Login overlay (shown when auth required) -->
+<div class="login-overlay hidden" id="login-overlay">
+    <div class="login-box">
+        <h2>🔒 Authentication Required</h2>
+        <p>Enter the web panel password to continue.</p>
+        <div class="login-error" id="login-error">Invalid password. Please try again.</div>
+        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+        <button onclick="doLogin()">Login</button>
+    </div>
+</div>
+
 <div class="header">
     <h1><span>Frikadellen</span> BAF — Control Panel</h1>
     <div class="links">
-        <a href="https://trexito.com" target="_blank">trexito.com</a>
+        <a href="https://tpm.auction" target="_blank">tpm.auction</a>
         <a href="https://github.com/TreXito/frikadellen-baf-121" target="_blank">GitHub</a>
     </div>
 </div>
 
-<div class="main">
+<div class="main" id="main-content">
 
 <!-- Row 1: Status + Controls -->
 <div class="grid">
@@ -163,7 +190,6 @@ function formatCoins(n) {
 
 /** Convert Minecraft §-codes to HTML spans */
 function mcToHtml(text) {
-    // Replace §<code> with spans
     let result = '';
     let open = 0;
     const codeMap = {
@@ -177,7 +203,6 @@ function mcToHtml(text) {
         if (text[i] === '§' && i + 1 < text.length) {
             const code = text[i+1].toLowerCase();
             if (code === 'r') {
-                // Reset: close all open spans
                 for (let j = 0; j < open; j++) result += '</span>';
                 open = 0;
             } else if (codeMap[code]) {
@@ -186,7 +211,6 @@ function mcToHtml(text) {
             }
             i += 2;
         } else {
-            // Escape HTML
             const c = text[i];
             if (c === '<') result += '&lt;';
             else if (c === '>') result += '&gt;';
@@ -204,14 +228,55 @@ function stripMC(text) {
     return text.replace(/§[0-9a-fk-or]/gi, '');
 }
 
+// ── Auth state ───────────────────────────────────────────────
+let needsAuth = false;
+
+async function doLogin() {
+    const pw = $('login-password').value;
+    if (!pw) return;
+    try {
+        const r = await fetch('/api/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({password: pw})
+        });
+        const d = await r.json();
+        if (d.success) {
+            $('login-overlay').classList.add('hidden');
+            $('login-error').style.display = 'none';
+            needsAuth = false;
+            fetchStatus();
+            fetchInventory();
+            connectChat();
+        } else {
+            $('login-error').style.display = 'block';
+        }
+    } catch(e) {
+        $('login-error').style.display = 'block';
+    }
+}
+
+$('login-password').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+});
+
+function showLoginOverlay() {
+    if (!needsAuth) {
+        needsAuth = true;
+        $('login-overlay').classList.remove('hidden');
+        $('login-password').focus();
+    }
+}
+
 // ── State ────────────────────────────────────────────────────
 let accounts = [];
-let currentIndex = 0;
+let currentAccountIndex = 0;
 
 // ── API calls ────────────────────────────────────────────────
 async function fetchStatus() {
     try {
         const r = await fetch('/api/status');
+        if (r.status === 401) { showLoginOverlay(); return; }
         const d = await r.json();
         $('s-state').textContent = d.state;
         $('s-queue').textContent = d.queue_depth;
@@ -221,11 +286,44 @@ async function fetchStatus() {
         $('tog-bz').checked = d.enable_bazaar_flips;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
         $('btn-resume').style.display = d.macro_paused ? '' : 'none';
-        currentIndex = 0; // will be set by account name match
-        if (accounts.length === 0 && d.account_count > 0) {
-            // We don't get the full list from status, but we can show current
-        }
+        accounts = d.accounts || [];
+        currentAccountIndex = d.current_account_index || 0;
+        renderAccounts();
     } catch(e) { console.error('Status fetch failed', e); }
+}
+
+function renderAccounts() {
+    const list = $('account-list');
+    list.innerHTML = '';
+    if (accounts.length === 0) {
+        list.innerHTML = '<p style="color:var(--text-dim);font-size:.85rem">No accounts configured</p>';
+        return;
+    }
+    accounts.forEach((name, idx) => {
+        const div = document.createElement('div');
+        div.className = 'account-item' + (idx === currentAccountIndex ? ' active' : '');
+        div.onclick = () => switchAccount(idx);
+        const img = document.createElement('img');
+        img.className = 'account-head';
+        img.src = 'https://mc-heads.net/avatar/' + encodeURIComponent(name) + '/32';
+        img.alt = name;
+        img.loading = 'lazy';
+        const info = document.createElement('div');
+        info.className = 'account-info';
+        const nameEl = document.createElement('div');
+        nameEl.className = 'account-name';
+        nameEl.textContent = name;
+        info.appendChild(nameEl);
+        if (idx === currentAccountIndex) {
+            const badge = document.createElement('div');
+            badge.className = 'account-badge';
+            badge.textContent = 'Active';
+            info.appendChild(badge);
+        }
+        div.appendChild(img);
+        div.appendChild(info);
+        list.appendChild(div);
+    });
 }
 
 async function pauseMacro() { await fetch('/api/pause', {method:'POST'}); fetchStatus(); }
@@ -239,22 +337,38 @@ async function toggleBZ(enabled) {
 }
 
 async function switchAccount(index) {
-    if (!confirm('Switch account? The process will restart.')) return;
+    if (accounts.length <= 1) return;
+    if (index === currentAccountIndex) return;
+    if (!confirm('Switch to ' + accounts[index] + '? The process will restart.')) return;
     await fetch('/api/switch_account', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index})});
 }
 
 async function fetchInventory() {
     try {
         const r = await fetch('/api/inventory');
+        if (r.status === 401) return;
         const d = await r.json();
         renderInventory(d);
     } catch(e) { console.error('Inventory fetch failed', e); }
 }
 
+/** Get an icon URL for an inventory item */
+function getItemIconUrl(slot) {
+    // SkyBlock items: use Coflnet icon by tag
+    if (slot.tag) {
+        return 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(slot.tag);
+    }
+    // Vanilla items: use minecraft registry name (strip "minecraft:" prefix)
+    if (slot.name) {
+        const name = slot.name.replace('minecraft:', '');
+        return 'https://mc-heads.net/item/' + encodeURIComponent(name);
+    }
+    return null;
+}
+
 function renderInventory(inv) {
     const grid = $('inv-grid');
     grid.innerHTML = '';
-    // Player inventory slots 9-44 (36 slots: 9 hotbar + 27 main)
     const slots = inv.slots || [];
     for (let i = 9; i < 45; i++) {
         const slot = slots[i];
@@ -262,7 +376,21 @@ function renderInventory(inv) {
         div.className = 'inv-slot' + (slot ? ' has-item' : '');
         if (slot) {
             const name = slot.displayName || slot.name || '?';
-            div.textContent = stripMC(name).substring(0, 8);
+            const iconUrl = getItemIconUrl(slot);
+            if (iconUrl) {
+                const img = document.createElement('img');
+                img.className = 'item-icon';
+                img.src = iconUrl;
+                img.alt = stripMC(name);
+                img.loading = 'lazy';
+                img.onerror = function() {
+                    this.style.display = 'none';
+                    this.parentElement.textContent = stripMC(name).substring(0, 8);
+                };
+                div.appendChild(img);
+            } else {
+                div.textContent = stripMC(name).substring(0, 8);
+            }
             if (slot.count > 1) {
                 const countEl = document.createElement('span');
                 countEl.className = 'count';
@@ -281,6 +409,7 @@ function renderInventory(inv) {
 // ── Chat WebSocket ───────────────────────────────────────────
 let chatWs = null;
 function connectChat() {
+    if (needsAuth) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     chatWs = new WebSocket(proto + '//' + location.host + '/api/chat/ws');
     chatWs.onmessage = (e) => {
@@ -300,7 +429,6 @@ function appendChat(text) {
     div.className = 'msg';
     div.innerHTML = mcToHtml(text);
     box.appendChild(div);
-    // Keep last 500 messages
     while (box.children.length > 500) box.removeChild(box.firstChild);
     box.scrollTop = box.scrollHeight;
 }
