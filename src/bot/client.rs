@@ -2159,8 +2159,8 @@ async fn handle_window_interaction(
                         let next_window_id = window_id.wrapping_add(1);
                         // Fastbuy pre-click: deliberately targets next_window_id before it
                         // opens (optimistic latency cut). Bypasses click_window_slot's
-                        // stale-window guard because the guard only allows the *current*
-                        // window — use the raw packet path here instead.
+                        // stale-window guard, which blocks clicks to any window other than
+                        // the current one (or window 0) — use the raw packet path here instead.
                         {
                             use azalea_protocol::packets::game::s_container_click::{
                                 ServerboundContainerClick, HashedStack,

@@ -184,6 +184,7 @@ pub async fn send_webhook_item_purchased(
     purse: Option<u64>,
     buy_speed_ms: Option<u64>,
     auction_uuid: Option<&str>,
+    finder: Option<&str>,
     webhook_url: &str,
 ) {
     let mut fields = vec![
@@ -223,6 +224,28 @@ pub async fn send_webhook_item_purchased(
             "value": format!("```\n{}ms\n```", ms),
             "inline": true
         }));
+    }
+    if let Some(f) = finder {
+        if !f.is_empty() {
+            // Convert COFL snake_case finder names to readable form
+            // e.g. "SNIPER_MEDIAN" → "Sniper Median"
+            let readable = f
+                .split('_')
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            fields.push(serde_json::json!({
+                "name": "🔍 Finder",
+                "value": format!("```\n{}\n```", readable),
+                "inline": true
+            }));
+        }
     }
     if let Some(uuid) = auction_uuid {
         if !uuid.is_empty() {

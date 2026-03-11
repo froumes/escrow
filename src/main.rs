@@ -393,7 +393,7 @@ async fn main() -> Result<()> {
                     // Also grab the color-coded item name from the flip for colorful output.
                     // Buy speed comes from the event (BIN Auction View open → escrow message),
                     // which is more accurate than the flip-receive-to-purchase tracker timing.
-                    let (opt_target, opt_profit, colored_name, opt_auction_uuid) = {
+                    let (opt_target, opt_profit, colored_name, opt_auction_uuid, opt_finder) = {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
                             Ok(mut tracker) => {
@@ -404,14 +404,15 @@ async fn main() -> Result<()> {
                                     let ah_fee = calculate_ah_fee(target);
                                     let expected_profit = target as i64 - price as i64 - ah_fee as i64;
                                     let uuid = entry.0.uuid.clone();
-                                    (Some(target), Some(expected_profit), entry.0.item_name.clone(), uuid)
+                                    let finder = entry.0.finder.clone();
+                                    (Some(target), Some(expected_profit), entry.0.item_name.clone(), uuid, finder)
                                 } else {
-                                    (None, None, item_name.clone(), None)
+                                    (None, None, item_name.clone(), None, None)
                                 }
                             }
                             Err(e) => {
                                 warn!("Flip tracker lock failed at ItemPurchased: {}", e);
-                                (None, None, item_name.clone(), None)
+                                (None, None, item_name.clone(), None, None)
                             }
                         }
                     };
@@ -435,7 +436,7 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_item_purchased(
                                 &name, &item, price, opt_target, opt_profit, purse,
-                                event_buy_speed_ms, uuid_str.as_deref(), &url,
+                                event_buy_speed_ms, uuid_str.as_deref(), opt_finder.as_deref(), &url,
                             ).await;
                         });
                     }
