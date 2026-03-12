@@ -314,6 +314,8 @@ async fn main() -> Result<()> {
                 std::collections::HashSet::new(),
             )),
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            started_at: std::time::Instant::now(),
+            hypixel_api_key: config.hypixel_api_key.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -1451,7 +1453,7 @@ async fn main() -> Result<()> {
                     "§f[§4BAF§f]: §eSwitching to account §b{}§e...",
                     next_name
                 ));
-                info!("[AccountSwitch] Exiting for supervisor restart with next account");
+                info!("[AccountSwitch] Exiting for supervisor restart with next account. If the bot doesn't restart, ensure you are running it inside a restart loop (e.g. 'while true; do ./frikadellen-baf; done') or a systemd service with Restart=always.");
                 std::process::exit(0);
             });
         }

@@ -75,7 +75,7 @@ pub fn append_inventory_upload_log(line: &str) {
     }
 }
 
-fn get_logs_dir() -> PathBuf {
+pub fn get_logs_dir() -> PathBuf {
     // Use executable directory for log file
     // This allows multiple instances to run with separate logs
     let exe_dir = match std::env::current_exe() {

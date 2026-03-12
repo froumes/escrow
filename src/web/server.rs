@@ -50,6 +50,10 @@ pub struct WebSharedState {
     /// Cached Minecraft UUID for the current account (dashes format).
     /// Resolved lazily from the Mojang API on first `/api/auctions` request.
     pub player_uuid: Arc<tokio::sync::RwLock<Option<String>>>,
+    /// Timestamp when the bot process started (for uptime tracking).
+    pub started_at: std::time::Instant,
+    /// Hypixel API key for fetching active auctions (optional).
+    pub hypixel_api_key: Option<String>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -65,6 +69,7 @@ struct StatusResponse {
     current_account_index: usize,
     accounts: Vec<String>,
     purse: Option<u64>,
+    uptime_seconds: u64,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +208,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
         .route("/api/auctions", get(get_auctions))
+        .route("/api/logs/latest", get(download_latest_log))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -308,6 +314,7 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
         current_account_index: s.current_account_index,
         accounts: s.ingame_names.clone(),
         purse: s.bot_client.get_purse(),
+        uptime_seconds: s.started_at.elapsed().as_secs(),
     })
 }
 
@@ -518,11 +525,6 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
         }
     };
 
-    // Fetch auctions from Coflnet
-    let url = format!(
-        "https://sky.coflnet.com/api/player/{}/auctions",
-        uuid
-    );
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -533,6 +535,48 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    // Try Hypixel API first if an API key is configured
+    if let Some(ref api_key) = s.hypixel_api_key {
+        let uuid_no_dashes = uuid.replace('-', "");
+        let url = format!(
+            "https://api.hypixel.net/v2/skyblock/auction?player={}",
+            uuid_no_dashes
+        );
+        match client
+            .get(&url)
+            .header("API-Key", api_key.as_str())
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        if data.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let entries = parse_hypixel_auctions(&data);
+                            return Json(entries).into_response();
+                        }
+                        warn!("[WebGUI] Hypixel API returned success=false, falling back to Coflnet");
+                    }
+                    Err(e) => {
+                        warn!("[WebGUI] Failed to parse Hypixel auction response: {}", e);
+                    }
+                }
+            }
+            Ok(resp) => {
+                warn!("[WebGUI] Hypixel API returned status {}, falling back to Coflnet", resp.status());
+            }
+            Err(e) => {
+                warn!("[WebGUI] Failed to fetch auctions from Hypixel: {}", e);
+            }
+        }
+    }
+
+    // Fallback: Fetch auctions from Coflnet
+    let url = format!(
+        "https://sky.coflnet.com/api/player/{}/auctions",
+        uuid
+    );
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
@@ -628,6 +672,114 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
     Json(entries).into_response()
 }
 
+/// Parse auctions from Hypixel API response format.
+/// Hypixel uses millisecond timestamps and different field names than Coflnet.
+fn parse_hypixel_auctions(data: &serde_json::Value) -> Vec<AuctionEntry> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    data.get("auctions")
+        .and_then(|a| a.as_array())
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|auction| {
+            // Skip claimed auctions
+            if auction.get("claimed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return None;
+            }
+            let end_ms = auction.get("end").and_then(|v| v.as_i64()).unwrap_or(0);
+            let time_remaining_ms = end_ms - now_ms;
+            if time_remaining_ms <= 0 {
+                return None;
+            }
+            let item_name = auction
+                .get("item_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            // Hypixel doesn't return a tag directly; derive from item_name for icon lookup
+            let tag = derive_item_tag(&item_name);
+            let highest_bid = auction
+                .get("highest_bid_amount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let starting_bid = auction
+                .get("starting_bid")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let bin = auction
+                .get("bin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let uuid = auction
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Convert millisecond end timestamp to ISO 8601
+            let nanos = ((end_ms % 1000).unsigned_abs() as u32) * 1_000_000;
+            let end_iso = chrono::DateTime::from_timestamp(end_ms / 1000, nanos)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
+            Some(AuctionEntry {
+                uuid,
+                item_name,
+                tag,
+                highest_bid,
+                starting_bid,
+                bin,
+                end: end_iso,
+                time_remaining_seconds: (time_remaining_ms / 1000).max(0),
+            })
+        })
+        .collect()
+}
+
+/// Derive a SkyBlock item tag from an item name for icon lookup.
+/// Converts "Aspect of the End" → "ASPECT_OF_THE_END".
+fn derive_item_tag(item_name: &str) -> Option<String> {
+    if item_name.is_empty() || item_name == "Unknown" {
+        return None;
+    }
+    Some(
+        item_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect::<String>()
+            .trim_matches('_')
+            .to_string(),
+    )
+}
+
+/// Serve the latest.log file as a downloadable file.
+async fn download_latest_log() -> impl IntoResponse {
+    let logs_dir = crate::logging::get_logs_dir();
+    let log_path = logs_dir.join("latest.log");
+
+    match tokio::fs::read(&log_path).await {
+        Ok(contents) => {
+            let headers = [
+                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"latest.log\"",
+                ),
+            ];
+            (StatusCode::OK, headers, contents).into_response()
+        }
+        Err(e) => {
+            warn!("[WebGUI] Failed to read latest.log: {}", e);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Log file not found"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ── WebSocket handler for live chat ──────────────────────────
 
 async fn chat_ws_handler(
@@ -661,4 +813,66 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
         }
     }
     debug!("[WebGUI] WebSocket client disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_tag_from_item_name() {
+        assert_eq!(derive_item_tag("Aspect of the End"), Some("ASPECT_OF_THE_END".to_string()));
+        assert_eq!(derive_item_tag("Mithril Drill SX-R326"), Some("MITHRIL_DRILL_SX_R326".to_string()));
+        assert_eq!(derive_item_tag(""), None);
+        assert_eq!(derive_item_tag("Unknown"), None);
+    }
+
+    #[test]
+    fn parse_hypixel_auctions_filters_claimed_and_expired() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let data = serde_json::json!({
+            "success": true,
+            "auctions": [
+                {
+                    "uuid": "abc123",
+                    "item_name": "Diamond Sword",
+                    "starting_bid": 1000,
+                    "highest_bid_amount": 5000,
+                    "end": now_ms + 3_600_000, // 1 hour from now
+                    "bin": true,
+                    "claimed": false
+                },
+                {
+                    "uuid": "def456",
+                    "item_name": "Expired Item",
+                    "starting_bid": 500,
+                    "highest_bid_amount": 0,
+                    "end": now_ms - 1000, // Already expired
+                    "bin": false,
+                    "claimed": false
+                },
+                {
+                    "uuid": "ghi789",
+                    "item_name": "Claimed Item",
+                    "starting_bid": 2000,
+                    "highest_bid_amount": 3000,
+                    "end": now_ms + 3_600_000,
+                    "bin": false,
+                    "claimed": true
+                }
+            ]
+        });
+
+        let entries = parse_hypixel_auctions(&data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item_name, "Diamond Sword");
+        assert_eq!(entries[0].highest_bid, 5000);
+        assert!(entries[0].bin);
+        assert!(entries[0].tag.is_some());
+        assert_eq!(entries[0].tag.as_deref(), Some("DIAMOND_SWORD"));
+    }
 }

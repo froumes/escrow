@@ -143,6 +143,11 @@ pub struct Config {
     /// Password to protect the web control panel. Leave empty to disable authentication.
     #[serde(default, with = "opt_string_as_empty")]
     pub web_gui_password: Option<String>,
+
+    /// Hypixel API key for fetching active auctions. Obtain one from https://developer.hypixel.net/
+    /// Leave empty to use the Coflnet API as a fallback.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub hypixel_api_key: Option<String>,
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
@@ -218,6 +223,7 @@ impl Default for Config {
             proxy_credentials: None,
             webhook_url: None,
             web_gui_password: None,
+            hypixel_api_key: None,
             sessions: HashMap::new(),
         }
     }
