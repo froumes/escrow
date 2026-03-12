@@ -143,6 +143,7 @@ a{color:var(--accent2);text-decoration:none}
             <div class="status-item"><div class="label">Queue</div><div class="value" id="s-queue">—</div></div>
             <div class="status-item"><div class="label">Account</div><div class="value" id="s-account">—</div></div>
             <div class="status-item"><div class="label">Purse</div><div class="value" id="s-purse">—</div></div>
+            <div class="status-item"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div></div>
         </div>
     </div>
 
@@ -151,6 +152,7 @@ a{color:var(--accent2);text-decoration:none}
         <div style="display:flex;gap:10px;margin-bottom:16px">
             <button class="btn btn-pause" id="btn-pause" onclick="pauseMacro()">⏸ Pause</button>
             <button class="btn btn-resume" id="btn-resume" onclick="resumeMacro()">▶ Resume</button>
+            <a class="btn btn-sm" href="/api/logs/latest" download="latest.log" style="background:var(--surface);color:var(--text);text-decoration:none;border:1px solid var(--border)">📥 Download Logs</a>
         </div>
         <div class="toggle-row">
             <span class="toggle-label">Auction House Flips</span>
@@ -207,6 +209,17 @@ const $ = id => document.getElementById(id);
 function formatCoins(n) {
     if (n == null) return '—';
     return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function formatUptime(secs) {
+    if (secs == null) return '—';
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+    if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
+    return m + 'm ' + s + 's';
 }
 
 /** Convert Minecraft §-codes to HTML spans */
@@ -303,6 +316,7 @@ async function fetchStatus() {
         $('s-queue').textContent = d.queue_depth;
         $('s-account').textContent = d.current_account || '—';
         $('s-purse').textContent = formatCoins(d.purse);
+        $('s-uptime').textContent = formatUptime(d.uptime_seconds);
         $('tog-ah').checked = d.enable_ah_flips;
         $('tog-bz').checked = d.enable_bazaar_flips;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
@@ -430,6 +444,16 @@ function getItemIconUrl(slot) {
     // SkyBlock items: use Coflnet icon by tag
     if (slot.tag) {
         return 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(slot.tag);
+    }
+    // Fallback: derive tag from display name (e.g. "Aspect of the End" → "ASPECT_OF_THE_END")
+    if (slot.displayName) {
+        const clean = slot.displayName.replace(/§[0-9a-fk-or]/gi, '').trim();
+        if (clean && clean !== '?') {
+            const derived = clean.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase().replace(/^_+|_+$/g, '');
+            if (derived) {
+                return 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(derived);
+            }
+        }
     }
     // Vanilla items: use minecraft registry name (strip "minecraft:" prefix)
     if (slot.name) {

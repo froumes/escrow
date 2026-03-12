@@ -3518,6 +3518,21 @@ fn should_suppress_component_patch_serialization_warning(error: &serde_json::Err
     error.to_string().contains("key must be a string")
 }
 
+/// Extract the SkyBlock item tag (ExtraAttributes.id) directly from the CustomData component.
+/// This bypasses the full component_patch serialization and works even when that fails
+/// (e.g., due to enchantment HashMap key serialization issues).
+fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStackData) -> Option<String> {
+    use azalea_inventory::components::CustomData;
+    let custom_data = item_data.component_patch.get::<CustomData>()?;
+    // Serialize just the CustomData.nbt compound to JSON and extract ExtraAttributes.id
+    let nbt_val = serde_json::to_value(&custom_data.nbt).ok()?;
+    nbt_val
+        .get("ExtraAttributes")
+        .and_then(|ea| ea.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
 ///
 /// Called after every ContainerSetContent / ContainerSetSlot so that
@@ -3578,7 +3593,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             // The NBT path differs between the two extraction paths:
             //   full component_patch: nbt["minecraft:custom_data"]["nbt"]["ExtraAttributes"]["id"]
             //   fallback (individual components): nbt["minecraft:custom_data"]["ExtraAttributes"]["id"]
-            if let Some(tag) = nbt_data.get("minecraft:custom_data")
+            let tag_from_json = nbt_data.get("minecraft:custom_data")
                 .and_then(|cd| {
                     // Try full component_patch path first (has extra "nbt" wrapper)
                     cd.get("nbt")
@@ -3591,10 +3606,22 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                                 .and_then(|ea| ea.get("id"))
                                 .and_then(|id| id.as_str())
                         })
-                }) {
+                })
+                .map(|s| s.to_string());
+
+            // If JSON extraction failed, try extracting directly from the CustomData component
+            let tag = tag_from_json.or_else(|| {
+                if let Some(item_data) = item.as_present() {
+                    extract_skyblock_tag_from_custom_data(item_data)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(ref tag_str) = tag {
                 slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
                     "tag".to_string(),
-                    serde_json::Value::String(tag.to_string()),
+                    serde_json::Value::String(tag_str.clone()),
                 );
             }
             slots_array[mineflayer_slot] = slot_obj;
