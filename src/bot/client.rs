@@ -130,6 +130,9 @@ pub struct BotClient {
     /// Cancel open bazaar orders when they are older than this many minutes.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes: u64,
+    /// Cached "My Auctions" JSON extracted from the in-game Manage Auctions window.
+    /// Updated whenever the bot opens the Manage/My Auctions GUI.
+    cached_my_auctions_json: Arc<RwLock<Option<String>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -206,6 +209,7 @@ impl BotClient {
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes: 5,
+            cached_my_auctions_json: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -299,6 +303,7 @@ impl BotClient {
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
             bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
+            cached_my_auctions_json: self.cached_my_auctions_json.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -464,6 +469,13 @@ impl BotClient {
     /// handler which calls `JSON.stringify(bot.inventory)` directly.
     pub fn get_cached_inventory_json(&self) -> Option<String> {
         self.cached_inventory_json.read().clone()
+    }
+
+    /// Return the last cached "My Auctions" JSON, extracted from the in-game
+    /// Manage Auctions GUI. Returns `None` if the bot has not opened the
+    /// My Auctions window yet.
+    pub fn get_cached_my_auctions_json(&self) -> Option<String> {
+        self.cached_my_auctions_json.read().clone()
     }
 
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
@@ -721,6 +733,8 @@ pub struct BotClientState {
     /// Cancel open bazaar orders when they are older than this many minutes.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes: u64,
+    /// Cached "My Auctions" JSON shared with BotClient for instant replies.
+    pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
 }
 
 impl Default for BotClientState {
@@ -777,6 +791,7 @@ impl Default for BotClientState {
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes: 5,
+            cached_my_auctions_json: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1999,6 +2014,16 @@ async fn handle_window_interaction(
     window_id: u8,
     window_title: &str,
 ) {
+    // Cache auction data whenever "My Auctions" / "Manage Auctions" opens,
+    // regardless of bot state, so the web panel always has fresh data.
+    if is_my_auctions_window_title(window_title) {
+        // Give ContainerSetContent a moment to arrive
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        let menu = bot.menu();
+        let slots = menu.slots();
+        build_cached_my_auctions_json(&slots, state);
+    }
+
     let bot_state = *state.bot_state.read();
     
     match bot_state {
@@ -3639,6 +3664,14 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     serde_json::Value::String(tag_str.clone()),
                 );
             }
+            // Add lore lines for rich tooltip display in the web panel.
+            let lore_lines = get_item_lore_from_slot(item);
+            if !lore_lines.is_empty() {
+                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
+                    "lore".to_string(),
+                    serde_json::Value::Array(lore_lines.into_iter().map(serde_json::Value::String).collect()),
+                );
+            }
             slots_array[mineflayer_slot] = slot_obj;
         }
     }
@@ -3659,6 +3692,182 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     if let Ok(json_str) = serde_json::to_string(&inventory_json) {
         *state.cached_inventory_json.write() = Some(json_str);
     }
+}
+
+/// Parse auction slots from the "Manage Auctions" / "My Auctions" GUI window
+/// and cache the result so the web panel can display active auctions without
+/// calling the Hypixel or Coflnet APIs.
+///
+/// Each auction slot in Hypixel's "Manage Auctions" window shows:
+/// - Display name: the item name (e.g. "§6Enchanted Diamond")
+/// - Lore: contains bid/price info, time remaining, and status
+///
+/// We extract the item name, lore, tag, and parse bid/time/status from lore.
+fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &BotClientState) {
+    let mut auctions: Vec<serde_json::Value> = Vec::new();
+
+    // Auction slots are typically in the first rows of the chest (slots 0-53).
+    // Skip navigation items (like Close, Create Auction, page arrows, etc.)
+    for item in slots.iter() {
+        if item.is_empty() {
+            continue;
+        }
+        let display_name = match get_item_display_name_from_slot(item) {
+            Some(n) => n,
+            None => continue,
+        };
+        let lore = get_item_lore_from_slot(item);
+        if lore.is_empty() {
+            continue;
+        }
+
+        let combined_lower = lore.join("\n").to_lowercase();
+
+        // Skip GUI buttons/navigation items (no auction indicators at all)
+        let is_auction_slot = combined_lower.contains("ends in")
+            || combined_lower.contains("buy it now")
+            || combined_lower.contains("starting bid")
+            || combined_lower.contains("sold")
+            || combined_lower.contains("expired")
+            || combined_lower.contains("ended")
+            || combined_lower.contains("click to claim");
+        if !is_auction_slot {
+            continue;
+        }
+
+        // Determine status
+        let status = if combined_lower.contains("sold!") || combined_lower.contains("click to claim") {
+            "sold"
+        } else if combined_lower.contains("expired") || combined_lower.contains("ended") {
+            "expired"
+        } else {
+            "active"
+        };
+
+        // Determine BIN vs Auction
+        let bin = combined_lower.contains("buy it now");
+
+        // Extract price from lore (Buy It Now: X coins / Starting bid: X coins / Top bid: X coins)
+        let price = extract_price_from_lore(&lore);
+
+        // Extract time remaining
+        let time_remaining_secs = if status == "active" {
+            extract_time_remaining_from_lore(&lore)
+        } else {
+            None
+        };
+
+        // Extract tag for icon lookup
+        let tag = if let Some(item_data) = item.as_present() {
+            let nbt_data = extract_item_nbt_components(item_data);
+            nbt_data.get("minecraft:custom_data")
+                .and_then(|cd| {
+                    cd.get("nbt")
+                        .and_then(|n| n.get("ExtraAttributes"))
+                        .and_then(|ea| ea.get("id"))
+                        .and_then(|id| id.as_str())
+                        .or_else(|| cd.get("ExtraAttributes").and_then(|ea| ea.get("id")).and_then(|id| id.as_str()))
+                        .or_else(|| cd.get("nbt").and_then(|n| n.get("id")).and_then(|id| id.as_str()))
+                        .or_else(|| cd.get("id").and_then(|id| id.as_str()))
+                })
+                .map(|s| s.to_string())
+                .or_else(|| extract_skyblock_tag_from_custom_data(item_data))
+        } else {
+            None
+        };
+
+        let mut entry = serde_json::json!({
+            "item_name": remove_mc_colors(&display_name),
+            "status": status,
+            "bin": bin,
+            "starting_bid": price.unwrap_or(0),
+            "highest_bid": 0,
+            "lore": lore,
+            "time_remaining_seconds": time_remaining_secs.unwrap_or(0),
+        });
+
+        if let Some(tag_str) = &tag {
+            entry.as_object_mut().unwrap().insert("tag".to_string(), serde_json::Value::String(tag_str.clone()));
+        }
+
+        auctions.push(entry);
+    }
+
+    info!("[MyAuctions] Cached {} auction entries from Manage Auctions window", auctions.len());
+
+    if let Ok(json_str) = serde_json::to_string(&auctions) {
+        *state.cached_my_auctions_json.write() = Some(json_str);
+    }
+}
+
+/// Extract a price value from lore lines.
+/// Looks for patterns like "Buy It Now: 1,234,567 coins" or "Starting bid: 100 coins"
+/// or "Top bid: 5,000 coins"
+fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
+    for line in lore {
+        let clean = remove_mc_colors(line).to_lowercase();
+        // Match various price patterns
+        for prefix in &["buy it now:", "starting bid:", "top bid:", "sold for:"] {
+            if let Some(rest) = clean.strip_prefix(prefix) {
+                let num_str: String = rest.chars()
+                    .filter(|c| c.is_ascii_digit() || *c == ',')
+                    .collect::<String>()
+                    .replace(',', "");
+                if let Ok(n) = num_str.parse::<i64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract time remaining from lore lines.
+/// Looks for patterns like "Ends in: 1d 2h 30m" or "Ends in: 45m 20s"
+fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
+    for line in lore {
+        let clean = remove_mc_colors(line).to_lowercase();
+        if !clean.contains("ends in") {
+            continue;
+        }
+        let mut total_secs: i64 = 0;
+        // Extract days
+        if let Ok(re) = regex::Regex::new(r"(\d+)\s*d") {
+            if let Some(caps) = re.captures(&clean) {
+                if let Some(d) = caps.get(1) {
+                    total_secs += d.as_str().parse::<i64>().unwrap_or(0) * 86400;
+                }
+            }
+        }
+        // Extract hours
+        if let Ok(re) = regex::Regex::new(r"(\d+)\s*h") {
+            if let Some(caps) = re.captures(&clean) {
+                if let Some(h) = caps.get(1) {
+                    total_secs += h.as_str().parse::<i64>().unwrap_or(0) * 3600;
+                }
+            }
+        }
+        // Extract minutes
+        if let Ok(re) = regex::Regex::new(r"(\d+)\s*m(?!s)") {
+            if let Some(caps) = re.captures(&clean) {
+                if let Some(m) = caps.get(1) {
+                    total_secs += m.as_str().parse::<i64>().unwrap_or(0) * 60;
+                }
+            }
+        }
+        // Extract seconds
+        if let Ok(re) = regex::Regex::new(r"(\d+)\s*s") {
+            if let Some(caps) = re.captures(&clean) {
+                if let Some(s) = caps.get(1) {
+                    total_secs += s.as_str().parse::<i64>().unwrap_or(0);
+                }
+            }
+        }
+        if total_secs > 0 {
+            return Some(total_secs);
+        }
+    }
+    None
 }
 
 fn bazaar_order_log_path() -> std::path::PathBuf {
