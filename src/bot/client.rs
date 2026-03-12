@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use bevy_app::AppExit;
-#[cfg(test)]
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
@@ -3667,7 +3666,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             // Add lore lines for rich tooltip display in the web panel.
             let lore_lines = get_item_lore_from_slot(item);
             if !lore_lines.is_empty() {
-                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
+                slot_obj.as_object_mut().expect("slot_obj is a JSON object created via json! macro").insert(
                     "lore".to_string(),
                     serde_json::Value::Array(lore_lines.into_iter().map(serde_json::Value::String).collect()),
                 );
@@ -3825,42 +3824,35 @@ fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
 /// Extract time remaining from lore lines.
 /// Looks for patterns like "Ends in: 1d 2h 30m" or "Ends in: 45m 20s"
 fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
+    static RE_DAYS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*d").unwrap());
+    static RE_HOURS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*h").unwrap());
+    static RE_MINS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*m(?!s)").unwrap());
+    static RE_SECS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*s").unwrap());
+
     for line in lore {
         let clean = remove_mc_colors(line).to_lowercase();
         if !clean.contains("ends in") {
             continue;
         }
         let mut total_secs: i64 = 0;
-        // Extract days
-        if let Ok(re) = regex::Regex::new(r"(\d+)\s*d") {
-            if let Some(caps) = re.captures(&clean) {
-                if let Some(d) = caps.get(1) {
-                    total_secs += d.as_str().parse::<i64>().unwrap_or(0) * 86400;
-                }
+        if let Some(caps) = RE_DAYS.captures(&clean) {
+            if let Some(d) = caps.get(1) {
+                total_secs += d.as_str().parse::<i64>().unwrap_or(0) * 86400;
             }
         }
-        // Extract hours
-        if let Ok(re) = regex::Regex::new(r"(\d+)\s*h") {
-            if let Some(caps) = re.captures(&clean) {
-                if let Some(h) = caps.get(1) {
-                    total_secs += h.as_str().parse::<i64>().unwrap_or(0) * 3600;
-                }
+        if let Some(caps) = RE_HOURS.captures(&clean) {
+            if let Some(h) = caps.get(1) {
+                total_secs += h.as_str().parse::<i64>().unwrap_or(0) * 3600;
             }
         }
-        // Extract minutes
-        if let Ok(re) = regex::Regex::new(r"(\d+)\s*m(?!s)") {
-            if let Some(caps) = re.captures(&clean) {
-                if let Some(m) = caps.get(1) {
-                    total_secs += m.as_str().parse::<i64>().unwrap_or(0) * 60;
-                }
+        if let Some(caps) = RE_MINS.captures(&clean) {
+            if let Some(m) = caps.get(1) {
+                total_secs += m.as_str().parse::<i64>().unwrap_or(0) * 60;
             }
         }
-        // Extract seconds
-        if let Ok(re) = regex::Regex::new(r"(\d+)\s*s") {
-            if let Some(caps) = re.captures(&clean) {
-                if let Some(s) = caps.get(1) {
-                    total_secs += s.as_str().parse::<i64>().unwrap_or(0);
-                }
+        if let Some(caps) = RE_SECS.captures(&clean) {
+            if let Some(s) = caps.get(1) {
+                total_secs += s.as_str().parse::<i64>().unwrap_or(0);
             }
         }
         if total_secs > 0 {
