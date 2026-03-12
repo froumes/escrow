@@ -3826,7 +3826,7 @@ fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
 fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
     static RE_DAYS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*d").unwrap());
     static RE_HOURS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*h").unwrap());
-    static RE_MINS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*m(?!s)").unwrap());
+    static RE_MINS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*m(?:[^s]|$)").unwrap());
     static RE_SECS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*s").unwrap());
 
     for line in lore {
