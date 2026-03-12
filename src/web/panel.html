@@ -67,14 +67,18 @@ a{color:var(--accent2);text-decoration:none}
 .inv-slot .count{position:absolute;bottom:1px;right:3px;font-size:.6rem;color:var(--warn);font-weight:700}
 .inv-slot:hover .tooltip{display:block}
 .inv-slot .item-icon{width:80%;height:80%;object-fit:contain;image-rendering:pixelated}
-.tooltip{display:none;position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:.72rem;white-space:nowrap;z-index:20;color:var(--heading);pointer-events:none}
+.tooltip{display:none;position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:.72rem;white-space:pre-line;z-index:20;color:var(--heading);pointer-events:none;max-width:300px;line-height:1.5;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+.tooltip .tip-title{font-weight:700;color:var(--accent2);margin-bottom:4px}
+.tooltip .tip-lore{color:var(--text-dim);font-size:.68rem}
 
 /* Auctions */
 .auction-table{width:100%;border-collapse:collapse;font-size:.82rem}
 .auction-table th{text-align:left;color:var(--text-dim);font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;padding:4px 8px;border-bottom:1px solid var(--border)}
 .auction-table td{padding:8px;border-bottom:1px solid rgba(30,34,64,.5);vertical-align:middle}
 .auction-table tr:last-child td{border-bottom:none}
+.auction-table tr{position:relative}
 .auction-table tr:hover td{background:rgba(108,92,231,.05)}
+.auction-table td:hover .tooltip{display:block}
 .auction-icon{width:28px;height:28px;image-rendering:pixelated;border-radius:4px;vertical-align:middle}
 .auction-bid{color:var(--warn);font-weight:700}
 .auction-bin{display:inline-block;background:var(--success);color:#000;font-size:.65rem;font-weight:700;padding:1px 5px;border-radius:4px;margin-left:4px}
@@ -420,6 +424,7 @@ function renderAuctions(auctions) {
     const tbody = document.createElement('tbody');
     auctions.forEach(a => {
         const tr = document.createElement('tr');
+        tr.style.position = 'relative';
         const iconUrl = a.tag
             ? 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(a.tag)
             : null;
@@ -433,6 +438,25 @@ function renderAuctions(auctions) {
             '<td class="auction-bid"><span title="coins">' + bid.toLocaleString() + ' ✦</span></td>' +
             '<td>' + (a.bin ? '<span class="auction-bin">BIN</span>' : 'Auction') + '</td>' +
             '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>';
+        // Add lore tooltip if available
+        if (a.lore && a.lore.length > 0) {
+            const tip = document.createElement('div');
+            tip.className = 'tooltip';
+            const titleEl = document.createElement('div');
+            titleEl.className = 'tip-title';
+            titleEl.textContent = a.item_name;
+            tip.appendChild(titleEl);
+            const loreEl = document.createElement('div');
+            loreEl.className = 'tip-lore';
+            loreEl.textContent = a.lore.join('\n');
+            tip.appendChild(loreEl);
+            // Attach tooltip to the item name cell (second td)
+            const nameCell = tr.querySelectorAll('td')[1];
+            if (nameCell) {
+                nameCell.style.position = 'relative';
+                nameCell.appendChild(tip);
+            }
+        }
         tbody.appendChild(tr);
     });
     table.appendChild(tbody);
@@ -497,7 +521,16 @@ function renderInventory(inv) {
             }
             const tip = document.createElement('div');
             tip.className = 'tooltip';
-            tip.textContent = stripMC(name) + (slot.count > 1 ? ' x' + slot.count : '');
+            const titleEl = document.createElement('div');
+            titleEl.className = 'tip-title';
+            titleEl.textContent = stripMC(name) + (slot.count > 1 ? ' x' + slot.count : '');
+            tip.appendChild(titleEl);
+            if (slot.lore && slot.lore.length > 0) {
+                const loreEl = document.createElement('div');
+                loreEl.className = 'tip-lore';
+                loreEl.textContent = slot.lore.join('\n');
+                tip.appendChild(loreEl);
+            }
             div.appendChild(tip);
         }
         grid.appendChild(div);

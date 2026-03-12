@@ -110,6 +110,9 @@ struct AuctionEntry {
     end: String,
     /// Seconds remaining until auction expires (negative = expired)
     time_remaining_seconds: i64,
+    /// Lore lines from the in-game item tooltip (only present for GUI-sourced entries)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lore: Option<Vec<String>>,
 }
 
 // ── Authentication middleware ─────────────────────────────────
@@ -490,6 +493,39 @@ async fn fetch_player_uuid(username: &str) -> Option<String> {
 }
 
 async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
+    // Try locally cached "My Auctions" data first (extracted from in-game GUI).
+    // This provides immediate, accurate data without external API calls.
+    if let Some(cached_json) = s.bot_client.get_cached_my_auctions_json() {
+        // Parse the cached array and convert to AuctionEntry format
+        if let Ok(cached_arr) = serde_json::from_str::<Vec<serde_json::Value>>(&cached_json) {
+            let entries: Vec<AuctionEntry> = cached_arr
+                .into_iter()
+                .filter(|a| {
+                    // Only include active auctions
+                    a.get("status").and_then(|s| s.as_str()).unwrap_or("") == "active"
+                })
+                .map(|a| {
+                    AuctionEntry {
+                        uuid: String::new(),
+                        item_name: a.get("item_name").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                        tag: a.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        highest_bid: a.get("highest_bid").and_then(|v| v.as_i64()).unwrap_or(0),
+                        starting_bid: a.get("starting_bid").and_then(|v| v.as_i64()).unwrap_or(0),
+                        bin: a.get("bin").and_then(|v| v.as_bool()).unwrap_or(false),
+                        end: String::new(),
+                        time_remaining_seconds: a.get("time_remaining_seconds").and_then(|v| v.as_i64()).unwrap_or(0),
+                        lore: a.get("lore").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|l| l.as_str().map(|s| s.to_string())).collect()
+                        }),
+                    }
+                })
+                .collect();
+            if !entries.is_empty() {
+                return Json(entries).into_response();
+            }
+        }
+    }
+
     // Resolve UUID — use cache if available, otherwise fetch from Mojang
     let uuid = {
         let cached = s.player_uuid.read().await.clone();
@@ -665,6 +701,7 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
                 bin,
                 end: end_str.to_string(),
                 time_remaining_seconds: time_remaining,
+                lore: None,
             })
         })
         .collect();
@@ -732,6 +769,7 @@ fn parse_hypixel_auctions(data: &serde_json::Value) -> Vec<AuctionEntry> {
                 bin,
                 end: end_iso,
                 time_remaining_seconds: (time_remaining_ms / 1000).max(0),
+                lore: None,
             })
         })
         .collect()
