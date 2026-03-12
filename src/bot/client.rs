@@ -3518,18 +3518,20 @@ fn should_suppress_component_patch_serialization_warning(error: &serde_json::Err
     error.to_string().contains("key must be a string")
 }
 
-/// Extract the SkyBlock item tag (ExtraAttributes.id) directly from the CustomData component.
+/// Extract the SkyBlock item tag (ExtraAttributes.id or direct id) from the CustomData component.
 /// This bypasses the full component_patch serialization and works even when that fails
 /// (e.g., due to enchantment HashMap key serialization issues).
 fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStackData) -> Option<String> {
     use azalea_inventory::components::CustomData;
     let custom_data = item_data.component_patch.get::<CustomData>()?;
-    // Serialize just the CustomData.nbt compound to JSON and extract ExtraAttributes.id
+    // Serialize just the CustomData.nbt compound to JSON and extract the id
     let nbt_val = serde_json::to_value(&custom_data.nbt).ok()?;
+    // Try ExtraAttributes.id first, then direct id (cosmetics, skins, etc.)
     nbt_val
         .get("ExtraAttributes")
         .and_then(|ea| ea.get("id"))
         .and_then(|id| id.as_str())
+        .or_else(|| nbt_val.get("id").and_then(|id| id.as_str()))
         .map(|s| s.to_string())
 }
 
@@ -3590,9 +3592,11 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                 );
             }
             // Extract SkyBlock item tag for icon lookup.
-            // The NBT path differs between the two extraction paths:
+            // The NBT path differs between the extraction paths:
             //   full component_patch: nbt["minecraft:custom_data"]["nbt"]["ExtraAttributes"]["id"]
             //   fallback (individual components): nbt["minecraft:custom_data"]["ExtraAttributes"]["id"]
+            //   direct id (cosmetics etc.): nbt["minecraft:custom_data"]["id"]
+            //   direct id under nbt wrapper: nbt["minecraft:custom_data"]["nbt"]["id"]
             let tag_from_json = nbt_data.get("minecraft:custom_data")
                 .and_then(|cd| {
                     // Try full component_patch path first (has extra "nbt" wrapper)
@@ -3604,6 +3608,17 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                         .or_else(|| {
                             cd.get("ExtraAttributes")
                                 .and_then(|ea| ea.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
+                        // Direct id under nbt wrapper (no ExtraAttributes)
+                        .or_else(|| {
+                            cd.get("nbt")
+                                .and_then(|n| n.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
+                        // Direct id under custom_data (cosmetics, skins, etc.)
+                        .or_else(|| {
+                            cd.get("id")
                                 .and_then(|id| id.as_str())
                         })
                 })
