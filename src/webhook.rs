@@ -25,9 +25,14 @@ fn format_number(n: f64) -> String {
     }
 }
 
-/// Sanitize an item name for use as an icon URL path component
+/// Sanitize an item name into an uppercase tag for use as a Coflnet icon URL path component.
+/// Converts "Meteor Magma Lord Helmet Skin" → "METEOR_MAGMA_LORD_HELMET_SKIN".
 fn sanitize_item_name(name: &str) -> String {
-    name.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
+    name.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 /// Unix timestamp seconds for Discord relative timestamps
