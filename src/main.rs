@@ -1453,9 +1453,7 @@ async fn main() -> Result<()> {
                     "§f[§4BAF§f]: §eSwitching to account §b{}§e...",
                     next_name
                 ));
-                info!("[AccountSwitch] Exiting for supervisor restart with next account. \
-                       If the bot doesn't restart, ensure you are running it inside a restart loop \
-                       (e.g. 'while true; do ./frikadellen-baf; done') or a systemd service with Restart=always.");
+                info!("[AccountSwitch] Exiting for supervisor restart with next account. If the bot doesn't restart, ensure you are running it inside a restart loop (e.g. 'while true; do ./frikadellen-baf; done') or a systemd service with Restart=always.");
                 std::process::exit(0);
             });
         }

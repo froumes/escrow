@@ -719,7 +719,8 @@ fn parse_hypixel_auctions(data: &serde_json::Value) -> Vec<AuctionEntry> {
                 .unwrap_or("")
                 .to_string();
             // Convert millisecond end timestamp to ISO 8601
-            let end_iso = chrono::DateTime::from_timestamp(end_ms / 1000, ((end_ms % 1000) * 1_000_000) as u32)
+            let nanos = ((end_ms % 1000).unsigned_abs() as u32) * 1_000_000;
+            let end_iso = chrono::DateTime::from_timestamp(end_ms / 1000, nanos)
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default();
             Some(AuctionEntry {
@@ -730,7 +731,7 @@ fn parse_hypixel_auctions(data: &serde_json::Value) -> Vec<AuctionEntry> {
                 starting_bid,
                 bin,
                 end: end_iso,
-                time_remaining_seconds: time_remaining_ms / 1000,
+                time_remaining_seconds: (time_remaining_ms / 1000).max(0),
             })
         })
         .collect()

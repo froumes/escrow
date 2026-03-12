@@ -37,6 +37,7 @@ a{color:var(--accent2);text-decoration:none}
 .btn-pause{background:var(--warn);color:#1a1a1a}
 .btn-resume{background:var(--success);color:#1a1a1a}
 .btn-sm{padding:6px 14px;font-size:.8rem}
+.btn-download{background:var(--surface);color:var(--text);text-decoration:none;border:1px solid var(--border)}
 
 /* Toggles */
 .toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
@@ -152,7 +153,7 @@ a{color:var(--accent2);text-decoration:none}
         <div style="display:flex;gap:10px;margin-bottom:16px">
             <button class="btn btn-pause" id="btn-pause" onclick="pauseMacro()">⏸ Pause</button>
             <button class="btn btn-resume" id="btn-resume" onclick="resumeMacro()">▶ Resume</button>
-            <a class="btn btn-sm" href="/api/logs/latest" download="latest.log" style="background:var(--surface);color:var(--text);text-decoration:none;border:1px solid var(--border)">📥 Download Logs</a>
+            <a class="btn btn-sm btn-download" href="/api/logs/latest" download="latest.log">📥 Download Logs</a>
         </div>
         <div class="toggle-row">
             <span class="toggle-label">Auction House Flips</span>
