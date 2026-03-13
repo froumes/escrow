@@ -513,7 +513,7 @@ function renderAuctions(auctions) {
             tip.className = 'tooltip';
             const titleEl = document.createElement('div');
             titleEl.className = 'tip-title';
-            titleEl.innerHTML = mcToHtml(a.item_name);
+            titleEl.innerHTML = mcToHtml(a.item_name_colored || a.item_name);
             tip.appendChild(titleEl);
             const loreEl = document.createElement('div');
             loreEl.className = 'tip-lore';
@@ -526,6 +526,7 @@ function renderAuctions(auctions) {
                 nameCell.appendChild(tip);
                 nameCell.addEventListener('mouseenter', e => positionTooltip(tip, e));
                 nameCell.addEventListener('mousemove', e => positionTooltip(tip, e));
+                nameCell.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
             }
         }
         tbody.appendChild(tr);
@@ -594,7 +595,7 @@ function renderInventory(inv) {
             tip.className = 'tooltip';
             const titleEl = document.createElement('div');
             titleEl.className = 'tip-title';
-            titleEl.innerHTML = mcToHtml(name) + (slot.count > 1 ? ' x' + slot.count : '');
+            titleEl.innerHTML = mcToHtml(slot.displayNameColored || name) + (slot.count > 1 ? ' x' + slot.count : '');
             tip.appendChild(titleEl);
             if (slot.lore && slot.lore.length > 0) {
                 const loreEl = document.createElement('div');
@@ -605,6 +606,7 @@ function renderInventory(inv) {
             div.appendChild(tip);
             div.addEventListener('mouseenter', e => positionTooltip(tip, e));
             div.addEventListener('mousemove', e => positionTooltip(tip, e));
+            div.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
         }
         grid.appendChild(div);
     }

@@ -902,6 +902,44 @@ fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option
     None
 }
 
+/// Get the display name of an item slot preserving §-color codes for rarity display.
+/// Same logic as `get_item_display_name_from_slot` but uses `extract_text_with_colors`
+/// so the web panel can render the name in the item's rarity color.
+fn get_item_display_name_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
+    if let Some(item_data) = item.as_present() {
+        if let Ok(value) = serde_json::to_value(item_data) {
+            let components = value.get("components");
+            let name_val = components
+                .and_then(|c| c.get("minecraft:custom_name"))
+                .or_else(|| components.and_then(|c| c.get("minecraft:item_name")));
+            if let Some(name_val) = name_val {
+                let raw = if name_val.is_string() {
+                    name_val.as_str().unwrap_or("").to_string()
+                } else {
+                    name_val.to_string()
+                };
+                let colored = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    extract_text_with_colors(&json_val)
+                } else {
+                    raw
+                };
+                return Some(colored);
+            }
+        } else {
+            use azalea_inventory::components::CustomName;
+            if let Some(cn) = item_data.component_patch.get::<CustomName>() {
+                if let Ok(cn_val) = serde_json::to_value(cn) {
+                    let colored = extract_text_with_colors(&cn_val);
+                    if !colored.is_empty() {
+                        return Some(colored);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Recursively extract plain text from an Azalea/Minecraft chat component
 fn extract_text_from_chat_component(val: &serde_json::Value) -> String {
     let mut result = String::new();
@@ -3833,6 +3871,13 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     serde_json::Value::String(display_name),
                 );
             }
+            // Add colored display name (with §-codes) for rarity-colored tooltip title
+            if let Some(colored_name) = get_item_display_name_with_colors_from_slot(item) {
+                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
+                    "displayNameColored".to_string(),
+                    serde_json::Value::String(colored_name),
+                );
+            }
             // Extract SkyBlock item tag for icon lookup.
             // The NBT path differs between the extraction paths:
             //   full component_patch: nbt["minecraft:custom_data"]["nbt"]["ExtraAttributes"]["id"]
@@ -4009,6 +4054,14 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
             "lore": lore_colored,
             "time_remaining_seconds": time_remaining_secs.unwrap_or(0),
         });
+
+        // Add colored item name (with §-codes) for rarity-colored tooltip title
+        if let Some(colored_name) = get_item_display_name_with_colors_from_slot(item) {
+            entry.as_object_mut().unwrap().insert(
+                "item_name_colored".to_string(),
+                serde_json::Value::String(colored_name),
+            );
+        }
 
         if let Some(tag_str) = &tag {
             entry.as_object_mut().unwrap().insert("tag".to_string(), serde_json::Value::String(tag_str.clone()));
