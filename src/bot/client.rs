@@ -916,6 +916,42 @@ fn extract_text_from_chat_component(val: &serde_json::Value) -> String {
     remove_mc_colors(&result)
 }
 
+/// Recursively extract text from a Minecraft chat component, preserving §-color codes.
+/// Converts JSON `"color"` fields back to § codes so the web UI can render them.
+fn extract_text_with_colors(val: &serde_json::Value) -> String {
+    let mut result = String::new();
+    // Emit color/format codes from the component's properties
+    if let Some(color) = val.get("color").and_then(|v| v.as_str()) {
+        let code = match color {
+            "black" => Some('0'), "dark_blue" => Some('1'), "dark_green" => Some('2'),
+            "dark_aqua" => Some('3'), "dark_red" => Some('4'), "dark_purple" => Some('5'),
+            "gold" => Some('6'), "gray" => Some('7'), "dark_gray" => Some('8'),
+            "blue" => Some('9'), "green" => Some('a'), "aqua" => Some('b'),
+            "red" => Some('c'), "light_purple" => Some('d'), "yellow" => Some('e'),
+            "white" => Some('f'),
+            _ => None,
+        };
+        if let Some(c) = code {
+            result.push('§');
+            result.push(c);
+        }
+    }
+    if val.get("bold").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§l"); }
+    if val.get("italic").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§o"); }
+    if val.get("underlined").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§n"); }
+    if val.get("strikethrough").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§m"); }
+    if val.get("obfuscated").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§k"); }
+    if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
+        result.push_str(text);
+    }
+    if let Some(extra) = val.get("extra").and_then(|v| v.as_array()) {
+        for part in extra {
+            result.push_str(&extract_text_with_colors(part));
+        }
+    }
+    result
+}
+
 /// Get lore lines from an item slot as plain strings (no color codes)
 fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
     let mut lore_lines = Vec::new();
@@ -938,6 +974,36 @@ fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
                         remove_mc_colors(&raw)
                     };
                     lore_lines.push(plain);
+                }
+            }
+        }
+    }
+    lore_lines
+}
+
+/// Get lore lines from an item slot preserving Minecraft §-color codes.
+/// Used by the web panel to render colorful lore tooltips.
+fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
+    let mut lore_lines = Vec::new();
+    if let Some(item_data) = item.as_present() {
+        if let Ok(value) = serde_json::to_value(item_data) {
+            if let Some(lore_arr) = value
+                .get("components")
+                .and_then(|c| c.get("minecraft:lore"))
+                .and_then(|l| l.as_array())
+            {
+                for entry in lore_arr {
+                    let raw = if entry.is_string() {
+                        entry.as_str().unwrap_or("").to_string()
+                    } else {
+                        entry.to_string()
+                    };
+                    let colored = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        extract_text_with_colors(&json_val)
+                    } else {
+                        raw
+                    };
+                    lore_lines.push(colored);
                 }
             }
         }
@@ -3818,8 +3884,8 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     serde_json::Value::String(tag_str.clone()),
                 );
             }
-            // Add lore lines for rich tooltip display in the web panel.
-            let lore_lines = get_item_lore_from_slot(item);
+            // Add lore lines with §-color codes for colorful tooltip display in the web panel.
+            let lore_lines = get_item_lore_with_colors_from_slot(item);
             if !lore_lines.is_empty() {
                 slot_obj.as_object_mut().expect("slot_obj is a JSON object created via json! macro").insert(
                     "lore".to_string(),
@@ -3874,6 +3940,8 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
         if lore.is_empty() {
             continue;
         }
+        // Colorful lore for web panel tooltip display
+        let lore_colored = get_item_lore_with_colors_from_slot(item);
 
         let combined_lower = lore.join("\n").to_lowercase();
 
@@ -3938,7 +4006,7 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
             "bin": bin,
             "starting_bid": price.unwrap_or(0),
             "highest_bid": 0,
-            "lore": lore,
+            "lore": lore_colored,
             "time_remaining_seconds": time_remaining_secs.unwrap_or(0),
         });
 
