@@ -1459,7 +1459,7 @@ async fn main() -> Result<()> {
 
                 // Safety cap: after REJOIN_MAX_ATTEMPTS consecutive failures,
                 // reset the counter so the backoff does not grow unbounded.
-                if consecutive_rejoin_attempts > REJOIN_MAX_ATTEMPTS {
+                if consecutive_rejoin_attempts >= REJOIN_MAX_ATTEMPTS {
                     warn!(
                         "[AFKHandler] {} consecutive rejoin attempts failed — resetting backoff",
                         REJOIN_MAX_ATTEMPTS
@@ -1489,6 +1489,8 @@ async fn main() -> Result<()> {
 
                 // Send commands with delays between them so each server
                 // transfer has time to complete before the next fires.
+                // Check bot state between steps: if the bot left Idle (e.g.
+                // a flip arrived), abort the sequence so we don't interfere.
                 command_queue_island.enqueue(
                     CommandType::SendChat { message: "/lobby".to_string() },
                     CommandPriority::High,
@@ -1496,12 +1498,20 @@ async fn main() -> Result<()> {
                 );
                 sleep(Duration::from_secs(5)).await;
 
+                if bot_client_island.state() != BotState::Idle {
+                    continue;
+                }
+
                 command_queue_island.enqueue(
                     CommandType::SendChat { message: "/play sb".to_string() },
                     CommandPriority::High,
                     false,
                 );
                 sleep(Duration::from_secs(10)).await;
+
+                if bot_client_island.state() != BotState::Idle {
+                    continue;
+                }
 
                 command_queue_island.enqueue(
                     CommandType::SendChat { message: "/is".to_string() },
