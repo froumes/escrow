@@ -214,6 +214,12 @@ a{color:var(--accent2);text-decoration:none}
 // ── Helpers ──────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
+function escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+}
+
 function formatCoins(n) {
     if (n == null) return '—';
     return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -443,15 +449,23 @@ function renderAuctions(auctions) {
             : null;
         const bid = a.highest_bid > 0 ? a.highest_bid : a.starting_bid;
         const urgent = a.time_remaining_seconds < 3600;
+        const escapedName = escapeHtml(a.item_name);
         tr.innerHTML =
             '<td style="width:36px">' +
-                (iconUrl ? '<img class="auction-icon" src="' + iconUrl + '" alt="' + a.item_name + '" loading="lazy" onerror="this.style.display=\'none\'">' : '') +
+                (iconUrl ? '<img class="auction-icon" src="' + iconUrl + '" alt="' + escapedName + '" loading="lazy" onerror="this.style.display=\'none\'">' : '') +
             '</td>' +
-            '<td>' + a.item_name + '</td>' +
+            '<td>' + escapedName + '</td>' +
             '<td class="auction-bid"><span title="coins">' + bid.toLocaleString() + ' ✦</span></td>' +
             '<td>' + (a.bin ? '<span class="auction-bin">BIN</span>' : 'Auction') + '</td>' +
             '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>' +
-            '<td><button class="btn btn-sm" style="background:var(--danger);font-size:.7rem;padding:3px 8px" onclick="cancelAuction(\'' + a.item_name.replace(/'/g, "\\'") + '\',' + (a.starting_bid || 0) + ')">✕ Cancel</button></td>';
+            '<td></td>';
+        // Create cancel button via DOM to avoid XSS
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.style.cssText = 'background:var(--danger);font-size:.7rem;padding:3px 8px';
+        cancelBtn.textContent = '✕ Cancel';
+        cancelBtn.addEventListener('click', () => cancelAuction(a.item_name, a.starting_bid || 0));
+        tr.lastElementChild.appendChild(cancelBtn);
         // Add lore tooltip if available
         if (a.lore && a.lore.length > 0) {
             const tip = document.createElement('div');
