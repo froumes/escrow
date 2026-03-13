@@ -17,6 +17,7 @@ use serde_json;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::HashMap;
 use std::time::Instant;
+use frikadellen_baf::utils::restart_process;
 
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
@@ -1428,7 +1429,7 @@ async fn main() -> Result<()> {
     // Automatic account switching timer.
     // When multiple accounts are configured and `multi_switch_time` is set, switch to the
     // next account after the specified number of hours by persisting the next account index
-    // and exiting so an external supervisor (systemd, a loop script, etc.) restarts the process.
+    // and restarting the process.
     if ingame_names.len() > 1 {
         if let Some(switch_hours) = config.multi_switch_time {
             let switch_secs = (switch_hours * 3600.0) as u64;
@@ -1453,8 +1454,8 @@ async fn main() -> Result<()> {
                     "§f[§4BAF§f]: §eSwitching to account §b{}§e...",
                     next_name
                 ));
-                info!("[AccountSwitch] Exiting for supervisor restart with next account. If the bot doesn't restart, ensure you are running it inside a restart loop (e.g. 'while true; do ./frikadellen-baf; done') or a systemd service with Restart=always.");
-                std::process::exit(0);
+                info!("[AccountSwitch] Restarting process with next account...");
+                restart_process();
             });
         }
     }
