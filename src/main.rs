@@ -26,6 +26,9 @@ const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
 const REJOIN_BACKOFF_BASE_SECS: u64 = 60;
 /// Maximum backoff delay between rejoin attempts (seconds).
 const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
+/// After this many consecutive rejoin attempts the counter resets so the
+/// backoff does not grow unbounded.
+const REJOIN_MAX_ATTEMPTS: u32 = 5;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -1430,11 +1433,12 @@ async fn main() -> Result<()> {
             loop {
                 sleep(Duration::from_secs(10)).await;
 
-                // Don't interfere during startup / order-management workflows.
-                if matches!(
-                    bot_client_island.state(),
-                    BotState::Startup | BotState::ManagingOrders
-                ) {
+                // Don't interfere while the bot is actively doing work.
+                // Any non-Idle state means the bot is in a GUI workflow (bazaar,
+                // purchasing, selling, claiming, …) and may have navigated away
+                // from the island — that is NOT a reason to rejoin.
+                if bot_client_island.state() != BotState::Idle {
+                    consecutive_rejoin_attempts = 0;
                     continue;
                 }
 
@@ -1452,6 +1456,16 @@ async fn main() -> Result<()> {
                 }
 
                 consecutive_rejoin_attempts += 1;
+
+                // Safety cap: after REJOIN_MAX_ATTEMPTS consecutive failures,
+                // reset the counter so the backoff does not grow unbounded.
+                if consecutive_rejoin_attempts >= REJOIN_MAX_ATTEMPTS {
+                    warn!(
+                        "[AFKHandler] {} consecutive rejoin attempts failed — resetting backoff",
+                        REJOIN_MAX_ATTEMPTS
+                    );
+                    consecutive_rejoin_attempts = 1;
+                }
 
                 // Exponential backoff: after repeated failures, wait longer to avoid
                 // infinite transfer cooldown when kicked from SkyBlock.
@@ -1473,16 +1487,40 @@ async fn main() -> Result<()> {
                 let _ = chat_tx_island.send(baf_msg);
                 info!("[AFKHandler] Not on island — sending /lobby → /play sb → /is");
 
-                for msg in ["/lobby", "/play sb", "/is"] {
-                    command_queue_island.enqueue(
-                        CommandType::SendChat { message: msg.to_string() },
-                        CommandPriority::High,
-                        false,
-                    );
+                // Send commands with delays between them so each server
+                // transfer has time to complete before the next fires.
+                // Check bot state between steps: if the bot left Idle (e.g.
+                // a flip arrived), abort the sequence so we don't interfere.
+                command_queue_island.enqueue(
+                    CommandType::SendChat { message: "/lobby".to_string() },
+                    CommandPriority::High,
+                    false,
+                );
+                sleep(Duration::from_secs(5)).await;
+
+                if bot_client_island.state() != BotState::Idle {
+                    continue;
                 }
 
-                // Wait for the navigation to complete before checking again.
-                sleep(Duration::from_secs(30)).await;
+                command_queue_island.enqueue(
+                    CommandType::SendChat { message: "/play sb".to_string() },
+                    CommandPriority::High,
+                    false,
+                );
+                sleep(Duration::from_secs(10)).await;
+
+                if bot_client_island.state() != BotState::Idle {
+                    continue;
+                }
+
+                command_queue_island.enqueue(
+                    CommandType::SendChat { message: "/is".to_string() },
+                    CommandPriority::High,
+                    false,
+                );
+
+                // Wait for the island teleport to finish before checking again.
+                sleep(Duration::from_secs(15)).await;
             }
         });
     }
