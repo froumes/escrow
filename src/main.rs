@@ -22,6 +22,11 @@ use frikadellen_baf::utils::restart_process;
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
 
+/// Base delay per consecutive rejoin attempt (seconds).
+const REJOIN_BACKOFF_BASE_SECS: u64 = 60;
+/// Maximum backoff delay between rejoin attempts (seconds).
+const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -467,10 +472,12 @@ async fn main() -> Result<()> {
                         format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
                     }).unwrap_or_default();
                     let speed_str = event_buy_speed_ms.map(|ms| format!(" §7| Buy speed: §e{}ms§r", ms)).unwrap_or_default();
-                    print_mc_chat(&format!(
+                    let baf_msg = format!(
                         "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}{}",
                         colored_name, format_coins(price as i64), profit_str, speed_str
-                    ));
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
                     // Send webhook
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
@@ -522,10 +529,12 @@ async fn main() -> Result<()> {
                         let color = if p >= 0 { "§a" } else { "§c" };
                         format!(" §7| Profit: {}{}§r", color, format_coins(p))
                     }).unwrap_or_default();
-                    print_mc_chat(&format!(
+                    let baf_msg = format!(
                         "§f[§4BAF§f]: §6⚡ SOLD §r{} §7to §e{}§7 for §6{}§7 coins!{}",
                         item_name, buyer, format_coins(price as i64), profit_str
-                    ));
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
@@ -543,10 +552,12 @@ async fn main() -> Result<()> {
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
                     let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
-                    print_mc_chat(&format!(
+                    let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
                         order_color, order_type, amount, item_name, format_coins(price_per_unit as i64)
-                    ));
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
@@ -561,10 +572,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::AuctionListed { item_name, starting_bid, duration_hours } => {
-                    print_mc_chat(&format!(
+                    let baf_msg = format!(
                         "§f[§4BAF§f]: §a🏷️ BIN listed: §r{} §7@ §6{}§7 coins for §e{}h",
                         item_name, format_coins(starting_bid as i64), duration_hours
-                    ));
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
@@ -573,6 +586,25 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_auction_listed(
                                 &name, &item, starting_bid, duration_hours, purse, &url,
+                            ).await;
+                        });
+                    }
+                }
+                frikadellen_baf::bot::BotEvent::AuctionCancelled { item_name, starting_bid } => {
+                    let baf_msg = format!(
+                        "§f[§4BAF§f]: §c❌ Auction cancelled: §r{} §7@ §6{}§7 coins",
+                        item_name, format_coins(starting_bid as i64)
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        let url = webhook_url.to_string();
+                        let name = ingame_name_for_events.clone();
+                        let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
+                        tokio::spawn(async move {
+                            frikadellen_baf::webhook::send_webhook_auction_cancelled(
+                                &name, &item, starting_bid, purse, &url,
                             ).await;
                         });
                     }
@@ -627,13 +659,15 @@ async fn main() -> Result<()> {
 
                     // Print colorful flip announcement (item name keeps its rarity color code)
                     let profit = flip.target.saturating_sub(flip.starting_bid);
-                    print_mc_chat(&format!(
+                    let baf_msg = format!(
                         "§f[§4BAF§f]: §eTrying to purchase flip: §r{}§r §7for §6{}§7 coins §7(Target: §6{}§7, Profit: §a{}§7)",
                         flip.item_name,
                         format_coins(flip.starting_bid as i64),
                         format_coins(flip.target as i64),
                         format_coins(profit as i64)
-                    ));
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_ws.send(baf_msg);
 
                     // Store flip in tracker so ItemPurchased / ItemSold webhooks can include profit
                     {
@@ -681,13 +715,15 @@ async fn main() -> Result<()> {
                     // Print colorful bazaar flip announcement
                     let effective_is_buy = bazaar_flip.effective_is_buy_order();
                     let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
-                    print_mc_chat(&format!(
+                    let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
                         order_color, order_label,
                         bazaar_flip.item_name,
                         bazaar_flip.amount,
                         format_coins(bazaar_flip.price_per_unit as i64)
-                    ));
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_ws.send(baf_msg);
 
                     // Queue the bazaar command.
                     // Matching TypeScript: SELL orders use HIGH priority (free up inventory),
@@ -998,17 +1034,21 @@ async fn main() -> Result<()> {
                     // Relaxed ordering is fine here — these are simple toggle flags where
                     // eventual visibility across threads is sufficient.
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
-                        print_mc_chat("§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips");
-                        let _ = chat_tx_ws.send("[Coflnet]: Flips in 10 seconds".to_string());
+                        let baf_msg = "§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips".to_string();
+                        print_mc_chat(&baf_msg);
+                        let _ = chat_tx_ws.send(baf_msg);
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
                         let ws = ws_client_clone.clone();
                         let enable_bz = enable_bazaar_flips_ws.clone();
+                        let chat_tx_resume = chat_tx_ws.clone();
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
                             // Notify user that bazaar flips are resuming (matching TypeScript bazaarFlipPauser.ts)
-                            print_mc_chat("§f[§4BAF§f]: §aBazaar flips resumed, requesting new recommendations...");
+                            let baf_msg = "§f[§4BAF§f]: §aBazaar flips resumed, requesting new recommendations...".to_string();
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx_resume.send(baf_msg);
                             info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
                             // Re-request bazaar flips to get fresh recommendations after the pause
                             if enable_bz.load(Ordering::Relaxed) {
@@ -1377,11 +1417,15 @@ async fn main() -> Result<()> {
     {
         let bot_client_island = bot_client.clone();
         let command_queue_island = command_queue.clone();
+        let chat_tx_island = chat_tx.clone();
         tokio::spawn(async move {
             use frikadellen_baf::types::{CommandType, CommandPriority, BotState};
 
             // Give the startup workflow time to complete before we start checking.
             sleep(Duration::from_secs(60)).await;
+
+            // Track consecutive rejoin attempts to add cooldown when kicked from SkyBlock.
+            let mut consecutive_rejoin_attempts: u32 = 0;
 
             loop {
                 sleep(Duration::from_secs(10)).await;
@@ -1403,13 +1447,30 @@ async fn main() -> Result<()> {
 
                 // If "Your Island" is in the sidebar we are home — nothing to do.
                 if lines.iter().any(|l| l.contains("Your Island")) {
+                    consecutive_rejoin_attempts = 0;
                     continue;
                 }
 
+                consecutive_rejoin_attempts += 1;
+
+                // Exponential backoff: after repeated failures, wait longer to avoid
+                // infinite transfer cooldown when kicked from SkyBlock.
+                if consecutive_rejoin_attempts > 1 {
+                    let backoff_secs = std::cmp::min(REJOIN_BACKOFF_BASE_SECS * consecutive_rejoin_attempts as u64, REJOIN_MAX_BACKOFF_SECS);
+                    let baf_msg = format!(
+                        "§f[§4BAF§f]: §cRejoin attempt #{} — waiting {}s before retry...",
+                        consecutive_rejoin_attempts, backoff_secs
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_island.send(baf_msg);
+                    warn!("[AFKHandler] Consecutive rejoin attempt #{} — backing off {}s", consecutive_rejoin_attempts, backoff_secs);
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                }
+
                 // Not on island — send the return sequence.
-                print_mc_chat(
-                    "§f[§4BAF§f]: §eNot detected on island — returning to island...",
-                );
+                let baf_msg = "§f[§4BAF§f]: §eNot detected on island — returning to island...".to_string();
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_island.send(baf_msg);
                 info!("[AFKHandler] Not on island — sending /lobby → /play sb → /is");
 
                 for msg in ["/lobby", "/play sb", "/is"] {
@@ -1436,6 +1497,7 @@ async fn main() -> Result<()> {
             let next_index = (current_account_index + 1) % ingame_names.len();
             let next_name = ingame_names[next_index].clone();
             let index_path = account_index_path.clone();
+            let chat_tx_switch = chat_tx.clone();
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
                 ingame_name, next_name, switch_hours
@@ -1450,10 +1512,12 @@ async fn main() -> Result<()> {
                 if let Err(e) = std::fs::write(&index_path, next_index.to_string()) {
                     warn!("[AccountSwitch] Failed to write account index: {}", e);
                 }
-                print_mc_chat(&format!(
+                let baf_msg = format!(
                     "§f[§4BAF§f]: §eSwitching to account §b{}§e...",
                     next_name
-                ));
+                );
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_switch.send(baf_msg);
                 info!("[AccountSwitch] Restarting process with next account...");
                 restart_process();
             });
