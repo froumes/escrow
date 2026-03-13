@@ -453,3 +453,30 @@ pub async fn send_webhook_banned(
     });
     post_embed(webhook_url, payload).await;
 }
+
+pub async fn send_webhook_auction_cancelled(
+    ingame_name: &str,
+    item_name: &str,
+    starting_bid: u64,
+    purse: Option<u64>,
+    webhook_url: &str,
+) {
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "❌ Auction Cancelled",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0xe74c3cu32,
+            "fields": [
+                {"name": "💵 Starting Bid", "value": format!("```fix\n{} coins\n```", format_number(starting_bid as f64)), "inline": true},
+            ],
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}

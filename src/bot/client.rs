@@ -175,6 +175,11 @@ pub enum BotEvent {
     },
     /// A bazaar buy/sell order was fully filled and is ready to collect
     BazaarOrderFilled,
+    /// An auction was cancelled via the web GUI
+    AuctionCancelled {
+        item_name: String,
+        starting_bid: u64,
+    },
 }
 
 impl BotClient {
@@ -2776,6 +2781,12 @@ async fn handle_window_interaction(
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 }
                 info!("[CancelAuction] Auction cancellation confirmed, going idle");
+                let cancelled_name = state.cancel_auction_item_name.read().clone();
+                let cancelled_bid = *state.cancel_auction_starting_bid.read();
+                let _ = state.event_tx.send(BotEvent::AuctionCancelled {
+                    item_name: cancelled_name,
+                    starting_bid: cancelled_bid as u64,
+                });
                 *state.bot_state.write() = BotState::Idle;
             }
         }
