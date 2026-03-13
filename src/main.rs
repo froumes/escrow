@@ -22,6 +22,11 @@ use frikadellen_baf::utils::restart_process;
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
 
+/// Base delay per consecutive rejoin attempt (seconds).
+const REJOIN_BACKOFF_BASE_SECS: u64 = 60;
+/// Maximum backoff delay between rejoin attempts (seconds).
+const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -1451,7 +1456,7 @@ async fn main() -> Result<()> {
                 // Exponential backoff: after repeated failures, wait longer to avoid
                 // infinite transfer cooldown when kicked from SkyBlock.
                 if consecutive_rejoin_attempts > 1 {
-                    let backoff_secs = std::cmp::min(60 * consecutive_rejoin_attempts as u64, 300);
+                    let backoff_secs = std::cmp::min(REJOIN_BACKOFF_BASE_SECS * consecutive_rejoin_attempts as u64, REJOIN_MAX_BACKOFF_SECS);
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §cRejoin attempt #{} — waiting {}s before retry...",
                         consecutive_rejoin_attempts, backoff_secs
