@@ -194,6 +194,8 @@ pub enum BotState {
     BuyingCookie,
     /// Instaselling a dominant inventory item via /bz → Sell Instantly to free space
     InstaSelling,
+    /// Cancelling an active auction via Manage Auctions
+    CancellingAuction,
 }
 
 impl BotState {
@@ -276,6 +278,12 @@ pub enum CommandType {
     },
     AcceptTrade {
         player_name: String,
+    },
+    /// Cancel an active auction via the Manage Auctions GUI.
+    /// Identifies the auction by item_name + starting_bid for accuracy.
+    CancelAuction {
+        item_name: String,
+        starting_bid: i64,
     },
 }
 

@@ -62,7 +62,7 @@ a{color:var(--accent2);text-decoration:none}
 
 /* Inventory */
 .inv-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:4px}
-.inv-slot{aspect-ratio:1;background:var(--surface);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:.65rem;text-align:center;padding:2px;overflow:hidden;cursor:default;position:relative}
+.inv-slot{aspect-ratio:1;background:var(--surface);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:.65rem;text-align:center;padding:2px;overflow:visible;cursor:default;position:relative}
 .inv-slot.has-item{border-color:var(--accent);background:rgba(108,92,231,.08)}
 .inv-slot .count{position:absolute;bottom:1px;right:3px;font-size:.6rem;color:var(--warn);font-weight:700}
 .inv-slot:hover .tooltip{display:block}
@@ -182,6 +182,9 @@ a{color:var(--accent2);text-decoration:none}
     <div class="card">
         <h2>Inventory</h2>
         <div class="inv-grid" id="inv-grid"></div>
+        <div style="margin-top:10px;text-align:center">
+            <button class="btn btn-sm" onclick="sellInventory()">💰 Sell Inventory</button>
+        </div>
     </div>
 </div>
 
@@ -210,6 +213,12 @@ a{color:var(--accent2);text-decoration:none}
 <script>
 // ── Helpers ──────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
+
+function escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+}
 
 function formatCoins(n) {
     if (n == null) return '—';
@@ -383,6 +392,16 @@ async function switchAccount(index) {
     await fetch('/api/switch_account', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index})});
 }
 
+async function sellInventory() {
+    if (!confirm('Sell all sellable items in your inventory?')) return;
+    await fetch('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:'/cofl sellinventory'})});
+}
+
+async function cancelAuction(itemName, startingBid) {
+    if (!confirm('Cancel auction for "' + itemName + '"?')) return;
+    await fetch('/api/cancel_auction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({item_name: itemName, starting_bid: startingBid})});
+}
+
 async function fetchInventory() {
     try {
         const r = await fetch('/api/inventory');
@@ -420,7 +439,7 @@ function renderAuctions(auctions) {
     }
     const table = document.createElement('table');
     table.className = 'auction-table';
-    table.innerHTML = '<thead><tr><th></th><th>Item</th><th>Bid</th><th>Type</th><th>Time Left</th></tr></thead>';
+    table.innerHTML = '<thead><tr><th></th><th>Item</th><th>Bid</th><th>Type</th><th>Time Left</th><th></th></tr></thead>';
     const tbody = document.createElement('tbody');
     auctions.forEach(a => {
         const tr = document.createElement('tr');
@@ -430,14 +449,23 @@ function renderAuctions(auctions) {
             : null;
         const bid = a.highest_bid > 0 ? a.highest_bid : a.starting_bid;
         const urgent = a.time_remaining_seconds < 3600;
+        const escapedName = escapeHtml(a.item_name);
         tr.innerHTML =
             '<td style="width:36px">' +
-                (iconUrl ? '<img class="auction-icon" src="' + iconUrl + '" alt="' + a.item_name + '" loading="lazy" onerror="this.style.display=\'none\'">' : '') +
+                (iconUrl ? '<img class="auction-icon" src="' + iconUrl + '" alt="' + escapedName + '" loading="lazy" onerror="this.style.display=\'none\'">' : '') +
             '</td>' +
-            '<td>' + a.item_name + '</td>' +
+            '<td>' + escapedName + '</td>' +
             '<td class="auction-bid"><span title="coins">' + bid.toLocaleString() + ' ✦</span></td>' +
             '<td>' + (a.bin ? '<span class="auction-bin">BIN</span>' : 'Auction') + '</td>' +
-            '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>';
+            '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>' +
+            '<td></td>';
+        // Create cancel button via DOM to avoid XSS
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.style.cssText = 'background:var(--danger);font-size:.7rem;padding:3px 8px';
+        cancelBtn.textContent = '✕ Cancel';
+        cancelBtn.addEventListener('click', () => cancelAuction(a.item_name, a.starting_bid || 0));
+        tr.lastElementChild.appendChild(cancelBtn);
         // Add lore tooltip if available
         if (a.lore && a.lore.length > 0) {
             const tip = document.createElement('div');

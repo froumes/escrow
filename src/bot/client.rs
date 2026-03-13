@@ -303,6 +303,8 @@ impl BotClient {
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
             bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
+            cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
+            cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -734,6 +736,10 @@ pub struct BotClientState {
     pub bazaar_order_cancel_minutes: u64,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
+    /// Item name of the auction to cancel (set by CancelAuction command).
+    pub cancel_auction_item_name: Arc<RwLock<String>>,
+    /// Starting bid of the auction to cancel (for accurate identification).
+    pub cancel_auction_starting_bid: Arc<RwLock<i64>>,
 }
 
 impl Default for BotClientState {
@@ -791,6 +797,8 @@ impl Default for BotClientState {
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
+            cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
+            cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
         }
     }
 }
@@ -2003,6 +2011,13 @@ async fn execute_command(
         CommandType::DiscoverOrders | CommandType::ExecuteOrders => {
             info!("Command type not yet fully implemented in execute_command: {:?}", command.command_type);
         }
+        CommandType::CancelAuction { item_name, starting_bid } => {
+            info!("[CancelAuction] Cancelling auction: {} (bid: {})", item_name, starting_bid);
+            *state.cancel_auction_item_name.write() = item_name.clone();
+            *state.cancel_auction_starting_bid.write() = *starting_bid;
+            bot.write_chat_packet("/ah");
+            *state.bot_state.write() = BotState::CancellingAuction;
+        }
     }
 }
 
@@ -2667,6 +2682,101 @@ async fn handle_window_interaction(
                         *claim_state_ref.write() = BotState::Idle;
                     }
                 });
+            }
+        }
+        BotState::CancellingAuction => {
+            // Cancel auction flow: /ah → Manage Auctions → find auction → Cancel Auction → Confirm
+            if window_title.contains("Auction House") {
+                info!("[CancelAuction] Auction House opened - navigating to Manage Auctions");
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                let menu = bot.menu();
+                let slots = menu.slots();
+                if let Some(i) = find_slot_by_name(&slots, "Manage Auctions")
+                    .or_else(|| find_slot_by_name(&slots, "My Auctions"))
+                {
+                    info!("[CancelAuction] Clicking Manage/My Auctions at slot {}", i);
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                } else {
+                    info!("[CancelAuction] Manage/My Auctions not found by name, clicking slot 15");
+                    click_window_slot(bot, &state.last_window_id, window_id, 15).await;
+                }
+            } else if is_my_auctions_window_title(window_title) {
+                info!("[CancelAuction] Manage Auctions opened - searching for target auction");
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                let menu = bot.menu();
+                let slots = menu.slots();
+                let target_name = state.cancel_auction_item_name.read().clone();
+                let target_bid = *state.cancel_auction_starting_bid.read();
+                let target_lower = target_name.to_lowercase();
+                // Find the auction slot matching item_name + starting_bid
+                let mut found = false;
+                for (i, item) in slots.iter().enumerate() {
+                    if item.is_empty() { continue; }
+                    let display_name = match get_item_display_name_from_slot(item) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let clean = remove_mc_colors(&display_name).to_lowercase();
+                    if !clean.contains(&target_lower) { continue; }
+                    // Verify price matches for accurate identification
+                    let lore = get_item_lore_from_slot(item);
+                    let price = extract_price_from_lore(&lore);
+                    if let Some(p) = price {
+                        if p != target_bid { continue; }
+                    }
+                    // Verify this is an active auction (not sold/expired)
+                    let combined_lower = lore.join("\n").to_lowercase();
+                    if combined_lower.contains("sold!")
+                        || combined_lower.contains("expired")
+                        || combined_lower.contains("ended")
+                    {
+                        continue;
+                    }
+                    info!("[CancelAuction] Found matching auction '{}' at slot {} (price: {:?})", display_name, i, price);
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                    found = true;
+                    break;
+                }
+                if !found {
+                    info!("[CancelAuction] Target auction not found in Manage Auctions, going idle");
+                    *state.bot_state.write() = BotState::Idle;
+                }
+            } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
+                info!("[CancelAuction] Auction detail opened - looking for Cancel Auction button");
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                let menu = bot.menu();
+                let slots = menu.slots();
+                if let Some(i) = find_slot_by_name(&slots, "Cancel Auction") {
+                    info!("[CancelAuction] Clicking Cancel Auction at slot {}", i);
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                } else {
+                    info!("[CancelAuction] Cancel Auction button not found, going idle");
+                    *state.bot_state.write() = BotState::Idle;
+                }
+                // Watchdog: go idle if no follow-up window in 2s
+                let cancel_state_ref = state.bot_state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                    if *cancel_state_ref.read() == BotState::CancellingAuction {
+                        info!("[CancelAuction] No follow-up window after 2s, going idle");
+                        *cancel_state_ref.write() = BotState::Idle;
+                    }
+                });
+            } else if window_title.contains("Confirm") {
+                info!("[CancelAuction] Confirm window opened - confirming cancellation");
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                let menu = bot.menu();
+                let slots = menu.slots();
+                // Click Confirm button — typically slot 11 or find by name
+                if let Some(i) = find_slot_by_name(&slots, "Confirm") {
+                    info!("[CancelAuction] Clicking Confirm at slot {}", i);
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                } else {
+                    info!("[CancelAuction] Confirm not found by name, clicking slot 11");
+                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                }
+                info!("[CancelAuction] Auction cancellation confirmed, going idle");
+                *state.bot_state.write() = BotState::Idle;
             }
         }
         BotState::Selling => {
@@ -3559,6 +3669,37 @@ fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStack
         .map(|s| s.to_string())
 }
 
+/// Resolve pet-specific tag from the generic "PET" tag.
+/// Pets all share ExtraAttributes.id = "PET". The actual pet type (e.g. "MAMMOTH")
+/// is inside the petInfo JSON string at ExtraAttributes.petInfo or custom_data.petInfo.
+/// Returns e.g. "PET_MAMMOTH" for Coflnet icon lookup, or the original tag unchanged.
+fn resolve_pet_tag(tag: &str, nbt_data: &serde_json::Value) -> String {
+    if tag != "PET" {
+        return tag.to_string();
+    }
+    // Try to extract petInfo from various NBT paths
+    let pet_info_str = nbt_data.get("minecraft:custom_data")
+        .and_then(|cd| {
+            // Path: custom_data.nbt.ExtraAttributes.petInfo
+            cd.get("nbt")
+                .and_then(|n| n.get("ExtraAttributes"))
+                .and_then(|ea| ea.get("petInfo"))
+                .and_then(|p| p.as_str())
+                // Fallback: custom_data.ExtraAttributes.petInfo
+                .or_else(|| cd.get("ExtraAttributes").and_then(|ea| ea.get("petInfo")).and_then(|p| p.as_str()))
+                // Fallback: custom_data.petInfo (direct)
+                .or_else(|| cd.get("petInfo").and_then(|p| p.as_str()))
+        });
+    if let Some(info_str) = pet_info_str {
+        if let Ok(info) = serde_json::from_str::<serde_json::Value>(info_str) {
+            if let Some(pet_type) = info.get("type").and_then(|t| t.as_str()) {
+                return format!("PET_{}", pet_type);
+            }
+        }
+    }
+    tag.to_string()
+}
+
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
 ///
 /// Called after every ContainerSetContent / ContainerSetSlot so that
@@ -3656,6 +3797,9 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                     None
                 }
             });
+
+            // Resolve pet-specific tags (PET → PET_MAMMOTH etc.)
+            let tag = tag.map(|t| resolve_pet_tag(&t, &nbt_data));
 
             if let Some(ref tag_str) = tag {
                 slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
@@ -3759,7 +3903,7 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
         // Extract tag for icon lookup
         let tag = if let Some(item_data) = item.as_present() {
             let nbt_data = extract_item_nbt_components(item_data);
-            nbt_data.get("minecraft:custom_data")
+            let raw_tag = nbt_data.get("minecraft:custom_data")
                 .and_then(|cd| {
                     cd.get("nbt")
                         .and_then(|n| n.get("ExtraAttributes"))
@@ -3770,7 +3914,9 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
                         .or_else(|| cd.get("id").and_then(|id| id.as_str()))
                 })
                 .map(|s| s.to_string())
-                .or_else(|| extract_skyblock_tag_from_custom_data(item_data))
+                .or_else(|| extract_skyblock_tag_from_custom_data(item_data));
+            // Resolve pet-specific tags (PET → PET_MAMMOTH etc.)
+            raw_tag.map(|t| resolve_pet_tag(&t, &nbt_data))
         } else {
             None
         };
@@ -4640,5 +4786,52 @@ mod tests {
         assert!(!result.contains_key("minecraft:lore"));
         assert!(!result.contains_key("minecraft:profile"));
         assert!(!result.contains_key("minecraft:tooltip_display"));
+    }
+
+    #[test]
+    fn test_resolve_pet_tag_mammoth() {
+        let nbt = serde_json::json!({
+            "minecraft:custom_data": {
+                "id": "PET",
+                "petInfo": "{\"type\":\"MAMMOTH\",\"active\":false,\"exp\":3.82685830919321E7,\"tier\":\"LEGENDARY\"}"
+            }
+        });
+        assert_eq!(resolve_pet_tag("PET", &nbt), "PET_MAMMOTH");
+    }
+
+    #[test]
+    fn test_resolve_pet_tag_nested_nbt() {
+        let nbt = serde_json::json!({
+            "minecraft:custom_data": {
+                "nbt": {
+                    "ExtraAttributes": {
+                        "id": "PET",
+                        "petInfo": "{\"type\":\"PHOENIX\",\"tier\":\"LEGENDARY\"}"
+                    }
+                }
+            }
+        });
+        assert_eq!(resolve_pet_tag("PET", &nbt), "PET_PHOENIX");
+    }
+
+    #[test]
+    fn test_resolve_pet_tag_non_pet_unchanged() {
+        let nbt = serde_json::json!({
+            "minecraft:custom_data": {
+                "id": "ASPECT_OF_THE_END"
+            }
+        });
+        assert_eq!(resolve_pet_tag("ASPECT_OF_THE_END", &nbt), "ASPECT_OF_THE_END");
+    }
+
+    #[test]
+    fn test_resolve_pet_tag_no_pet_info_falls_back() {
+        let nbt = serde_json::json!({
+            "minecraft:custom_data": {
+                "id": "PET"
+            }
+        });
+        // No petInfo available — falls back to "PET"
+        assert_eq!(resolve_pet_tag("PET", &nbt), "PET");
     }
 }

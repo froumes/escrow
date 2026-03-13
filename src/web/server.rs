@@ -88,6 +88,12 @@ struct SwitchPayload {
 }
 
 #[derive(Deserialize)]
+struct CancelAuctionPayload {
+    item_name: String,
+    starting_bid: i64,
+}
+
+#[derive(Deserialize)]
 struct LoginPayload {
     password: String,
 }
@@ -210,6 +216,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/chat/send", axum::routing::post(send_chat))
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
+        .route("/api/cancel_auction", axum::routing::post(cancel_auction))
         .route("/api/auctions", get(get_auctions))
         .route("/api/logs/latest", get(download_latest_log))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
@@ -450,13 +457,39 @@ async fn switch_account(
         .chat_tx
         .send(format!("[BAF Web] Switching to account {}...", next_name));
 
-    // Exit so that the supervisor restarts the process with the new account.
+    // Restart the process with the new account index.
     tokio::spawn(async {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        std::process::exit(0);
+        crate::utils::restart_process();
     });
 
     (StatusCode::OK, "Switching account — process will restart")
+}
+
+async fn cancel_auction(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<CancelAuctionPayload>,
+) -> impl IntoResponse {
+    info!(
+        "[WebGUI] Cancel auction requested: '{}' (bid: {})",
+        payload.item_name, payload.starting_bid
+    );
+
+    let _ = s.chat_tx.send(format!(
+        "[BAF Web] Cancelling auction: {}...",
+        payload.item_name
+    ));
+
+    s.command_queue.enqueue(
+        CommandType::CancelAuction {
+            item_name: payload.item_name,
+            starting_bid: payload.starting_bid,
+        },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Cancel auction command queued")
 }
 
 // ── Active auctions ───────────────────────────────────────────
