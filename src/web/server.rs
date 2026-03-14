@@ -469,16 +469,8 @@ async fn switch_account(
     // Restart the process with the new account index.
     tokio::spawn(async move {
         if license_index > 0 {
-            let args = format!("use {} {}", license_index, target_name);
-            let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
-            let message = serde_json::json!({
-                "type": "license",
-                "data": data_json
-            }).to_string();
-            if let Err(e) = ws.send_message(&message).await {
-                warn!("[WebGUI] Failed to send license transfer command: {}", e);
-            } else {
-                info!("[WebGUI] Sent /cofl license use {} {}", license_index, target_name);
+            if let Err(e) = ws.transfer_license(license_index, &target_name).await {
+                warn!("[WebGUI] Failed to transfer license: {}", e);
             }
             // Give COFL time to process the license transfer before restarting.
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;

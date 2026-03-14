@@ -270,6 +270,23 @@ impl CoflWebSocket {
         debug!("Sent WS message ({} bytes)", message.len());
         Ok(())
     }
+
+    /// Transfer a COFL license to a different IGN.
+    ///
+    /// Sends `/cofl license use <license_index> <target_ign>` via the WebSocket.
+    /// Used before account switching to move the license to the next account.
+    pub async fn transfer_license(&self, license_index: u32, target_ign: &str) -> Result<()> {
+        let args = format!("use {} {}", license_index, target_ign);
+        let data_json = serde_json::to_string(&args)
+            .context("Failed to serialize license transfer args")?;
+        let message = serde_json::json!({
+            "type": "license",
+            "data": data_json
+        }).to_string();
+        self.send_message(&message).await?;
+        info!("[LicenseTransfer] Sent /cofl license use {} {}", license_index, target_ign);
+        Ok(())
+    }
 }
 
 fn extract_upload_inventory_payload(message: &str) -> Option<String> {

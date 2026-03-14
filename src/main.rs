@@ -1551,16 +1551,8 @@ async fn main() -> Result<()> {
                 );
                 // Transfer the COFL license to the next account before restarting.
                 if license_index > 0 {
-                    let args = format!("use {} {}", license_index, next_name);
-                    let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
-                    let message = serde_json::json!({
-                        "type": "license",
-                        "data": data_json
-                    }).to_string();
-                    if let Err(e) = ws_switch.send_message(&message).await {
-                        warn!("[AccountSwitch] Failed to send license transfer command: {}", e);
-                    } else {
-                        info!("[AccountSwitch] Sent /cofl license use {} {}", license_index, next_name);
+                    if let Err(e) = ws_switch.transfer_license(license_index, &next_name).await {
+                        warn!("[AccountSwitch] Failed to transfer license: {}", e);
                     }
                     // Give COFL time to process the license transfer before restarting.
                     sleep(Duration::from_secs(3)).await;
