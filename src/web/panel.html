@@ -453,7 +453,7 @@ async function claimPurchases() {
 }
 
 async function collectBzOrders() {
-    if (!confirm('Collect filled bazaar orders (sell instantly)?')) return;
+    if (!confirm('Sell entire inventory instantly on the Bazaar?')) return;
     await fetch('/api/collect_bz_orders', {method:'POST'});
 }
 

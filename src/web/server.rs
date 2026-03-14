@@ -513,17 +513,17 @@ async fn claim_purchases(
 async fn collect_bz_orders(
     State(s): State<WebSharedState>,
 ) -> impl IntoResponse {
-    info!("[WebGUI] Collect bazaar orders (sell instantly) requested");
+    info!("[WebGUI] Sell inventory instantly on bazaar requested");
 
-    let _ = s.chat_tx.send("[BAF Web] Collecting bazaar orders...".to_string());
+    let _ = s.chat_tx.send("[BAF Web] Selling inventory on bazaar...".to_string());
 
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: false },
+        CommandType::SellInventoryBz,
         CommandPriority::High,
         false,
     );
 
-    (StatusCode::OK, "Collect bazaar orders command queued")
+    (StatusCode::OK, "Sell inventory on bazaar command queued")
 }
 
 // ── Active auctions ───────────────────────────────────────────

@@ -196,6 +196,8 @@ pub enum BotState {
     InstaSelling,
     /// Cancelling an active auction via Manage Auctions
     CancellingAuction,
+    /// Selling whole inventory instantly via /bz → slot 47 → slot 11
+    SellingInventoryBz,
 }
 
 impl BotState {
@@ -285,6 +287,9 @@ pub enum CommandType {
         item_name: String,
         starting_bid: i64,
     },
+    /// Sell entire inventory instantly via /bz → "Sell Inventory Now" (slot 47)
+    /// → "Selling whole inventory" (slot 11).
+    SellInventoryBz,
 }
 
 /// Window types that can be opened
