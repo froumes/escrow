@@ -429,4 +429,5 @@ proxy_credentials = "myuser:mypassword"
         assert!(!toml.contains("[skip]"));
         assert!(!toml.contains("min_profit"));
     }
+
 }

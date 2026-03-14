@@ -30,6 +30,10 @@ const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
 /// backoff does not grow unbounded.
 const REJOIN_MAX_ATTEMPTS: u32 = 5;
 
+/// Maximum number of COFL license list pages to search when auto-detecting
+/// the current account's license index.
+const LICENSE_MAX_PAGES: u32 = 10;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -216,6 +220,15 @@ async fn main() -> Result<()> {
     // Tuple: (tier, expires_str) e.g. ("Premium Plus", "2026-Feb-10 08:55 UTC").
     let cofl_premium: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
+    // Auto-detected COFL license index for the current IGN.
+    // Populated at startup by requesting `/cofl licenses list` and parsing the response.
+    // 0 means no license detected.
+    let detected_cofl_license = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // Tracks the cumulative number of license entries seen across pages so far,
+    // used to compute the global license index when paginating.
+    let license_entries_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
         // Check if session is expired
@@ -278,6 +291,25 @@ async fn main() -> Result<()> {
         });
     }
 
+    // When multi-account is enabled, request the COFL licenses list at startup
+    // so we can auto-detect which license is assigned to the current IGN.
+    // Delay slightly to let the WS authenticate first.
+    if ingame_names.len() > 1 {
+        let ws_license = ws_client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let message = serde_json::json!({
+                "type": "licenses",
+                "data": "\"list\""
+            }).to_string();
+            if let Err(e) = ws_license.send_message(&message).await {
+                warn!("[LicenseDetect] Failed to request licenses list: {}", e);
+            } else {
+                info!("[LicenseDetect] Requested COFL licenses list for auto-detection");
+            }
+        });
+    }
+
     // Initialize and connect bot client
     info!("Initializing Minecraft bot...");
     info!("Authenticating with Microsoft account...");
@@ -325,6 +357,7 @@ async fn main() -> Result<()> {
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),
             hypixel_api_key: config.hypixel_api_key.clone(),
+            detected_cofl_license: detected_cofl_license.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -641,6 +674,9 @@ async fn main() -> Result<()> {
     let enable_ah_flips_ws = enable_ah_flips.clone();
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
     let chat_tx_ws = chat_tx.clone();
+    let detected_cofl_license_ws = detected_cofl_license.clone();
+    let ingame_name_ws = ingame_name.clone();
+    let license_entries_seen_ws = license_entries_seen.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1066,6 +1102,42 @@ async fn main() -> Result<()> {
                                 }
                             }
                         });
+                    }
+                }
+                CoflEvent::LicenseList { entries, page } => {
+                    // Auto-detect which license belongs to the current IGN.
+                    // Entries have page-local 1-based indices; add the cumulative
+                    // offset from previous pages to get the global license index.
+                    let offset = license_entries_seen_ws.load(Ordering::Relaxed);
+                    let page_count = entries.len() as u32;
+                    license_entries_seen_ws.fetch_add(page_count, Ordering::Relaxed);
+
+                    if let Some((found_ign, local_idx)) = entries.iter().find(|(name, _)| name.eq_ignore_ascii_case(&ingame_name_ws)) {
+                        let global_idx = offset + local_idx;
+                        info!("[LicenseDetect] Found license {} for current IGN '{}' (page {}, local index {})", global_idx, found_ign, page, local_idx);
+                        detected_cofl_license_ws.store(global_idx, Ordering::Relaxed);
+                    } else {
+                        // Not found on this page — request next page if within limit.
+                        let next_page = page + 1;
+                        if next_page <= LICENSE_MAX_PAGES {
+                            info!("[LicenseDetect] Current IGN '{}' not found on page {} ({} entries), trying page {}...", ingame_name_ws, page, page_count, next_page);
+                            let ws = ws_client_clone.clone();
+                            tokio::spawn(async move {
+                                // Small delay between page requests to avoid flooding
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                let message = serde_json::json!({
+                                    "type": "licenses",
+                                    "data": format!("\"list {}\"", next_page)
+                                }).to_string();
+                                if let Err(e) = ws.send_message(&message).await {
+                                    warn!("[LicenseDetect] Failed to request licenses page {}: {}", next_page, e);
+                                } else {
+                                    info!("[LicenseDetect] Requested COFL licenses list page {}", next_page);
+                                }
+                            });
+                        } else {
+                            info!("[LicenseDetect] No license found for current IGN '{}' after {} pages", ingame_name_ws, page);
+                        }
                     }
                 }
             }
@@ -1536,6 +1608,8 @@ async fn main() -> Result<()> {
             let next_name = ingame_names[next_index].clone();
             let index_path = account_index_path.clone();
             let chat_tx_switch = chat_tx.clone();
+            let detected_license_switch = detected_cofl_license.clone();
+            let ws_switch = ws_client.clone();
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
                 ingame_name, next_name, switch_hours
@@ -1546,6 +1620,15 @@ async fn main() -> Result<()> {
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
                     next_index + 1, next_name
                 );
+                // Transfer the COFL license to the next account before restarting.
+                let license_index = detected_license_switch.load(Ordering::Relaxed);
+                if license_index > 0 {
+                    if let Err(e) = ws_switch.transfer_license(license_index, &next_name).await {
+                        warn!("[AccountSwitch] Failed to transfer license: {}", e);
+                    }
+                    // Give COFL time to process the license transfer before restarting.
+                    sleep(Duration::from_secs(3)).await;
+                }
                 // Persist the next account index so the next process invocation picks it up.
                 if let Err(e) = std::fs::write(&index_path, next_index.to_string()) {
                     warn!("[AccountSwitch] Failed to write account index: {}", e);

@@ -54,6 +54,8 @@ pub struct WebSharedState {
     pub started_at: std::time::Instant,
     /// Hypixel API key for fetching active auctions (optional).
     pub hypixel_api_key: Option<String>,
+    /// Auto-detected COFL license index for the current IGN (0 = none detected).
+    pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -459,9 +461,22 @@ async fn switch_account(
         .chat_tx
         .send(format!("[BAF Web] Switching to account {}...", next_name));
 
+    // Transfer the COFL license to the next account before restarting.
+    let license_index = s.detected_cofl_license.load(std::sync::atomic::Ordering::Relaxed);
+    let ws = s.ws_client.clone();
+    let target_name = next_name.clone();
+
     // Restart the process with the new account index.
-    tokio::spawn(async {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    tokio::spawn(async move {
+        if license_index > 0 {
+            if let Err(e) = ws.transfer_license(license_index, &target_name).await {
+                warn!("[WebGUI] Failed to transfer license: {}", e);
+            }
+            // Give COFL time to process the license transfer before restarting.
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        } else {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
         crate::utils::restart_process();
     });
 

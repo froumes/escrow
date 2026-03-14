@@ -22,6 +22,13 @@ pub enum CoflEvent {
     /// COFL "countdown" message – AH flips arriving in ~10 seconds.
     /// Used to pause bazaar flips while the AH flip window is active.
     Countdown,
+    /// Parsed license list from `/cofl licenses list` response.
+    /// Fields: `(entries, page_number)` where entries are `(ign, 1-based global license index)` pairs
+    /// and `page_number` is the 1-based page that was returned.
+    LicenseList {
+        entries: Vec<(String, u32)>,
+        page: u32,
+    },
 }
 
 #[derive(Clone)]
@@ -171,6 +178,15 @@ impl CoflWebSocket {
             "chatMessage" | "writeToChat" => {
                 // Try to parse as array of chat messages (most common for chatMessage)
                 if let Ok(messages) = parse_message_data::<Vec<ChatMessage>>(&msg.data) {
+                    // Check if this looks like a licenses list response and emit a
+                    // LicenseList event so the main loop can auto-detect the license
+                    // index for the current IGN.
+                    let license_entries = parse_license_entries(&messages);
+                    if !license_entries.is_empty() {
+                        let page = parse_license_page_number(&messages);
+                        let _ = tx.send(CoflEvent::LicenseList { entries: license_entries, page });
+                    }
+
                     for msg in messages {
                         let msg_with_ref = msg.with_referral_id();
                         
@@ -270,6 +286,77 @@ impl CoflWebSocket {
         debug!("Sent WS message ({} bytes)", message.len());
         Ok(())
     }
+
+    /// Transfer a COFL license to a different IGN.
+    ///
+    /// Sends `/cofl license use <license_index> <target_ign>` via the WebSocket.
+    /// Used before account switching to move the license to the next account.
+    pub async fn transfer_license(&self, license_index: u32, target_ign: &str) -> Result<()> {
+        let args = format!("use {} {}", license_index, target_ign);
+        let data_json = serde_json::json!(args).to_string();
+        let message = serde_json::json!({
+            "type": "license",
+            "data": data_json
+        }).to_string();
+        self.send_message(&message).await?;
+        info!("[LicenseTransfer] Sent /cofl license use {} {}", license_index, target_ign);
+        Ok(())
+    }
+}
+
+/// Prefix for license entry text lines in COFL's licenses list response: `§7> §a`
+const LICENSE_ENTRY_PREFIX: &str = "\u{00a7}7> \u{00a7}a";
+
+/// Parse the page number from a COFL licenses list response.
+///
+/// COFL includes a line like `"Content (page 1):"` or `"Content (page 2):"`.
+/// Returns the parsed page number, defaulting to 1 if not found.
+pub fn parse_license_page_number(messages: &[ChatMessage]) -> u32 {
+    for msg in messages {
+        // Look for "Content (page N):" pattern
+        if let Some(start) = msg.text.find("(page ") {
+            let rest = &msg.text[start + 6..]; // skip "(page "
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            match num_str.parse::<u32>() {
+                Ok(n) => return n,
+                Err(_) => {
+                    tracing::debug!("[LicenseDetect] Found page indicator but failed to parse number from '{}'", num_str);
+                }
+            }
+        }
+    }
+    1 // Default to page 1 if not found
+}
+
+/// Parse license entries from a COFL licenses list chatMessage response.
+///
+/// Each license entry in the response has text like:
+///   `§7> §aIGN_NAME §2§mNONE§c expired`  (expired license)
+///   `§7> §aIGN_NAME §2TIER`               (active license)
+///
+/// Returns `(ign, 1-based page-local index)` pairs.
+/// The caller must add the cumulative offset from previous pages to get the
+/// global license index.
+pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32)> {
+    let mut entries = Vec::new();
+    let mut counter: u32 = 0;
+
+    for msg in messages {
+        if msg.text.starts_with(LICENSE_ENTRY_PREFIX) {
+            counter += 1;
+            // Extract IGN: characters after "§a" until next space or '§'
+            let rest = &msg.text[LICENSE_ENTRY_PREFIX.len()..];
+            let ign: String = rest
+                .chars()
+                .take_while(|&c| c != ' ' && c != '\u{00a7}')
+                .collect();
+            if !ign.is_empty() {
+                entries.push((ign, counter));
+            }
+        }
+    }
+
+    entries
 }
 
 fn extract_upload_inventory_payload(message: &str) -> Option<String> {
@@ -415,5 +502,110 @@ mod tests {
             payload.as_deref(),
             Some("[{\"count\":1,\"name\":\"minecraft:stone\"}]")
         );
+    }
+
+    #[test]
+    fn test_parse_license_entries_from_cofl_response() {
+        use crate::websocket::messages::ChatMessage;
+        // Simulate a COFL licenses list response (simplified from real output)
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Content (page 1):§3(1)".to_string(), on_click: Some("/cofl licenses ls 2".to_string()), hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §azShadowReaper_ §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[RENEW]§7§3(2)".to_string(), on_click: Some("/cofl licenses add 651c NONE".to_string()), hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §ausaiddd §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[RENEW]§7§3(3)".to_string(), on_click: Some("/cofl licenses add 58f1 NONE".to_string()), hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aoBlanky_ §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[RENEW]§7§3(4)".to_string(), on_click: None, hover: None },
+        ];
+
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], ("zShadowReaper_".to_string(), 1));
+        assert_eq!(entries[1], ("usaiddd".to_string(), 2));
+        assert_eq!(entries[2], ("oBlanky_".to_string(), 3));
+    }
+
+    #[test]
+    fn test_parse_license_entries_empty_array() {
+        let entries = parse_license_entries(&[]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_license_entries_no_license_entries() {
+        use crate::websocket::messages::ChatMessage;
+        // A non-license chatMessage should return empty
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Some other message".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_license_entries_case_insensitive_lookup() {
+        use crate::websocket::messages::ChatMessage;
+        let messages = vec![
+            ChatMessage { text: "§7> §aPlayerOne §2NONE".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aPlayerTwo §2NONE".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 2);
+        // The parser returns the IGN as-is; case-insensitive matching is done at lookup time
+        assert_eq!(entries[0].0, "PlayerOne");
+        assert_eq!(entries[1].0, "PlayerTwo");
+    }
+
+    #[test]
+    fn test_parse_license_page_number_from_response() {
+        use crate::websocket::messages::ChatMessage;
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Content (page 1):§3(1)".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aPlayer1 §2NONE".to_string(), on_click: None, hover: None },
+        ];
+        assert_eq!(parse_license_page_number(&messages), 1);
+    }
+
+    #[test]
+    fn test_parse_license_page_number_page_2() {
+        use crate::websocket::messages::ChatMessage;
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Content (page 2):§3(5)".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aPlayer4 §2NONE".to_string(), on_click: None, hover: None },
+        ];
+        assert_eq!(parse_license_page_number(&messages), 2);
+    }
+
+    #[test]
+    fn test_parse_license_page_number_defaults_to_1() {
+        use crate::websocket::messages::ChatMessage;
+        let messages = vec![
+            ChatMessage { text: "some other message".to_string(), on_click: None, hover: None },
+        ];
+        assert_eq!(parse_license_page_number(&messages), 1);
+    }
+
+    #[test]
+    fn test_license_entries_page_local_indices() {
+        use crate::websocket::messages::ChatMessage;
+        // Entries on any page always start from 1 (page-local indexing).
+        // The caller adds the cumulative offset from previous pages.
+        let page2_messages = vec![
+            ChatMessage { text: "Content (page 2):§3(5)".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aPlayer4 §2NONE".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aPlayer5 §2NONE".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&page2_messages);
+        // Page-local indices: 1, 2 (caller must add offset from page 1's entry count)
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("Player4".to_string(), 1));
+        assert_eq!(entries[1], ("Player5".to_string(), 2));
     }
 }
