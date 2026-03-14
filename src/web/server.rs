@@ -217,6 +217,8 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
         .route("/api/cancel_auction", axum::routing::post(cancel_auction))
+        .route("/api/claim_purchases", axum::routing::post(claim_purchases))
+        .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/auctions", get(get_auctions))
         .route("/api/logs/latest", get(download_latest_log))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
@@ -490,6 +492,38 @@ async fn cancel_auction(
     );
 
     (StatusCode::OK, "Cancel auction command queued")
+}
+
+async fn claim_purchases(
+    State(s): State<WebSharedState>,
+) -> impl IntoResponse {
+    info!("[WebGUI] Claim purchases requested");
+
+    let _ = s.chat_tx.send("[BAF Web] Checking unclaimed purchases...".to_string());
+
+    s.command_queue.enqueue(
+        CommandType::ClaimPurchasedItem,
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Claim purchases command queued")
+}
+
+async fn collect_bz_orders(
+    State(s): State<WebSharedState>,
+) -> impl IntoResponse {
+    info!("[WebGUI] Collect bazaar orders (sell instantly) requested");
+
+    let _ = s.chat_tx.send("[BAF Web] Collecting bazaar orders...".to_string());
+
+    s.command_queue.enqueue(
+        CommandType::ManageOrders { cancel_open: false },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Collect bazaar orders command queued")
 }
 
 // ── Active auctions ───────────────────────────────────────────

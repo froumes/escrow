@@ -3398,6 +3398,19 @@ async fn handle_window_interaction(
                         }
                     } else {
                         debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode)");
+                        // Re-navigate to /bz so the ManagingOrders flow continues
+                        // processing remaining orders instead of getting stuck.
+                        if *state.last_window_id.read() == window_id {
+                            info!("[ManageOrders] Re-opening /bz after skipping cancel in Order options");
+                            bot.write_chat_packet("/bz");
+                        }
+                    }
+                } else {
+                    // Neither Collect nor Cancel found (timeout or window superseded).
+                    // Re-navigate to /bz to avoid getting stuck in ManagingOrders.
+                    if *state.last_window_id.read() == window_id {
+                        warn!("[ManageOrders] No action taken in Order options — re-opening /bz");
+                        bot.write_chat_packet("/bz");
                     }
                 }
                 // After clicking Cancel/Collect, Hypixel should reopen "Your Bazaar Orders"
