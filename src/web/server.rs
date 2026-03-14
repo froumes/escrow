@@ -54,8 +54,8 @@ pub struct WebSharedState {
     pub started_at: std::time::Instant,
     /// Hypixel API key for fetching active auctions (optional).
     pub hypixel_api_key: Option<String>,
-    /// Coflnet license index to transfer on account switch (0 = disabled).
-    pub cofl_license_index: u32,
+    /// Auto-detected COFL license index for the current IGN (0 = none detected).
+    pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -462,7 +462,7 @@ async fn switch_account(
         .send(format!("[BAF Web] Switching to account {}...", next_name));
 
     // Transfer the COFL license to the next account before restarting.
-    let license_index = s.cofl_license_index;
+    let license_index = s.detected_cofl_license.load(std::sync::atomic::Ordering::Relaxed);
     let ws = s.ws_client.clone();
     let target_name = next_name.clone();
 

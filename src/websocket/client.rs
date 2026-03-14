@@ -22,6 +22,9 @@ pub enum CoflEvent {
     /// COFL "countdown" message – AH flips arriving in ~10 seconds.
     /// Used to pause bazaar flips while the AH flip window is active.
     Countdown,
+    /// Parsed license list from `/cofl licenses list` response.
+    /// Contains `(ign, 1-based license index)` pairs.
+    LicenseList(Vec<(String, u32)>),
 }
 
 #[derive(Clone)]
@@ -171,6 +174,14 @@ impl CoflWebSocket {
             "chatMessage" | "writeToChat" => {
                 // Try to parse as array of chat messages (most common for chatMessage)
                 if let Ok(messages) = parse_message_data::<Vec<ChatMessage>>(&msg.data) {
+                    // Check if this looks like a licenses list response and emit a
+                    // LicenseList event so the main loop can auto-detect the license
+                    // index for the current IGN.
+                    let license_entries = parse_license_entries(&messages);
+                    if !license_entries.is_empty() {
+                        let _ = tx.send(CoflEvent::LicenseList(license_entries));
+                    }
+
                     for msg in messages {
                         let msg_with_ref = msg.with_referral_id();
                         
@@ -287,6 +298,36 @@ impl CoflWebSocket {
         info!("[LicenseTransfer] Sent /cofl license use {} {}", license_index, target_ign);
         Ok(())
     }
+}
+
+/// Parse license entries from a COFL licenses list chatMessage response.
+///
+/// Each license entry in the response has text like:
+///   `§7> §aIGN_NAME §2§mNONE§c expired`  (expired license)
+///   `§7> §aIGN_NAME §2TIER`               (active license)
+///
+/// Returns `(ign, 1-based license index)` pairs.
+pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32)> {
+    let prefix = "\u{00a7}7> \u{00a7}a"; // §7> §a
+    let mut entries = Vec::new();
+    let mut license_index: u32 = 0;
+
+    for msg in messages {
+        if msg.text.starts_with(prefix) {
+            license_index += 1;
+            // Extract IGN: characters after "§a" until next space or '§'
+            let rest = &msg.text[prefix.len()..];
+            let ign: String = rest
+                .chars()
+                .take_while(|&c| c != ' ' && c != '\u{00a7}')
+                .collect();
+            if !ign.is_empty() {
+                entries.push((ign, license_index));
+            }
+        }
+    }
+
+    entries
 }
 
 fn extract_upload_inventory_payload(message: &str) -> Option<String> {
@@ -432,5 +473,62 @@ mod tests {
             payload.as_deref(),
             Some("[{\"count\":1,\"name\":\"minecraft:stone\"}]")
         );
+    }
+
+    #[test]
+    fn test_parse_license_entries_from_cofl_response() {
+        use crate::websocket::messages::ChatMessage;
+        // Simulate a COFL licenses list response (simplified from real output)
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Content (page 1):§3(1)".to_string(), on_click: Some("/cofl licenses ls 2".to_string()), hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §azShadowReaper_ §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[RENEW]§7§3(2)".to_string(), on_click: Some("/cofl licenses add 651c NONE".to_string()), hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §ausaiddd §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[RENEW]§7§3(3)".to_string(), on_click: Some("/cofl licenses add 58f1 NONE".to_string()), hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aoBlanky_ §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[RENEW]§7§3(4)".to_string(), on_click: None, hover: None },
+        ];
+
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], ("zShadowReaper_".to_string(), 1));
+        assert_eq!(entries[1], ("usaiddd".to_string(), 2));
+        assert_eq!(entries[2], ("oBlanky_".to_string(), 3));
+    }
+
+    #[test]
+    fn test_parse_license_entries_empty_array() {
+        let entries = parse_license_entries(&[]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_license_entries_no_license_entries() {
+        use crate::websocket::messages::ChatMessage;
+        // A non-license chatMessage should return empty
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Some other message".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_license_entries_case_insensitive_lookup() {
+        use crate::websocket::messages::ChatMessage;
+        let messages = vec![
+            ChatMessage { text: "§7> §aPlayerOne §2NONE".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aPlayerTwo §2NONE".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 2);
+        // The parser returns the IGN as-is; case-insensitive matching is done at lookup time
+        assert_eq!(entries[0].0, "PlayerOne");
+        assert_eq!(entries[1].0, "PlayerTwo");
     }
 }

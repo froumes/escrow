@@ -216,6 +216,11 @@ async fn main() -> Result<()> {
     // Tuple: (tier, expires_str) e.g. ("Premium Plus", "2026-Feb-10 08:55 UTC").
     let cofl_premium: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
+    // Auto-detected COFL license index for the current IGN.
+    // Populated at startup by requesting `/cofl licenses list` and parsing the response.
+    // 0 means no license detected.
+    let detected_cofl_license = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
         // Check if session is expired
@@ -278,6 +283,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    // When multi-account is enabled, request the COFL licenses list at startup
+    // so we can auto-detect which license is assigned to the current IGN.
+    // Delay slightly to let the WS authenticate first.
+    if ingame_names.len() > 1 {
+        let ws_license = ws_client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let data_json = serde_json::to_string("list").unwrap_or_else(|_| "\"list\"".to_string());
+            let message = serde_json::json!({
+                "type": "licenses",
+                "data": data_json
+            }).to_string();
+            if let Err(e) = ws_license.send_message(&message).await {
+                warn!("[LicenseDetect] Failed to request licenses list: {}", e);
+            } else {
+                info!("[LicenseDetect] Requested COFL licenses list for auto-detection");
+            }
+        });
+    }
+
     // Initialize and connect bot client
     info!("Initializing Minecraft bot...");
     info!("Authenticating with Microsoft account...");
@@ -325,7 +350,7 @@ async fn main() -> Result<()> {
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),
             hypixel_api_key: config.hypixel_api_key.clone(),
-            cofl_license_index: config.cofl_license_index,
+            detected_cofl_license: detected_cofl_license.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -642,6 +667,8 @@ async fn main() -> Result<()> {
     let enable_ah_flips_ws = enable_ah_flips.clone();
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
     let chat_tx_ws = chat_tx.clone();
+    let detected_cofl_license_ws = detected_cofl_license.clone();
+    let ingame_name_ws = ingame_name.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1067,6 +1094,17 @@ async fn main() -> Result<()> {
                                 }
                             }
                         });
+                    }
+                }
+                CoflEvent::LicenseList(entries) => {
+                    // Auto-detect which license belongs to the current IGN.
+                    // The first matching entry's 1-based index is stored for use
+                    // during account switching.
+                    if let Some((ign, idx)) = entries.iter().find(|(ign, _)| ign.eq_ignore_ascii_case(&ingame_name_ws)) {
+                        info!("[LicenseDetect] Found license {} for current IGN '{}'", idx, ign);
+                        detected_cofl_license_ws.store(*idx, Ordering::Relaxed);
+                    } else {
+                        info!("[LicenseDetect] No license found for current IGN '{}' in {} entries", ingame_name_ws, entries.len());
                     }
                 }
             }
@@ -1537,7 +1575,7 @@ async fn main() -> Result<()> {
             let next_name = ingame_names[next_index].clone();
             let index_path = account_index_path.clone();
             let chat_tx_switch = chat_tx.clone();
-            let license_index = config.cofl_license_index;
+            let detected_license_switch = detected_cofl_license.clone();
             let ws_switch = ws_client.clone();
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
@@ -1550,6 +1588,7 @@ async fn main() -> Result<()> {
                     next_index + 1, next_name
                 );
                 // Transfer the COFL license to the next account before restarting.
+                let license_index = detected_license_switch.load(Ordering::Relaxed);
                 if license_index > 0 {
                     if let Err(e) = ws_switch.transfer_license(license_index, &next_name).await {
                         warn!("[AccountSwitch] Failed to transfer license: {}", e);

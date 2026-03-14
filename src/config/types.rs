@@ -148,14 +148,6 @@ pub struct Config {
     /// Leave empty to use the Coflnet API as a fallback.
     #[serde(default, with = "opt_string_as_empty")]
     pub hypixel_api_key: Option<String>,
-
-    /// Coflnet license index to transfer when switching accounts.
-    /// When multiple accounts are configured and this is set to a non-zero value,
-    /// the bot will send `/cofl license use <index> <new_ign>` before switching
-    /// to transfer the license to the next account.
-    /// Set to `0` (default) to disable automatic license transfer.
-    #[serde(default)]
-    pub cofl_license_index: u32,
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
@@ -232,7 +224,6 @@ impl Default for Config {
             webhook_url: None,
             web_gui_password: None,
             hypixel_api_key: None,
-            cofl_license_index: 0,
             sessions: HashMap::new(),
         }
     }
@@ -439,15 +430,4 @@ proxy_credentials = "myuser:mypassword"
         assert!(!toml.contains("min_profit"));
     }
 
-    #[test]
-    fn cofl_license_index_defaults_to_zero() {
-        let config = Config::default();
-        assert_eq!(config.cofl_license_index, 0);
-    }
-
-    #[test]
-    fn parses_cofl_license_index() {
-        let config: Config = toml::from_str("cofl_license_index = 3").expect("config should parse");
-        assert_eq!(config.cofl_license_index, 3);
-    }
 }
