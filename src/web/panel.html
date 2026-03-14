@@ -200,6 +200,10 @@ a{color:var(--accent2);text-decoration:none}
             <button class="btn btn-resume" id="btn-resume" onclick="resumeMacro()">▶ Resume</button>
             <a class="btn btn-sm btn-download" href="/api/logs/latest" download="latest.log">📥 Download Logs</a>
         </div>
+        <div style="display:flex;gap:10px;margin-bottom:16px">
+            <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimPurchases()">📦 Claim Purchases</button>
+            <button class="btn btn-sm" style="background:var(--warn);color:#1a1a1a" onclick="collectBzOrders()">💰 Sell Instantly (BZ)</button>
+        </div>
         <div class="toggle-row">
             <span class="toggle-label">Auction House Flips</span>
             <label class="toggle"><input type="checkbox" id="tog-ah" onchange="toggleAH(this.checked)"><span class="slider"></span></label>
@@ -441,6 +445,16 @@ async function sellInventory() {
 async function cancelAuction(itemName, startingBid) {
     if (!confirm('Cancel auction for "' + itemName + '"?')) return;
     await fetch('/api/cancel_auction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({item_name: itemName, starting_bid: startingBid})});
+}
+
+async function claimPurchases() {
+    if (!confirm('Check and claim unclaimed purchases?')) return;
+    await fetch('/api/claim_purchases', {method:'POST'});
+}
+
+async function collectBzOrders() {
+    if (!confirm('Sell entire inventory instantly on the Bazaar?')) return;
+    await fetch('/api/collect_bz_orders', {method:'POST'});
 }
 
 async function fetchInventory() {

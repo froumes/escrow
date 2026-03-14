@@ -1603,6 +1603,16 @@ async fn event_handler(
                 state.inventory_full.store(true, Ordering::Relaxed);
             }
 
+            // Detect "You don't have anything to sell!" during SellingInventoryBz
+            // — Hypixel sends this when inventory has no instasellable items.
+            if clean_message.contains("don't have anything to sell")
+                && *state.bot_state.read() == BotState::SellingInventoryBz
+            {
+                info!("[SellInventoryBz] Nothing to sell — going idle");
+                *state.bazaar_step.write() = BazaarStep::Initial;
+                *state.bot_state.write() = BotState::Idle;
+            }
+
             // Check if we've teleported to island yet
             let teleported = *state.teleported_to_island.read();
             let join_time = *state.skyblock_join_time.read();
@@ -2126,6 +2136,12 @@ async fn execute_command(
             *state.cancel_auction_starting_bid.write() = *starting_bid;
             bot.write_chat_packet("/ah");
             *state.bot_state.write() = BotState::CancellingAuction;
+        }
+        CommandType::SellInventoryBz => {
+            info!("[SellInventoryBz] Opening /bz to sell inventory instantly");
+            *state.bazaar_step.write() = BazaarStep::Initial;
+            bot.write_chat_packet("/bz");
+            *state.bot_state.write() = BotState::SellingInventoryBz;
         }
     }
 }
@@ -3404,6 +3420,40 @@ async fn handle_window_interaction(
                 // as a new window. The ManagingOrders handler will be called again to continue
                 // processing remaining orders. If Hypixel closed all windows instead (last
                 // order processed), the /bz re-navigation above keeps the flow running.
+            }
+        }
+        BotState::SellingInventoryBz => {
+            // Sell whole inventory instantly via /bz → "Sell Inventory Now" (slot 47)
+            // → "Selling whole inventory" (slot 11).
+            //
+            // Flow (reuses bazaar_step for sub-state):
+            //   Initial          — bazaar main page: click "Sell Inventory Now" at slot 47
+            //   SearchResults    — confirmation page: click slot 11 to confirm
+            //
+            // If inventory has no instasellable items, Hypixel sends
+            // "You don't have anything to sell!" in chat and does not open
+            // the confirmation window.
+            let step = *state.bazaar_step.read();
+            if *state.last_window_id.read() != window_id {
+                return;
+            }
+
+            if step == BazaarStep::Initial && window_title.contains("Bazaar") {
+                info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot 47");
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                if *state.last_window_id.read() != window_id { return; }
+                *state.bazaar_step.write() = BazaarStep::SearchResults;
+                click_window_slot(bot, &state.last_window_id, window_id, 47).await;
+            } else if step == BazaarStep::SearchResults {
+                // Confirmation page — click slot 11 ("Selling whole inventory")
+                info!("[SellInventoryBz] Confirmation window open — clicking slot 11 to sell");
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                if *state.last_window_id.read() != window_id { return; }
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                info!("[SellInventoryBz] Done — going idle");
+                *state.bazaar_step.write() = BazaarStep::Initial;
+                *state.bot_state.write() = BotState::Idle;
             }
         }
         BotState::CheckingCookie => {
