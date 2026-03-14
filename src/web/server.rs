@@ -54,6 +54,8 @@ pub struct WebSharedState {
     pub started_at: std::time::Instant,
     /// Hypixel API key for fetching active auctions (optional).
     pub hypixel_api_key: Option<String>,
+    /// Coflnet license index to transfer on account switch (0 = disabled).
+    pub cofl_license_index: u32,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -459,9 +461,30 @@ async fn switch_account(
         .chat_tx
         .send(format!("[BAF Web] Switching to account {}...", next_name));
 
+    // Transfer the COFL license to the next account before restarting.
+    let license_index = s.cofl_license_index;
+    let ws = s.ws_client.clone();
+    let target_name = next_name.clone();
+
     // Restart the process with the new account index.
-    tokio::spawn(async {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    tokio::spawn(async move {
+        if license_index > 0 {
+            let args = format!("use {} {}", license_index, target_name);
+            let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
+            let message = serde_json::json!({
+                "type": "license",
+                "data": data_json
+            }).to_string();
+            if let Err(e) = ws.send_message(&message).await {
+                warn!("[WebGUI] Failed to send license transfer command: {}", e);
+            } else {
+                info!("[WebGUI] Sent /cofl license use {} {}", license_index, target_name);
+            }
+            // Give COFL time to process the license transfer before restarting.
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        } else {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
         crate::utils::restart_process();
     });
 

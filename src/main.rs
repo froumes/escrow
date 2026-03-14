@@ -325,6 +325,7 @@ async fn main() -> Result<()> {
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),
             hypixel_api_key: config.hypixel_api_key.clone(),
+            cofl_license_index: config.cofl_license_index,
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -1536,6 +1537,8 @@ async fn main() -> Result<()> {
             let next_name = ingame_names[next_index].clone();
             let index_path = account_index_path.clone();
             let chat_tx_switch = chat_tx.clone();
+            let license_index = config.cofl_license_index;
+            let ws_switch = ws_client.clone();
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
                 ingame_name, next_name, switch_hours
@@ -1546,6 +1549,22 @@ async fn main() -> Result<()> {
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
                     next_index + 1, next_name
                 );
+                // Transfer the COFL license to the next account before restarting.
+                if license_index > 0 {
+                    let args = format!("use {} {}", license_index, next_name);
+                    let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
+                    let message = serde_json::json!({
+                        "type": "license",
+                        "data": data_json
+                    }).to_string();
+                    if let Err(e) = ws_switch.send_message(&message).await {
+                        warn!("[AccountSwitch] Failed to send license transfer command: {}", e);
+                    } else {
+                        info!("[AccountSwitch] Sent /cofl license use {} {}", license_index, next_name);
+                    }
+                    // Give COFL time to process the license transfer before restarting.
+                    sleep(Duration::from_secs(3)).await;
+                }
                 // Persist the next account index so the next process invocation picks it up.
                 if let Err(e) = std::fs::write(&index_path, next_index.to_string()) {
                     warn!("[AccountSwitch] Failed to write account index: {}", e);
