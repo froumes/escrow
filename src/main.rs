@@ -290,10 +290,9 @@ async fn main() -> Result<()> {
         let ws_license = ws_client.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let data_json = serde_json::to_string("list").unwrap_or_else(|_| "\"list\"".to_string());
             let message = serde_json::json!({
                 "type": "licenses",
-                "data": data_json
+                "data": "\"list\""
             }).to_string();
             if let Err(e) = ws_license.send_message(&message).await {
                 warn!("[LicenseDetect] Failed to request licenses list: {}", e);
@@ -1100,8 +1099,8 @@ async fn main() -> Result<()> {
                     // Auto-detect which license belongs to the current IGN.
                     // The first matching entry's 1-based index is stored for use
                     // during account switching.
-                    if let Some((ign, idx)) = entries.iter().find(|(ign, _)| ign.eq_ignore_ascii_case(&ingame_name_ws)) {
-                        info!("[LicenseDetect] Found license {} for current IGN '{}'", idx, ign);
+                    if let Some((found_ign, idx)) = entries.iter().find(|(name, _)| name.eq_ignore_ascii_case(&ingame_name_ws)) {
+                        info!("[LicenseDetect] Found license {} for current IGN '{}'", idx, found_ign);
                         detected_cofl_license_ws.store(*idx, Ordering::Relaxed);
                     } else {
                         info!("[LicenseDetect] No license found for current IGN '{}' in {} entries", ingame_name_ws, entries.len());

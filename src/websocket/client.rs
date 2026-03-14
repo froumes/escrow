@@ -288,8 +288,7 @@ impl CoflWebSocket {
     /// Used before account switching to move the license to the next account.
     pub async fn transfer_license(&self, license_index: u32, target_ign: &str) -> Result<()> {
         let args = format!("use {} {}", license_index, target_ign);
-        let data_json = serde_json::to_string(&args)
-            .context("Failed to serialize license transfer args")?;
+        let data_json = serde_json::json!(args).to_string();
         let message = serde_json::json!({
             "type": "license",
             "data": data_json
@@ -300,6 +299,9 @@ impl CoflWebSocket {
     }
 }
 
+/// Prefix for license entry text lines in COFL's licenses list response: `§7> §a`
+const LICENSE_ENTRY_PREFIX: &str = "\u{00a7}7> \u{00a7}a";
+
 /// Parse license entries from a COFL licenses list chatMessage response.
 ///
 /// Each license entry in the response has text like:
@@ -308,21 +310,20 @@ impl CoflWebSocket {
 ///
 /// Returns `(ign, 1-based license index)` pairs.
 pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32)> {
-    let prefix = "\u{00a7}7> \u{00a7}a"; // §7> §a
     let mut entries = Vec::new();
-    let mut license_index: u32 = 0;
+    let mut counter: u32 = 0;
 
     for msg in messages {
-        if msg.text.starts_with(prefix) {
-            license_index += 1;
+        if msg.text.starts_with(LICENSE_ENTRY_PREFIX) {
+            counter += 1;
             // Extract IGN: characters after "§a" until next space or '§'
-            let rest = &msg.text[prefix.len()..];
+            let rest = &msg.text[LICENSE_ENTRY_PREFIX.len()..];
             let ign: String = rest
                 .chars()
                 .take_while(|&c| c != ' ' && c != '\u{00a7}')
                 .collect();
             if !ign.is_empty() {
-                entries.push((ign, license_index));
+                entries.push((ign, counter));
             }
         }
     }
