@@ -45,6 +45,8 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
+/// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
+const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
@@ -2363,17 +2365,17 @@ async fn handle_window_interaction(
                 // wasting a tick on a packet the server has already processed.
 
                 // Short wait for the server to process and close the window.
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
 
                 // Safety retry loop: if the window is still open (click was lost or
-                // the server needs more time), keep retrying every 50ms.
+                // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
                 while state.handlers.current_window_title()
                     .as_deref()
                     .map(|t| t.contains("Confirm Purchase"))
                     .unwrap_or(false)
                 {
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
                 }
 
                 *state.bot_state.write() = BotState::Idle;
