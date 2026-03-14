@@ -1123,8 +1123,8 @@ async fn main() -> Result<()> {
                             info!("[LicenseDetect] Current IGN '{}' not found on page {} ({} entries), trying page {}...", ingame_name_ws, page, page_count, next_page);
                             let ws = ws_client_clone.clone();
                             tokio::spawn(async move {
-                                // Small delay between page requests
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                // Small delay between page requests to avoid flooding
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                                 let message = serde_json::json!({
                                     "type": "licenses",
                                     "data": format!("\"list {}\"", next_page)

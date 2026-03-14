@@ -317,8 +317,11 @@ pub fn parse_license_page_number(messages: &[ChatMessage]) -> u32 {
         if let Some(start) = msg.text.find("(page ") {
             let rest = &msg.text[start + 6..]; // skip "(page "
             let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(n) = num_str.parse::<u32>() {
-                return n;
+            match num_str.parse::<u32>() {
+                Ok(n) => return n,
+                Err(_) => {
+                    tracing::debug!("[LicenseDetect] Found page indicator but failed to parse number from '{}'", num_str);
+                }
             }
         }
     }
