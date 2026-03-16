@@ -307,6 +307,9 @@ impl CoflWebSocket {
 /// Prefix for license entry text lines in COFL's licenses list response: `§7> §a`
 const LICENSE_ENTRY_PREFIX: &str = "\u{00a7}7> \u{00a7}a";
 
+/// License tier value indicating no active license (default/expired).
+const LICENSE_TIER_NONE: &str = "NONE";
+
 /// Parse the page number from a COFL licenses list response.
 ///
 /// COFL includes a line like `"Content (page 1):"` or `"Content (page 2):"`.
@@ -366,27 +369,26 @@ pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, Stri
 ///   ` §2§mNONE§c expired`  →  `"NONE"`
 ///   ` §2PREMIUM 9.9d`      →  `"PREMIUM"`
 fn extract_license_tier(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\u{00a7}' && i + 1 < chars.len() && chars[i + 1] == '2' {
-            i += 2; // skip §2
-            // Skip optional §m (strikethrough for expired)
-            if i + 1 < chars.len() && chars[i] == '\u{00a7}' && chars[i + 1] == 'm' {
-                i += 2;
-            }
-            // Read tier name until space or §
-            let tier: String = chars[i..]
-                .iter()
-                .take_while(|&&c| c != ' ' && c != '\u{00a7}')
-                .collect();
-            if !tier.is_empty() {
-                return tier;
-            }
+    // Find §2 color code (§ = U+00A7, 2 bytes in UTF-8, plus '2')
+    let marker = "\u{00a7}2";
+    if let Some(pos) = text.find(marker) {
+        let after = &text[pos + marker.len()..];
+        // Skip optional §m (strikethrough for expired)
+        let tier_start = if after.starts_with("\u{00a7}m") {
+            &after["\u{00a7}m".len()..]
+        } else {
+            after
+        };
+        // Read tier name until space or §
+        let tier: String = tier_start
+            .chars()
+            .take_while(|&c| c != ' ' && c != '\u{00a7}')
+            .collect();
+        if !tier.is_empty() {
+            return tier;
         }
-        i += 1;
     }
-    "NONE".to_string()
+    LICENSE_TIER_NONE.to_string()
 }
 
 fn extract_upload_inventory_payload(message: &str) -> Option<String> {
