@@ -153,6 +153,23 @@ async fn main() -> Result<()> {
         config_loader.save(&config)?;
     }
 
+    // Prompt for Discord ID if not yet configured (for pinging on legendary/divine flips and bans)
+    if config.discord_id.is_none() {
+        let wants_discord_id = Confirm::new()
+            .with_prompt("Configure Discord user ID for ping notifications? (optional)")
+            .default(false)
+            .interact()?;
+        if wants_discord_id {
+            let id: String = Input::new()
+                .with_prompt("Enter your Discord user ID")
+                .interact_text()?;
+            config.discord_id = Some(id);
+        } else {
+            config.discord_id = Some(String::new());
+        }
+        config_loader.save(&config)?;
+    }
+
     // Resolve the active ingame name.
     // When multiple names are configured, the account index is advanced at runtime by the
     // account-switching timer (see below) and the process restarts with exit(0) so that an
@@ -404,8 +421,9 @@ async fn main() -> Result<()> {
                             let url = webhook_url.to_string();
                             let name = ingame_name_for_events.clone();
                             let ban_reason = reason.clone();
+                            let did = config_for_events.active_discord_id().map(|s| s.to_string());
                             tokio::spawn(async move {
-                                frikadellen_baf::webhook::send_webhook_banned(&name, &ban_reason, &url).await;
+                                frikadellen_baf::webhook::send_webhook_banned(&name, &ban_reason, did.as_deref(), &url).await;
                             });
                         }
                     }
@@ -527,6 +545,37 @@ async fn main() -> Result<()> {
                                 event_buy_speed_ms, uuid_str.as_deref(), opt_finder.as_deref(), &url,
                             ).await;
                         });
+                    }
+                    // Send legendary/divine flip webhooks for high-profit purchases
+                    if let Some(profit) = opt_profit {
+                        if profit >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64 {
+                            // Send to shared anonymous channel
+                            let item_for_channel = item_name.clone();
+                            tokio::spawn(async move {
+                                frikadellen_baf::webhook::send_webhook_flip_channel(&item_for_channel, profit).await;
+                            });
+
+                            // Send to user's webhook with ping
+                            if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                                let url = webhook_url.to_string();
+                                let name = ingame_name_for_events.clone();
+                                let item = item_name.clone();
+                                let did = config_for_events.active_discord_id().map(|s| s.to_string());
+                                if profit >= frikadellen_baf::webhook::DIVINE_PROFIT_THRESHOLD as i64 {
+                                    tokio::spawn(async move {
+                                        frikadellen_baf::webhook::send_webhook_divine_flip(
+                                            &name, &item, price, profit, event_buy_speed_ms, did.as_deref(), &url,
+                                        ).await;
+                                    });
+                                } else {
+                                    tokio::spawn(async move {
+                                        frikadellen_baf::webhook::send_webhook_legendary_flip(
+                                            &name, &item, price, profit, event_buy_speed_ms, did.as_deref(), &url,
+                                        ).await;
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 frikadellen_baf::bot::BotEvent::ItemSold { item_name, price, buyer } => {

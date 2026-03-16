@@ -139,6 +139,11 @@ pub struct Config {
     /// `Some("")` = explicitly disabled (no further prompts).
     /// `Some(url)` = active webhook.
     pub webhook_url: Option<String>,
+
+    /// Discord user ID for pinging on legendary/divine flips and bans.
+    /// Leave empty to disable pings.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub discord_id: Option<String>,
     
     /// Password to protect the web control panel. Leave empty to disable authentication.
     #[serde(default, with = "opt_string_as_empty")]
@@ -222,6 +227,7 @@ impl Default for Config {
             proxy_address: None,
             proxy_credentials: None,
             webhook_url: None,
+            discord_id: None,
             web_gui_password: None,
             hypixel_api_key: None,
             sessions: HashMap::new(),
@@ -241,6 +247,11 @@ impl Config {
     /// Returns the webhook URL only if it is non-empty.
     pub fn active_webhook_url(&self) -> Option<&str> {
         self.webhook_url.as_deref().filter(|u| !u.is_empty())
+    }
+
+    /// Returns the Discord user ID only if it is non-empty.
+    pub fn active_discord_id(&self) -> Option<&str> {
+        self.discord_id.as_deref().filter(|id| !id.is_empty())
     }
 
     /// Returns all ingame names parsed from the (comma-separated) `ingame_name` field.
@@ -405,6 +416,7 @@ mod tests {
         assert!(toml.contains("proxy_address"), "proxy_address should appear in default config");
         assert!(toml.contains("proxy_credentials"), "proxy_credentials should appear in default config");
         assert!(toml.contains("multi_switch_time"), "multi_switch_time should appear in default config");
+        assert!(toml.contains("discord_id"), "discord_id should appear in default config");
     }
 
     #[test]
@@ -428,6 +440,19 @@ proxy_credentials = "myuser:mypassword"
         let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(!toml.contains("[skip]"));
         assert!(!toml.contains("min_profit"));
+    }
+
+    #[test]
+    fn discord_id_empty_string_is_none() {
+        let config: Config = toml::from_str(r#"discord_id = """#).expect("config should parse");
+        assert_eq!(config.discord_id, None);
+        assert_eq!(config.active_discord_id(), None);
+    }
+
+    #[test]
+    fn discord_id_parses_and_returns_active() {
+        let config: Config = toml::from_str(r#"discord_id = "123456789012345678""#).expect("config should parse");
+        assert_eq!(config.active_discord_id(), Some("123456789012345678"));
     }
 
 }
