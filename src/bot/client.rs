@@ -3384,7 +3384,19 @@ async fn handle_window_interaction(
                         break;
                     }
                     if tokio::time::Instant::now() >= action_deadline {
-                        warn!("[ManageOrders] No Collect/Cancel button found in Order options window");
+                        // Log visible slot names to aid future debugging of
+                        // unrecognised button layouts.
+                        let slot_names: Vec<String> = slots2
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, item)| {
+                                get_item_display_name_from_slot(item).map(|n| format!("{}={}", idx, n))
+                            })
+                            .collect();
+                        warn!(
+                            "[ManageOrders] No Collect/Cancel button found in Order options window — visible slots: [{}]",
+                            slot_names.join(", ")
+                        );
                         break;
                     }
                 }
@@ -3430,6 +3442,24 @@ async fn handle_window_interaction(
                         }
                     } else {
                         debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode)");
+                        // Re-navigate to /bz so the ManagingOrders flow continues to
+                        // process remaining orders (there may be filled orders after
+                        // this open one).  Without this the bot stays stuck in
+                        // ManagingOrders with the Order options window open until the
+                        // command timeout fires.
+                        if *state.last_window_id.read() == window_id {
+                            info!("[ManageOrders] Re-opening /bz after skipping open order in Order options");
+                            bot.write_chat_packet("/bz");
+                        }
+                    }
+                } else {
+                    // Neither Collect nor Cancel found — likely a transient GUI
+                    // glitch or unexpected window content.  Re-navigate to /bz so
+                    // the ManagingOrders flow can retry instead of hanging until the
+                    // command timeout.
+                    warn!("[ManageOrders] No actionable button in Order options — re-opening /bz");
+                    if *state.last_window_id.read() == window_id {
+                        bot.write_chat_packet("/bz");
                     }
                 }
                 // After clicking Cancel/Collect, Hypixel should reopen "Your Bazaar Orders"
