@@ -246,6 +246,10 @@ async fn main() -> Result<()> {
     // used to compute the global license index when paginating.
     let license_entries_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+    // Tracks the number of license list page responses processed, used to
+    // prevent infinite pagination when the current IGN is not found.
+    let license_pages_fetched = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
         // Check if session is expired
@@ -743,6 +747,7 @@ async fn main() -> Result<()> {
     let detected_cofl_license_ws = detected_cofl_license.clone();
     let ingame_name_ws = ingame_name.clone();
     let license_entries_seen_ws = license_entries_seen.clone();
+    let license_pages_fetched_ws = license_pages_fetched.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1171,39 +1176,44 @@ async fn main() -> Result<()> {
                     }
                 }
                 CoflEvent::LicenseList { entries, page } => {
-                    // Auto-detect which license belongs to the current IGN.
+                    // Auto-detect which non-NONE license belongs to the current IGN.
                     // Entries have page-local 1-based indices; add the cumulative
                     // offset from previous pages to get the global license index.
                     let offset = license_entries_seen_ws.load(Ordering::Relaxed);
                     let page_count = entries.len() as u32;
                     license_entries_seen_ws.fetch_add(page_count, Ordering::Relaxed);
+                    let pages_so_far = license_pages_fetched_ws.fetch_add(1, Ordering::Relaxed) + 1;
 
-                    if let Some((found_ign, local_idx)) = entries.iter().find(|(name, _)| name.eq_ignore_ascii_case(&ingame_name_ws)) {
+                    // Look for a non-NONE license for the current IGN.
+                    if let Some((found_ign, local_idx, tier)) = entries.iter().find(|(name, _, tier)| {
+                        name.eq_ignore_ascii_case(&ingame_name_ws) && !tier.eq_ignore_ascii_case("NONE")
+                    }) {
                         let global_idx = offset + local_idx;
-                        info!("[LicenseDetect] Found license {} for current IGN '{}' (page {}, local index {})", global_idx, found_ign, page, local_idx);
+                        info!("[LicenseDetect] Found {} license {} for current IGN '{}' (page {}, local index {})", tier, global_idx, found_ign, page, local_idx);
                         detected_cofl_license_ws.store(global_idx, Ordering::Relaxed);
-                    } else {
+                    } else if entries.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(&ingame_name_ws)) {
+                        // Current IGN found on this page but only with NONE licenses — nothing to transfer.
+                        info!("[LicenseDetect] Current IGN '{}' found on page {} but only has NONE licenses — no transfer needed", ingame_name_ws, page);
+                    } else if pages_so_far < LICENSE_MAX_PAGES {
                         // Not found on this page — request next page if within limit.
                         let next_page = page + 1;
-                        if next_page <= LICENSE_MAX_PAGES {
-                            info!("[LicenseDetect] Current IGN '{}' not found on page {} ({} entries), trying page {}...", ingame_name_ws, page, page_count, next_page);
-                            let ws = ws_client_clone.clone();
-                            tokio::spawn(async move {
-                                // Small delay between page requests to avoid flooding
-                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                let message = serde_json::json!({
-                                    "type": "licenses",
-                                    "data": format!("\"list {}\"", next_page)
-                                }).to_string();
-                                if let Err(e) = ws.send_message(&message).await {
-                                    warn!("[LicenseDetect] Failed to request licenses page {}: {}", next_page, e);
-                                } else {
-                                    info!("[LicenseDetect] Requested COFL licenses list page {}", next_page);
-                                }
-                            });
-                        } else {
-                            info!("[LicenseDetect] No license found for current IGN '{}' after {} pages", ingame_name_ws, page);
-                        }
+                        info!("[LicenseDetect] Current IGN '{}' not found on page {} ({} entries), trying page {}...", ingame_name_ws, page, page_count, next_page);
+                        let ws = ws_client_clone.clone();
+                        tokio::spawn(async move {
+                            // Small delay between page requests to avoid flooding
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            let message = serde_json::json!({
+                                "type": "licenses",
+                                "data": format!("\"list {}\"", next_page)
+                            }).to_string();
+                            if let Err(e) = ws.send_message(&message).await {
+                                warn!("[LicenseDetect] Failed to request licenses page {}: {}", next_page, e);
+                            } else {
+                                info!("[LicenseDetect] Requested COFL licenses list page {}", next_page);
+                            }
+                        });
+                    } else {
+                        info!("[LicenseDetect] No license found for current IGN '{}' after {} pages", ingame_name_ws, pages_so_far);
                     }
                 }
             }

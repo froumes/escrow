@@ -23,10 +23,10 @@ pub enum CoflEvent {
     /// Used to pause bazaar flips while the AH flip window is active.
     Countdown,
     /// Parsed license list from `/cofl licenses list` response.
-    /// Fields: `(entries, page_number)` where entries are `(ign, 1-based global license index)` pairs
+    /// Fields: `(entries, page_number)` where entries are `(ign, 1-based page-local index, tier)` tuples
     /// and `page_number` is the 1-based page that was returned.
     LicenseList {
-        entries: Vec<(String, u32)>,
+        entries: Vec<(String, u32, String)>,
         page: u32,
     },
 }
@@ -334,10 +334,10 @@ pub fn parse_license_page_number(messages: &[ChatMessage]) -> u32 {
 ///   `§7> §aIGN_NAME §2§mNONE§c expired`  (expired license)
 ///   `§7> §aIGN_NAME §2TIER`               (active license)
 ///
-/// Returns `(ign, 1-based page-local index)` pairs.
+/// Returns `(ign, 1-based page-local index, tier)` tuples.
 /// The caller must add the cumulative offset from previous pages to get the
-/// global license index.
-pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32)> {
+/// global license index. The `tier` is e.g. `"NONE"`, `"PREMIUM"`, etc.
+pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, String)> {
     let mut entries = Vec::new();
     let mut counter: u32 = 0;
 
@@ -351,12 +351,42 @@ pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32)> {
                 .take_while(|&c| c != ' ' && c != '\u{00a7}')
                 .collect();
             if !ign.is_empty() {
-                entries.push((ign, counter));
+                let tier = extract_license_tier(&rest[ign.len()..]);
+                entries.push((ign, counter, tier));
             }
         }
     }
 
     entries
+}
+
+/// Extract the license tier from the text following an IGN in a COFL license entry.
+///
+/// Input examples:
+///   ` §2§mNONE§c expired`  →  `"NONE"`
+///   ` §2PREMIUM 9.9d`      →  `"PREMIUM"`
+fn extract_license_tier(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{00a7}' && i + 1 < chars.len() && chars[i + 1] == '2' {
+            i += 2; // skip §2
+            // Skip optional §m (strikethrough for expired)
+            if i + 1 < chars.len() && chars[i] == '\u{00a7}' && chars[i + 1] == 'm' {
+                i += 2;
+            }
+            // Read tier name until space or §
+            let tier: String = chars[i..]
+                .iter()
+                .take_while(|&&c| c != ' ' && c != '\u{00a7}')
+                .collect();
+            if !tier.is_empty() {
+                return tier;
+            }
+        }
+        i += 1;
+    }
+    "NONE".to_string()
 }
 
 fn extract_upload_inventory_payload(message: &str) -> Option<String> {
@@ -524,9 +554,9 @@ mod tests {
 
         let entries = parse_license_entries(&messages);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], ("zShadowReaper_".to_string(), 1));
-        assert_eq!(entries[1], ("usaiddd".to_string(), 2));
-        assert_eq!(entries[2], ("oBlanky_".to_string(), 3));
+        assert_eq!(entries[0], ("zShadowReaper_".to_string(), 1, "NONE".to_string()));
+        assert_eq!(entries[1], ("usaiddd".to_string(), 2, "NONE".to_string()));
+        assert_eq!(entries[2], ("oBlanky_".to_string(), 3, "NONE".to_string()));
     }
 
     #[test]
@@ -605,7 +635,34 @@ mod tests {
         let entries = parse_license_entries(&page2_messages);
         // Page-local indices: 1, 2 (caller must add offset from page 1's entry count)
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], ("Player4".to_string(), 1));
-        assert_eq!(entries[1], ("Player5".to_string(), 2));
+        assert_eq!(entries[0], ("Player4".to_string(), 1, "NONE".to_string()));
+        assert_eq!(entries[1], ("Player5".to_string(), 2, "NONE".to_string()));
+    }
+
+    #[test]
+    fn test_parse_license_entries_with_premium_tier() {
+        use crate::websocket::messages::ChatMessage;
+        // Simulate a response with mixed tiers (NONE and PREMIUM for the same IGN)
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Content (page 1):§3(1)".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aargamer1014 §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§7> §aargamer1014 §2PREMIUM 9.9d".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("argamer1014".to_string(), 1, "NONE".to_string()));
+        assert_eq!(entries[1], ("argamer1014".to_string(), 2, "PREMIUM".to_string()));
+    }
+
+    #[test]
+    fn test_extract_license_tier_from_entry_text() {
+        // Test the tier extraction helper directly
+        assert_eq!(extract_license_tier(" §2§mNONE§c expired"), "NONE");
+        assert_eq!(extract_license_tier(" §2PREMIUM 9.9d"), "PREMIUM");
+        assert_eq!(extract_license_tier(" §2NONE"), "NONE");
+        assert_eq!(extract_license_tier(" §2STARTER_PREMIUM 2.1d"), "STARTER_PREMIUM");
+        // Fallback when no §2 found
+        assert_eq!(extract_license_tier(""), "NONE");
     }
 }
