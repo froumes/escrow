@@ -14,6 +14,19 @@ async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
     }
 }
 
+/// Post an embed with optional text content (used for Discord pings).
+async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, payload: serde_json::Value) {
+    let mut body = payload;
+    if let Some(text) = content {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("content".to_string(), serde_json::Value::String(text.to_string()));
+        }
+    }
+    if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&body).send().await {
+        warn!("[Webhook] Failed to send webhook: {}", e);
+    }
+}
+
 /// Format a number with M/K suffixes matching TypeScript formatNumber()
 fn format_number(n: f64) -> String {
     if n >= 1_000_000.0 {
@@ -437,21 +450,72 @@ pub async fn send_webhook_auction_listed(
 pub async fn send_webhook_banned(
     ingame_name: &str,
     reason: &str,
+    discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let payload = serde_json::json!({
-        "embeds": [{
-            "title": "⛔ Bot Banned / Disconnected",
-            "description": format!("**{}** appears to be banned.\n\n```{}```", ingame_name, reason),
-            "color": 0xe74c3cu32,
-            "footer": {
-                "text": format!("BAF - {}", ingame_name),
-                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
-            },
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        }]
+    let parsed = parse_ban_reason(reason);
+
+    let mut fields: Vec<serde_json::Value> = Vec::new();
+    if let Some(duration) = &parsed.duration {
+        fields.push(serde_json::json!({
+            "name": "⏱️ Duration",
+            "value": format!("```\n{}\n```", duration),
+            "inline": true
+        }));
+    }
+    if let Some(ban_reason) = &parsed.reason {
+        fields.push(serde_json::json!({
+            "name": "📋 Reason",
+            "value": format!("```\n{}\n```", ban_reason),
+            "inline": false
+        }));
+    }
+    if let Some(ban_id) = &parsed.ban_id {
+        fields.push(serde_json::json!({
+            "name": "🔖 Ban ID",
+            "value": format!("`{}`", ban_id),
+            "inline": true
+        }));
+    }
+    if let Some(appeal_url) = &parsed.appeal_url {
+        fields.push(serde_json::json!({
+            "name": "🔗 Appeal",
+            "value": appeal_url,
+            "inline": true
+        }));
+    }
+
+    let title = if parsed.is_permanent {
+        "⛔ Permanently Banned"
+    } else if parsed.duration.is_some() {
+        "⛔ Temporarily Banned"
+    } else {
+        "⛔ Bot Banned / Disconnected"
+    };
+
+    let description = if parsed.clean_text.is_empty() {
+        format!("**{}** has been banned.", ingame_name)
+    } else {
+        format!("**{}** has been banned.\n\n{}", ingame_name, parsed.clean_text)
+    };
+
+    let mut embed = serde_json::json!({
+        "title": title,
+        "description": description,
+        "color": 0xe74c3cu32,
+        "footer": {
+            "text": format!("BAF - {}", ingame_name),
+            "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+        },
+        "timestamp": chrono::Utc::now().to_rfc3339()
     });
-    post_embed(webhook_url, payload).await;
+    if !fields.is_empty() {
+        embed.as_object_mut().unwrap().insert("fields".to_string(), serde_json::json!(fields));
+    }
+
+    let payload = serde_json::json!({ "embeds": [embed] });
+    let ping = discord_id.map(|id| format!("<@{}>", id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
 
 pub async fn send_webhook_auction_cancelled(
@@ -479,4 +543,272 @@ pub async fn send_webhook_auction_cancelled(
         }]
     });
     post_embed(webhook_url, payload).await;
+}
+
+/// Shared webhook URL for legendary/divine flip announcements (anonymized).
+const LEGENDARY_FLIP_CHANNEL_WEBHOOK: &str = "https://discord.com/api/webhooks/1483075797789966346/yHDNP07dlx3LO4wRgO8E4d0S9Mo0Z3JaBOcdGwL8R8yxBzBKo9xAgENnkVFKUF9PDbGf";
+
+/// Profit threshold for a "Legendary" flip (100M coins).
+pub const LEGENDARY_PROFIT_THRESHOLD: u64 = 100_000_000;
+
+/// Profit threshold for a "Divine" flip (1B coins).
+pub const DIVINE_PROFIT_THRESHOLD: u64 = 1_000_000_000;
+
+/// Send a legendary flip (100M+ profit) notification to the user's webhook.
+/// Yellow embed color, with optional Discord ping.
+pub async fn send_webhook_legendary_flip(
+    ingame_name: &str,
+    item_name: &str,
+    price: u64,
+    profit: i64,
+    buy_speed_ms: Option<u64>,
+    discord_id: Option<&str>,
+    webhook_url: &str,
+) {
+    let safe_item = sanitize_item_name(item_name);
+    let fields = build_flip_tier_fields(price, profit, buy_speed_ms);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🌟 Legendary Flip!",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0xFFD700u32,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    let ping = discord_id.map(|id| format!("<@{}>", id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
+
+/// Send a divine flip (1B+ profit) notification to the user's webhook.
+/// Cyan embed color, with optional Discord ping.
+pub async fn send_webhook_divine_flip(
+    ingame_name: &str,
+    item_name: &str,
+    price: u64,
+    profit: i64,
+    buy_speed_ms: Option<u64>,
+    discord_id: Option<&str>,
+    webhook_url: &str,
+) {
+    let safe_item = sanitize_item_name(item_name);
+    let fields = build_flip_tier_fields(price, profit, buy_speed_ms);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "💎 Divine Flip!",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0x00FFFFu32,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    let ping = discord_id.map(|id| format!("<@{}>", id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
+
+/// Send an anonymized legendary/divine flip notification to the shared channel.
+/// No IGN, purse, auction link, or other identifying info.
+pub async fn send_webhook_flip_channel(
+    item_name: &str,
+    profit: i64,
+) {
+    let (title, color) = if profit >= DIVINE_PROFIT_THRESHOLD as i64 {
+        ("💎 Divine Flip!", 0x00FFFFu32)
+    } else {
+        ("🌟 Legendary Flip!", 0xFFD700u32)
+    };
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": title,
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": color,
+            "fields": [
+                {"name": "📈 Profit", "value": format!("```diff\n+{} coins\n```", format_number(profit as f64)), "inline": true},
+            ],
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": "BAF"
+            }
+        }]
+    });
+    post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
+}
+
+/// Build embed fields for legendary/divine flip notifications.
+fn build_flip_tier_fields(price: u64, profit: i64, buy_speed_ms: Option<u64>) -> Vec<serde_json::Value> {
+    let mut fields = vec![
+        serde_json::json!({
+            "name": "💰 Purchase Price",
+            "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
+            "inline": true
+        }),
+        serde_json::json!({
+            "name": "📈 Profit",
+            "value": format!("```diff\n+{} coins\n```", format_number(profit as f64)),
+            "inline": true
+        }),
+    ];
+    if let Some(ms) = buy_speed_ms {
+        fields.push(serde_json::json!({
+            "name": "⚡ Buy Speed",
+            "value": format!("```\n{}ms\n```", ms),
+            "inline": true
+        }));
+    }
+    fields
+}
+
+/// Parsed ban information extracted from the debug-formatted disconnect reason.
+pub struct ParsedBan {
+    pub is_permanent: bool,
+    pub duration: Option<String>,
+    pub reason: Option<String>,
+    pub ban_id: Option<String>,
+    pub appeal_url: Option<String>,
+    pub clean_text: String,
+}
+
+/// Parse a ban disconnect reason string (Debug-formatted TextComponent) into structured fields.
+pub fn parse_ban_reason(reason: &str) -> ParsedBan {
+    // Extract all `text: "..."` values from the Debug-formatted TextComponent
+    let mut texts: Vec<String> = Vec::new();
+    let mut i = 0;
+    let bytes = reason.as_bytes();
+    let prefix = b"text: \"";
+    while i < bytes.len() {
+        if bytes[i..].starts_with(prefix) {
+            i += prefix.len();
+            let mut s = String::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    match bytes[i + 1] {
+                        b'n' => { s.push('\n'); i += 2; continue; }
+                        b'"' => { s.push('"'); i += 2; continue; }
+                        b'\\' => { s.push('\\'); i += 2; continue; }
+                        _ => {}
+                    }
+                }
+                s.push(bytes[i] as char);
+                i += 1;
+            }
+            if !s.is_empty() {
+                texts.push(s);
+            }
+            i += 1; // skip closing quote
+        } else {
+            i += 1;
+        }
+    }
+
+    let full_text = texts.join("");
+    let lower = full_text.to_ascii_lowercase();
+    let is_permanent = lower.contains("permanently banned");
+
+    // Extract duration (e.g. "29d 23h 59m 58s")
+    let duration = texts.iter().find(|t| {
+        let t = t.trim();
+        !t.is_empty() && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && (t.contains('d') || t.contains('h') || t.contains('m') || t.contains('s'))
+    }).map(|s| s.trim().to_string());
+
+    // Extract ban reason
+    let reason_text = {
+        let mut found = false;
+        let mut result = None;
+        for t in &texts {
+            if found {
+                let trimmed = t.trim().trim_end_matches('\n');
+                if !trimmed.is_empty() && !trimmed.starts_with("Find out more") && !trimmed.starts_with("Ban ID") {
+                    result = Some(trimmed.to_string());
+                }
+                break;
+            }
+            if t.trim().starts_with("Reason:") || t.trim() == "Reason: " {
+                found = true;
+            }
+        }
+        result
+    };
+
+    // Extract ban ID (e.g. "#AF4CD6A8")
+    let ban_id = {
+        let mut found = false;
+        let mut result = None;
+        for t in &texts {
+            if found {
+                let trimmed = t.trim().trim_end_matches('\n');
+                if !trimmed.is_empty() {
+                    result = Some(trimmed.to_string());
+                }
+                break;
+            }
+            if t.trim().starts_with("Ban ID:") || t.trim() == "Ban ID: " {
+                found = true;
+            }
+        }
+        result
+    };
+
+    // Extract appeal URL
+    let appeal_url = texts.iter().find(|t| t.contains("hypixel.net/appeal"))
+        .map(|s| s.trim().trim_end_matches('\n').to_string());
+
+    // Build clean text summary (no raw debug output)
+    let clean_text = if !texts.is_empty() {
+        full_text.trim().replace("\n\n\n", "\n\n").to_string()
+    } else {
+        // Fallback: if no text: fields were found, the reason might be plain text
+        reason.to_string()
+    };
+
+    ParsedBan {
+        is_permanent,
+        duration,
+        reason: reason_text,
+        ban_id,
+        appeal_url,
+        clean_text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ban_reason;
+
+    #[test]
+    fn parse_temporary_ban_message() {
+        let reason = r##"Some(Text(TextComponent { base: BaseComponent { siblings: [Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 16733525, name: Some("red") }) } }, text: "You are temporarily banned for " }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 16777215, name: Some("white") }) } }, text: "29d 23h 59m 58s" }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 16733525, name: Some("red") }) } }, text: " from this server!\n\n" }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 11184810, name: Some("gray") }) } }, text: "Reason: " }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 16777215, name: Some("white") }) } }, text: "Cheating through the use of unfair game advantages.\n" }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 11184810, name: Some("gray") }) } }, text: "Find out more: " }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 5636095, name: Some("aqua") }) } }, text: "https://www.hypixel.net/appeal\n\n" }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 11184810, name: Some("gray") }) } }, text: "Ban ID: " }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 16777215, name: Some("white") }) } }, text: "#AF4CD6A8\n" }), Text(TextComponent { base: BaseComponent { siblings: [], style: Style { color: Some(TextColor { value: 11184810, name: Some("gray") }) } }, text: "Sharing your Ban ID may affect the processing of your appeal!" })], style: Style { color: None } }, text: "" }))"##;
+
+        let parsed = parse_ban_reason(reason);
+        assert!(!parsed.is_permanent);
+        assert_eq!(parsed.duration.as_deref(), Some("29d 23h 59m 58s"));
+        assert_eq!(parsed.reason.as_deref(), Some("Cheating through the use of unfair game advantages."));
+        assert_eq!(parsed.ban_id.as_deref(), Some("#AF4CD6A8"));
+        assert_eq!(parsed.appeal_url.as_deref(), Some("https://www.hypixel.net/appeal"));
+    }
+
+    #[test]
+    fn parse_permanent_ban_message() {
+        let reason = r#"Some(Text(TextComponent { base: BaseComponent { siblings: [Text(TextComponent { text: "You are permanently banned from this server!" })], style: Style {} }, text: "" }))"#;
+
+        let parsed = parse_ban_reason(reason);
+        assert!(parsed.is_permanent);
+    }
+
+    #[test]
+    fn parse_plain_text_ban_fallback() {
+        let reason = "You are temporarily banned for 5d from this server!";
+        let parsed = parse_ban_reason(reason);
+        // Falls back to raw text since there are no `text: "..."` fields
+        assert_eq!(parsed.clean_text, reason);
+    }
 }
