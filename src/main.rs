@@ -532,25 +532,13 @@ async fn main() -> Result<()> {
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    // Send webhook
+                    // Send webhook: for legendary/divine flips, send the styled
+                    // webhook (with ping + color) instead of the regular purchase one.
+                    let is_legendary_flip = opt_profit.map_or(false, |p| p >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64);
                     let opt_finder_for_flip = opt_finder.clone();
-                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
-                        let url = webhook_url.to_string();
-                        let name = ingame_name_for_events.clone();
-                        let item = item_name.clone();
-                        let purse = bot_client_clone.get_purse();
-                        let uuid_str = opt_auction_uuid.clone();
-                        tokio::spawn(async move {
-                            frikadellen_baf::webhook::send_webhook_item_purchased(
-                                &name, &item, price, opt_target, opt_profit, purse,
-                                event_buy_speed_ms, uuid_str.as_deref(), opt_finder.as_deref(), &url,
-                            ).await;
-                        });
-                    }
-                    // Send legendary/divine flip webhooks for high-profit purchases
-                    if let Some(profit) = opt_profit {
-                        if profit >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64 {
-                            // Send to shared anonymous channel (if not opted out)
+                    if is_legendary_flip {
+                        // Send to shared anonymous channel (if not opted out)
+                        if let Some(profit) = opt_profit {
                             if config_for_events.share_legendary_flips {
                                 let item_for_channel = item_name.clone();
                                 let finder_for_channel = opt_finder_for_flip.clone();
@@ -562,20 +550,20 @@ async fn main() -> Result<()> {
                                 });
                             }
 
-                            // Send to user's webhook with ping
+                            // Send legendary/divine styled webhook to user (replaces regular purchase webhook)
                             if let Some(webhook_url) = config_for_events.active_webhook_url() {
                                 let url = webhook_url.to_string();
                                 let name = ingame_name_for_events.clone();
                                 let item = item_name.clone();
                                 let did = config_for_events.active_discord_id().map(|s| s.to_string());
                                 let purse = bot_client_clone.get_purse();
-                                let uuid_str2 = opt_auction_uuid.clone();
-                                let finder2 = opt_finder_for_flip.clone();
+                                let uuid_str = opt_auction_uuid.clone();
+                                let finder = opt_finder_for_flip.clone();
                                 if profit >= frikadellen_baf::webhook::DIVINE_PROFIT_THRESHOLD as i64 {
                                     tokio::spawn(async move {
                                         frikadellen_baf::webhook::send_webhook_divine_flip(
                                             &name, &item, price, opt_target, profit, purse,
-                                            event_buy_speed_ms, uuid_str2.as_deref(), finder2.as_deref(),
+                                            event_buy_speed_ms, uuid_str.as_deref(), finder.as_deref(),
                                             did.as_deref(), &url,
                                         ).await;
                                     });
@@ -583,12 +571,27 @@ async fn main() -> Result<()> {
                                     tokio::spawn(async move {
                                         frikadellen_baf::webhook::send_webhook_legendary_flip(
                                             &name, &item, price, opt_target, profit, purse,
-                                            event_buy_speed_ms, uuid_str2.as_deref(), finder2.as_deref(),
+                                            event_buy_speed_ms, uuid_str.as_deref(), finder.as_deref(),
                                             did.as_deref(), &url,
                                         ).await;
                                     });
                                 }
                             }
+                        }
+                    } else {
+                        // Regular purchase webhook for non-legendary flips
+                        if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                            let url = webhook_url.to_string();
+                            let name = ingame_name_for_events.clone();
+                            let item = item_name.clone();
+                            let purse = bot_client_clone.get_purse();
+                            let uuid_str = opt_auction_uuid.clone();
+                            tokio::spawn(async move {
+                                frikadellen_baf::webhook::send_webhook_item_purchased(
+                                    &name, &item, price, opt_target, opt_profit, purse,
+                                    event_buy_speed_ms, uuid_str.as_deref(), opt_finder.as_deref(), &url,
+                                ).await;
+                            });
                         }
                     }
                 }
