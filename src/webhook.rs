@@ -510,7 +510,7 @@ pub async fn send_webhook_banned(
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
     if !fields.is_empty() {
-        embed.as_object_mut().unwrap().insert("fields".to_string(), serde_json::json!(fields));
+        embed.as_object_mut().expect("embed is a JSON object").insert("fields".to_string(), serde_json::json!(fields));
     }
 
     let payload = serde_json::json!({ "embeds": [embed] });
@@ -679,34 +679,37 @@ pub struct ParsedBan {
 
 /// Parse a ban disconnect reason string (Debug-formatted TextComponent) into structured fields.
 pub fn parse_ban_reason(reason: &str) -> ParsedBan {
-    // Extract all `text: "..."` values from the Debug-formatted TextComponent
+    // Extract all `text: "..."` values from the Debug-formatted TextComponent.
+    // The Debug format uses ASCII-safe escaping (\n, \\, \", \u{xxxx}) for
+    // non-printable / non-ASCII chars, so byte-level matching on the prefix
+    // is safe. Content bytes within the quoted value are valid UTF-8 because
+    // any non-ASCII is escaped by Rust's Debug trait.
     let mut texts: Vec<String> = Vec::new();
-    let mut i = 0;
-    let bytes = reason.as_bytes();
-    let prefix = b"text: \"";
-    while i < bytes.len() {
-        if bytes[i..].starts_with(prefix) {
-            i += prefix.len();
-            let mut s = String::new();
-            while i < bytes.len() && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    match bytes[i + 1] {
-                        b'n' => { s.push('\n'); i += 2; continue; }
-                        b'"' => { s.push('"'); i += 2; continue; }
-                        b'\\' => { s.push('\\'); i += 2; continue; }
-                        _ => {}
-                    }
+    let prefix = "text: \"";
+    let mut search_start = 0;
+    while let Some(pos) = reason[search_start..].find(prefix) {
+        let content_start = search_start + pos + prefix.len();
+        let mut s = String::new();
+        let mut i = content_start;
+        let bytes = reason.as_bytes();
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'n' => { s.push('\n'); i += 2; continue; }
+                    b'"' => { s.push('"'); i += 2; continue; }
+                    b'\\' => { s.push('\\'); i += 2; continue; }
+                    _ => {}
                 }
-                s.push(bytes[i] as char);
-                i += 1;
             }
-            if !s.is_empty() {
-                texts.push(s);
-            }
-            i += 1; // skip closing quote
-        } else {
+            // Safe: Rust Debug format escapes non-ASCII to \u{xxxx}, so
+            // unescaped bytes here are always valid single-byte ASCII chars.
+            s.push(bytes[i] as char);
             i += 1;
         }
+        if !s.is_empty() {
+            texts.push(s);
+        }
+        search_start = if i < bytes.len() { i + 1 } else { bytes.len() };
     }
 
     let full_text = texts.join("");
