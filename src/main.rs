@@ -533,6 +533,7 @@ async fn main() -> Result<()> {
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
                     // Send webhook
+                    let opt_finder_for_flip = opt_finder.clone();
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
@@ -549,11 +550,17 @@ async fn main() -> Result<()> {
                     // Send legendary/divine flip webhooks for high-profit purchases
                     if let Some(profit) = opt_profit {
                         if profit >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64 {
-                            // Send to shared anonymous channel
-                            let item_for_channel = item_name.clone();
-                            tokio::spawn(async move {
-                                frikadellen_baf::webhook::send_webhook_flip_channel(&item_for_channel, profit).await;
-                            });
+                            // Send to shared anonymous channel (if not opted out)
+                            if config_for_events.share_legendary_flips {
+                                let item_for_channel = item_name.clone();
+                                let finder_for_channel = opt_finder_for_flip.clone();
+                                tokio::spawn(async move {
+                                    frikadellen_baf::webhook::send_webhook_flip_channel(
+                                        &item_for_channel, price, opt_target, profit,
+                                        event_buy_speed_ms, finder_for_channel.as_deref(),
+                                    ).await;
+                                });
+                            }
 
                             // Send to user's webhook with ping
                             if let Some(webhook_url) = config_for_events.active_webhook_url() {
@@ -561,16 +568,23 @@ async fn main() -> Result<()> {
                                 let name = ingame_name_for_events.clone();
                                 let item = item_name.clone();
                                 let did = config_for_events.active_discord_id().map(|s| s.to_string());
+                                let purse = bot_client_clone.get_purse();
+                                let uuid_str2 = opt_auction_uuid.clone();
+                                let finder2 = opt_finder_for_flip.clone();
                                 if profit >= frikadellen_baf::webhook::DIVINE_PROFIT_THRESHOLD as i64 {
                                     tokio::spawn(async move {
                                         frikadellen_baf::webhook::send_webhook_divine_flip(
-                                            &name, &item, price, profit, event_buy_speed_ms, did.as_deref(), &url,
+                                            &name, &item, price, opt_target, profit, purse,
+                                            event_buy_speed_ms, uuid_str2.as_deref(), finder2.as_deref(),
+                                            did.as_deref(), &url,
                                         ).await;
                                     });
                                 } else {
                                     tokio::spawn(async move {
                                         frikadellen_baf::webhook::send_webhook_legendary_flip(
-                                            &name, &item, price, profit, event_buy_speed_ms, did.as_deref(), &url,
+                                            &name, &item, price, opt_target, profit, purse,
+                                            event_buy_speed_ms, uuid_str2.as_deref(), finder2.as_deref(),
+                                            did.as_deref(), &url,
                                         ).await;
                                     });
                                 }

@@ -153,6 +153,11 @@ pub struct Config {
     /// Leave empty to use the Coflnet API as a fallback.
     #[serde(default, with = "opt_string_as_empty")]
     pub hypixel_api_key: Option<String>,
+
+    /// Whether to share legendary/divine flip purchases to the public Discord channel.
+    /// Defaults to true. Set to false to opt out.
+    #[serde(default = "default_true")]
+    pub share_legendary_flips: bool,
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
@@ -230,6 +235,7 @@ impl Default for Config {
             discord_id: None,
             web_gui_password: None,
             hypixel_api_key: None,
+            share_legendary_flips: true,
             sessions: HashMap::new(),
         }
     }
