@@ -577,12 +577,13 @@ pub async fn send_webhook_flip_channel(
     let payload = serde_json::json!({
         "embeds": [{
             "title": title,
-            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "description": format!("**{}** • <t:{}:R>\n\n[Discord](https://discord.gg/42DvX6T9jh)", item_name, now_unix()),
             "color": color,
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
-            "footer": {
-                "text": "Frikadellen-BAF (tpm.auction) •  Discord (discord.gg/42DvX6T9jh)",
+            "author": {
+                "name": "Frikadellen-BAF",
+                "url": "https://tpm.auction",
                 "icon_url": "https://cdn.discordapp.com/icons/1073701591647031336/a_1c1ce88572e498940340b6e5d5eee683.gif"
             }
         }]
