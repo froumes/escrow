@@ -332,7 +332,6 @@ async fn main() -> Result<()> {
     // Initialize bot client (not connected yet — web server starts first so
     // the chat GUI is available during Microsoft auth)
     let mut bot_client = BotClient::new();
-    bot_client.fastbuy = config.fastbuy_enabled();
     bot_client.set_auto_cookie_hours(config.auto_cookie);
     bot_client.freemoney = config.freemoney_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;

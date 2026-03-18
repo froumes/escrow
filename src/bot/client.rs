@@ -44,7 +44,6 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 /// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
-const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
@@ -96,8 +95,6 @@ pub struct BotClient {
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Whether to use fastbuy (window-skip) when purchasing BIN auctions
-    pub fastbuy: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
@@ -201,7 +198,6 @@ impl BotClient {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
-            fastbuy: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
@@ -286,8 +282,6 @@ impl BotClient {
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
-            fastbuy: self.fastbuy,
-            fastbuy_preclick_sent: Arc::new(AtomicBool::new(false)),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
@@ -686,12 +680,6 @@ pub struct BotClientState {
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Whether to use fastbuy (window-skip) when purchasing BIN auctions
-    pub fastbuy: bool,
-    /// Set to true when a fastbuy pre-click packet (slot 11 in the next window) has been
-    /// sent optimistically. The Confirm Purchase handler reads this to skip redundant
-    /// clicks and avoid wasting ticks on duplicate packets.
-    pub fastbuy_preclick_sent: Arc<AtomicBool>,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
@@ -787,8 +775,6 @@ impl Default for BotClientState {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
-            fastbuy: false,
-            fastbuy_preclick_sent: Arc::new(AtomicBool::new(false)),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
@@ -1463,7 +1449,6 @@ async fn event_handler(
                 }
                 *state.bot_state.write() = BotState::Idle;
                 state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                state.fastbuy_preclick_sent.store(false, Ordering::Relaxed);
                 *state.purchase_start_time.write() = None;
                 *state.pending_purchase_at_ms.write() = None;
                 state.bed_timing_active.store(false, Ordering::Relaxed);
@@ -1748,7 +1733,6 @@ async fn event_handler(
                     // Clear grace-period spam and bed-timing flags so a new BIN Auction View
                     // can start fresh.
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                    state.fastbuy_preclick_sent.store(false, Ordering::Relaxed);
                     *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
@@ -2309,75 +2293,26 @@ async fn handle_window_interaction(
                         }
                     }
                 } else {
+                    // Non-bed BIN auction — buy as fast as possible.
                     // Click slot 31 once (buy-now button).
-                    // Single click only — double-clicking sends a second packet while Hypixel
-                    // is already preparing the Confirm Purchase window, which confuses the server
-                    // and adds ~300ms of unnecessary latency.
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-
-                    // Optional fastbuy (window-skip): pre-click confirm in the next window.
-                    // If this packet is ignored/lost, the Confirm Purchase handler below still
-                    // performs normal confirm clicks with retries.
-                    if state.fastbuy && slot_31_kind.contains(BIN_PURCHASE_ITEM_KIND) {
-                        // No delay — TCP preserves packet ordering so the slot-31 buy packet
-                        // always arrives at the server before this pre-click.  Any sleep here
-                        // (even 10ms) can overshoot to the next game-loop tick (~50-100ms)
-                        // because the .await yields control back to the scheduler.
-                        // Hypixel's confirm GUI for this click is the next container id.
-                        // Use the known window_id directly instead of re-reading last_window_id
-                        // which may have already changed if the Confirm Purchase window arrived
-                        // during processing — that race condition would skip the
-                        // pre-click entirely and add an extra round-trip (~200ms).
-                        let next_window_id = window_id.wrapping_add(1);
-                        // Fastbuy pre-click: deliberately targets next_window_id before it
-                        // opens (optimistic latency cut). Bypasses click_window_slot's
-                        // stale-window guard, which blocks clicks to any window other than
-                        // the current one (or window 0) — use the raw packet path here instead.
-                        {
-                            use azalea_protocol::packets::game::s_container_click::{
-                                ServerboundContainerClick, HashedStack,
-                            };
-                            bot.write_packet(ServerboundContainerClick {
-                                container_id: next_window_id as i32,
-                                state_id: 0,
-                                slot_num: 11,
-                                button_num: 0,
-                                click_type: ClickType::Pickup,
-                                changed_slots: Default::default(),
-                                carried_item: HashedStack(None),
-                            });
-                            state.fastbuy_preclick_sent.store(true, Ordering::Relaxed);
-                            info!("Clicked slot 11 in window {} (fastbuy pre-click)", next_window_id);
-                        }
-                    }
                 }
             } else if window_title.contains("Confirm Purchase") {
-                let preclick_was_sent = state.fastbuy_preclick_sent.swap(false, Ordering::Relaxed);
+                // Click confirm (slot 11) immediately for fastest buy speed.
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
 
-                if preclick_was_sent {
-                    // Pre-click was already sent before this window opened — the server
-                    // already has the confirm click packet queued.  Do NOT sleep or retry
-                    // here: any await blocks the event loop and delays the "Putting coins
-                    // in escrow…" chat event, which inflates the measured buy speed.
-                    // The 5-second GUI watchdog covers the rare case where the pre-click
-                    // was lost.
-                } else {
-                    // No pre-click was sent — click confirm immediately.
+                // Short wait for the server to process and close the window.
+                tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+
+                // Safety retry loop: if the window is still open (click was lost or
+                // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
+                while state.handlers.current_window_title()
+                    .as_deref()
+                    .map(|t| t.contains("Confirm Purchase"))
+                    .unwrap_or(false)
+                {
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-
-                    // Short wait for the server to process and close the window.
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
-
-                    // Safety retry loop: if the window is still open (click was lost or
-                    // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
-                    while state.handlers.current_window_title()
-                        .as_deref()
-                        .map(|t| t.contains("Confirm Purchase"))
-                        .unwrap_or(false)
-                    {
-                        click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
-                    }
                 }
 
                 *state.bot_state.write() = BotState::Idle;

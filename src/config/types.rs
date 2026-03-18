@@ -108,10 +108,6 @@ pub struct Config {
     #[serde(default)]
     pub auto_cookie: u64,
 
-    /// Enable fastbuy (window-skip): click BIN buy (slot 31) and pre-click confirm (slot 11).
-    /// Disabled by default and omitted from generated config unless manually added.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fastbuy: Option<bool>,
     
     #[serde(default = "default_true")]
     pub enable_console_input: bool,
@@ -159,9 +155,9 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub share_legendary_flips: bool,
 
-    /// Whether to anonymize the username in profit summary webhooks.
-    /// When true, the IGN is replaced with random characters each time.
-    /// Defaults to true.
+    /// Whether to anonymize the username in the web GUI panel and profit summary webhooks.
+    /// When true, account names and avatars in the web panel are hidden, and the IGN is
+    /// replaced with random characters in webhooks.  Defaults to true.
     #[serde(default = "default_true")]
     pub anonymize_webhook_name: bool,
     
@@ -231,7 +227,6 @@ impl Default for Config {
             freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
-            fastbuy: None,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
             proxy_enabled: false,
@@ -251,10 +246,6 @@ impl Default for Config {
 impl Config {
     pub fn freemoney_enabled(&self) -> bool {
         self.freemoney.unwrap_or(false)
-    }
-
-    pub fn fastbuy_enabled(&self) -> bool {
-        self.fastbuy.unwrap_or(true)
     }
 
     /// Returns the webhook URL only if it is non-empty.
@@ -309,27 +300,6 @@ mod tests {
     fn manual_freemoney_true_enables_flag() {
         let config: Config = toml::from_str("freemoney = true").expect("config should parse");
         assert!(config.freemoney_enabled());
-    }
-
-    #[test]
-    fn fastbuy_defaults_to_true() {
-        assert!(Config::default().fastbuy_enabled());
-    }
-
-    #[test]
-    fn default_config_omits_fastbuy() {
-        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
-        assert!(!toml.contains("fastbuy"));
-    }
-
-    #[test]
-    fn confirm_skip_does_not_affect_fastbuy() {
-        // confirm_skip is a separate setting; fastbuy defaults to true
-        let config: Config = toml::from_str("confirm_skip = true").expect("config should parse");
-        assert!(config.fastbuy_enabled());
-        // Explicit fastbuy = false still overrides the default
-        let config: Config = toml::from_str("fastbuy = false\nconfirm_skip = true").expect("config should parse");
-        assert!(!config.fastbuy_enabled());
     }
 
     #[test]

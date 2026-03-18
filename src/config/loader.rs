@@ -97,20 +97,12 @@ mod tests {
     use super::ConfigLoader;
 
     #[test]
-    fn parse_config_does_not_map_confirm_skip_to_fastbuy() {
-        // confirm_skip alone does not affect fastbuy; fastbuy defaults to true
+    fn parse_config_ignores_unknown_fields() {
+        // confirm_skip is an unknown field and should not break parsing
         let config = ConfigLoader::parse_config("confirm_skip = true")
             .expect("config should parse");
-        assert!(config.fastbuy_enabled());
-
-        let config = ConfigLoader::parse_config("fastbuy = true\nconfirm_skip = false")
-            .expect("config should parse");
-        assert!(config.fastbuy_enabled());
-
-        // Explicit fastbuy = false overrides the default
-        let config = ConfigLoader::parse_config("fastbuy = false\nconfirm_skip = true")
-            .expect("config should parse");
-        assert!(!config.fastbuy_enabled());
+        // freemoney defaults to false
+        assert!(!config.freemoney_enabled());
     }
 }
 
