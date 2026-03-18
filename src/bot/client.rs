@@ -293,7 +293,7 @@ impl BotClient {
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
-            purchase_at_instant: Arc::new(RwLock::new(None)),
+            pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
@@ -704,8 +704,10 @@ pub struct BotClientState {
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
     pub grace_period_spam_active: Arc<AtomicBool>,
-    /// COFL-provided bed end timing (`purchaseAt`) converted to a local instant.
-    pub purchase_at_instant: Arc<RwLock<Option<tokio::time::Instant>>>,
+    /// Raw COFL `purchaseAt` epoch-ms timestamp from the flip.  Converted to a
+    /// local `Instant` only when a bed (grace-period) is detected in the BIN
+    /// Auction View **and** freemoney mode is enabled.
+    pub pending_purchase_at_ms: Arc<RwLock<Option<i64>>>,
     /// Set to true while the bot is waiting for a bed (grace-period) to expire so
     /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
     pub bed_timing_active: Arc<AtomicBool>,
@@ -792,7 +794,7 @@ impl Default for BotClientState {
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
-            purchase_at_instant: Arc::new(RwLock::new(None)),
+            pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
@@ -1463,7 +1465,7 @@ async fn event_handler(
                 state.grace_period_spam_active.store(false, Ordering::Relaxed);
                 state.fastbuy_preclick_sent.store(false, Ordering::Relaxed);
                 *state.purchase_start_time.write() = None;
-                *state.purchase_at_instant.write() = None;
+                *state.pending_purchase_at_ms.write() = None;
                 state.bed_timing_active.store(false, Ordering::Relaxed);
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
@@ -1747,7 +1749,7 @@ async fn event_handler(
                     // can start fresh.
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
                     state.fastbuy_preclick_sent.store(false, Ordering::Relaxed);
-                    *state.purchase_at_instant.write() = None;
+                    *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
@@ -1995,20 +1997,10 @@ async fn execute_command(
             info!("Sending chat command: {}", chat_command);
             bot.write_chat_packet(&chat_command);
 
-            // Convert COFL purchaseAt to a local instant so bed timing can wait
-            // for the exact grace-period end sent by COFL.
-            let purchase_at_instant = flip.purchase_at_ms.and_then(|purchase_at_ms| {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_millis() as i64)?;
-                if purchase_at_ms <= now_ms {
-                    return Some(tokio::time::Instant::now());
-                }
-                let wait_ms = (purchase_at_ms - now_ms) as u64;
-                Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms))
-            });
-            *state.purchase_at_instant.write() = purchase_at_instant;
+            // Store raw COFL purchaseAt timestamp.  It is only converted to a
+            // local Instant later — and only when the auction turns out to be a
+            // bed (grace-period) and freemoney mode is enabled.
+            *state.pending_purchase_at_ms.write() = flip.purchase_at_ms;
             
             // Set state to purchasing
             *state.bot_state.write() = BotState::Purchasing;
@@ -2211,10 +2203,16 @@ async fn handle_window_interaction(
                         // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
                         // If purchaseAt is not available, fall through to immediate bed spam.
                         let pre_click_lead_ms = state.bed_pre_click_ms;
-                        let remaining_ms_from_purchase_at = state.purchase_at_instant.read()
-                            .as_ref()
-                            .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
-                            .map(|d| d.as_millis() as u64);
+                        // Convert the raw epoch-ms timestamp to a remaining-ms delta.
+                        let remaining_ms_from_purchase_at = state.pending_purchase_at_ms.read()
+                            .and_then(|purchase_at_ms| {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_millis() as i64)?;
+                                let diff = purchase_at_ms - now_ms;
+                                if diff <= 0 { None } else { Some(diff as u64) }
+                            });
 
                         if let Some(remaining_ms) = remaining_ms_from_purchase_at {
                             let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
@@ -2356,26 +2354,30 @@ async fn handle_window_interaction(
             } else if window_title.contains("Confirm Purchase") {
                 let preclick_was_sent = state.fastbuy_preclick_sent.swap(false, Ordering::Relaxed);
 
-                if !preclick_was_sent {
+                if preclick_was_sent {
+                    // Pre-click was already sent before this window opened — the server
+                    // already has the confirm click packet queued.  Do NOT sleep or retry
+                    // here: any await blocks the event loop and delays the "Putting coins
+                    // in escrow…" chat event, which inflates the measured buy speed.
+                    // The 5-second GUI watchdog covers the rare case where the pre-click
+                    // was lost.
+                } else {
                     // No pre-click was sent — click confirm immediately.
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-                }
-                // If pre-click WAS sent, the server already received the confirm click
-                // before this window even opened.  Skip the redundant duplicate to avoid
-                // wasting a tick on a packet the server has already processed.
 
-                // Short wait for the server to process and close the window.
-                tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
-
-                // Safety retry loop: if the window is still open (click was lost or
-                // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
-                while state.handlers.current_window_title()
-                    .as_deref()
-                    .map(|t| t.contains("Confirm Purchase"))
-                    .unwrap_or(false)
-                {
-                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                    // Short wait for the server to process and close the window.
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+
+                    // Safety retry loop: if the window is still open (click was lost or
+                    // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
+                    while state.handlers.current_window_title()
+                        .as_deref()
+                        .map(|t| t.contains("Confirm Purchase"))
+                        .unwrap_or(false)
+                    {
+                        click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+                    }
                 }
 
                 *state.bot_state.write() = BotState::Idle;
