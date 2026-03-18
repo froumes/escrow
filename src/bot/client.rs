@@ -736,9 +736,11 @@ pub struct BotClientState {
     /// Cancel open bazaar orders when they are older than this many minutes.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes: u64,
-    /// Identity of the order currently being processed in the ManageOrders iteration.
+    /// Context of the order currently being processed in the ManageOrders iteration.
     /// Stored when clicking an order in Branch B so that Branch C (separate "Order options"
-    /// window) can apply the same `cancel_due_to_age` logic.  Format: (is_buy, tag).
+    /// window) can apply the same `cancel_due_to_age` logic.
+    /// Fields: `(is_buy, order_display_name, order_identity)` where `order_identity` is
+    /// the `(is_buy, item_tag)` tuple used by `should_cancel_open_order_due_to_age()`.
     pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>)>>>,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
