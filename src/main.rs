@@ -524,9 +524,8 @@ async fn main() -> Result<()> {
             uncached_accounts
         );
         run_first_time_setup(&config, &uncached_accounts).await?;
-        // run_first_time_setup calls restart_process() and never returns,
-        // but just in case:
-        unreachable!("run_first_time_setup should have restarted the process");
+        // run_first_time_setup ends with restart_process() which never returns.
+        unreachable!("run_first_time_setup ends with restart_process() and should never return");
     }
 
     info!("Connecting to Coflnet WebSocket...");

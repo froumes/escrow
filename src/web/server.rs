@@ -1123,7 +1123,10 @@ async fn handle_setup_chat_ws(mut socket: WebSocket, state: SetupWebState) {
                     break;
                 }
             }
-            // During setup, incoming chat input is ignored (no bot/ws to send to)
+            // During setup mode there is no bot client or COFL WebSocket to
+            // forward messages to, so incoming chat input from the web panel is
+            // silently discarded.  Once setup completes and the process restarts,
+            // the normal web server will handle chat input properly.
             Some(Ok(_msg)) = socket.recv() => {}
             else => break,
         }
