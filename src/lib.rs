@@ -18,4 +18,4 @@ pub mod webhook;
 
 pub use bot::{BotClient, BotEvent, BotEventHandlers};
 pub use types::{BotState, CommandPriority, CommandType, Flip, BazaarFlipRecommendation};
-pub use web::{start_web_server, start_setup_web_server, WebSharedState, SetupWebState};
+pub use web::{start_web_server, WebSharedState};

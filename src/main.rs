@@ -8,7 +8,7 @@ use frikadellen_baf::{
     websocket::CoflWebSocket,
     bot::BotClient,
     types::Flip,
-    web::{start_web_server, start_setup_web_server, WebSharedState, SetupWebState},
+    web::{start_web_server, WebSharedState},
 };
 use tracing::{debug, error, info, warn};
 use tokio::time::{sleep, Duration};
@@ -29,10 +29,6 @@ const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
 /// After this many consecutive rejoin attempts the counter resets so the
 /// backoff does not grow unbounded.
 const REJOIN_MAX_ATTEMPTS: u32 = 5;
-
-/// Maximum number of COFL license list pages to search when auto-detecting
-/// the current account's license index.
-const LICENSE_MAX_PAGES: u32 = 10;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -95,228 +91,6 @@ fn should_drop_bazaar_command_during_ah_pause(
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
-
-/// Check whether a cached (non-expired) Microsoft auth token exists for the given cache key.
-///
-/// Azalea stores its auth cache in `~/.minecraft/azalea-auth.json`.  If the file is missing,
-/// unreadable, or the key is absent / expired, the user will need to go through the device-code
-/// login flow again – i.e. this is a "first startup".
-async fn has_cached_microsoft_auth(cache_key: &str) -> bool {
-    let minecraft_dir = match minecraft_folder_path::minecraft_dir() {
-        Some(d) => d,
-        None => return false,
-    };
-    let cache_file = minecraft_dir.join("azalea-auth.json");
-    if !cache_file.exists() {
-        return false;
-    }
-    let contents = match tokio::fs::read_to_string(&cache_file).await {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    // The cache is a JSON array of CachedAccount objects.
-    let accounts: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    accounts.iter().any(|acct| {
-        // azalea-auth's CachedAccount uses `cache_key` (with legacy alias `email`)
-        let key_match = acct
-            .get("cache_key")
-            .or_else(|| acct.get("email"))
-            .and_then(|v| v.as_str())
-            == Some(cache_key);
-        let mca_valid = acct
-            .get("mca")
-            .and_then(|mca| mca.get("expires_at"))
-            .and_then(|e| e.as_u64())
-            .map(|exp| exp > now_secs)
-            .unwrap_or(false);
-        key_match && mca_valid
-    })
-}
-
-/// First-time setup mode — pre-authenticate all Microsoft accounts.
-///
-/// When multiple accounts are configured, the bot switches between them
-/// automatically.  If a Microsoft auth token is not cached for every account,
-/// the switch will block on an interactive login prompt that nobody can answer.
-///
-/// This function starts a lightweight web server (panel + chat only) so the
-/// user can see the login links in the web UI, then walks through each
-/// uncached account one-by-one and restarts once they are all done.
-async fn run_first_time_setup(
-    config: &frikadellen_baf::config::types::Config,
-    uncached_accounts: &[String],
-) -> Result<()> {
-    info!("[Setup] Pre-authenticating {} Microsoft account(s)", uncached_accounts.len());
-
-    let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
-
-    // ── Start the setup web server so users can see the chat ─────────
-    let setup_state = SetupWebState {
-        chat_tx: chat_tx.clone(),
-        web_gui_password: config.web_gui_password.clone(),
-        valid_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
-    };
-    let web_port = config.web_gui_port;
-    tokio::spawn(async move {
-        start_setup_web_server(setup_state, web_port).await;
-    });
-
-    // Give the web server a moment to bind
-    sleep(Duration::from_millis(500)).await;
-
-    let welcome_msg = format!(
-        "§f[§4BAF§f]: §a========================================\n\
-         §f[§4BAF§f]: §e§lFrikadellen BAF — Account Setup\n\
-         §f[§4BAF§f]: §f{} account(s) need Microsoft login.\n\
-         §f[§4BAF§f]: §fOpen §bhttp://localhost:{}§f to follow along.\n\
-         §f[§4BAF§f]: §a========================================",
-        uncached_accounts.len(),
-        web_port
-    );
-    print_mc_chat(&welcome_msg);
-    let _ = chat_tx.send(welcome_msg);
-
-    // ── Authenticate each account sequentially ───────────────────────
-    let total = uncached_accounts.len();
-    let mut success_count = 0usize;
-
-    for (i, account_name) in uncached_accounts.iter().enumerate() {
-        let step_msg = format!(
-            "§f[§4BAF§f]: §e§lAccount {}/{}: §f{}\n\
-             §f[§4BAF§f]: §7Getting login link...",
-            i + 1,
-            total,
-            account_name
-        );
-        print_mc_chat(&step_msg);
-        let _ = chat_tx.send(step_msg);
-
-        let http_client = reqwest::Client::new();
-        let device_code = match azalea_auth::get_ms_link_code(&http_client, None, None).await {
-            Ok(dc) => dc,
-            Err(e) => {
-                let err_msg = format!(
-                    "§f[§4BAF§f]: §cFailed to get login link for {}: {}",
-                    account_name, e
-                );
-                print_mc_chat(&err_msg);
-                let _ = chat_tx.send(err_msg);
-                continue;
-            }
-        };
-
-        let ms_url = format!("{}?otc={}", device_code.verification_uri, device_code.user_code);
-        let auth_msg = format!(
-            "§f[§4BAF§f]: §c========================================\n\
-             §f[§4BAF§f]: §c§lMicrosoft Login — §f{}\n\
-             §f[§4BAF§f]: §eGo to: §b§n{}\n\
-             §f[§4BAF§f]: §eCode: §f§l{}\n\
-             §f[§4BAF§f]: §c========================================",
-            account_name, ms_url, device_code.user_code
-        );
-        print_mc_chat(&auth_msg);
-        let _ = chat_tx.send(auth_msg);
-
-        // Poll until the user finishes logging in
-        match azalea_auth::get_ms_auth_token(&http_client, device_code, None).await {
-            Ok(msa) => {
-                // Complete the auth chain: Xbox → Minecraft → Profile, then cache
-                match azalea_auth::get_minecraft_token(&http_client, &msa.data.access_token).await {
-                    Ok(mc_token) => {
-                        match azalea_auth::get_profile(&http_client, &mc_token.minecraft_access_token).await {
-                            Ok(profile) => {
-                                // Cache with the profile name as key (this is what
-                                // Account::microsoft() will look up later).
-                                if let Some(minecraft_dir) = minecraft_folder_path::minecraft_dir() {
-                                    let cache_file = minecraft_dir.join("azalea-auth.json");
-                                    let cached = azalea_auth::cache::CachedAccount {
-                                        cache_key: profile.name.clone(),
-                                        msa,
-                                        xbl: mc_token.xbl,
-                                        mca: mc_token.mca,
-                                        profile: profile.clone(),
-                                    };
-                                    if let Err(e) = azalea_auth::cache::set_account_in_cache(
-                                        &cache_file,
-                                        &profile.name,
-                                        cached,
-                                    ).await {
-                                        error!("[Setup] Failed to cache auth for {}: {}", profile.name, e);
-                                    }
-                                }
-                                let done_msg = format!(
-                                    "§f[§4BAF§f]: §a✓ Logged in as §f§l{}",
-                                    profile.name
-                                );
-                                print_mc_chat(&done_msg);
-                                let _ = chat_tx.send(done_msg);
-                                success_count += 1;
-                            }
-                            Err(e) => {
-                                let err_msg = format!(
-                                    "§f[§4BAF§f]: §cFailed to get Minecraft profile for {}: {}",
-                                    account_name, e
-                                );
-                                print_mc_chat(&err_msg);
-                                let _ = chat_tx.send(err_msg);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let err_msg = format!(
-                            "§f[§4BAF§f]: §cFailed to get Minecraft token for {}: {}",
-                            account_name, e
-                        );
-                        print_mc_chat(&err_msg);
-                        let _ = chat_tx.send(err_msg);
-                    }
-                }
-            }
-            Err(e) => {
-                let err_msg = format!(
-                    "§f[§4BAF§f]: §cMicrosoft login timed out or failed for {}: {}",
-                    account_name, e
-                );
-                print_mc_chat(&err_msg);
-                let _ = chat_tx.send(err_msg);
-            }
-        }
-    }
-
-    // ── Done ─────────────────────────────────────────────────────────
-    if success_count == 0 {
-        let fail_msg = "§f[§4BAF§f]: §c========================================\n\
-                        §f[§4BAF§f]: §cNo accounts were authenticated.\n\
-                        §f[§4BAF§f]: §ePlease restart the bot and try again.\n\
-                        §f[§4BAF§f]: §c========================================";
-        print_mc_chat(fail_msg);
-        let _ = chat_tx.send(fail_msg.to_string());
-        sleep(Duration::from_secs(5)).await;
-        anyhow::bail!("No Microsoft accounts were authenticated — please restart and try again");
-    }
-
-    let restart_msg = format!(
-        "§f[§4BAF§f]: §a========================================\n\
-         §f[§4BAF§f]: §a§l{}/{} account(s) authenticated!\n\
-         §f[§4BAF§f]: §aRestarting bot...\n\
-         §f[§4BAF§f]: §a========================================",
-        success_count, total
-    );
-    print_mc_chat(&restart_msg);
-    let _ = chat_tx.send(restart_msg);
-    // Small delay so the web panel has time to receive the final messages
-    sleep(Duration::from_secs(2)).await;
-
-    info!("[Setup] {} account(s) authenticated — restarting process", success_count);
-    restart_process();
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -459,18 +233,16 @@ async fn main() -> Result<()> {
     // Tuple: (tier, expires_str) e.g. ("Premium Plus", "2026-Feb-10 08:55 UTC").
     let cofl_premium: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
-    // Auto-detected COFL license index for the current IGN.
-    // Populated at startup by requesting `/cofl licenses list` and parsing the response.
+    // Auto-detected COFL license index for the first account's IGN.
+    // Populated at startup by requesting `/cofl licenses list <first_ign>` and
+    // parsing the `N>` numbered index from the response.
     // 0 means no license detected.
     let detected_cofl_license = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    // Tracks the cumulative number of license entries seen across pages so far,
-    // used to compute the global license index when paginating.
-    let license_entries_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-    // Tracks the number of license list page responses processed, used to
-    // prevent infinite pagination when the current IGN is not found.
-    let license_pages_fetched = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Coflnet authentication flag — set to true when the COFL "Hello <IGN>"
+    // message is received. Flip processing is blocked until this is true so the
+    // bot does not attempt purchases before COFL auth is complete.
+    let cofl_authenticated = Arc::new(AtomicBool::new(false));
 
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
@@ -504,30 +276,6 @@ async fn main() -> Result<()> {
         new_id
     };
 
-    // ── Pre-authenticate all Microsoft accounts ────────────────────
-    // When multiple accounts are configured, the bot switches between them
-    // automatically.  If any account does not have a cached Microsoft auth
-    // token, the switch would block on an interactive login the user cannot
-    // answer.  Detect uncached accounts here and enter setup mode to
-    // authenticate them all upfront.
-    let mut uncached_accounts: Vec<String> = Vec::new();
-    for name in &ingame_names {
-        if !has_cached_microsoft_auth(name).await {
-            uncached_accounts.push(name.clone());
-        }
-    }
-    if !uncached_accounts.is_empty() {
-        info!(
-            "[Setup] {} of {} account(s) need Microsoft login: {:?}",
-            uncached_accounts.len(),
-            ingame_names.len(),
-            uncached_accounts
-        );
-        run_first_time_setup(&config, &uncached_accounts).await?;
-        // run_first_time_setup ends with restart_process() which never returns.
-        unreachable!("run_first_time_setup ends with restart_process() and should never return");
-    }
-
     info!("Connecting to Coflnet WebSocket...");
     
     // Connect to Coflnet WebSocket
@@ -559,29 +307,29 @@ async fn main() -> Result<()> {
     }
 
     // When multi-account is enabled, request the COFL licenses list at startup
-    // so we can auto-detect which license is assigned to the current IGN.
+    // searching by the first account's IGN so we get its global license index.
     // Delay slightly to let the WS authenticate first.
     if ingame_names.len() > 1 {
         let ws_license = ws_client.clone();
+        let first_ign = ingame_names[0].clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let args = format!("list {}", first_ign);
+            let data_json = serde_json::json!(args).to_string();
             let message = serde_json::json!({
                 "type": "licenses",
-                "data": "\"list\""
+                "data": data_json
             }).to_string();
             if let Err(e) = ws_license.send_message(&message).await {
                 warn!("[LicenseDetect] Failed to request licenses list: {}", e);
             } else {
-                info!("[LicenseDetect] Requested COFL licenses list for auto-detection");
+                info!("[LicenseDetect] Requested COFL licenses list for '{}'", first_ign);
             }
         });
     }
 
-    // Initialize and connect bot client
-    info!("Initializing Minecraft bot...");
-    info!("Authenticating with Microsoft account...");
-    info!("A browser window will open for you to log in");
-    
+    // Initialize bot client (not connected yet — web server starts first so
+    // the chat GUI is available during Microsoft auth)
     let mut bot_client = BotClient::new();
     bot_client.fastbuy = config.fastbuy_enabled();
     bot_client.set_auto_cookie_hours(config.auto_cookie);
@@ -590,20 +338,9 @@ async fn main() -> Result<()> {
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
     bot_client.bazaar_order_cancel_minutes = config.bazaar_order_cancel_minutes;
     *bot_client.ingame_name.write() = ingame_name.clone();
-    
-    // Connect to Hypixel - Azalea will handle Microsoft OAuth in browser
-    match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
-        Ok(_) => {
-            info!("Bot connection initiated successfully");
-        }
-        Err(e) => {
-            warn!("Failed to connect bot: {}", e);
-            warn!("The bot will continue running in limited mode (WebSocket only)");
-            warn!("Please ensure your Microsoft account is valid and you have access to Hypixel");
-        }
-    }
 
-    // Start web control panel server
+    // Start web control panel server BEFORE bot connect so the chat GUI
+    // is available to show login links during Microsoft/Coflnet auth.
     {
         let web_state = WebSharedState {
             bot_client: bot_client.clone(),
@@ -630,6 +367,23 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             start_web_server(web_state, web_port).await;
         });
+    }
+
+    // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
+    // is printed to the terminal; the Coflnet auth link is sent via chat_tx and
+    // appears in the web panel automatically).
+    info!("Initializing Minecraft bot...");
+    info!("Authenticating with Microsoft account...");
+    info!("A browser window will open for you to log in");
+    match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
+        Ok(_) => {
+            info!("Bot connection initiated successfully");
+        }
+        Err(e) => {
+            warn!("Failed to connect bot: {}", e);
+            warn!("The bot will continue running in limited mode (WebSocket only)");
+            warn!("Please ensure your Microsoft account is valid and you have access to Hypixel");
+        }
     }
 
     // Spawn bot event handler
@@ -991,9 +745,8 @@ async fn main() -> Result<()> {
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
     let chat_tx_ws = chat_tx.clone();
     let detected_cofl_license_ws = detected_cofl_license.clone();
-    let ingame_name_ws = ingame_name.clone();
-    let license_entries_seen_ws = license_entries_seen.clone();
-    let license_pages_fetched_ws = license_pages_fetched.clone();
+    let cofl_authenticated_ws = cofl_authenticated.clone();
+    let ingame_names_ws = ingame_names.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1004,6 +757,12 @@ async fn main() -> Result<()> {
                 CoflEvent::AuctionFlip(flip) => {
                     // Skip if AH flips are disabled
                     if !enable_ah_flips_ws.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Block flips until Coflnet auth is confirmed
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        debug!("Skipping flip — Coflnet not yet authenticated: {}", flip.item_name);
                         continue;
                     }
 
@@ -1044,6 +803,12 @@ async fn main() -> Result<()> {
                 CoflEvent::BazaarFlip(bazaar_flip) => {
                     // Skip if bazaar flips are disabled
                     if !enable_bazaar_flips_ws.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Block flips until Coflnet auth is confirmed
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        debug!("Skipping bazaar flip — Coflnet not yet authenticated: {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -1123,6 +888,21 @@ async fn main() -> Result<()> {
                             if let Ok(mut g) = cofl_connection_id_ws.lock() {
                                 *g = Some(conn_id);
                             }
+                        }
+                    }
+                    // Detect Coflnet authentication success.
+                    // COFL sends "Hello <IGN> (<email>)" after successful auth.
+                    // The message may contain color codes, e.g. "§7Hello §aIGN §7(email)".
+                    // We check for "Hello " to catch all variants.
+                    if msg.contains("Hello ") && !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        // Verify it's actually the Hello-auth message by checking for
+                        // the IGN or the parenthesized email that follows it.
+                        if msg.contains("(") && msg.contains(")") {
+                            info!("[Coflnet] Authentication confirmed — flips enabled");
+                            cofl_authenticated_ws.store(true, Ordering::Relaxed);
+                            let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx_ws.send(baf_msg);
                         }
                     }
                     // Parse "You have X until Y" premium info (from writeToChat/chatMessage)
@@ -1421,45 +1201,24 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                CoflEvent::LicenseList { entries, page } => {
-                    // Auto-detect which non-NONE license belongs to the current IGN.
-                    // Entries have page-local 1-based indices; add the cumulative
-                    // offset from previous pages to get the global license index.
-                    let offset = license_entries_seen_ws.load(Ordering::Relaxed);
-                    let page_count = entries.len() as u32;
-                    license_entries_seen_ws.fetch_add(page_count, Ordering::Relaxed);
-                    let pages_so_far = license_pages_fetched_ws.fetch_add(1, Ordering::Relaxed) + 1;
-
-                    // Look for a non-NONE license for the current IGN.
-                    if let Some((found_ign, local_idx, tier)) = entries.iter().find(|(name, _, tier)| {
-                        name.eq_ignore_ascii_case(&ingame_name_ws) && !tier.eq_ignore_ascii_case("NONE")
+                CoflEvent::LicenseList { entries, page: _ } => {
+                    // Auto-detect the license index for the first account's IGN.
+                    // We searched by `/cofl licenses list <first_ign>`, so the
+                    // response contains entries with global license indices.
+                    // Look for any non-NONE license matching the first IGN.
+                    let first_ign = &ingame_names_ws[0];
+                    if let Some((found_ign, global_idx, tier)) = entries.iter().find(|(name, _, tier)| {
+                        name.eq_ignore_ascii_case(first_ign) && !tier.eq_ignore_ascii_case("NONE")
                     }) {
-                        let global_idx = offset + local_idx;
-                        info!("[LicenseDetect] Found {} license {} for current IGN '{}' (page {}, local index {})", tier, global_idx, found_ign, page, local_idx);
-                        detected_cofl_license_ws.store(global_idx, Ordering::Relaxed);
-                    } else if entries.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(&ingame_name_ws)) {
-                        // Current IGN found on this page but only with NONE licenses — nothing to transfer.
-                        info!("[LicenseDetect] Current IGN '{}' found on page {} but only has NONE licenses — no transfer needed", ingame_name_ws, page);
-                    } else if pages_so_far < LICENSE_MAX_PAGES {
-                        // Not found on this page — request next page if within limit.
-                        let next_page = page + 1;
-                        info!("[LicenseDetect] Current IGN '{}' not found on page {} ({} entries), trying page {}...", ingame_name_ws, page, page_count, next_page);
-                        let ws = ws_client_clone.clone();
-                        tokio::spawn(async move {
-                            // Small delay between page requests to avoid flooding
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            let message = serde_json::json!({
-                                "type": "licenses",
-                                "data": format!("\"list {}\"", next_page)
-                            }).to_string();
-                            if let Err(e) = ws.send_message(&message).await {
-                                warn!("[LicenseDetect] Failed to request licenses page {}: {}", next_page, e);
-                            } else {
-                                info!("[LicenseDetect] Requested COFL licenses list page {}", next_page);
-                            }
-                        });
+                        info!("[LicenseDetect] Found {} license index {} for '{}' ", tier, global_idx, found_ign);
+                        detected_cofl_license_ws.store(*global_idx, Ordering::Relaxed);
+                    } else if let Some((found_ign, _, _)) = entries.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(first_ign)) {
+                        info!("[LicenseDetect] Found '{}' but only has NONE licenses — no transfer needed", found_ign);
+                    } else if !entries.is_empty() {
+                        // Entries present but none match our IGN
+                        info!("[LicenseDetect] Search returned {} entries but none match '{}'", entries.len(), first_ign);
                     } else {
-                        info!("[LicenseDetect] No license found for current IGN '{}' after {} pages", ingame_name_ws, pages_so_far);
+                        info!("[LicenseDetect] No license entries found for '{}'", first_ign);
                     }
                 }
             }
