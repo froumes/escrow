@@ -30,7 +30,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures = "0.3"
 
 # Networking
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

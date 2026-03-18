@@ -30,10 +30,6 @@ const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
 /// backoff does not grow unbounded.
 const REJOIN_MAX_ATTEMPTS: u32 = 5;
 
-/// Maximum number of COFL license list pages to search when auto-detecting
-/// the current account's license index.
-const LICENSE_MAX_PAGES: u32 = 10;
-
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -237,18 +233,16 @@ async fn main() -> Result<()> {
     // Tuple: (tier, expires_str) e.g. ("Premium Plus", "2026-Feb-10 08:55 UTC").
     let cofl_premium: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
-    // Auto-detected COFL license index for the current IGN.
-    // Populated at startup by requesting `/cofl licenses list` and parsing the response.
+    // Auto-detected COFL license index for the first account's IGN.
+    // Populated at startup by requesting `/cofl licenses list <first_ign>` and
+    // parsing the `N>` numbered index from the response.
     // 0 means no license detected.
     let detected_cofl_license = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    // Tracks the cumulative number of license entries seen across pages so far,
-    // used to compute the global license index when paginating.
-    let license_entries_seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-    // Tracks the number of license list page responses processed, used to
-    // prevent infinite pagination when the current IGN is not found.
-    let license_pages_fetched = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Coflnet authentication flag — set to true when the COFL "Hello <IGN>"
+    // message is received. Flip processing is blocked until this is true so the
+    // bot does not attempt purchases before COFL auth is complete.
+    let cofl_authenticated = Arc::new(AtomicBool::new(false));
 
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
@@ -313,29 +307,29 @@ async fn main() -> Result<()> {
     }
 
     // When multi-account is enabled, request the COFL licenses list at startup
-    // so we can auto-detect which license is assigned to the current IGN.
+    // searching by the first account's IGN so we get its global license index.
     // Delay slightly to let the WS authenticate first.
     if ingame_names.len() > 1 {
         let ws_license = ws_client.clone();
+        let first_ign = ingame_names[0].clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let args = format!("list {}", first_ign);
+            let data_json = serde_json::json!(args).to_string();
             let message = serde_json::json!({
                 "type": "licenses",
-                "data": "\"list\""
+                "data": data_json
             }).to_string();
             if let Err(e) = ws_license.send_message(&message).await {
                 warn!("[LicenseDetect] Failed to request licenses list: {}", e);
             } else {
-                info!("[LicenseDetect] Requested COFL licenses list for auto-detection");
+                info!("[LicenseDetect] Requested COFL licenses list for '{}'", first_ign);
             }
         });
     }
 
-    // Initialize and connect bot client
-    info!("Initializing Minecraft bot...");
-    info!("Authenticating with Microsoft account...");
-    info!("A browser window will open for you to log in");
-    
+    // Initialize bot client (not connected yet — web server starts first so
+    // the chat GUI is available during Microsoft auth)
     let mut bot_client = BotClient::new();
     bot_client.fastbuy = config.fastbuy_enabled();
     bot_client.set_auto_cookie_hours(config.auto_cookie);
@@ -344,20 +338,9 @@ async fn main() -> Result<()> {
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
     bot_client.bazaar_order_cancel_minutes = config.bazaar_order_cancel_minutes;
     *bot_client.ingame_name.write() = ingame_name.clone();
-    
-    // Connect to Hypixel - Azalea will handle Microsoft OAuth in browser
-    match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
-        Ok(_) => {
-            info!("Bot connection initiated successfully");
-        }
-        Err(e) => {
-            warn!("Failed to connect bot: {}", e);
-            warn!("The bot will continue running in limited mode (WebSocket only)");
-            warn!("Please ensure your Microsoft account is valid and you have access to Hypixel");
-        }
-    }
 
-    // Start web control panel server
+    // Start web control panel server BEFORE bot connect so the chat GUI
+    // is available to show login links during Microsoft/Coflnet auth.
     {
         let web_state = WebSharedState {
             bot_client: bot_client.clone(),
@@ -384,6 +367,23 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             start_web_server(web_state, web_port).await;
         });
+    }
+
+    // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
+    // is printed to the terminal; the Coflnet auth link is sent via chat_tx and
+    // appears in the web panel automatically).
+    info!("Initializing Minecraft bot...");
+    info!("Authenticating with Microsoft account...");
+    info!("A browser window will open for you to log in");
+    match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
+        Ok(_) => {
+            info!("Bot connection initiated successfully");
+        }
+        Err(e) => {
+            warn!("Failed to connect bot: {}", e);
+            warn!("The bot will continue running in limited mode (WebSocket only)");
+            warn!("Please ensure your Microsoft account is valid and you have access to Hypixel");
+        }
     }
 
     // Spawn bot event handler
@@ -745,9 +745,8 @@ async fn main() -> Result<()> {
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
     let chat_tx_ws = chat_tx.clone();
     let detected_cofl_license_ws = detected_cofl_license.clone();
-    let ingame_name_ws = ingame_name.clone();
-    let license_entries_seen_ws = license_entries_seen.clone();
-    let license_pages_fetched_ws = license_pages_fetched.clone();
+    let cofl_authenticated_ws = cofl_authenticated.clone();
+    let ingame_names_ws = ingame_names.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -758,6 +757,12 @@ async fn main() -> Result<()> {
                 CoflEvent::AuctionFlip(flip) => {
                     // Skip if AH flips are disabled
                     if !enable_ah_flips_ws.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Block flips until Coflnet auth is confirmed
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        debug!("Skipping flip — Coflnet not yet authenticated: {}", flip.item_name);
                         continue;
                     }
 
@@ -798,6 +803,12 @@ async fn main() -> Result<()> {
                 CoflEvent::BazaarFlip(bazaar_flip) => {
                     // Skip if bazaar flips are disabled
                     if !enable_bazaar_flips_ws.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Block flips until Coflnet auth is confirmed
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        debug!("Skipping bazaar flip — Coflnet not yet authenticated: {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -876,6 +887,27 @@ async fn main() -> Result<()> {
                             info!("[Coflnet] Connection ID: {}", conn_id);
                             if let Ok(mut g) = cofl_connection_id_ws.lock() {
                                 *g = Some(conn_id);
+                            }
+                        }
+                    }
+                    // Detect Coflnet authentication success.
+                    // COFL sends "Hello <IGN> (<email>)" after successful auth, e.g.:
+                    //   "[Coflnet]: Hello iLoveTreXitoCfg (tre********@****l.com)"
+                    // The message may contain §-color codes. We look for "Hello "
+                    // followed by a parenthesized email (with '@' inside) to avoid
+                    // matching unrelated messages.
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        if let Some(hello_pos) = msg.find("Hello ") {
+                            let after_hello = &msg[hello_pos..];
+                            // Expect "(…@…)" somewhere after "Hello "
+                            if let (Some(open), Some(close)) = (after_hello.find('('), after_hello.find(')')) {
+                                if open < close && after_hello[open..close].contains('@') {
+                                    info!("[Coflnet] Authentication confirmed — flips enabled");
+                                    cofl_authenticated_ws.store(true, Ordering::Relaxed);
+                                    let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
+                                    print_mc_chat(&baf_msg);
+                                    let _ = chat_tx_ws.send(baf_msg);
+                                }
                             }
                         }
                     }
@@ -1175,45 +1207,24 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                CoflEvent::LicenseList { entries, page } => {
-                    // Auto-detect which non-NONE license belongs to the current IGN.
-                    // Entries have page-local 1-based indices; add the cumulative
-                    // offset from previous pages to get the global license index.
-                    let offset = license_entries_seen_ws.load(Ordering::Relaxed);
-                    let page_count = entries.len() as u32;
-                    license_entries_seen_ws.fetch_add(page_count, Ordering::Relaxed);
-                    let pages_so_far = license_pages_fetched_ws.fetch_add(1, Ordering::Relaxed) + 1;
-
-                    // Look for a non-NONE license for the current IGN.
-                    if let Some((found_ign, local_idx, tier)) = entries.iter().find(|(name, _, tier)| {
-                        name.eq_ignore_ascii_case(&ingame_name_ws) && !tier.eq_ignore_ascii_case("NONE")
+                CoflEvent::LicenseList { entries, page: _ } => {
+                    // Auto-detect the license index for the first account's IGN.
+                    // We searched by `/cofl licenses list <first_ign>`, so the
+                    // response contains entries with global license indices.
+                    // Look for any non-NONE license matching the first IGN.
+                    let first_ign = &ingame_names_ws[0];
+                    if let Some((found_ign, global_idx, tier)) = entries.iter().find(|(name, _, tier)| {
+                        name.eq_ignore_ascii_case(first_ign) && !tier.eq_ignore_ascii_case("NONE")
                     }) {
-                        let global_idx = offset + local_idx;
-                        info!("[LicenseDetect] Found {} license {} for current IGN '{}' (page {}, local index {})", tier, global_idx, found_ign, page, local_idx);
-                        detected_cofl_license_ws.store(global_idx, Ordering::Relaxed);
-                    } else if entries.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(&ingame_name_ws)) {
-                        // Current IGN found on this page but only with NONE licenses — nothing to transfer.
-                        info!("[LicenseDetect] Current IGN '{}' found on page {} but only has NONE licenses — no transfer needed", ingame_name_ws, page);
-                    } else if pages_so_far < LICENSE_MAX_PAGES {
-                        // Not found on this page — request next page if within limit.
-                        let next_page = page + 1;
-                        info!("[LicenseDetect] Current IGN '{}' not found on page {} ({} entries), trying page {}...", ingame_name_ws, page, page_count, next_page);
-                        let ws = ws_client_clone.clone();
-                        tokio::spawn(async move {
-                            // Small delay between page requests to avoid flooding
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            let message = serde_json::json!({
-                                "type": "licenses",
-                                "data": format!("\"list {}\"", next_page)
-                            }).to_string();
-                            if let Err(e) = ws.send_message(&message).await {
-                                warn!("[LicenseDetect] Failed to request licenses page {}: {}", next_page, e);
-                            } else {
-                                info!("[LicenseDetect] Requested COFL licenses list page {}", next_page);
-                            }
-                        });
+                        info!("[LicenseDetect] Found {} license index {} for '{}' ", tier, global_idx, found_ign);
+                        detected_cofl_license_ws.store(*global_idx, Ordering::Relaxed);
+                    } else if let Some((found_ign, _, _)) = entries.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(first_ign)) {
+                        info!("[LicenseDetect] Found '{}' but only has NONE licenses — no transfer needed", found_ign);
+                    } else if !entries.is_empty() {
+                        // Entries present but none match our IGN
+                        info!("[LicenseDetect] Search returned {} entries but none match '{}'", entries.len(), first_ign);
                     } else {
-                        info!("[LicenseDetect] No license found for current IGN '{}' after {} pages", ingame_name_ws, pages_so_far);
+                        info!("[LicenseDetect] No license entries found for '{}'", first_ign);
                     }
                 }
             }

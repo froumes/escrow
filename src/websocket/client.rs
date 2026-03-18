@@ -305,7 +305,11 @@ impl CoflWebSocket {
 }
 
 /// Prefix for license entry text lines in COFL's licenses list response: `§7> §a`
+/// When searching by IGN, the format includes a global index: `§7N> §a` where N is the number.
 const LICENSE_ENTRY_PREFIX: &str = "\u{00a7}7> \u{00a7}a";
+
+/// Suffix after the digits in a numbered license entry: `> §a`
+const LICENSE_NUMBERED_SUFFIX: &str = "> \u{00a7}a";
 
 /// License tier value indicating no active license (default/expired).
 const LICENSE_TIER_NONE: &str = "NONE";
@@ -333,21 +337,25 @@ pub fn parse_license_page_number(messages: &[ChatMessage]) -> u32 {
 
 /// Parse license entries from a COFL licenses list chatMessage response.
 ///
-/// Each license entry in the response has text like:
-///   `§7> §aIGN_NAME §2§mNONE§c expired`  (expired license)
-///   `§7> §aIGN_NAME §2TIER`               (active license)
+/// Supports two formats:
+///   **Page listing** — no global index prefix:
+///     `§7> §aIGN_NAME §2§mNONE§c expired`  (expired license)
+///     `§7> §aIGN_NAME §2TIER`               (active license)
 ///
-/// Returns `(ign, 1-based page-local index, tier)` tuples.
-/// The caller must add the cumulative offset from previous pages to get the
-/// global license index. The `tier` is e.g. `"NONE"`, `"PREMIUM"`, etc.
+///   **Search results** — global index prefix:
+///     `§7N> §aIGN_NAME §2TIER Xd`           (e.g. `§716> §aTreXitooo §2PREMIUM 29.9d`)
+///
+/// Returns `(ign, index, tier)` tuples.  For page listings the index is a
+/// 1-based page-local counter; for search results it is the global license
+/// index parsed from the `N>` prefix.
 pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, String)> {
     let mut entries = Vec::new();
     let mut counter: u32 = 0;
 
     for msg in messages {
+        // Match the exact old format: `§7> §a...`
         if msg.text.starts_with(LICENSE_ENTRY_PREFIX) {
             counter += 1;
-            // Extract IGN: characters after "§a" until next space or '§'
             let rest = &msg.text[LICENSE_ENTRY_PREFIX.len()..];
             let ign: String = rest
                 .chars()
@@ -356,6 +364,31 @@ pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, Stri
             if !ign.is_empty() {
                 let tier = extract_license_tier(&rest[ign.len()..]);
                 entries.push((ign, counter, tier));
+            }
+        }
+        // Match search result format: `§7N> §a...` where N is digits
+        else if msg.text.starts_with("\u{00a7}7") {
+            let after_color = &msg.text["\u{00a7}7".len()..];
+            // Try to read digits followed by "> §a"
+            let num_str: String = after_color
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !num_str.is_empty() {
+                let rest_after_num = &after_color[num_str.len()..];
+                if rest_after_num.starts_with(LICENSE_NUMBERED_SUFFIX) {
+                    if let Ok(global_idx) = num_str.parse::<u32>() {
+                        let ign_start = &rest_after_num[LICENSE_NUMBERED_SUFFIX.len()..];
+                        let ign: String = ign_start
+                            .chars()
+                            .take_while(|&c| c != ' ' && c != '\u{00a7}')
+                            .collect();
+                        if !ign.is_empty() {
+                            let tier = extract_license_tier(&ign_start[ign.len()..]);
+                            entries.push((ign, global_idx, tier));
+                        }
+                    }
+                }
             }
         }
     }
@@ -666,5 +699,36 @@ mod tests {
         assert_eq!(extract_license_tier(" §2STARTER_PREMIUM 2.1d"), "STARTER_PREMIUM");
         // Fallback when no §2 found
         assert_eq!(extract_license_tier(""), "NONE");
+    }
+
+    #[test]
+    fn test_parse_license_entries_search_result_with_global_index() {
+        use crate::websocket::messages::ChatMessage;
+        // Simulate a COFL `/cofl licenses list trexitooo` search response
+        // which returns entries with global index prefixes like `§716> §a`
+        let messages = vec![
+            ChatMessage { text: "[§1C§6oflnet§f]§7: ".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "Search for trexitooo resulted in:".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "\n".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§716> §aTreXitooo §2PREMIUM 29.9d".to_string(), on_click: None, hover: None },
+            ChatMessage { text: " §a[EXTEND]§7".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], ("TreXitooo".to_string(), 16, "PREMIUM".to_string()));
+    }
+
+    #[test]
+    fn test_parse_license_entries_search_result_multiple() {
+        use crate::websocket::messages::ChatMessage;
+        // Search result with multiple entries at different global indices
+        let messages = vec![
+            ChatMessage { text: "§716> §aTreXitooo §2PREMIUM 29.9d".to_string(), on_click: None, hover: None },
+            ChatMessage { text: "§742> §aTreXitooo §2§mNONE§c expired".to_string(), on_click: None, hover: None },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("TreXitooo".to_string(), 16, "PREMIUM".to_string()));
+        assert_eq!(entries[1], ("TreXitooo".to_string(), 42, "NONE".to_string()));
     }
 }
