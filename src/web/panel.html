@@ -238,7 +238,7 @@ a{color:var(--accent2);text-decoration:none}
             <label class="toggle"><input type="checkbox" id="tog-bz" onchange="toggleBZ(this.checked)"><span class="slider"></span></label>
         </div>
         <div class="toggle-row">
-            <span class="toggle-label">Anonymize Webhook Name</span>
+            <span class="toggle-label">Anonymize</span>
             <label class="toggle"><input type="checkbox" id="tog-anon" onchange="toggleAnonymize(this.checked)"><span class="slider"></span></label>
         </div>
     </div>
@@ -434,6 +434,7 @@ function showLoginOverlay() {
 // ── State ────────────────────────────────────────────────────
 let accounts = [];
 let currentAccountIndex = 0;
+let isAnonymized = false;
 
 // ── API calls ────────────────────────────────────────────────
 async function fetchStatus() {
@@ -449,6 +450,7 @@ async function fetchStatus() {
         $('tog-ah').checked = d.enable_ah_flips;
         $('tog-bz').checked = d.enable_bazaar_flips;
         $('tog-anon').checked = d.anonymize_webhook_name;
+        isAnonymized = d.anonymize_webhook_name;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
         $('btn-resume').style.display = d.macro_paused ? '' : 'none';
         accounts = d.accounts || [];
@@ -470,8 +472,10 @@ function renderAccounts() {
         div.onclick = () => switchAccount(idx);
         const img = document.createElement('img');
         img.className = 'account-head';
-        img.src = 'https://mc-heads.net/avatar/' + encodeURIComponent(name) + '/32';
-        img.alt = name;
+        img.src = isAnonymized
+            ? 'https://mc-heads.net/avatar/MHF_Question/32'
+            : 'https://mc-heads.net/avatar/' + encodeURIComponent(name) + '/32';
+        img.alt = isAnonymized ? 'Hidden' : name;
         img.loading = 'lazy';
         const info = document.createElement('div');
         info.className = 'account-info';

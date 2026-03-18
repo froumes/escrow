@@ -44,7 +44,6 @@ const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
 /// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
 const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
-const BIN_PURCHASE_ITEM_KIND: &str = "gold_nugget";
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
@@ -96,8 +95,6 @@ pub struct BotClient {
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Whether to use fastbuy (window-skip) when purchasing BIN auctions
-    pub fastbuy: bool,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
@@ -201,7 +198,6 @@ impl BotClient {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
-            fastbuy: false,
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
@@ -286,14 +282,12 @@ impl BotClient {
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
-            fastbuy: self.fastbuy,
-            fastbuy_preclick_sent: Arc::new(AtomicBool::new(false)),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
-            purchase_at_instant: Arc::new(RwLock::new(None)),
+            pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
@@ -309,6 +303,7 @@ impl BotClient {
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
             bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
+            managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
@@ -686,12 +681,6 @@ pub struct BotClientState {
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
-    /// Whether to use fastbuy (window-skip) when purchasing BIN auctions
-    pub fastbuy: bool,
-    /// Set to true when a fastbuy pre-click packet (slot 11 in the next window) has been
-    /// sent optimistically. The Confirm Purchase handler reads this to skip redundant
-    /// clicks and avoid wasting ticks on duplicate packets.
-    pub fastbuy_preclick_sent: Arc<AtomicBool>,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
@@ -704,8 +693,10 @@ pub struct BotClientState {
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
     pub grace_period_spam_active: Arc<AtomicBool>,
-    /// COFL-provided bed end timing (`purchaseAt`) converted to a local instant.
-    pub purchase_at_instant: Arc<RwLock<Option<tokio::time::Instant>>>,
+    /// Raw COFL `purchaseAt` epoch-ms timestamp from the flip.  Converted to a
+    /// local `Instant` only when a bed (grace-period) is detected in the BIN
+    /// Auction View **and** freemoney mode is enabled.
+    pub pending_purchase_at_ms: Arc<RwLock<Option<i64>>>,
     /// Set to true while the bot is waiting for a bed (grace-period) to expire so
     /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
     pub bed_timing_active: Arc<AtomicBool>,
@@ -745,6 +736,12 @@ pub struct BotClientState {
     /// Cancel open bazaar orders when they are older than this many minutes.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes: u64,
+    /// Context of the order currently being processed in the ManageOrders iteration.
+    /// Stored when clicking an order in Branch B so that Branch C (separate "Order options"
+    /// window) can apply the same `cancel_due_to_age` logic.
+    /// Fields: `(is_buy, order_display_name, order_identity)` where `order_identity` is
+    /// the `(is_buy, item_tag)` tuple used by `should_cancel_open_order_due_to_age()`.
+    pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>)>>>,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
     /// Item name of the auction to cancel (set by CancelAuction command).
@@ -785,14 +782,12 @@ impl Default for BotClientState {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
-            fastbuy: false,
-            fastbuy_preclick_sent: Arc::new(AtomicBool::new(false)),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
-            purchase_at_instant: Arc::new(RwLock::new(None)),
+            pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
@@ -808,6 +803,7 @@ impl Default for BotClientState {
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes: 5,
+            managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
@@ -1461,9 +1457,8 @@ async fn event_handler(
                 }
                 *state.bot_state.write() = BotState::Idle;
                 state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                state.fastbuy_preclick_sent.store(false, Ordering::Relaxed);
                 *state.purchase_start_time.write() = None;
-                *state.purchase_at_instant.write() = None;
+                *state.pending_purchase_at_ms.write() = None;
                 state.bed_timing_active.store(false, Ordering::Relaxed);
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
@@ -1746,8 +1741,7 @@ async fn event_handler(
                     // Clear grace-period spam and bed-timing flags so a new BIN Auction View
                     // can start fresh.
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                    state.fastbuy_preclick_sent.store(false, Ordering::Relaxed);
-                    *state.purchase_at_instant.write() = None;
+                    *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
@@ -1995,20 +1989,10 @@ async fn execute_command(
             info!("Sending chat command: {}", chat_command);
             bot.write_chat_packet(&chat_command);
 
-            // Convert COFL purchaseAt to a local instant so bed timing can wait
-            // for the exact grace-period end sent by COFL.
-            let purchase_at_instant = flip.purchase_at_ms.and_then(|purchase_at_ms| {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_millis() as i64)?;
-                if purchase_at_ms <= now_ms {
-                    return Some(tokio::time::Instant::now());
-                }
-                let wait_ms = (purchase_at_ms - now_ms) as u64;
-                Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms))
-            });
-            *state.purchase_at_instant.write() = purchase_at_instant;
+            // Store raw COFL purchaseAt timestamp.  It is only converted to a
+            // local Instant later — and only when the auction turns out to be a
+            // bed (grace-period) and freemoney mode is enabled.
+            *state.pending_purchase_at_ms.write() = flip.purchase_at_ms;
             
             // Set state to purchasing
             *state.bot_state.write() = BotState::Purchasing;
@@ -2211,10 +2195,16 @@ async fn handle_window_interaction(
                         // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
                         // If purchaseAt is not available, fall through to immediate bed spam.
                         let pre_click_lead_ms = state.bed_pre_click_ms;
-                        let remaining_ms_from_purchase_at = state.purchase_at_instant.read()
-                            .as_ref()
-                            .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
-                            .map(|d| d.as_millis() as u64);
+                        // Convert the raw epoch-ms timestamp to a remaining-ms delta.
+                        let remaining_ms_from_purchase_at = state.pending_purchase_at_ms.read()
+                            .and_then(|purchase_at_ms| {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_millis() as i64)?;
+                                let diff = purchase_at_ms - now_ms;
+                                if diff <= 0 { None } else { Some(diff as u64) }
+                            });
 
                         if let Some(remaining_ms) = remaining_ms_from_purchase_at {
                             let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
@@ -2311,58 +2301,13 @@ async fn handle_window_interaction(
                         }
                     }
                 } else {
+                    // Non-bed BIN auction — buy as fast as possible.
                     // Click slot 31 once (buy-now button).
-                    // Single click only — double-clicking sends a second packet while Hypixel
-                    // is already preparing the Confirm Purchase window, which confuses the server
-                    // and adds ~300ms of unnecessary latency.
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-
-                    // Optional fastbuy (window-skip): pre-click confirm in the next window.
-                    // If this packet is ignored/lost, the Confirm Purchase handler below still
-                    // performs normal confirm clicks with retries.
-                    if state.fastbuy && slot_31_kind.contains(BIN_PURCHASE_ITEM_KIND) {
-                        // No delay — TCP preserves packet ordering so the slot-31 buy packet
-                        // always arrives at the server before this pre-click.  Any sleep here
-                        // (even 10ms) can overshoot to the next game-loop tick (~50-100ms)
-                        // because the .await yields control back to the scheduler.
-                        // Hypixel's confirm GUI for this click is the next container id.
-                        // Use the known window_id directly instead of re-reading last_window_id
-                        // which may have already changed if the Confirm Purchase window arrived
-                        // during processing — that race condition would skip the
-                        // pre-click entirely and add an extra round-trip (~200ms).
-                        let next_window_id = window_id.wrapping_add(1);
-                        // Fastbuy pre-click: deliberately targets next_window_id before it
-                        // opens (optimistic latency cut). Bypasses click_window_slot's
-                        // stale-window guard, which blocks clicks to any window other than
-                        // the current one (or window 0) — use the raw packet path here instead.
-                        {
-                            use azalea_protocol::packets::game::s_container_click::{
-                                ServerboundContainerClick, HashedStack,
-                            };
-                            bot.write_packet(ServerboundContainerClick {
-                                container_id: next_window_id as i32,
-                                state_id: 0,
-                                slot_num: 11,
-                                button_num: 0,
-                                click_type: ClickType::Pickup,
-                                changed_slots: Default::default(),
-                                carried_item: HashedStack(None),
-                            });
-                            state.fastbuy_preclick_sent.store(true, Ordering::Relaxed);
-                            info!("Clicked slot 11 in window {} (fastbuy pre-click)", next_window_id);
-                        }
-                    }
                 }
             } else if window_title.contains("Confirm Purchase") {
-                let preclick_was_sent = state.fastbuy_preclick_sent.swap(false, Ordering::Relaxed);
-
-                if !preclick_was_sent {
-                    // No pre-click was sent — click confirm immediately.
-                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-                }
-                // If pre-click WAS sent, the server already received the confirm click
-                // before this window even opened.  Skip the redundant duplicate to avoid
-                // wasting a tick on a packet the server has already processed.
+                // Click confirm (slot 11) immediately for fastest buy speed.
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
 
                 // Short wait for the server to process and close the window.
                 tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
@@ -3211,6 +3156,10 @@ async fn handle_window_interaction(
                                 .map(|(is_buy, _)| *is_buy)
                                 .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
+                            // Store order context so Branch C (Order options window) can
+                            // apply the same cancel_due_to_age logic.
+                            *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone()));
+
                             // Click the order to view its detail page
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
 
@@ -3363,6 +3312,14 @@ async fn handle_window_interaction(
                 // Look for Cancel/Collect buttons here and act accordingly.
                 // Mirrors upstream TypeScript bazaarOrderManager.ts pollForCancelButton().
                 info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
+
+                // Retrieve the order context stored when the order was clicked in Branch B.
+                let order_ctx = state.managing_order_context.read().clone();
+                let (order_name, order_identity) = match &order_ctx {
+                    Some((_is_buy, name, identity)) => (name.clone(), identity.clone()),
+                    None => (String::new(), None),
+                };
+
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
                 let mut cancel_slot: Option<usize> = None;
@@ -3401,13 +3358,24 @@ async fn handle_window_interaction(
                     }
                 }
 
+                // Apply the same age-based cancel logic as Branch B.
+                let cancel_due_to_age = !cancel_open
+                    && cancel_slot.is_some()
+                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes);
+                if cancel_due_to_age {
+                    info!(
+                        "[ManageOrders] Open order \"{}\" is older than {} minute(s) — will cancel (Order options)",
+                        order_name, state.bazaar_order_cancel_minutes
+                    );
+                }
+
                 if let Some(cs) = collect_slot {
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        // After collecting, also cancel if in startup mode
-                        if cancel_open {
+                        // After collecting, also cancel if in startup mode or age-based
+                        if cancel_open || cancel_due_to_age {
                             if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                 if *state.last_window_id.read() == window_id {
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
@@ -3426,7 +3394,7 @@ async fn handle_window_interaction(
                         }
                     }
                 } else if let Some(cs) = cancel_slot {
-                    if cancel_open {
+                    if cancel_open || cancel_due_to_age {
                         if *state.last_window_id.read() == window_id {
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
@@ -3441,7 +3409,7 @@ async fn handle_window_interaction(
                             }
                         }
                     } else {
-                        debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode)");
+                        debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode, order not old enough)");
                         // Re-navigate to /bz so the ManagingOrders flow continues to
                         // process remaining orders (there may be filled orders after
                         // this open one).  Without this the bot stays stuck in

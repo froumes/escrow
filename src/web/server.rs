@@ -334,16 +334,32 @@ async fn login(
 }
 
 async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
+    let anonymize = s.anonymize_webhook_name.load(Ordering::Relaxed);
+
+    // When anonymize is enabled, hide account names in the web panel so
+    // screenshots don't leak the player's IGN.
+    let (current_account, accounts) = if anonymize {
+        let hidden = "Hidden".to_string();
+        let anon_accounts: Vec<String> = s.ingame_names.iter().map(|_| hidden.clone()).collect();
+        let anon_current = anon_accounts.get(s.current_account_index).cloned().unwrap_or_default();
+        (anon_current, anon_accounts)
+    } else {
+        (
+            s.ingame_names.get(s.current_account_index).cloned().unwrap_or_default(),
+            s.ingame_names.clone(),
+        )
+    };
+
     Json(StatusResponse {
         state: format!("{:?}", s.bot_client.state()),
         macro_paused: s.macro_paused.load(Ordering::Relaxed),
         enable_ah_flips: s.enable_ah_flips.load(Ordering::Relaxed),
         enable_bazaar_flips: s.enable_bazaar_flips.load(Ordering::Relaxed),
-        anonymize_webhook_name: s.anonymize_webhook_name.load(Ordering::Relaxed),
+        anonymize_webhook_name: anonymize,
         queue_depth: s.command_queue.len(),
-        current_account: s.ingame_names.get(s.current_account_index).cloned().unwrap_or_default(),
+        current_account,
         current_account_index: s.current_account_index,
-        accounts: s.ingame_names.clone(),
+        accounts,
         purse: s.bot_client.get_purse(),
         uptime_seconds: s.started_at.elapsed().as_secs(),
     })
@@ -397,8 +413,8 @@ async fn toggle_anonymize(
     Json(payload): Json<TogglePayload>,
 ) -> impl IntoResponse {
     s.anonymize_webhook_name.store(payload.enabled, Ordering::Relaxed);
-    info!("[WebGUI] Webhook anonymization set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] Webhook name anonymization {}", if payload.enabled { "enabled" } else { "disabled" });
+    info!("[WebGUI] Anonymize set to {} via web panel", payload.enabled);
+    let msg = format!("[BAF Web] Anonymize {}", if payload.enabled { "enabled" } else { "disabled" });
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
 }
