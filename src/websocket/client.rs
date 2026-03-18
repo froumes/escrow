@@ -308,8 +308,8 @@ impl CoflWebSocket {
 /// When searching by IGN, the format includes a global index: `§7N> §a` where N is the number.
 const LICENSE_ENTRY_PREFIX: &str = "\u{00a7}7> \u{00a7}a";
 
-/// Color-code prefix for the leading `§7` in numbered license entries.
-const LICENSE_COLOR7: &str = "\u{00a7}7";
+/// Suffix after the digits in a numbered license entry: `> §a`
+const LICENSE_NUMBERED_SUFFIX: &str = "> \u{00a7}a";
 
 /// License tier value indicating no active license (default/expired).
 const LICENSE_TIER_NONE: &str = "NONE";
@@ -367,8 +367,8 @@ pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, Stri
             }
         }
         // Match search result format: `§7N> §a...` where N is digits
-        else if msg.text.starts_with(LICENSE_COLOR7) {
-            let after_color = &msg.text[LICENSE_COLOR7.len()..];
+        else if msg.text.starts_with("\u{00a7}7") {
+            let after_color = &msg.text["\u{00a7}7".len()..];
             // Try to read digits followed by "> §a"
             let num_str: String = after_color
                 .chars()
@@ -376,10 +376,9 @@ pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, Stri
                 .collect();
             if !num_str.is_empty() {
                 let rest_after_num = &after_color[num_str.len()..];
-                let expected_suffix = format!("> \u{00a7}a");
-                if rest_after_num.starts_with(&expected_suffix) {
+                if rest_after_num.starts_with(LICENSE_NUMBERED_SUFFIX) {
                     if let Ok(global_idx) = num_str.parse::<u32>() {
-                        let ign_start = &rest_after_num[expected_suffix.len()..];
+                        let ign_start = &rest_after_num[LICENSE_NUMBERED_SUFFIX.len()..];
                         let ign: String = ign_start
                             .chars()
                             .take_while(|&c| c != ' ' && c != '\u{00a7}')

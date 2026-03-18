@@ -891,18 +891,24 @@ async fn main() -> Result<()> {
                         }
                     }
                     // Detect Coflnet authentication success.
-                    // COFL sends "Hello <IGN> (<email>)" after successful auth.
-                    // The message may contain color codes, e.g. "§7Hello §aIGN §7(email)".
-                    // We check for "Hello " to catch all variants.
-                    if msg.contains("Hello ") && !cofl_authenticated_ws.load(Ordering::Relaxed) {
-                        // Verify it's actually the Hello-auth message by checking for
-                        // the IGN or the parenthesized email that follows it.
-                        if msg.contains("(") && msg.contains(")") {
-                            info!("[Coflnet] Authentication confirmed — flips enabled");
-                            cofl_authenticated_ws.store(true, Ordering::Relaxed);
-                            let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
-                            print_mc_chat(&baf_msg);
-                            let _ = chat_tx_ws.send(baf_msg);
+                    // COFL sends "Hello <IGN> (<email>)" after successful auth, e.g.:
+                    //   "[Coflnet]: Hello iLoveTreXitoCfg (tre********@****l.com)"
+                    // The message may contain §-color codes. We look for "Hello "
+                    // followed by a parenthesized email (with '@' inside) to avoid
+                    // matching unrelated messages.
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        if let Some(hello_pos) = msg.find("Hello ") {
+                            let after_hello = &msg[hello_pos..];
+                            // Expect "(…@…)" somewhere after "Hello "
+                            if let (Some(open), Some(close)) = (after_hello.find('('), after_hello.find(')')) {
+                                if open < close && after_hello[open..close].contains('@') {
+                                    info!("[Coflnet] Authentication confirmed — flips enabled");
+                                    cofl_authenticated_ws.store(true, Ordering::Relaxed);
+                                    let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
+                                    print_mc_chat(&baf_msg);
+                                    let _ = chat_tx_ws.send(baf_msg);
+                                }
+                            }
                         }
                     }
                     // Parse "You have X until Y" premium info (from writeToChat/chatMessage)
