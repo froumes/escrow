@@ -303,6 +303,7 @@ impl BotClient {
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
             bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
+            managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
@@ -735,6 +736,10 @@ pub struct BotClientState {
     /// Cancel open bazaar orders when they are older than this many minutes.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes: u64,
+    /// Identity of the order currently being processed in the ManageOrders iteration.
+    /// Stored when clicking an order in Branch B so that Branch C (separate "Order options"
+    /// window) can apply the same `cancel_due_to_age` logic.  Format: (is_buy, tag).
+    pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>)>>>,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
     /// Item name of the auction to cancel (set by CancelAuction command).
@@ -796,6 +801,7 @@ impl Default for BotClientState {
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes: 5,
+            managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
@@ -3148,6 +3154,10 @@ async fn handle_window_interaction(
                                 .map(|(is_buy, _)| *is_buy)
                                 .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
+                            // Store order context so Branch C (Order options window) can
+                            // apply the same cancel_due_to_age logic.
+                            *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone()));
+
                             // Click the order to view its detail page
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
 
@@ -3300,6 +3310,14 @@ async fn handle_window_interaction(
                 // Look for Cancel/Collect buttons here and act accordingly.
                 // Mirrors upstream TypeScript bazaarOrderManager.ts pollForCancelButton().
                 info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
+
+                // Retrieve the order context stored when the order was clicked in Branch B.
+                let order_ctx = state.managing_order_context.read().clone();
+                let (order_name, order_identity) = match &order_ctx {
+                    Some((_is_buy, name, identity)) => (name.clone(), identity.clone()),
+                    None => (String::new(), None),
+                };
+
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
                 let mut cancel_slot: Option<usize> = None;
@@ -3338,13 +3356,24 @@ async fn handle_window_interaction(
                     }
                 }
 
+                // Apply the same age-based cancel logic as Branch B.
+                let cancel_due_to_age = !cancel_open
+                    && cancel_slot.is_some()
+                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes);
+                if cancel_due_to_age {
+                    info!(
+                        "[ManageOrders] Open order \"{}\" is older than {} minute(s) — will cancel (Order options)",
+                        order_name, state.bazaar_order_cancel_minutes
+                    );
+                }
+
                 if let Some(cs) = collect_slot {
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        // After collecting, also cancel if in startup mode
-                        if cancel_open {
+                        // After collecting, also cancel if in startup mode or age-based
+                        if cancel_open || cancel_due_to_age {
                             if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                 if *state.last_window_id.read() == window_id {
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
@@ -3363,7 +3392,7 @@ async fn handle_window_interaction(
                         }
                     }
                 } else if let Some(cs) = cancel_slot {
-                    if cancel_open {
+                    if cancel_open || cancel_due_to_age {
                         if *state.last_window_id.read() == window_id {
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
@@ -3378,7 +3407,7 @@ async fn handle_window_interaction(
                             }
                         }
                     } else {
-                        debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode)");
+                        debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode, order not old enough)");
                         // Re-navigate to /bz so the ManagingOrders flow continues to
                         // process remaining orders (there may be filled orders after
                         // this open one).  Without this the bot stays stuck in

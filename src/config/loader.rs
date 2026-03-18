@@ -98,10 +98,10 @@ mod tests {
 
     #[test]
     fn parse_config_ignores_unknown_fields() {
-        // confirm_skip is an unknown field and should not break parsing
+        // confirm_skip is an unknown field — parsing must succeed (not panic/error).
         let config = ConfigLoader::parse_config("confirm_skip = true")
-            .expect("config should parse");
-        // freemoney defaults to false
+            .expect("config with unknown field should still parse");
+        // Known defaults still apply
         assert!(!config.freemoney_enabled());
     }
 }
