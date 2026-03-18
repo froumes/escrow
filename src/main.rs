@@ -94,9 +94,6 @@ fn should_drop_bazaar_command_during_ah_pause(
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
-/// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
-/// buy_price is 0 until ItemPurchased fires and updates it.
-/// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
 
 /// Check whether a cached (non-expired) Microsoft auth token exists for the given cache key.
@@ -127,6 +124,7 @@ async fn has_cached_microsoft_auth(cache_key: &str) -> bool {
         .unwrap_or_default()
         .as_secs();
     accounts.iter().any(|acct| {
+        // azalea-auth's CachedAccount uses `cache_key` (with legacy alias `email`)
         let key_match = acct
             .get("cache_key")
             .or_else(|| acct.get("email"))
@@ -218,8 +216,21 @@ async fn run_first_time_setup(
                         match azalea_auth::get_profile(&http_client, &mc_token.minecraft_access_token).await {
                             Ok(profile) => {
                                 // Cache the auth result for subsequent runs
-                                let minecraft_dir = minecraft_folder_path::minecraft_dir()
-                                    .expect("No minecraft directory found");
+                                let minecraft_dir = match minecraft_folder_path::minecraft_dir() {
+                                    Some(d) => d,
+                                    None => {
+                                        error!("[Setup] Could not determine Minecraft directory for caching");
+                                        let done_msg = format!(
+                                            "§f[§4BAF§f]: §a✓ Microsoft login successful! Logged in as §f§l{}\n\
+                                             §f[§4BAF§f]: §cWarning: could not cache auth (no Minecraft directory)",
+                                            profile.name
+                                        );
+                                        print_mc_chat(&done_msg);
+                                        let _ = chat_tx_ms.send(done_msg);
+                                        ms_done_flag.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
                                 let cache_file = minecraft_dir.join("azalea-auth.json");
                                 let cached = azalea_auth::cache::CachedAccount {
                                     cache_key: profile.name.clone(),
@@ -295,8 +306,8 @@ async fn run_first_time_setup(
                             if msg.contains("sky.coflnet.com/authmod") || msg.contains("Authentication URL") {
                                 got_auth_prompt = true;
                             }
-                            // If COFL sends a "Your connection id is" message, auth is done
-                            if msg.contains("connection id is") || msg.contains("You have") {
+                            // If COFL sends a "Your connection id is" or premium info message, auth is done
+                            if msg.contains("Your connection id is ") || (msg.contains("You have ") && msg.contains(" until ")) {
                                 let done_msg = "§f[§4BAF§f]: §a✓ Coflnet authentication successful!";
                                 print_mc_chat(done_msg);
                                 let _ = chat_tx_cofl.send(done_msg.to_string());
@@ -328,6 +339,18 @@ async fn run_first_time_setup(
     // ── Wait for Microsoft auth to complete ──────────────────────────
     // Microsoft auth is required; Coflnet auth is optional (may already be authed).
     let _ = ms_handle.await;
+
+    if !ms_auth_done.load(Ordering::SeqCst) {
+        let fail_msg = "§f[§4BAF§f]: §c========================================\n\
+                        §f[§4BAF§f]: §cMicrosoft authentication did not complete.\n\
+                        §f[§4BAF§f]: §ePlease restart the bot and try again.\n\
+                        §f[§4BAF§f]: §c========================================";
+        print_mc_chat(fail_msg);
+        let _ = chat_tx.send(fail_msg.to_string());
+        // Wait so the message reaches the web panel before we exit
+        sleep(Duration::from_secs(5)).await;
+        anyhow::bail!("Microsoft authentication failed — please restart and try again");
+    }
 
     // If COFL auth is pending, wait a short time for it
     if !cofl_auth_done.load(Ordering::SeqCst) {
