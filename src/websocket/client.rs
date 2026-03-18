@@ -202,6 +202,14 @@ impl CoflWebSocket {
                     }
                 } else if let Ok(chat) = parse_message_data::<ChatMessage>(&msg.data) {
                     // Single chat message (common for writeToChat)
+                    // Also check for license entries in single-message responses
+                    let single = [chat.clone()];
+                    let license_entries = parse_license_entries(&single);
+                    if !license_entries.is_empty() {
+                        let page = parse_license_page_number(&single);
+                        let _ = tx.send(CoflEvent::LicenseList { entries: license_entries, page });
+                    }
+
                     let msg_with_ref = chat.with_referral_id();
                     
                     // Check for authentication URL
@@ -353,39 +361,44 @@ pub fn parse_license_entries(messages: &[ChatMessage]) -> Vec<(String, u32, Stri
     let mut counter: u32 = 0;
 
     for msg in messages {
-        // Match the exact old format: `§7> §a...`
-        if msg.text.starts_with(LICENSE_ENTRY_PREFIX) {
-            counter += 1;
-            let rest = &msg.text[LICENSE_ENTRY_PREFIX.len()..];
-            let ign: String = rest
-                .chars()
-                .take_while(|&c| c != ' ' && c != '\u{00a7}')
-                .collect();
-            if !ign.is_empty() {
-                let tier = extract_license_tier(&rest[ign.len()..]);
-                entries.push((ign, counter, tier));
+        // Split by newlines so entries embedded in multi-line ChatMessages
+        // (e.g. the COFL server sending the whole response in one text field)
+        // are still detected.
+        for line in msg.text.split('\n') {
+            // Match the exact old format: `§7> §a...`
+            if line.starts_with(LICENSE_ENTRY_PREFIX) {
+                counter += 1;
+                let rest = &line[LICENSE_ENTRY_PREFIX.len()..];
+                let ign: String = rest
+                    .chars()
+                    .take_while(|&c| c != ' ' && c != '\u{00a7}')
+                    .collect();
+                if !ign.is_empty() {
+                    let tier = extract_license_tier(&rest[ign.len()..]);
+                    entries.push((ign, counter, tier));
+                }
             }
-        }
-        // Match search result format: `§7N> §a...` where N is digits
-        else if msg.text.starts_with("\u{00a7}7") {
-            let after_color = &msg.text["\u{00a7}7".len()..];
-            // Try to read digits followed by "> §a"
-            let num_str: String = after_color
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if !num_str.is_empty() {
-                let rest_after_num = &after_color[num_str.len()..];
-                if rest_after_num.starts_with(LICENSE_NUMBERED_SUFFIX) {
-                    if let Ok(global_idx) = num_str.parse::<u32>() {
-                        let ign_start = &rest_after_num[LICENSE_NUMBERED_SUFFIX.len()..];
-                        let ign: String = ign_start
-                            .chars()
-                            .take_while(|&c| c != ' ' && c != '\u{00a7}')
-                            .collect();
-                        if !ign.is_empty() {
-                            let tier = extract_license_tier(&ign_start[ign.len()..]);
-                            entries.push((ign, global_idx, tier));
+            // Match search result format: `§7N> §a...` where N is digits
+            else if line.starts_with("\u{00a7}7") {
+                let after_color = &line["\u{00a7}7".len()..];
+                // Try to read digits followed by "> §a"
+                let num_str: String = after_color
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if !num_str.is_empty() {
+                    let rest_after_num = &after_color[num_str.len()..];
+                    if rest_after_num.starts_with(LICENSE_NUMBERED_SUFFIX) {
+                        if let Ok(global_idx) = num_str.parse::<u32>() {
+                            let ign_start = &rest_after_num[LICENSE_NUMBERED_SUFFIX.len()..];
+                            let ign: String = ign_start
+                                .chars()
+                                .take_while(|&c| c != ' ' && c != '\u{00a7}')
+                                .collect();
+                            if !ign.is_empty() {
+                                let tier = extract_license_tier(&ign_start[ign.len()..]);
+                                entries.push((ign, global_idx, tier));
+                            }
                         }
                     }
                 }
@@ -730,5 +743,40 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], ("TreXitooo".to_string(), 16, "PREMIUM".to_string()));
         assert_eq!(entries[1], ("TreXitooo".to_string(), 42, "NONE".to_string()));
+    }
+
+    #[test]
+    fn test_parse_license_entries_multiline_chat_message() {
+        use crate::websocket::messages::ChatMessage;
+        // COFL may send the entire search response as a single multi-line ChatMessage
+        // instead of separate ChatMessage objects per line. The parser must handle
+        // entries embedded within newline-separated text.
+        let messages = vec![
+            ChatMessage {
+                text: "[§1C§6oflnet§f]§7: \nSearch for xtytextorial resulted in:\n\n§719> §aXtyTextorial §2PREMIUM 29.9d\n §a[EXTEND]§7".to_string(),
+                on_click: None,
+                hover: None,
+            },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], ("XtyTextorial".to_string(), 19, "PREMIUM".to_string()));
+    }
+
+    #[test]
+    fn test_parse_license_entries_multiline_page_format() {
+        use crate::websocket::messages::ChatMessage;
+        // Page listing entries embedded in a single multi-line ChatMessage
+        let messages = vec![
+            ChatMessage {
+                text: "Content (page 1):§3(1)\n§7> §aPlayer1 §2NONE\n§7> §aPlayer2 §2PREMIUM 9.9d".to_string(),
+                on_click: None,
+                hover: None,
+            },
+        ];
+        let entries = parse_license_entries(&messages);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("Player1".to_string(), 1, "NONE".to_string()));
+        assert_eq!(entries[1], ("Player2".to_string(), 2, "PREMIUM".to_string()));
     }
 }
