@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Frikadellen BAF — Control Panel</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root,[data-theme="midnight"]{--bg:#0b0d17;--bg-card:#111425;--surface:#171a2e;--border:#1e2240;--text:#c9cde8;--text-dim:#7b82a8;--heading:#eaedf9;--accent:#6c5ce7;--accent2:#a29bfe;--success:#00cec9;--danger:#ff5f56;--warn:#ffbd2e;--radius:10px;--lore-bg:#1a0e2e;--lore-border:#2d1b4e}
@@ -145,6 +146,21 @@ a{color:var(--accent2);text-decoration:none}
 .login-box button{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-weight:600;font-size:.92rem;cursor:pointer}
 .login-box button:hover{background:var(--accent2)}
 .login-error{color:var(--danger);font-size:.82rem;margin-bottom:10px;display:none}
+/* Tab system */
+.tab-bar{display:flex;gap:0;margin-bottom:20px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.tab-btn{flex:1;padding:12px 16px;background:var(--bg-card);border:none;color:var(--text-dim);font-weight:600;font-size:.88rem;cursor:pointer;transition:background .2s,color .2s;border-right:1px solid var(--border)}
+.tab-btn:last-child{border-right:none}
+.tab-btn:hover{background:var(--surface);color:var(--heading)}
+.tab-btn.active{background:var(--accent);color:#fff}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.profit-container{display:grid;grid-template-columns:2fr 1fr;gap:20px}
+@media(max-width:768px){.profit-container{grid-template-columns:1fr}}
+.profit-chart-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+.profit-stats{display:flex;flex-direction:column;gap:16px}
+.profit-stat-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;text-align:center}
+.profit-stat-box .label{font-size:.75rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.profit-stat-box .value{font-size:1.5rem;font-weight:700;color:var(--success)}
 </style>
 </head>
 <body>
@@ -180,6 +196,15 @@ a{color:var(--accent2);text-decoration:none}
 
 <div class="main" id="main-content">
 
+<div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('controls')">Controls</button>
+    <button class="tab-btn" onclick="switchTab('ah-profit')">AH Profit</button>
+    <button class="tab-btn" onclick="switchTab('bz-profit')">BZ Profit</button>
+    <button class="tab-btn" onclick="switchTab('total-profit')">Total Profit</button>
+</div>
+
+<div class="tab-content active" id="tab-controls">
+
 <!-- Row 1: Status + Controls -->
 <div class="grid">
     <div class="card">
@@ -211,6 +236,10 @@ a{color:var(--accent2);text-decoration:none}
         <div class="toggle-row">
             <span class="toggle-label">Bazaar Flips</span>
             <label class="toggle"><input type="checkbox" id="tog-bz" onchange="toggleBZ(this.checked)"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Anonymize Webhook Name</span>
+            <label class="toggle"><input type="checkbox" id="tog-anon" onchange="toggleAnonymize(this.checked)"><span class="slider"></span></label>
         </div>
     </div>
 </div>
@@ -249,6 +278,47 @@ a{color:var(--accent2);text-decoration:none}
         <div class="chat-input-row">
             <input type="text" id="chat-input" placeholder="Type a message or /command..." autocomplete="off">
             <button onclick="sendChat()">Send</button>
+        </div>
+    </div>
+</div>
+
+</div><!-- tab-controls -->
+
+<div class="tab-content" id="tab-ah-profit">
+    <div class="profit-container">
+        <div class="profit-chart-card">
+            <canvas id="chart-ah" height="300"></canvas>
+        </div>
+        <div class="profit-stats">
+            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="ah-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="ah-uptime">—</div></div>
+            <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="ah-per-hour">0</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="tab-content" id="tab-bz-profit">
+    <div class="profit-container">
+        <div class="profit-chart-card">
+            <canvas id="chart-bz" height="300"></canvas>
+        </div>
+        <div class="profit-stats">
+            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="bz-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="bz-uptime">—</div></div>
+            <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="bz-per-hour">0</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="tab-content" id="tab-total-profit">
+    <div class="profit-container">
+        <div class="profit-chart-card">
+            <canvas id="chart-total" height="300"></canvas>
+        </div>
+        <div class="profit-stats">
+            <div class="profit-stat-box"><div class="label">Total Profit</div><div class="value" id="total-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="total-uptime">—</div></div>
+            <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="total-per-hour">0</div></div>
         </div>
     </div>
 </div>
@@ -378,6 +448,7 @@ async function fetchStatus() {
         $('s-uptime').textContent = formatUptime(d.uptime_seconds);
         $('tog-ah').checked = d.enable_ah_flips;
         $('tog-bz').checked = d.enable_bazaar_flips;
+        $('tog-anon').checked = d.anonymize_webhook_name;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
         $('btn-resume').style.display = d.macro_paused ? '' : 'none';
         accounts = d.accounts || [];
@@ -428,6 +499,9 @@ async function toggleAH(enabled) {
 }
 async function toggleBZ(enabled) {
     await fetch('/api/toggle_bazaar', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+}
+async function toggleAnonymize(enabled) {
+    await fetch('/api/toggle_anonymize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
 }
 
 async function switchAccount(index) {
@@ -722,6 +796,146 @@ document.addEventListener('click', e => {
     const saved = localStorage.getItem('baf-theme');
     if (saved && THEMES.includes(saved)) setTheme(saved);
 })();
+
+// ── Tabs ─────────────────────────────────────────────────────
+function switchTab(tabId) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    const tab = document.getElementById('tab-' + tabId);
+    if (tab) tab.classList.add('active');
+    const buttons = document.querySelectorAll('.tab-btn');
+    const map = {'controls':0,'ah-profit':1,'bz-profit':2,'total-profit':3};
+    if (map[tabId] !== undefined && buttons[map[tabId]]) buttons[map[tabId]].classList.add('active');
+    if (tabId !== 'controls') fetchProfit();
+}
+
+// ── Profit Charts ────────────────────────────────────────────
+let chartAH = null, chartBZ = null, chartTotal = null;
+
+function formatProfitLabel(val) {
+    if (Math.abs(val) >= 1e9) return (val/1e9).toFixed(1) + 'B';
+    if (Math.abs(val) >= 1e6) return (val/1e6).toFixed(1) + 'M';
+    if (Math.abs(val) >= 1e3) return (val/1e3).toFixed(1) + 'K';
+    return val.toString();
+}
+
+function makeChartConfig(label, color, points) {
+    const labels = points.map(p => {
+        const d = new Date(p[0] * 1000);
+        return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    });
+    const data = points.map(p => p[1]);
+    return {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [{
+                label,
+                data,
+                borderColor: color,
+                backgroundColor: color + '33',
+                fill: true,
+                tension: 0.3,
+                pointRadius: 2,
+                pointHoverRadius: 5,
+                borderWidth: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {legend:{display:false},tooltip:{callbacks:{label:ctx=>formatProfitLabel(ctx.parsed.y)+' coins'}}},
+            scales: {
+                x: {title:{display:true,text:'TIME',color:'#888'},ticks:{color:'#888',maxTicksLimit:10},grid:{color:'rgba(255,255,255,0.05)'}},
+                y: {title:{display:true,text:'PROFIT',color:'#888'},ticks:{color:'#888',callback:v=>formatProfitLabel(v)},grid:{color:'rgba(255,255,255,0.05)'}}
+            }
+        }
+    };
+}
+
+function makeTotalChartConfig(ahPoints, bzPoints) {
+    const allTimes = new Set();
+    ahPoints.forEach(p => allTimes.add(p[0]));
+    bzPoints.forEach(p => allTimes.add(p[0]));
+    const sorted = [...allTimes].sort((a,b)=>a-b);
+
+    const labels = sorted.map(t => {
+        const d = new Date(t * 1000);
+        return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    });
+
+    function interpolate(points, times) {
+        const result = [];
+        let idx = 0;
+        for (const t of times) {
+            while (idx < points.length - 1 && points[idx+1][0] <= t) idx++;
+            result.push(idx < points.length ? points[idx][1] : 0);
+        }
+        return result;
+    }
+
+    const ahData = interpolate(ahPoints, sorted);
+    const bzData = interpolate(bzPoints, sorted);
+    const totalData = sorted.map((_, i) => ahData[i] + bzData[i]);
+
+    return {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {label:'AH Profit',data:ahData,borderColor:'#2ecc71',backgroundColor:'#2ecc7133',fill:true,tension:0.3,pointRadius:1,borderWidth:2},
+                {label:'BZ Profit',data:bzData,borderColor:'#e67e22',backgroundColor:'#e67e2233',fill:true,tension:0.3,pointRadius:1,borderWidth:2},
+                {label:'Total',data:totalData,borderColor:'#3498db',backgroundColor:'#3498db22',fill:false,tension:0.3,pointRadius:0,borderWidth:2,borderDash:[5,5]}
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {legend:{display:true,labels:{color:'#ccc'}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatProfitLabel(ctx.parsed.y)+' coins'}}},
+            scales: {
+                x: {title:{display:true,text:'TIME',color:'#888'},ticks:{color:'#888',maxTicksLimit:10},grid:{color:'rgba(255,255,255,0.05)'}},
+                y: {title:{display:true,text:'PROFIT',color:'#888'},ticks:{color:'#888',callback:v=>formatProfitLabel(v)},grid:{color:'rgba(255,255,255,0.05)'}}
+            }
+        }
+    };
+}
+
+async function fetchProfit() {
+    try {
+        const r = await fetch('/api/profit');
+        if (r.status === 401) return;
+        const d = await r.json();
+        const upStr = formatUptime(d.uptime_seconds);
+        const hours = d.uptime_seconds / 3600;
+
+        $('ah-profit-total').textContent = formatProfitLabel(d.ah_total);
+        $('ah-uptime').textContent = upStr;
+        $('ah-per-hour').textContent = hours > 0 ? formatProfitLabel(d.ah_total / hours) : '0';
+
+        $('bz-profit-total').textContent = formatProfitLabel(d.bz_total);
+        $('bz-uptime').textContent = upStr;
+        $('bz-per-hour').textContent = hours > 0 ? formatProfitLabel(d.bz_total / hours) : '0';
+
+        const total = d.ah_total + d.bz_total;
+        $('total-profit-total').textContent = formatProfitLabel(total);
+        $('total-uptime').textContent = upStr;
+        $('total-per-hour').textContent = hours > 0 ? formatProfitLabel(total / hours) : '0';
+
+        if (chartAH) chartAH.destroy();
+        if (chartBZ) chartBZ.destroy();
+        if (chartTotal) chartTotal.destroy();
+
+        const ahCtx = $('chart-ah');
+        const bzCtx = $('chart-bz');
+        const totalCtx = $('chart-total');
+
+        if (ahCtx) chartAH = new Chart(ahCtx, makeChartConfig('AH Profit', '#2ecc71', d.ah_points));
+        if (bzCtx) chartBZ = new Chart(bzCtx, makeChartConfig('BZ Profit', '#e67e22', d.bz_points));
+        if (totalCtx) chartTotal = new Chart(totalCtx, makeTotalChartConfig(d.ah_points, d.bz_points));
+    } catch(e) { console.error('Profit fetch failed', e); }
+}
+
+setInterval(fetchProfit, 15000);
 
 // ── Init ─────────────────────────────────────────────────────
 fetchStatus();

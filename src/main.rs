@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
     // Shared enable flags — web panel can toggle these at runtime.
     let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
     let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
+    let anonymize_webhook_name = Arc::new(AtomicBool::new(config.anonymize_webhook_name));
 
     // Broadcast channel for chat messages → web panel clients.
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
@@ -339,6 +340,9 @@ async fn main() -> Result<()> {
     bot_client.bazaar_order_cancel_minutes = config.bazaar_order_cancel_minutes;
     *bot_client.ingame_name.write() = ingame_name.clone();
 
+    // Shared profit tracker for AH and Bazaar realized profits.
+    let profit_tracker = Arc::new(frikadellen_baf::profit::ProfitTracker::new());
+
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
     {
@@ -362,6 +366,8 @@ async fn main() -> Result<()> {
             started_at: std::time::Instant::now(),
             hypixel_api_key: config.hypixel_api_key.clone(),
             detected_cofl_license: detected_cofl_license.clone(),
+            profit_tracker: profit_tracker.clone(),
+            anonymize_webhook_name: anonymize_webhook_name.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -397,6 +403,7 @@ async fn main() -> Result<()> {
     let cofl_premium_events = cofl_premium.clone();
     let chat_tx_events = chat_tx.clone();
     let enable_bazaar_flips_events = enable_bazaar_flips.clone();
+    let profit_tracker_events = profit_tracker.clone();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -630,6 +637,10 @@ async fn main() -> Result<()> {
                             }
                         }
                     };
+                    // Record realized AH profit
+                    if let Some(profit) = opt_profit {
+                        profit_tracker_events.record_ah_profit(profit);
+                    }
                     // Print colorful sold announcement
                     let profit_str = opt_profit.map(|p| {
                         let color = if p >= 0 { "§a" } else { "§c" };
@@ -657,6 +668,14 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
+                    // Track bazaar profit: buy orders are costs, sell orders are revenue.
+                    // price_per_unit is f64 (may have decimal), so we multiply then truncate.
+                    let total = (price_per_unit * amount as f64) as i64;
+                    if is_buy_order {
+                        profit_tracker_events.record_bz_profit(-total);
+                    } else {
+                        profit_tracker_events.record_bz_profit(total);
+                    }
                     let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
@@ -1730,6 +1749,27 @@ async fn main() -> Result<()> {
                 restart_process();
             });
         }
+    }
+
+    // Periodic profit summary webhook every 30 minutes
+    if let Some(webhook_url) = config.active_webhook_url() {
+        let profit_tracker_webhook = profit_tracker.clone();
+        let webhook_url = webhook_url.to_string();
+        let name = ingame_name.clone();
+        let anonymize_flag = anonymize_webhook_name.clone();
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(30 * 60)).await;
+                let (ah, bz) = profit_tracker_webhook.totals();
+                let uptime = started.elapsed().as_secs();
+                let anonymize = anonymize_flag.load(Ordering::Relaxed);
+                frikadellen_baf::webhook::send_webhook_profit_summary(
+                    &name, ah, bz, uptime, anonymize, &webhook_url,
+                )
+                .await;
+            }
+        });
     }
 
     // Keep the application running

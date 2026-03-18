@@ -1,4 +1,5 @@
 use once_cell::sync::Lazy;
+use rand::Rng;
 use tracing::warn;
 
 // Shared HTTP client - reqwest clients are designed to be cloned/reused
@@ -46,6 +47,21 @@ fn sanitize_item_name(name: &str) -> String {
         .collect::<String>()
         .trim_matches('_')
         .to_string()
+}
+
+/// Minimum length for anonymized names so they look like real usernames.
+const MIN_ANONYMIZED_NAME_LEN: usize = 6;
+
+/// Generate an anonymized/censored username with random characters.
+/// Preserves the length of the original name but replaces each character
+/// with a random alphanumeric character, producing a different result each call.
+fn anonymize_name(name: &str) -> String {
+    let mut rng = rand::rng();
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let len = name.len().max(MIN_ANONYMIZED_NAME_LEN);
+    (0..len)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 /// Unix timestamp seconds for Discord relative timestamps
@@ -786,6 +802,57 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         appeal_url,
         clean_text,
     }
+}
+
+/// Send a periodic profit summary embed.
+/// When `anonymize` is true the username is replaced with random characters.
+pub async fn send_webhook_profit_summary(
+    ingame_name: &str,
+    ah_profit: i64,
+    bz_profit: i64,
+    uptime_secs: u64,
+    anonymize: bool,
+    webhook_url: &str,
+) {
+    let total = ah_profit + bz_profit;
+    let hours = uptime_secs as f64 / 3600.0;
+    let per_hour = if hours > 0.0 {
+        total as f64 / hours
+    } else {
+        0.0
+    };
+
+    let display_name = if anonymize {
+        anonymize_name(ingame_name)
+    } else {
+        ingame_name.to_string()
+    };
+
+    // When anonymized, use a generic icon since the random name has no Minecraft avatar.
+    let icon_url = if anonymize {
+        "https://mc-heads.net/avatar/MHF_Question/32.png".to_string()
+    } else {
+        format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+    };
+
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "📊 Profit Summary",
+            "description": format!("<t:{}:R>", now_unix()),
+            "color": 0x2ecc71u32,
+            "fields": [
+                {"name": "🏛️ Auction House Profit", "value": format!("```{}```", format_number(ah_profit as f64)), "inline": true},
+                {"name": "📦 Bazaar Profit", "value": format!("```{}```", format_number(bz_profit as f64)), "inline": true},
+                {"name": "💰 Total Profit", "value": format!("```{}```", format_number(total as f64)), "inline": false},
+                {"name": "⏱️ Profit per Hour", "value": format!("```{}```", format_number(per_hour)), "inline": true}
+            ],
+            "footer": {
+                "text": format!("BAF • {} • Uptime: {}", display_name, format_duration(uptime_secs)),
+                "icon_url": icon_url
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
 }
 
 #[cfg(test)]

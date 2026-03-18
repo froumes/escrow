@@ -9,6 +9,7 @@ pub mod gui;
 pub mod handlers;
 pub mod inventory;
 pub mod logging;
+pub mod profit;
 pub mod state;
 pub mod types;
 pub mod utils;

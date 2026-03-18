@@ -158,6 +158,12 @@ pub struct Config {
     /// Defaults to true. Set to false to opt out.
     #[serde(default = "default_true")]
     pub share_legendary_flips: bool,
+
+    /// Whether to anonymize the username in profit summary webhooks.
+    /// When true, the IGN is replaced with random characters each time.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub anonymize_webhook_name: bool,
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
@@ -236,6 +242,7 @@ impl Default for Config {
             web_gui_password: None,
             hypixel_api_key: None,
             share_legendary_flips: true,
+            anonymize_webhook_name: true,
             sessions: HashMap::new(),
         }
     }

@@ -56,6 +56,10 @@ pub struct WebSharedState {
     pub hypixel_api_key: Option<String>,
     /// Auto-detected COFL license index for the current IGN (0 = none detected).
     pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
+    /// Shared profit tracker for AH and Bazaar realized profits.
+    pub profit_tracker: Arc<crate::profit::ProfitTracker>,
+    /// Whether to anonymize the username in profit webhooks — toggled at runtime.
+    pub anonymize_webhook_name: Arc<AtomicBool>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -66,6 +70,7 @@ struct StatusResponse {
     macro_paused: bool,
     enable_ah_flips: bool,
     enable_bazaar_flips: bool,
+    anonymize_webhook_name: bool,
     queue_depth: usize,
     current_account: String,
     current_account_index: usize,
@@ -103,6 +108,15 @@ struct LoginPayload {
 #[derive(Serialize)]
 struct LoginResponse {
     success: bool,
+}
+
+#[derive(Serialize)]
+struct ProfitResponse {
+    ah_points: Vec<(u64, i64)>,
+    bz_points: Vec<(u64, i64)>,
+    ah_total: i64,
+    bz_total: i64,
+    uptime_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -215,6 +229,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/inventory", get(get_inventory))
         .route("/api/toggle_ah", axum::routing::post(toggle_ah))
         .route("/api/toggle_bazaar", axum::routing::post(toggle_bazaar))
+        .route("/api/toggle_anonymize", axum::routing::post(toggle_anonymize))
         .route("/api/chat/send", axum::routing::post(send_chat))
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
@@ -223,6 +238,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/auctions", get(get_auctions))
         .route("/api/logs/latest", get(download_latest_log))
+        .route("/api/profit", get(get_profit))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -323,6 +339,7 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
         macro_paused: s.macro_paused.load(Ordering::Relaxed),
         enable_ah_flips: s.enable_ah_flips.load(Ordering::Relaxed),
         enable_bazaar_flips: s.enable_bazaar_flips.load(Ordering::Relaxed),
+        anonymize_webhook_name: s.anonymize_webhook_name.load(Ordering::Relaxed),
         queue_depth: s.command_queue.len(),
         current_account: s.ingame_names.get(s.current_account_index).cloned().unwrap_or_default(),
         current_account_index: s.current_account_index,
@@ -371,6 +388,17 @@ async fn toggle_bazaar(
     s.enable_bazaar_flips.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] Bazaar flips set to {} via web panel", payload.enabled);
     let msg = format!("[BAF Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    let _ = s.chat_tx.send(msg);
+    StatusCode::OK
+}
+
+async fn toggle_anonymize(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<TogglePayload>,
+) -> impl IntoResponse {
+    s.anonymize_webhook_name.store(payload.enabled, Ordering::Relaxed);
+    info!("[WebGUI] Webhook anonymization set to {} via web panel", payload.enabled);
+    let msg = format!("[BAF Web] Webhook name anonymization {}", if payload.enabled { "enabled" } else { "disabled" });
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
 }
@@ -901,6 +929,17 @@ async fn download_latest_log() -> impl IntoResponse {
 }
 
 // ── WebSocket handler for live chat ──────────────────────────
+
+async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
+    let (ah_total, bz_total) = s.profit_tracker.totals();
+    Json(ProfitResponse {
+        ah_points: s.profit_tracker.ah_points(),
+        bz_points: s.profit_tracker.bz_points(),
+        ah_total,
+        bz_total,
+        uptime_seconds: s.started_at.elapsed().as_secs(),
+    })
+}
 
 async fn chat_ws_handler(
     ws: WebSocketUpgrade,
