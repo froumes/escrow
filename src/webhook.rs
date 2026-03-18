@@ -788,6 +788,42 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
     }
 }
 
+/// Send a periodic profit summary embed.
+pub async fn send_webhook_profit_summary(
+    ingame_name: &str,
+    ah_profit: i64,
+    bz_profit: i64,
+    uptime_secs: u64,
+    webhook_url: &str,
+) {
+    let total = ah_profit + bz_profit;
+    let hours = uptime_secs as f64 / 3600.0;
+    let per_hour = if hours > 0.0 {
+        total as f64 / hours
+    } else {
+        0.0
+    };
+
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "📊 Profit Summary",
+            "description": format!("<t:{}:R>", now_unix()),
+            "color": 0x2ecc71u32,
+            "fields": [
+                {"name": "🏛️ Auction House Profit", "value": format!("```{}```", format_number(ah_profit as f64)), "inline": true},
+                {"name": "📦 Bazaar Profit", "value": format!("```{}```", format_number(bz_profit as f64)), "inline": true},
+                {"name": "💰 Total Profit", "value": format!("```{}```", format_number(total as f64)), "inline": false},
+                {"name": "⏱️ Profit per Hour", "value": format!("```{}```", format_number(per_hour)), "inline": true}
+            ],
+            "footer": {
+                "text": format!("BAF • {} • Uptime: {}", ingame_name, format_duration(uptime_secs)),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_ban_reason;

@@ -56,6 +56,8 @@ pub struct WebSharedState {
     pub hypixel_api_key: Option<String>,
     /// Auto-detected COFL license index for the current IGN (0 = none detected).
     pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
+    /// Shared profit tracker for AH and Bazaar realized profits.
+    pub profit_tracker: Arc<crate::profit::ProfitTracker>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -103,6 +105,15 @@ struct LoginPayload {
 #[derive(Serialize)]
 struct LoginResponse {
     success: bool,
+}
+
+#[derive(Serialize)]
+struct ProfitResponse {
+    ah_points: Vec<(u64, i64)>,
+    bz_points: Vec<(u64, i64)>,
+    ah_total: i64,
+    bz_total: i64,
+    uptime_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -223,6 +234,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/auctions", get(get_auctions))
         .route("/api/logs/latest", get(download_latest_log))
+        .route("/api/profit", get(get_profit))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -901,6 +913,17 @@ async fn download_latest_log() -> impl IntoResponse {
 }
 
 // ── WebSocket handler for live chat ──────────────────────────
+
+async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
+    let (ah_total, bz_total) = s.profit_tracker.totals();
+    Json(ProfitResponse {
+        ah_points: s.profit_tracker.ah_points(),
+        bz_points: s.profit_tracker.bz_points(),
+        ah_total,
+        bz_total,
+        uptime_seconds: s.started_at.elapsed().as_secs(),
+    })
+}
 
 async fn chat_ws_handler(
     ws: WebSocketUpgrade,
