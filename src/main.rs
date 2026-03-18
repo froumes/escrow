@@ -8,7 +8,7 @@ use frikadellen_baf::{
     websocket::CoflWebSocket,
     bot::BotClient,
     types::Flip,
-    web::{start_web_server, WebSharedState},
+    web::{start_web_server, start_setup_web_server, WebSharedState, SetupWebState},
 };
 use tracing::{debug, error, info, warn};
 use tokio::time::{sleep, Duration};
@@ -94,7 +94,265 @@ fn should_drop_bazaar_command_during_ah_pause(
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
+/// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
+/// buy_price is 0 until ItemPurchased fires and updates it.
+/// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
+
+/// Check whether a cached (non-expired) Microsoft auth token exists for the given cache key.
+///
+/// Azalea stores its auth cache in `~/.minecraft/azalea-auth.json`.  If the file is missing,
+/// unreadable, or the key is absent / expired, the user will need to go through the device-code
+/// login flow again – i.e. this is a "first startup".
+async fn has_cached_microsoft_auth(cache_key: &str) -> bool {
+    let minecraft_dir = match minecraft_folder_path::minecraft_dir() {
+        Some(d) => d,
+        None => return false,
+    };
+    let cache_file = minecraft_dir.join("azalea-auth.json");
+    if !cache_file.exists() {
+        return false;
+    }
+    let contents = match tokio::fs::read_to_string(&cache_file).await {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // The cache is a JSON array of CachedAccount objects.
+    let accounts: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    accounts.iter().any(|acct| {
+        let key_match = acct
+            .get("cache_key")
+            .or_else(|| acct.get("email"))
+            .and_then(|v| v.as_str())
+            == Some(cache_key);
+        let mca_valid = acct
+            .get("mca")
+            .and_then(|mca| mca.get("expires_at"))
+            .and_then(|e| e.as_u64())
+            .map(|exp| exp > now_secs)
+            .unwrap_or(false);
+        key_match && mca_valid
+    })
+}
+
+/// First-time setup mode.
+///
+/// Starts a lightweight web server (panel + chat only) so the user can see
+/// both the Microsoft and Coflnet login links in the web chat, then restarts
+/// the process once authentication is complete.
+async fn run_first_time_setup(
+    config: &frikadellen_baf::config::types::Config,
+    ingame_name: &str,
+    session_id: &str,
+) -> Result<()> {
+    info!("[Setup] First-time setup detected — starting authentication flow");
+
+    let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
+
+    // ── Start the setup web server so users can see the chat ─────────
+    let setup_state = SetupWebState {
+        chat_tx: chat_tx.clone(),
+        web_gui_password: config.web_gui_password.clone(),
+        valid_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+    };
+    let web_port = config.web_gui_port;
+    tokio::spawn(async move {
+        start_setup_web_server(setup_state, web_port).await;
+    });
+
+    // Give the web server a moment to bind
+    sleep(Duration::from_millis(500)).await;
+
+    let welcome_msg = format!(
+        "§f[§4BAF§f]: §a========================================\n\
+         §f[§4BAF§f]: §e§lWelcome to Frikadellen BAF!\n\
+         §f[§4BAF§f]: §fFirst-time setup — please log in below.\n\
+         §f[§4BAF§f]: §fOpen §bhttp://localhost:{}§f to follow along.\n\
+         §f[§4BAF§f]: §a========================================",
+        web_port
+    );
+    print_mc_chat(&welcome_msg);
+    let _ = chat_tx.send(welcome_msg);
+
+    // ── Microsoft Authentication ─────────────────────────────────────
+    let ms_auth_done = Arc::new(AtomicBool::new(false));
+    let cofl_auth_done = Arc::new(AtomicBool::new(false));
+
+    let ms_msg = "§f[§4BAF§f]: §e§lStep 1: §fMicrosoft Authentication\n\
+                  §f[§4BAF§f]: §7Getting login link...";
+    print_mc_chat(ms_msg);
+    let _ = chat_tx.send(ms_msg.to_string());
+
+    let http_client = reqwest::Client::new();
+    let device_code = azalea_auth::get_ms_link_code(&http_client, None, None).await
+        .map_err(|e| anyhow::anyhow!("Failed to get Microsoft login link: {}", e))?;
+
+    let ms_url = format!("{}?otc={}", device_code.verification_uri, device_code.user_code);
+    let ms_auth_msg = format!(
+        "§f[§4BAF§f]: §c========================================\n\
+         §f[§4BAF§f]: §c§lMicrosoft Login Required!\n\
+         §f[§4BAF§f]: §eGo to: §b§n{}\n\
+         §f[§4BAF§f]: §eCode: §f§l{}\n\
+         §f[§4BAF§f]: §c========================================",
+        ms_url, device_code.user_code
+    );
+    print_mc_chat(&ms_auth_msg);
+    let _ = chat_tx.send(ms_auth_msg);
+
+    // Start polling for Microsoft auth in background
+    let ms_done_flag = ms_auth_done.clone();
+    let chat_tx_ms = chat_tx.clone();
+    let ms_handle = tokio::spawn(async move {
+        match azalea_auth::get_ms_auth_token(&http_client, device_code, None).await {
+            Ok(msa) => {
+                // Complete the full auth chain to validate & cache
+                match azalea_auth::get_minecraft_token(&http_client, &msa.data.access_token).await {
+                    Ok(mc_token) => {
+                        match azalea_auth::get_profile(&http_client, &mc_token.minecraft_access_token).await {
+                            Ok(profile) => {
+                                // Cache the auth result for subsequent runs
+                                let minecraft_dir = minecraft_folder_path::minecraft_dir()
+                                    .expect("No minecraft directory found");
+                                let cache_file = minecraft_dir.join("azalea-auth.json");
+                                let cached = azalea_auth::cache::CachedAccount {
+                                    cache_key: profile.name.clone(),
+                                    msa,
+                                    xbl: mc_token.xbl,
+                                    mca: mc_token.mca,
+                                    profile: profile.clone(),
+                                };
+                                if let Err(e) = azalea_auth::cache::set_account_in_cache(&cache_file, &profile.name, cached).await {
+                                    error!("[Setup] Failed to cache Microsoft auth: {}", e);
+                                }
+                                let done_msg = format!(
+                                    "§f[§4BAF§f]: §a✓ Microsoft login successful! Logged in as §f§l{}",
+                                    profile.name
+                                );
+                                print_mc_chat(&done_msg);
+                                let _ = chat_tx_ms.send(done_msg);
+                                ms_done_flag.store(true, Ordering::SeqCst);
+                            }
+                            Err(e) => {
+                                let err_msg = format!("§f[§4BAF§f]: §cFailed to get Minecraft profile: {}", e);
+                                print_mc_chat(&err_msg);
+                                let _ = chat_tx_ms.send(err_msg);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("§f[§4BAF§f]: §cFailed to get Minecraft token: {}", e);
+                        print_mc_chat(&err_msg);
+                        let _ = chat_tx_ms.send(err_msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("§f[§4BAF§f]: §cMicrosoft authentication failed: {}", e);
+                print_mc_chat(&err_msg);
+                let _ = chat_tx_ms.send(err_msg);
+            }
+        }
+    });
+
+    // ── Coflnet WebSocket Authentication ─────────────────────────────
+    let cofl_msg = "§f[§4BAF§f]: §e§lStep 2: §fCoflnet Authentication\n\
+                    §f[§4BAF§f]: §7Connecting to Coflnet...";
+    print_mc_chat(cofl_msg);
+    let _ = chat_tx.send(cofl_msg.to_string());
+
+    let cofl_done_flag = cofl_auth_done.clone();
+    let chat_tx_cofl = chat_tx.clone();
+
+    // Connect to Coflnet — this may trigger an auth prompt via chat messages
+    match CoflWebSocket::connect(
+        config.websocket_url.clone(),
+        ingame_name.to_string(),
+        VERSION.to_string(),
+        session_id.to_string(),
+    ).await {
+        Ok((_ws_client, mut ws_rx)) => {
+            let connected_msg = "§f[§4BAF§f]: §aConnected to Coflnet WebSocket";
+            print_mc_chat(connected_msg);
+            let _ = chat_tx_cofl.send(connected_msg.to_string());
+
+            // Process Coflnet events in background — auth prompts will be
+            // forwarded to chat_tx so they appear in the web panel.
+            tokio::spawn(async move {
+                let mut got_auth_prompt = false;
+                while let Some(event) = ws_rx.recv().await {
+                    match event {
+                        frikadellen_baf::websocket::CoflEvent::ChatMessage(msg) => {
+                            print_mc_chat(&msg);
+                            let _ = chat_tx_cofl.send(msg.clone());
+                            // If the message contains an auth URL, we know COFL needs auth
+                            if msg.contains("sky.coflnet.com/authmod") || msg.contains("Authentication URL") {
+                                got_auth_prompt = true;
+                            }
+                            // If COFL sends a "Your connection id is" message, auth is done
+                            if msg.contains("connection id is") || msg.contains("You have") {
+                                let done_msg = "§f[§4BAF§f]: §a✓ Coflnet authentication successful!";
+                                print_mc_chat(done_msg);
+                                let _ = chat_tx_cofl.send(done_msg.to_string());
+                                cofl_done_flag.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // If we never got an auth prompt, COFL was already authenticated
+                if !got_auth_prompt {
+                    cofl_done_flag.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        Err(e) => {
+            let err_msg = format!(
+                "§f[§4BAF§f]: §cFailed to connect to Coflnet: {}\n\
+                 §f[§4BAF§f]: §eYou can authenticate with Coflnet after restart.",
+                e
+            );
+            print_mc_chat(&err_msg);
+            let _ = chat_tx.send(err_msg);
+            // Mark as done so we don't block on COFL auth
+            cofl_auth_done.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // ── Wait for Microsoft auth to complete ──────────────────────────
+    // Microsoft auth is required; Coflnet auth is optional (may already be authed).
+    let _ = ms_handle.await;
+
+    // If COFL auth is pending, wait a short time for it
+    if !cofl_auth_done.load(Ordering::SeqCst) {
+        let wait_msg = "§f[§4BAF§f]: §7Waiting for Coflnet authentication (30s timeout)...";
+        print_mc_chat(wait_msg);
+        let _ = chat_tx.send(wait_msg.to_string());
+
+        let start = Instant::now();
+        while !cofl_auth_done.load(Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(30) {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // ── Restart ──────────────────────────────────────────────────────
+    let restart_msg = "§f[§4BAF§f]: §a========================================\n\
+                       §f[§4BAF§f]: §a§lSetup complete! Restarting bot...\n\
+                       §f[§4BAF§f]: §a========================================";
+    print_mc_chat(restart_msg);
+    let _ = chat_tx.send(restart_msg.to_string());
+    // Small delay so the web panel has time to receive the final messages
+    sleep(Duration::from_secs(2)).await;
+
+    info!("[Setup] Authentication complete — restarting process");
+    restart_process();
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -281,6 +539,18 @@ async fn main() -> Result<()> {
         config_loader.save(&config)?;
         new_id
     };
+
+    // ── First-time setup detection ───────────────────────────────────
+    // If Microsoft auth is not cached for this account, enter setup mode:
+    // start a lightweight web server, show login links for Microsoft and
+    // Coflnet in the chat, and restart once authentication is complete.
+    if !has_cached_microsoft_auth(&ingame_name).await {
+        info!("[Setup] No cached Microsoft auth for '{}' — entering first-time setup", ingame_name);
+        run_first_time_setup(&config, &ingame_name, &session_id).await?;
+        // run_first_time_setup calls restart_process() and never returns,
+        // but just in case:
+        unreachable!("run_first_time_setup should have restarted the process");
+    }
 
     info!("Connecting to Coflnet WebSocket...");
     

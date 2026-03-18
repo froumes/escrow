@@ -17,10 +17,12 @@ path = "src/loader.rs"
 [dependencies]
 # Azalea Minecraft bot framework
 azalea = "0.15"
+azalea-auth = "0.15"
 azalea-protocol = "0.15"
 azalea-inventory = "0.15"
 azalea-client = "0.15"
 azalea-chat = "0.15"
+minecraft_folder_path = "0.1"
 bevy_app = "0.18"
 bevy_ecs = "0.18"
 
@@ -30,7 +32,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures = "0.3"
 
 # Networking
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
