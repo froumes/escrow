@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
     // Shared enable flags — web panel can toggle these at runtime.
     let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
     let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
+    let anonymize_webhook_name = Arc::new(AtomicBool::new(config.anonymize_webhook_name));
 
     // Broadcast channel for chat messages → web panel clients.
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
@@ -366,6 +367,7 @@ async fn main() -> Result<()> {
             hypixel_api_key: config.hypixel_api_key.clone(),
             detected_cofl_license: detected_cofl_license.clone(),
             profit_tracker: profit_tracker.clone(),
+            anonymize_webhook_name: anonymize_webhook_name.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -1754,14 +1756,16 @@ async fn main() -> Result<()> {
         let profit_tracker_webhook = profit_tracker.clone();
         let webhook_url = webhook_url.to_string();
         let name = ingame_name.clone();
+        let anonymize_flag = anonymize_webhook_name.clone();
         let started = std::time::Instant::now();
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(30 * 60)).await;
                 let (ah, bz) = profit_tracker_webhook.totals();
                 let uptime = started.elapsed().as_secs();
+                let anonymize = anonymize_flag.load(Ordering::Relaxed);
                 frikadellen_baf::webhook::send_webhook_profit_summary(
-                    &name, ah, bz, uptime, &webhook_url,
+                    &name, ah, bz, uptime, anonymize, &webhook_url,
                 )
                 .await;
             }

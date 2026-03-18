@@ -237,6 +237,10 @@ a{color:var(--accent2);text-decoration:none}
             <span class="toggle-label">Bazaar Flips</span>
             <label class="toggle"><input type="checkbox" id="tog-bz" onchange="toggleBZ(this.checked)"><span class="slider"></span></label>
         </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Anonymize Webhook Name</span>
+            <label class="toggle"><input type="checkbox" id="tog-anon" onchange="toggleAnonymize(this.checked)"><span class="slider"></span></label>
+        </div>
     </div>
 </div>
 
@@ -444,6 +448,7 @@ async function fetchStatus() {
         $('s-uptime').textContent = formatUptime(d.uptime_seconds);
         $('tog-ah').checked = d.enable_ah_flips;
         $('tog-bz').checked = d.enable_bazaar_flips;
+        $('tog-anon').checked = d.anonymize_webhook_name;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
         $('btn-resume').style.display = d.macro_paused ? '' : 'none';
         accounts = d.accounts || [];
@@ -494,6 +499,9 @@ async function toggleAH(enabled) {
 }
 async function toggleBZ(enabled) {
     await fetch('/api/toggle_bazaar', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+}
+async function toggleAnonymize(enabled) {
+    await fetch('/api/toggle_anonymize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
 }
 
 async function switchAccount(index) {
