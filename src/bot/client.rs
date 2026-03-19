@@ -1625,7 +1625,7 @@ async fn event_handler(
 
             // Detect bazaar order rejection ("Your price isn't competitive enough")
             // so the confirm handler knows not to emit BazaarOrderPlaced.
-            if clean_message.contains("[Bazaar]") && clean_message.contains("price isn") && clean_message.contains("competitive") {
+            if clean_message.contains("[Bazaar]") && clean_message.contains("Your price isn't competitive enough") {
                 warn!("[Bazaar] Order rejected — price not competitive");
                 state.bazaar_order_rejected.store(true, Ordering::Relaxed);
             }
