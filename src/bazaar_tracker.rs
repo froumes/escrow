@@ -87,6 +87,19 @@ impl BazaarOrderTracker {
     pub fn get_orders(&self) -> Vec<TrackedBazaarOrder> {
         self.orders.read().clone()
     }
+
+    /// Remove orders older than `max_age_secs` seconds.
+    /// Returns the number of stale orders removed.
+    pub fn remove_stale_orders(&self, max_age_secs: u64) -> usize {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut orders = self.orders.write();
+        let original_len = orders.len();
+        orders.retain(|o| now.saturating_sub(o.placed_at) < max_age_secs);
+        original_len - orders.len()
+    }
 }
 
 fn normalize_for_match(name: &str) -> String {
@@ -140,6 +153,31 @@ mod tests {
     fn remove_returns_none_for_missing() {
         let tracker = BazaarOrderTracker::new();
         assert!(tracker.remove_order("Nonexistent", true).is_none());
+    }
+
+    #[test]
+    fn remove_stale_orders() {
+        let tracker = BazaarOrderTracker::new();
+        // Manually insert an order with a very old timestamp
+        {
+            let mut orders = tracker.orders.write();
+            orders.push(TrackedBazaarOrder {
+                item_name: "Old Item".into(),
+                amount: 10,
+                price_per_unit: 100.0,
+                is_buy_order: true,
+                status: "open".into(),
+                placed_at: 1000, // ancient timestamp
+            });
+        }
+        // Also add a fresh order normally
+        tracker.add_order("Fresh Item".into(), 5, 200.0, false);
+
+        let removed = tracker.remove_stale_orders(3600); // 1 hour max age
+        assert_eq!(removed, 1);
+        let remaining = tracker.get_orders();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].item_name, "Fresh Item");
     }
 
     #[test]

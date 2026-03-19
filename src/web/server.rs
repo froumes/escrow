@@ -63,6 +63,8 @@ pub struct WebSharedState {
     pub anonymize_webhook_name: Arc<AtomicBool>,
     /// Tracks active bazaar orders for the web panel and profit calculation.
     pub bazaar_tracker: Arc<BazaarOrderTracker>,
+    /// Config loader for persisting changes to config.toml.
+    pub config_loader: Arc<crate::config::ConfigLoader>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -241,6 +243,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
+        .route("/api/config", get(get_config).post(save_config))
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
@@ -398,6 +401,14 @@ async fn toggle_ah(
     info!("[WebGUI] AH flips set to {} via web panel", payload.enabled);
     let msg = format!("[BAF Web] AH flips {}", if payload.enabled { "enabled" } else { "disabled" });
     let _ = s.chat_tx.send(msg);
+    // Persist to config file
+    let enabled = payload.enabled;
+    let loader = s.config_loader.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = loader.update_property(|c| c.enable_ah_flips = enabled) {
+            error!("[WebGUI] Failed to persist AH flips toggle to config: {}", e);
+        }
+    });
     StatusCode::OK
 }
 
@@ -409,6 +420,14 @@ async fn toggle_bazaar(
     info!("[WebGUI] Bazaar flips set to {} via web panel", payload.enabled);
     let msg = format!("[BAF Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
     let _ = s.chat_tx.send(msg);
+    // Persist to config file
+    let enabled = payload.enabled;
+    let loader = s.config_loader.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = loader.update_property(|c| c.enable_bazaar_flips = enabled) {
+            error!("[WebGUI] Failed to persist Bazaar flips toggle to config: {}", e);
+        }
+    });
     StatusCode::OK
 }
 
@@ -843,6 +862,72 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
 
 async fn get_bazaar_orders(State(s): State<WebSharedState>) -> Json<Vec<crate::bazaar_tracker::TrackedBazaarOrder>> {
     Json(s.bazaar_tracker.get_orders())
+}
+
+// ── Config endpoint ─────────────────────────────────────────
+
+async fn get_config(State(s): State<WebSharedState>) -> impl IntoResponse {
+    let loader = s.config_loader.clone();
+    match tokio::task::spawn_blocking(move || {
+        loader.load()
+    }).await {
+        Ok(Ok(config)) => {
+            match toml::to_string_pretty(&config) {
+                Ok(toml_str) => (StatusCode::OK, toml_str).into_response(),
+                Err(e) => {
+                    error!("[WebGUI] Failed to serialize config: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize config").into_response()
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            error!("[WebGUI] Failed to load config: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load config").into_response()
+        }
+        Err(e) => {
+            error!("[WebGUI] Config task panicked: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SaveConfigPayload {
+    config_toml: String,
+}
+
+async fn save_config(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<SaveConfigPayload>,
+) -> impl IntoResponse {
+    let loader = s.config_loader.clone();
+    let enable_ah = s.enable_ah_flips.clone();
+    let enable_bz = s.enable_bazaar_flips.clone();
+    let toml_str = payload.config_toml;
+    match tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // Parse the TOML to validate it first
+        let config: crate::config::Config = toml::from_str(&toml_str)
+            .map_err(|e| format!("Invalid config TOML: {}", e))?;
+        // Update in-memory toggle flags to match the saved config
+        enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
+        enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
+        // Save validated config
+        loader.save(&config).map_err(|e| format!("Failed to save config: {}", e))
+    }).await {
+        Ok(Ok(())) => {
+            info!("[WebGUI] Config saved via web panel");
+            let _ = s.chat_tx.send("[BAF Web] Config saved".to_string());
+            StatusCode::OK.into_response()
+        }
+        Ok(Err(msg)) => {
+            warn!("[WebGUI] Config save failed: {}", msg);
+            (StatusCode::BAD_REQUEST, msg).into_response()
+        }
+        Err(e) => {
+            error!("[WebGUI] Config save task panicked: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()).into_response()
+        }
+    }
 }
 
 /// Parse auctions from Hypixel API response format.

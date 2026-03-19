@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     info!("Starting Frikadellen BAF v{}", VERSION);
 
     // Load or create configuration
-    let config_loader = ConfigLoader::new();
+    let config_loader = Arc::new(ConfigLoader::new());
     let mut config = config_loader.load()?;
 
     // Prompt for username if not set
@@ -373,6 +373,7 @@ async fn main() -> Result<()> {
             profit_tracker: profit_tracker.clone(),
             anonymize_webhook_name: anonymize_webhook_name.clone(),
             bazaar_tracker: bazaar_tracker.clone(),
+            config_loader: config_loader.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -1418,6 +1419,7 @@ async fn main() -> Result<()> {
     let bazaar_flips_paused_proc = bazaar_flips_paused.clone();
     let macro_paused_proc = macro_paused.clone();
     let command_delay_ms = config.command_delay_ms;
+    let auction_listing_delay_ms = config.auction_listing_delay_ms;
     tokio::spawn(async move {
         use frikadellen_baf::types::BotState;
         loop {
@@ -1508,8 +1510,14 @@ async fn main() -> Result<()> {
                 // Always wait the configurable inter-command delay so Hypixel interactions
                 // don't run back-to-back.  Skip the delay when we interrupted for an
                 // AH flip so it is picked up immediately.
+                // Use a longer delay after auction listings to prevent "Sending packets too fast" kicks.
                 if !interrupted {
-                    sleep(Duration::from_millis(command_delay_ms)).await;
+                    let delay = if matches!(cmd.command_type, frikadellen_baf::types::CommandType::SellToAuction { .. }) {
+                        std::cmp::max(command_delay_ms, auction_listing_delay_ms)
+                    } else {
+                        command_delay_ms
+                    };
+                    sleep(Duration::from_millis(delay)).await;
                 }
             }
             
@@ -1742,6 +1750,25 @@ async fn main() -> Result<()> {
                         CommandPriority::Normal,
                         false,
                     );
+                }
+            }
+        });
+    }
+
+    // Periodic stale bazaar order cleanup — remove tracked orders that are older
+    // than the cancel timeout so the web panel doesn't accumulate stale entries
+    // from orders that were cancelled/collected without emitting events.
+    {
+        let bazaar_tracker_cleanup = bazaar_tracker.clone();
+        let cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
+        tokio::spawn(async move {
+            // Max age = 2 × cancel_timeout or at least 30 minutes (in seconds)
+            let max_age_secs = std::cmp::max(cancel_minutes_per_million * 2, 30) * 60;
+            loop {
+                sleep(Duration::from_secs(60)).await;
+                let removed = bazaar_tracker_cleanup.remove_stale_orders(max_age_secs);
+                if removed > 0 {
+                    info!("[BazaarTracker] Cleaned up {} stale order(s) older than {}m", removed, max_age_secs / 60);
                 }
             }
         });
