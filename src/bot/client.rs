@@ -128,10 +128,9 @@ pub struct BotClient {
     pub ingame_name: Arc<RwLock<String>>,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     manage_orders_cancel_open: Arc<AtomicBool>,
-    /// Cancel open bazaar orders when they are older than this many minutes.
+    /// Cancel open bazaar orders when they are older than this many minutes per million coins.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
-    pub bazaar_order_cancel_minutes: u64,
-    /// Cached "My Auctions" JSON extracted from the in-game Manage Auctions window.
+    pub bazaar_order_cancel_minutes_per_million: u64,
     /// Updated whenever the bot opens the Manage/My Auctions GUI.
     cached_my_auctions_json: Arc<RwLock<Option<String>>>,
 }
@@ -224,7 +223,7 @@ impl BotClient {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
-            bazaar_order_cancel_minutes: 5,
+            bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
         }
     }
@@ -319,7 +318,7 @@ impl BotClient {
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
-            bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
+            bazaar_order_cancel_minutes_per_million: self.bazaar_order_cancel_minutes_per_million,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
             manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
@@ -758,9 +757,9 @@ pub struct BotClientState {
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     /// When false, it only collects filled orders and leaves open orders untouched.
     pub manage_orders_cancel_open: Arc<AtomicBool>,
-    /// Cancel open bazaar orders when they are older than this many minutes.
+    /// Cancel open bazaar orders when they are older than this many minutes per million coins.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
-    pub bazaar_order_cancel_minutes: u64,
+    pub bazaar_order_cancel_minutes_per_million: u64,
     /// Context of the order currently being processed in the ManageOrders iteration.
     /// Stored when clicking an order in Branch B so that Branch C (separate "Order options"
     /// window) can apply the same `cancel_due_to_age` logic.
@@ -834,7 +833,7 @@ impl Default for BotClientState {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
-            bazaar_order_cancel_minutes: 5,
+            bazaar_order_cancel_minutes_per_million: 5,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
@@ -1108,8 +1107,23 @@ fn format_price_for_sign(price: f64) -> String {
     format!("{}.{}", with_commas, frac_digit)
 }
 
+/// Normalize a string for fuzzy item-name matching: lowercase, strip Minecraft
+/// color codes, replace hyphens/underscores with spaces, remove common decorative
+/// Unicode symbols, and collapse consecutive whitespace.
+fn normalize_for_matching(s: &str) -> String {
+    remove_mc_colors(s)
+        .to_lowercase()
+        .replace(['-', '_'], " ")
+        .replace(['☘', '☂', '✪', '◆', '❤'], "")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Option<usize> {
     let name_lower = name.to_lowercase();
+
+    // Phase 1: fast-path — original exact `contains` check (case-insensitive).
     for (i, item) in slots.iter().enumerate() {
         if let Some(display) = get_item_display_name_from_slot(item) {
             if display.to_lowercase().contains(&name_lower) {
@@ -1117,6 +1131,34 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
             }
         }
     }
+
+    // Phase 2: normalized `contains` — strips hyphens, underscores, decorative
+    // symbols and MC color codes so e.g. "turbo wheat v" matches "Turbo-Wheat V".
+    let name_norm = normalize_for_matching(name);
+    for (i, item) in slots.iter().enumerate() {
+        if let Some(display) = get_item_display_name_from_slot(item) {
+            if normalize_for_matching(&display).contains(&name_norm) {
+                return Some(i);
+            }
+        }
+    }
+
+    // Phase 3: token-based — every whitespace-delimited token of the search term
+    // must appear somewhere in the (normalized) slot display name.  This handles
+    // cases where the slot name has extra words, e.g. "Turbo-Wheat Hoe V" still
+    // matches a search for "turbo wheat v".
+    let tokens: Vec<&str> = name_norm.split_whitespace().collect();
+    if tokens.len() > 1 {
+        for (i, item) in slots.iter().enumerate() {
+            if let Some(display) = get_item_display_name_from_slot(item) {
+                let display_norm = normalize_for_matching(&display);
+                if tokens.iter().all(|tok| display_norm.contains(tok)) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -1264,6 +1306,25 @@ fn normalize_bazaar_order_text(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Extract the clean item name from a ManageOrders order slot display name.
+/// Uses the parsed `order_identity` (which already contains the clean name) when
+/// available, otherwise strips BUY/SELL/Buy Order/Sell Offer prefixes.
+fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String)>) -> String {
+    if let Some((_, item)) = order_identity {
+        return item.clone();
+    }
+    // Fallback: try to strip the prefix ourselves
+    let normalized = normalize_bazaar_order_text(order_name);
+    for prefix in ["buy order: ", "sell offer: ", "buy ", "sell "] {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                return rest.trim().to_string();
+            }
+        }
+    }
+    order_name.to_string()
 }
 
 fn parse_bazaar_order_identity_from_name(name: &str) -> Option<(bool, String)> {
@@ -2624,7 +2685,8 @@ async fn handle_window_interaction(
                     let item = item_name.clone();
                     let amount = *state.bazaar_amount.read();
                     let price_per_unit = *state.bazaar_price_per_unit.read();
-                    log_bazaar_order_placed(is_buy_order, &item);
+                    let total_value = amount as f64 * price_per_unit;
+                    log_bazaar_order_placed(is_buy_order, &item, total_value);
                     let _ = state.event_tx.send(BotEvent::BazaarOrderPlaced {
                         item_name: item,
                         amount,
@@ -3318,11 +3380,11 @@ async fn handle_window_interaction(
 
                             let cancel_due_to_age = !cancel_open
                                 && cancel_slot.is_some()
-                                && should_cancel_open_order_due_to_age(order_identity.clone(), state.bazaar_order_cancel_minutes);
+                                && should_cancel_open_order_due_to_age(order_identity.clone(), state.bazaar_order_cancel_minutes_per_million);
                             if cancel_due_to_age {
                                 info!(
-                                    "[ManageOrders] Open order \"{}\" is older than {} minute(s) — will cancel",
-                                    order_name, state.bazaar_order_cancel_minutes
+                                    "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel",
+                                    order_name, state.bazaar_order_cancel_minutes_per_million
                                 );
                             }
 
@@ -3348,7 +3410,7 @@ async fn handle_window_interaction(
                                         info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
                                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                                         let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                            item_name: order_name.clone(),
+                                            item_name: clean_order_item_name(&order_name, &order_identity),
                                             is_buy_order: order_is_buy,
                                         });
                                         // Wait briefly, then check if inventory became full
@@ -3373,7 +3435,7 @@ async fn handle_window_interaction(
                                                 if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                                     cancelled += 1;
                                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                        item_name: order_name.clone(),
+                                                        item_name: clean_order_item_name(&order_name, &order_identity),
                                                         is_buy_order: order_is_buy,
                                                     });
                                                 } else {
@@ -3400,7 +3462,7 @@ async fn handle_window_interaction(
                                         if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                             cancelled += 1;
                                             let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                item_name: order_name.clone(),
+                                                item_name: clean_order_item_name(&order_name, &order_identity),
                                                 is_buy_order: order_is_buy,
                                             });
                                         } else {
@@ -3459,6 +3521,7 @@ async fn handle_window_interaction(
                     Some((_is_buy, name, identity)) => (name.clone(), identity.clone()),
                     None => (String::new(), None),
                 };
+                let order_identity_for_clean = order_ctx.as_ref().and_then(|(_, _, id)| id.clone());
 
                 // Check persistent set — if this order was already handled in a
                 // previous cycle, skip it to avoid duplicate events/webhooks.
@@ -3511,11 +3574,11 @@ async fn handle_window_interaction(
                 // Apply the same age-based cancel logic as Branch B.
                 let cancel_due_to_age = !cancel_open
                     && cancel_slot.is_some()
-                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes);
+                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
                 if cancel_due_to_age {
                     info!(
-                        "[ManageOrders] Open order \"{}\" is older than {} minute(s) — will cancel (Order options)",
-                        order_name, state.bazaar_order_cancel_minutes
+                        "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel (Order options)",
+                        order_name, state.bazaar_order_cancel_minutes_per_million
                     );
                 }
 
@@ -3525,7 +3588,7 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                         if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                             let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                item_name: order_name.clone(),
+                                item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                 is_buy_order: *ctx_is_buy,
                             });
                         }
@@ -3540,7 +3603,7 @@ async fn handle_window_interaction(
                                         *state.manage_orders_cancelled.write() += 1;
                                         if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                             let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                item_name: order_name.clone(),
+                                                item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                                 is_buy_order: *ctx_is_buy,
                                             });
                                         }
@@ -3567,7 +3630,7 @@ async fn handle_window_interaction(
                                 *state.manage_orders_cancelled.write() += 1;
                                 if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                        item_name: order_name.clone(),
+                                        item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                         is_buy_order: *ctx_is_buy,
                                     });
                                 }
@@ -4404,14 +4467,14 @@ fn bazaar_order_log_path() -> std::path::PathBuf {
 }
 
 /// Persist a placed bazaar order for later stale-order checks in ManageOrders.
-fn log_bazaar_order_placed(is_buy: bool, item_name: &str) {
+fn log_bazaar_order_placed(is_buy: bool, item_name: &str, total_value: f64) {
     use std::io::Write;
     let side = if is_buy { "buy" } else { "sell" };
     let normalized_item = normalize_bazaar_order_text(item_name);
     if normalized_item.is_empty() {
         return;
     }
-    let line = format!("{}|{}|{}\n", chrono::Utc::now().timestamp(), side, normalized_item);
+    let line = format!("{}|{}|{}|{:.0}\n", chrono::Utc::now().timestamp(), side, normalized_item, total_value);
     let log_path = bazaar_order_log_path();
     match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(mut f) => {
@@ -4423,7 +4486,9 @@ fn log_bazaar_order_placed(is_buy: bool, item_name: &str) {
     }
 }
 
-fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
+/// Returns (timestamp, total_value_coins) for the most recent matching logged order.
+/// Old log entries without a value field default to 1_000_000.0 (1M coins) for backward compat.
+fn last_logged_order_info(is_buy: bool, item_name: &str) -> Option<(i64, f64)> {
     let target_side = if is_buy { "buy" } else { "sell" };
     let target_item = normalize_bazaar_order_text(item_name);
     if target_item.is_empty() {
@@ -4431,27 +4496,35 @@ fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
     }
     let content = std::fs::read_to_string(bazaar_order_log_path()).ok()?;
     for line in content.lines().rev() {
-        let mut parts = line.splitn(3, '|');
+        let mut parts = line.splitn(4, '|');
         let ts = parts.next()?.parse::<i64>().ok()?;
         let side = parts.next()?.trim();
         let item = parts.next()?.trim();
         if side == target_side && item == target_item {
-            return Some(ts);
+            let total_value = parts.next()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(1_000_000.0); // backward compat: old entries default to 1M
+            return Some((ts, total_value));
         }
     }
     None
 }
 
-fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes: u64) -> bool {
-    if cancel_minutes == 0 {
+#[cfg(test)]
+fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
+    last_logged_order_info(is_buy, item_name).map(|(ts, _)| ts)
+}
+
+fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes_per_million: u64) -> bool {
+    if cancel_minutes_per_million == 0 {
         return false;
     }
     let (is_buy, item_name) = match order_identity {
         Some(identity) => identity,
         None => return false,
     };
-    let last_logged = match last_logged_order_timestamp(is_buy, &item_name) {
-        Some(ts) => ts,
+    let (last_logged, total_value) = match last_logged_order_info(is_buy, &item_name) {
+        Some(info) => info,
         None => return false,
     };
     let now = chrono::Utc::now().timestamp();
@@ -4460,7 +4533,12 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
     } else {
         0
     };
-    age_secs >= cancel_minutes.saturating_mul(60)
+    // Scale cancel timeout by total order value: minutes_per_million * (total_value / 1_000_000)
+    // Floor at 1.0M so orders under 1M coins still get the base cancel_minutes_per_million
+    // timeout (e.g. a 100K order with 5m/M → 5 min, not 0.5 min).
+    let millions = (total_value / 1_000_000.0).max(1.0);
+    let cancel_secs = (cancel_minutes_per_million as f64 * millions * 60.0) as u64;
+    age_secs >= cancel_secs
 }
 
 /// Append an unclaimed bazaar order to `pending_claims.log` with an RFC 3339 timestamp.
@@ -5063,7 +5141,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         );
-        log_bazaar_order_placed(true, &item_name);
+        log_bazaar_order_placed(true, &item_name, 5_000_000.0);
         let last = last_logged_order_timestamp(true, &item_name);
         assert!(last.is_some(), "placed order should be present in bazaar_orders.log");
     }
@@ -5247,5 +5325,98 @@ mod tests {
         });
         // No petInfo available — falls back to "PET"
         assert_eq!(resolve_pet_tag("PET", &nbt), "PET");
+    }
+
+    // ---- normalize_for_matching tests ----
+
+    #[test]
+    fn test_normalize_strips_hyphens_and_lowercases() {
+        assert_eq!(normalize_for_matching("Turbo-Wheat V"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_strips_underscores() {
+        assert_eq!(normalize_for_matching("TURBO_WHEAT_V"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_collapses_whitespace() {
+        assert_eq!(normalize_for_matching("  turbo   wheat   v  "), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_strips_mc_color_codes() {
+        assert_eq!(normalize_for_matching("§aTurbo-Wheat §eV"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_strips_decorative_symbols() {
+        assert_eq!(normalize_for_matching("✪ Turbo-Wheat V ☘"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_plain_button_name_unchanged() {
+        assert_eq!(normalize_for_matching("Custom Amount"), "custom amount");
+    }
+
+    // ---- find_slot_by_name tests ----
+
+    /// Helper: build a minimal `ItemStack` whose display name is `display_name`.
+    fn make_named_item(display_name: &str) -> ItemStack {
+        use azalea_chat::{FormattedText, text_component::TextComponent};
+        use azalea_inventory::components::CustomName;
+        let cn = CustomName {
+            name: FormattedText::Text(TextComponent::new(display_name.to_string())),
+        };
+        ItemStack::from(ItemKind::Paper).with_component(cn)
+    }
+
+    #[test]
+    fn test_find_slot_exact_contains() {
+        let slots = vec![
+            ItemStack::Empty,
+            make_named_item("Turbo-Wheat V"),
+            ItemStack::Empty,
+        ];
+        // Exact contains: "Turbo-Wheat V" contains "Turbo-Wheat V"
+        assert_eq!(find_slot_by_name(&slots, "Turbo-Wheat V"), Some(1));
+    }
+
+    #[test]
+    fn test_find_slot_normalized_hyphen_vs_space() {
+        let slots = vec![
+            ItemStack::Empty,
+            make_named_item("Turbo-Wheat V"),
+            ItemStack::Empty,
+        ];
+        // "turbo wheat v" should match "Turbo-Wheat V" via normalized phase
+        assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), Some(1));
+    }
+
+    #[test]
+    fn test_find_slot_case_insensitive() {
+        let slots = vec![
+            make_named_item("Create Buy Order"),
+        ];
+        assert_eq!(find_slot_by_name(&slots, "create buy order"), Some(0));
+    }
+
+    #[test]
+    fn test_find_slot_token_matching() {
+        let slots = vec![
+            ItemStack::Empty,
+            make_named_item("Turbo-Wheat Hoe V"),
+        ];
+        // Token matching: "turbo", "wheat", "v" all in "turbo wheat hoe v"
+        assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), Some(1));
+    }
+
+    #[test]
+    fn test_find_slot_no_match() {
+        let slots = vec![
+            make_named_item("Enchanted Bread"),
+            make_named_item("Wheat"),
+        ];
+        assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), None);
     }
 }
