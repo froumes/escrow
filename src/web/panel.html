@@ -682,12 +682,14 @@ function renderBazaarOrders(orders) {
 function formatTimeAge(unixSecs) {
     const now = Math.floor(Date.now() / 1000);
     const diff = now - unixSecs;
+    if (diff < 0) return 'just now';
     if (diff < 60) return diff + 's ago';
     if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
     return Math.floor(diff / 3600) + 'h ago';
 }
 
 function formatShortCoins(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '0';
     if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
