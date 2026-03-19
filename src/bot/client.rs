@@ -46,6 +46,10 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
+/// Gap in ms between clicking slot 31 and pre-clicking slot 11 on the next window
+/// for gold-nugget BIN auctions.  50 ms is long enough to avoid anti-cheat flags
+/// on packet loss while keeping buy speed consistent (~100 ms total).
+const SKIP_CLICK_GAP_MS: u64 = 50;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
@@ -2301,6 +2305,36 @@ async fn handle_window_interaction(
                     // Non-bed BIN auction — buy as fast as possible.
                     // Click slot 31 once (buy-now button).
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
+                    // Skip-click: for gold_nugget BIN auctions, pre-click the confirm
+                    // button (slot 11) on the predicted next window after a short gap.
+                    // This gives consistent ~100ms buy speeds.  Beds and potatoes are
+                    // excluded — they have their own timing logic.
+                    if slot_31_kind.contains("gold_nugget") {
+                        // Predict next window ID: Hypixel increments container IDs
+                        // sequentially. Window 0 is the player inventory and is never
+                        // used for GUI containers, so wrap 255 → 1.
+                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                        tokio::time::sleep(tokio::time::Duration::from_millis(SKIP_CLICK_GAP_MS)).await;
+                        info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (gap {}ms)", next_wid, SKIP_CLICK_GAP_MS);
+                        // Raw click — bypasses the stale-window guard because
+                        // the Confirm Purchase window has not opened yet.
+                        // state_id 0 matches click_window_slot() used elsewhere.
+                        use azalea_protocol::packets::game::s_container_click::{
+                            ServerboundContainerClick,
+                            HashedStack,
+                        };
+                        let packet = ServerboundContainerClick {
+                            container_id: next_wid as i32,
+                            state_id: 0,
+                            slot_num: 11,
+                            button_num: 0,
+                            click_type: ClickType::Pickup,
+                            changed_slots: Default::default(),
+                            carried_item: HashedStack(None),
+                        };
+                        bot.write_packet(packet);
+                    }
                 }
             } else if window_title.contains("Confirm Purchase") {
                 // Click confirm (slot 11) immediately for fastest buy speed.
