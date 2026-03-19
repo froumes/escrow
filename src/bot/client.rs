@@ -3395,11 +3395,10 @@ async fn handle_window_interaction(
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                        {
-                            let ctx_is_buy = order_ctx.as_ref().map(|(ib, _, _)| *ib).unwrap_or(true);
+                        if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                             let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
                                 item_name: order_name.clone(),
-                                is_buy_order: ctx_is_buy,
+                                is_buy_order: *ctx_is_buy,
                             });
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -3410,11 +3409,10 @@ async fn handle_window_interaction(
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
                                     click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
                                     *state.manage_orders_cancelled.write() += 1;
-                                    {
-                                        let ctx_is_buy = order_ctx.as_ref().map(|(ib, _, _)| *ib).unwrap_or(true);
+                                    if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                         let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                             item_name: order_name.clone(),
-                                            is_buy_order: ctx_is_buy,
+                                            is_buy_order: *ctx_is_buy,
                                         });
                                     }
                                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -3435,11 +3433,10 @@ async fn handle_window_interaction(
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                             *state.manage_orders_cancelled.write() += 1;
-                            {
-                                let ctx_is_buy = order_ctx.as_ref().map(|(ib, _, _)| *ib).unwrap_or(true);
+                            if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                 let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                     item_name: order_name.clone(),
-                                    is_buy_order: ctx_is_buy,
+                                    is_buy_order: *ctx_is_buy,
                                 });
                             }
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
