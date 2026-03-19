@@ -4534,7 +4534,8 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
         0
     };
     // Scale cancel timeout by total order value: minutes_per_million * (total_value / 1_000_000)
-    // Minimum 1 minute so even tiny orders eventually get cancelled.
+    // Floor at 1.0M so orders under 1M coins still get the base cancel_minutes_per_million
+    // timeout (e.g. a 100K order with 5m/M → 5 min, not 0.5 min).
     let millions = (total_value / 1_000_000.0).max(1.0);
     let cancel_secs = (cancel_minutes_per_million as f64 * millions * 60.0) as u64;
     age_secs >= cancel_secs
