@@ -46,10 +46,6 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
-/// Gap in ms between clicking slot 31 and pre-clicking slot 11 on the next window
-/// for gold-nugget BIN auctions.  50 ms is long enough to avoid anti-cheat flags
-/// on packet loss while keeping buy speed consistent (~100 ms total).
-const SKIP_CLICK_GAP_MS: u64 = 50;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
@@ -303,6 +299,7 @@ impl BotClient {
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
+            skip_click_sent: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             freemoney: self.freemoney,
@@ -715,6 +712,9 @@ pub struct BotClientState {
     /// Set to true while the bot is waiting for a bed (grace-period) to expire so
     /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
     pub bed_timing_active: Arc<AtomicBool>,
+    /// Set when a skip-click (pre-click on predicted Confirm Purchase window) is sent.
+    /// The Confirm Purchase handler checks this to avoid sending a duplicate reactive click.
+    pub skip_click_sent: Arc<AtomicBool>,
     /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
@@ -809,6 +809,7 @@ impl Default for BotClientState {
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
+            skip_click_sent: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
@@ -1478,6 +1479,7 @@ async fn event_handler(
                 }
                 *state.bot_state.write() = BotState::Idle;
                 state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                state.skip_click_sent.store(false, Ordering::Relaxed);
                 *state.purchase_start_time.write() = None;
                 *state.pending_purchase_at_ms.write() = None;
                 state.bed_timing_active.store(false, Ordering::Relaxed);
@@ -2315,16 +2317,17 @@ async fn handle_window_interaction(
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
 
                     // Skip-click: for gold_nugget BIN auctions, pre-click the confirm
-                    // button (slot 11) on the predicted next window after a short gap.
-                    // This gives consistent ~100ms buy speeds.  Beds and potatoes are
+                    // button (slot 11) on the predicted next window immediately (no gap).
+                    // Both packets arrive at the server within the same tick, giving
+                    // consistent ~100ms (2-tick) buy speeds.  Beds and potatoes are
                     // excluded — they have their own timing logic.
                     if slot_31_kind.contains("gold_nugget") {
                         // Predict next window ID: Hypixel increments container IDs
                         // sequentially. Window 0 is the player inventory and is never
                         // used for GUI containers, so wrap 255 → 1.
                         let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        tokio::time::sleep(tokio::time::Duration::from_millis(SKIP_CLICK_GAP_MS)).await;
-                        info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (gap {}ms)", next_wid, SKIP_CLICK_GAP_MS);
+                        info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
+                        state.skip_click_sent.store(true, Ordering::Relaxed);
                         // Raw click — bypasses the stale-window guard because
                         // the Confirm Purchase window has not opened yet.
                         // state_id 0 matches click_window_slot() used elsewhere.
@@ -2345,14 +2348,21 @@ async fn handle_window_interaction(
                     }
                 }
             } else if window_title.contains("Confirm Purchase") {
-                // Click confirm (slot 11) immediately for fastest buy speed.
-                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                // If a skip-click was already sent for this window, don't fire a
+                // redundant reactive click — the pre-click packet should already be
+                // queued on the server for the same tick.
+                if state.skip_click_sent.swap(false, Ordering::Relaxed) {
+                    info!("[AH] Skip-click was sent — skipping reactive confirm click");
+                } else {
+                    // No skip-click — click confirm (slot 11) immediately.
+                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                }
 
                 // Short wait for the server to process and close the window.
                 tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
 
-                // Safety retry loop: if the window is still open (click was lost or
-                // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
+                // Safety retry loop: if the window is still open (pre-click failed,
+                // click was lost, or the server needs more time), keep retrying.
                 while state.handlers.current_window_title()
                     .as_deref()
                     .map(|t| t.contains("Confirm Purchase"))
@@ -3359,7 +3369,12 @@ async fn handle_window_interaction(
                                     break;
                                 }
                                 log_pending_claim(&order_name);
-                                processed_orders.clear();
+                                // Mark order as processed to avoid infinite re-processing.
+                                // (Previously this called processed_orders.clear() which
+                                // caused the loop to revisit already-handled orders until
+                                // the 60-second ManageOrders timeout fired.)
+                                processed_orders.insert(processed_key);
+                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                             } else {
                                 processed_orders.insert(processed_key);
                                 persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));

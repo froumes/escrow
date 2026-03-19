@@ -345,6 +345,9 @@ async fn main() -> Result<()> {
     // Shared profit tracker for AH and Bazaar realized profits.
     let profit_tracker = Arc::new(frikadellen_baf::profit::ProfitTracker::new());
 
+    // Shared tracker for active bazaar orders (web panel + profit calculation).
+    let bazaar_tracker = Arc::new(frikadellen_baf::bazaar_tracker::BazaarOrderTracker::new());
+
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
     {
@@ -370,6 +373,7 @@ async fn main() -> Result<()> {
             detected_cofl_license: detected_cofl_license.clone(),
             profit_tracker: profit_tracker.clone(),
             anonymize_webhook_name: anonymize_webhook_name.clone(),
+            bazaar_tracker: bazaar_tracker.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
@@ -406,6 +410,7 @@ async fn main() -> Result<()> {
     let chat_tx_events = chat_tx.clone();
     let enable_bazaar_flips_events = enable_bazaar_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
+    let bazaar_tracker_events = bazaar_tracker.clone();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -670,9 +675,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
-                    // NOTE: Profit is NOT recorded here — it is tracked when orders are
-                    // actually collected (BazaarOrderCollected). Recording at placement
-                    // time inflates profits because cancelled orders would count.
+                    // Track the order for the web panel and profit calculation on collect.
+                    bazaar_tracker_events.add_order(item_name.clone(), amount, price_per_unit, is_buy_order);
                     let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
@@ -732,6 +736,15 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order } => {
+                    // Remove from tracker and record realized bazaar profit.
+                    // BUY collected = money spent (negative), SELL collected = money earned (positive).
+                    if let Some(order) = bazaar_tracker_events.remove_order(&item_name, is_buy_order) {
+                        let total = order.price_per_unit * order.amount as f64;
+                        let profit = if is_buy_order { -(total as i64) } else { total as i64 };
+                        profit_tracker_events.record_bz_profit(profit);
+                        info!("[BazaarProfit] Recorded {} coins for {} {} order",
+                            profit, item_name, if is_buy_order { "BUY" } else { "SELL" });
+                    }
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order collected: {} ({})", item_name, order_type);
                     let baf_msg = format!(
@@ -753,6 +766,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order } => {
+                    // Remove from tracker without recording profit (cancelled orders don't count).
+                    let _ = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order cancelled: {} ({})", item_name, order_type);
                     let baf_msg = format!(

@@ -20,6 +20,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::bot::BotClient;
+use crate::bazaar_tracker::BazaarOrderTracker;
 use crate::state::CommandQueue;
 use crate::types::{CommandPriority, CommandType};
 use crate::websocket::CoflWebSocket;
@@ -60,6 +61,8 @@ pub struct WebSharedState {
     pub profit_tracker: Arc<crate::profit::ProfitTracker>,
     /// Whether to anonymize the username in profit webhooks — toggled at runtime.
     pub anonymize_webhook_name: Arc<AtomicBool>,
+    /// Tracks active bazaar orders for the web panel and profit calculation.
+    pub bazaar_tracker: Arc<BazaarOrderTracker>,
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -237,6 +240,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/claim_purchases", axum::routing::post(claim_purchases))
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/auctions", get(get_auctions))
+        .route("/api/bazaar_orders", get(get_bazaar_orders))
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
@@ -833,6 +837,12 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
         .collect();
 
     Json(entries).into_response()
+}
+
+// ── Bazaar orders endpoint ──────────────────────────────────
+
+async fn get_bazaar_orders(State(s): State<WebSharedState>) -> Json<Vec<crate::bazaar_tracker::TrackedBazaarOrder>> {
+    Json(s.bazaar_tracker.get_orders())
 }
 
 /// Parse auctions from Hypixel API response format.
