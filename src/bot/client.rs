@@ -3312,12 +3312,15 @@ async fn handle_window_interaction(
                                             if let Some(cancel_after_collect) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                                 info!("[ManageOrders] Clicking Cancel at slot {} after collecting \"{}\"", cancel_after_collect, order_name);
                                                 click_window_slot(bot, &state.last_window_id, window_id, cancel_after_collect as i16).await;
-                                                cancelled += 1;
-                                                let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                    item_name: order_name.clone(),
-                                                    is_buy_order: order_is_buy,
-                                                });
-                                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                                if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
+                                                    cancelled += 1;
+                                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                                        item_name: order_name.clone(),
+                                                        is_buy_order: order_is_buy,
+                                                    });
+                                                } else {
+                                                    warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server — skipping event", order_name);
+                                                }
                                             }
                                         }
                                     }
@@ -3336,13 +3339,15 @@ async fn handle_window_interaction(
                                     if *state.last_window_id.read() == window_id {
                                         info!("[ManageOrders] Clicking Cancel at slot {}", cs);
                                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                                        cancelled += 1;
-                                        let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                            item_name: order_name.clone(),
-                                            is_buy_order: order_is_buy,
-                                        });
-                                        // Wait for the window content to revert to the order list
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
+                                            cancelled += 1;
+                                            let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                                item_name: order_name.clone(),
+                                                is_buy_order: order_is_buy,
+                                            });
+                                        } else {
+                                            warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server — skipping event", order_name);
+                                        }
                                     }
                                     // Track this order as processed so it cannot be re-cancelled
                                     // if the server is slow to remove it from the window.
@@ -3473,14 +3478,17 @@ async fn handle_window_interaction(
                                 if *state.last_window_id.read() == window_id {
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
                                     click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
-                                    *state.manage_orders_cancelled.write() += 1;
-                                    if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
-                                        let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                            item_name: order_name.clone(),
-                                            is_buy_order: *ctx_is_buy,
-                                        });
+                                    if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
+                                        *state.manage_orders_cancelled.write() += 1;
+                                        if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                            let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                                item_name: order_name.clone(),
+                                                is_buy_order: *ctx_is_buy,
+                                            });
+                                        }
+                                    } else {
+                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server in Order options — skipping event", order_name);
                                     }
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 }
                             }
                         }
@@ -3497,14 +3505,17 @@ async fn handle_window_interaction(
                         if *state.last_window_id.read() == window_id {
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                            *state.manage_orders_cancelled.write() += 1;
-                            if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
-                                let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                    item_name: order_name.clone(),
-                                    is_buy_order: *ctx_is_buy,
-                                });
+                            if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
+                                *state.manage_orders_cancelled.write() += 1;
+                                if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                        item_name: order_name.clone(),
+                                        is_buy_order: *ctx_is_buy,
+                                    });
+                                }
+                            } else {
+                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server in Order options — skipping event", order_name);
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             // If Hypixel closed all bazaar windows without reopening "Your Bazaar
                             // Orders" (e.g. last order was cancelled), re-navigate to /bz so the
                             // ManagingOrders flow continues and correctly reaches Idle when empty.
@@ -4470,6 +4481,33 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
     
     bot.write_packet(packet);
     info!("Clicked slot {} in window {}", slot, window_id);
+}
+
+/// After clicking a Cancel button in a bazaar order management window, wait for
+/// confirmation that the server processed the cancellation.  Returns `true` when
+/// the Cancel button disappears from the window (or the window itself changes),
+/// `false` on timeout (meaning the cancel click was likely not processed).
+async fn wait_for_cancel_confirmation(
+    bot: &Client,
+    last_window_id: &Arc<RwLock<u8>>,
+    window_id: u8,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Window changed — server processed the action
+        if *last_window_id.read() != window_id {
+            return true;
+        }
+        // Cancel button gone — cancellation confirmed
+        let slots = bot.menu().slots();
+        if find_slot_by_name(&slots, "Cancel").is_none() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
 }
 
 /// Click a window slot while reporting the item currently on the cursor.

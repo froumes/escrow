@@ -164,6 +164,8 @@ impl CoflWebSocket {
                 if let Ok(bazaar_flip) = parse_message_data::<BazaarFlipRecommendation>(&msg.data) {
                     debug!("Parsed bazaar flip: {:?}", bazaar_flip.item_name);
                     let _ = tx.send(CoflEvent::BazaarFlip(bazaar_flip));
+                } else {
+                    warn!("Failed to parse bazaar flip from {} message — data: {}", msg.msg_type, msg.data);
                 }
             }
             "getbazaarflips" => {
