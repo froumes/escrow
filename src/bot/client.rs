@@ -1108,8 +1108,23 @@ fn format_price_for_sign(price: f64) -> String {
     format!("{}.{}", with_commas, frac_digit)
 }
 
+/// Normalize a string for fuzzy item-name matching: lowercase, strip Minecraft
+/// color codes, replace hyphens/underscores with spaces, remove common decorative
+/// Unicode symbols, and collapse consecutive whitespace.
+fn normalize_for_matching(s: &str) -> String {
+    remove_mc_colors(s)
+        .to_lowercase()
+        .replace(['-', '_'], " ")
+        .replace(['☘', '☂', '✪', '◆', '❤'], "")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Option<usize> {
     let name_lower = name.to_lowercase();
+
+    // Phase 1: fast-path — original exact `contains` check (case-insensitive).
     for (i, item) in slots.iter().enumerate() {
         if let Some(display) = get_item_display_name_from_slot(item) {
             if display.to_lowercase().contains(&name_lower) {
@@ -1117,6 +1132,34 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
             }
         }
     }
+
+    // Phase 2: normalized `contains` — strips hyphens, underscores, decorative
+    // symbols and MC color codes so e.g. "turbo wheat v" matches "Turbo-Wheat V".
+    let name_norm = normalize_for_matching(name);
+    for (i, item) in slots.iter().enumerate() {
+        if let Some(display) = get_item_display_name_from_slot(item) {
+            if normalize_for_matching(&display).contains(&name_norm) {
+                return Some(i);
+            }
+        }
+    }
+
+    // Phase 3: token-based — every whitespace-delimited token of the search term
+    // must appear somewhere in the (normalized) slot display name.  This handles
+    // cases where the slot name has extra words, e.g. "Turbo-Wheat Hoe V" still
+    // matches a search for "turbo wheat v".
+    let tokens: Vec<&str> = name_norm.split_whitespace().collect();
+    if tokens.len() > 1 {
+        for (i, item) in slots.iter().enumerate() {
+            if let Some(display) = get_item_display_name_from_slot(item) {
+                let display_norm = normalize_for_matching(&display);
+                if tokens.iter().all(|tok| display_norm.contains(tok)) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -5247,5 +5290,98 @@ mod tests {
         });
         // No petInfo available — falls back to "PET"
         assert_eq!(resolve_pet_tag("PET", &nbt), "PET");
+    }
+
+    // ---- normalize_for_matching tests ----
+
+    #[test]
+    fn test_normalize_strips_hyphens_and_lowercases() {
+        assert_eq!(normalize_for_matching("Turbo-Wheat V"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_strips_underscores() {
+        assert_eq!(normalize_for_matching("TURBO_WHEAT_V"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_collapses_whitespace() {
+        assert_eq!(normalize_for_matching("  turbo   wheat   v  "), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_strips_mc_color_codes() {
+        assert_eq!(normalize_for_matching("§aTurbo-Wheat §eV"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_strips_decorative_symbols() {
+        assert_eq!(normalize_for_matching("✪ Turbo-Wheat V ☘"), "turbo wheat v");
+    }
+
+    #[test]
+    fn test_normalize_plain_button_name_unchanged() {
+        assert_eq!(normalize_for_matching("Custom Amount"), "custom amount");
+    }
+
+    // ---- find_slot_by_name tests ----
+
+    /// Helper: build a minimal `ItemStack` whose display name is `display_name`.
+    fn make_named_item(display_name: &str) -> ItemStack {
+        use azalea_chat::{FormattedText, text_component::TextComponent};
+        use azalea_inventory::components::CustomName;
+        let cn = CustomName {
+            name: FormattedText::Text(TextComponent::new(display_name.to_string())),
+        };
+        ItemStack::from(ItemKind::Paper).with_component(cn)
+    }
+
+    #[test]
+    fn test_find_slot_exact_contains() {
+        let slots = vec![
+            ItemStack::Empty,
+            make_named_item("Turbo-Wheat V"),
+            ItemStack::Empty,
+        ];
+        // Exact contains: "Turbo-Wheat V" contains "Turbo-Wheat V"
+        assert_eq!(find_slot_by_name(&slots, "Turbo-Wheat V"), Some(1));
+    }
+
+    #[test]
+    fn test_find_slot_normalized_hyphen_vs_space() {
+        let slots = vec![
+            ItemStack::Empty,
+            make_named_item("Turbo-Wheat V"),
+            ItemStack::Empty,
+        ];
+        // "turbo wheat v" should match "Turbo-Wheat V" via normalized phase
+        assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), Some(1));
+    }
+
+    #[test]
+    fn test_find_slot_case_insensitive() {
+        let slots = vec![
+            make_named_item("Create Buy Order"),
+        ];
+        assert_eq!(find_slot_by_name(&slots, "create buy order"), Some(0));
+    }
+
+    #[test]
+    fn test_find_slot_token_matching() {
+        let slots = vec![
+            ItemStack::Empty,
+            make_named_item("Turbo-Wheat Hoe V"),
+        ];
+        // Token matching: "turbo", "wheat", "v" all in "turbo wheat hoe v"
+        assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), Some(1));
+    }
+
+    #[test]
+    fn test_find_slot_no_match() {
+        let slots = vec![
+            make_named_item("Enchanted Bread"),
+            make_named_item("Wheat"),
+        ];
+        assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), None);
     }
 }
