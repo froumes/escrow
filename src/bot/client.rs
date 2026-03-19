@@ -2159,8 +2159,32 @@ async fn execute_command(
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
+            let initial_wid = *state.last_window_id.read();
             bot.write_chat_packet("/bz");
             *state.bot_state.write() = BotState::ManagingOrders;
+
+            // Safety: if no window opens within 5 seconds (e.g. chat throttle,
+            // server lag), retry /bz once.  If still no window after another 5 s,
+            // give up and return to Idle so the queue isn't blocked for 60 s.
+            {
+                let retry_state = state.bot_state.clone();
+                let retry_wid = state.last_window_id.clone();
+                let retry_bot = bot.clone();
+                let saved_wid = initial_wid;
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    if *retry_state.read() != BotState::ManagingOrders { return; }
+                    if *retry_wid.read() != saved_wid { return; } // window opened, handler working
+                    warn!("[ManageOrders] No window after 5 s — retrying /bz");
+                    retry_bot.write_chat_packet("/bz");
+
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    if *retry_state.read() != BotState::ManagingOrders { return; }
+                    if *retry_wid.read() != saved_wid { return; }
+                    warn!("[ManageOrders] Still no window after retry — forcing Idle");
+                    *retry_state.write() = BotState::Idle;
+                });
+            }
         }
         CommandType::DiscoverOrders | CommandType::ExecuteOrders => {
             info!("Command type not yet fully implemented in execute_command: {:?}", command.command_type);
@@ -2202,17 +2226,28 @@ async fn handle_window_interaction(
     
     match bot_state {
         BotState::Purchasing => {
-            if window_title.contains("BIN Auction View") {
+            if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // Check item in slot 31 to decide on purchase strategy.
-                // No pre-delay — slot 31 is always fixed (gold_nugget for normal BIN,
-                // bed during grace period). Click immediately for minimum latency.
+                // Wait briefly for ContainerSetContent to arrive so slot 31 is populated.
+                // Without this, the slot may still be air/empty and clicks are ignored by Hypixel.
                 let slot_31_kind = {
-                    let menu = bot.menu();
-                    let slots = menu.slots();
-                    slots.get(31).map(|s| s.kind().to_string().to_lowercase()).unwrap_or_default()
+                    let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+                    let mut kind;
+                    loop {
+                        let menu = bot.menu();
+                        let slots = menu.slots();
+                        kind = slots.get(31).map(|s| {
+                            if s.is_empty() { "air".to_string() }
+                            else { s.kind().to_string().to_lowercase() }
+                        }).unwrap_or_else(|| "air".to_string());
+                        if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                    kind
                 };
 
                 if slot_31_kind.contains("bed") {
@@ -4515,7 +4550,7 @@ async fn wait_for_cancel_confirmation(
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         // Window changed — server processed the action

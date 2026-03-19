@@ -77,33 +77,33 @@ impl BotEventHandlers {
         // Try to parse as JSON
         match serde_json::from_str::<JsonValue>(title_json) {
             Ok(json) => {
-                // Try to extract from "extra" array first
-                if let Some(extra) = json.get("extra") {
-                    if let Some(extra_array) = extra.as_array() {
-                        if let Some(first) = extra_array.get(0) {
-                            if let Some(text) = first.get("text") {
-                                if let Some(text_str) = text.as_str() {
-                                    return text_str.to_string();
-                                }
-                            }
+                // Build the title by concatenating the root "text" and all "extra" elements.
+                // Hypixel may split a title like "BIN Auction View" across multiple
+                // extra elements (e.g. [{"text":"BIN "},{"text":"Auction View"}]) or
+                // prepend an empty root text with a single extra element.
+                let mut result = String::new();
+
+                // Root "text" field
+                if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                    result.push_str(text);
+                }
+
+                // Concatenate all extra elements' text fields
+                if let Some(extra_array) = json.get("extra").and_then(|v| v.as_array()) {
+                    for element in extra_array {
+                        if let Some(text) = element.get("text").and_then(|v| v.as_str()) {
+                            result.push_str(text);
                         }
                     }
+                }
+
+                if !result.is_empty() {
+                    return result;
                 }
 
                 // Try "translate" field
-                if let Some(translate) = json.get("translate") {
-                    if let Some(translate_str) = translate.as_str() {
-                        return translate_str.to_string();
-                    }
-                }
-
-                // Try direct "text" field
-                if let Some(text) = json.get("text") {
-                    if let Some(text_str) = text.as_str() {
-                        if !text_str.is_empty() {
-                            return text_str.to_string();
-                        }
-                    }
+                if let Some(translate) = json.get("translate").and_then(|v| v.as_str()) {
+                    return translate.to_string();
                 }
 
                 // Return raw JSON if we can't parse it
@@ -343,6 +343,49 @@ mod tests {
         let json = r#"{"translate":"container.chest"}"#;
         let title = handlers.parse_window_title(json);
         assert_eq!(title, "container.chest");
+    }
+
+    #[test]
+    fn test_parse_window_title_multi_extra() {
+        let handlers = BotEventHandlers::new();
+        // Hypixel may split a title across multiple extra elements
+        let json = r#"{"text":"","extra":[{"text":"BIN "},{"text":"Auction View"}]}"#;
+        let title = handlers.parse_window_title(json);
+        assert_eq!(title, "BIN Auction View");
+    }
+
+    #[test]
+    fn test_parse_window_title_extra_with_empty_first() {
+        let handlers = BotEventHandlers::new();
+        // First extra element is empty, second has the title
+        let json = r#"{"text":"","extra":[{"text":""},{"text":"Confirm Purchase"}]}"#;
+        let title = handlers.parse_window_title(json);
+        assert_eq!(title, "Confirm Purchase");
+    }
+
+    #[test]
+    fn test_parse_window_title_root_text_with_extra() {
+        let handlers = BotEventHandlers::new();
+        // Root text and extra elements should be concatenated
+        let json = r#"{"text":"Your ","extra":[{"text":"Bazaar Orders"}]}"#;
+        let title = handlers.parse_window_title(json);
+        assert_eq!(title, "Your Bazaar Orders");
+    }
+
+    #[test]
+    fn test_parse_window_title_direct_text() {
+        let handlers = BotEventHandlers::new();
+        let json = r#"{"text":"BIN Auction View"}"#;
+        let title = handlers.parse_window_title(json);
+        assert_eq!(title, "BIN Auction View");
+    }
+
+    #[test]
+    fn test_parse_window_title_plain_text() {
+        let handlers = BotEventHandlers::new();
+        // Non-JSON plain text should be returned as-is
+        let title = handlers.parse_window_title("Auction View");
+        assert_eq!(title, "Auction View");
     }
 
     #[test]
