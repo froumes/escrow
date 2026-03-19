@@ -648,20 +648,21 @@ pub async fn send_webhook_flip_channel(
         ("🌟 Legendary Flip!", 0xFFD700u32)
     };
     // No auction_uuid for anonymized channel webhook
-    let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, None);
+    let mut fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, None);
+    // Append clickable footer-style links below the purchase info fields
+    fields.push(serde_json::json!({
+        "name": "\u{200b}",
+        "value": "[Frikadellen-BAF](https://tpm.auction) • [Discord](https://discord.gg/42DvX6T9jh)",
+        "inline": false
+    }));
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
         "embeds": [{
             "title": title,
-            "description": format!("**{}** • <t:{}:R>\n\n[Discord](https://discord.gg/42DvX6T9jh)", item_name, now_unix()),
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": color,
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
-            "author": {
-                "name": "Frikadellen-BAF",
-                "url": "https://tpm.auction",
-                "icon_url": "https://cdn.discordapp.com/icons/1073701591647031336/a_1c1ce88572e498940340b6e5d5eee683.gif"
-            }
         }]
     });
     post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
