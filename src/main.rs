@@ -1028,6 +1028,56 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
+                    // Try to parse the Coflnet chat message as a bazaar flip recommendation.
+                    // Coflnet may send flip recommendations as chat messages (e.g.
+                    // "Recommending sell order: 2x Item at 30.1K per unit(1)") without a
+                    // corresponding structured `bazaarFlip` WebSocket message.
+                    if enable_bazaar_flips_ws.load(Ordering::Relaxed)
+                        && cofl_authenticated_ws.load(Ordering::Relaxed)
+                        && !bazaar_flips_paused_ws.load(Ordering::Relaxed)
+                        && !bot_client_for_ws.is_bazaar_at_limit()
+                    {
+                        if let Ok(Some(rec)) = frikadellen_baf::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
+                            let bot_state = bot_client_for_ws.state();
+                            if !matches!(bot_state, frikadellen_baf::types::BotState::Startup | frikadellen_baf::types::BotState::ManagingOrders) {
+                                let effective_is_buy = rec.effective_is_buy_order();
+                                let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
+                                let baf_msg = format!(
+                                    "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
+                                    order_color, order_label,
+                                    rec.item_name,
+                                    rec.amount,
+                                    format_coins(rec.price_per_unit as i64)
+                                );
+                                print_mc_chat(&baf_msg);
+                                let _ = chat_tx_ws.send(baf_msg);
+
+                                let priority = if effective_is_buy {
+                                    CommandPriority::Normal
+                                } else {
+                                    CommandPriority::High
+                                };
+                                let command_type = if effective_is_buy {
+                                    CommandType::BazaarBuyOrder {
+                                        item_name: rec.item_name.clone(),
+                                        item_tag: rec.item_tag.clone(),
+                                        amount: rec.amount,
+                                        price_per_unit: rec.price_per_unit,
+                                    }
+                                } else {
+                                    CommandType::BazaarSellOrder {
+                                        item_name: rec.item_name.clone(),
+                                        item_tag: rec.item_tag.clone(),
+                                        amount: rec.amount,
+                                        price_per_unit: rec.price_per_unit,
+                                    }
+                                };
+                                command_queue_clone.enqueue(command_type, priority, true);
+                                info!("[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
+                                    order_label, rec.item_name, rec.amount, rec.price_per_unit);
+                            }
+                        }
+                    }
                     // Display COFL chat messages with proper color formatting
                     // These are informational messages and should NOT be sent to Hypixel server
                     if config_clone.use_cofl_chat {

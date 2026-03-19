@@ -217,17 +217,69 @@ impl BazaarFlipHandler {
         })
     }
 
-    /// Parse a bazaar flip recommendation message from Coflnet
+    /// Parse a bazaar flip recommendation message from Coflnet chat
     /// 
-    /// Example: "[Coflnet]: Recommending an order of 4x Cindershade for 1.06M(1)"
+    /// Handles two formats:
+    /// - Old: "[Coflnet]: Recommending an order of 4x Cindershade for 1.06M(1)"
+    /// - New: "[Coflnet]: Recommending sell order: 2x Enchanted Coal Block at 30.1K per unit(1)"
     pub fn parse_bazaar_flip_message(message: &str) -> Result<Option<BazaarFlipRecommendation>> {
         let clean_message = WindowHandler::remove_minecraft_colors(message);
 
-        // Check if this is a bazaar flip recommendation
-        if !clean_message.contains("[Coflnet]") || !clean_message.contains("Recommending an order of") {
+        // Check if this is a bazaar flip recommendation (old or new format)
+        if !clean_message.contains("[Coflnet]") {
             return Ok(None);
         }
 
+        let is_old_format = clean_message.contains("Recommending an order of");
+        let is_new_format = clean_message.contains("Recommending sell order")
+            || clean_message.contains("Recommending buy order");
+
+        if !is_old_format && !is_new_format {
+            return Ok(None);
+        }
+
+        if is_new_format {
+            // New format: "Recommending sell order: 2x Enchanted Coal Block at 30.1K per unit(1)"
+            let re_order = regex::Regex::new(
+                r"(?i)Recommending\s+(?:sell|buy)\s+order:\s+(\d+)x\s+(.+?)\s+at\s+([\d.]+[KkMm]?)\s+per\s+unit"
+            ).unwrap();
+            let order_match = re_order
+                .captures(&clean_message)
+                .ok_or_else(|| anyhow!("Failed to parse bazaar flip recommendation from chat message: {}", clean_message))?;
+
+            let amount = order_match[1].parse::<u64>()?;
+            let item_name = order_match[2].trim().to_string();
+            let price_str = &order_match[3];
+
+            let mut price_per_unit = price_str
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>()
+                .parse::<f64>()?;
+
+            // Convert K/M suffixes
+            if price_str.to_lowercase().ends_with('k') {
+                price_per_unit *= 1000.0;
+            } else if price_str.to_lowercase().ends_with('m') {
+                price_per_unit *= 1_000_000.0;
+            }
+
+            let total_price = price_per_unit * amount as f64;
+
+            let is_buy_order = clean_message.to_lowercase().contains("buy order");
+
+            return Ok(Some(BazaarFlipRecommendation {
+                item_name,
+                item_tag: None,
+                amount,
+                price_per_unit,
+                total_price: Some(total_price),
+                is_buy_order,
+                is_sell: None,
+            }));
+        }
+
+        // Old format: "Recommending an order of 4x Cindershade for 1.06M(1)"
         // Extract amount and item name: "4x Cindershade"
         let re_order = regex::Regex::new(r"(\d+)x\s+([^\s]+(?:\s+[^\s]+)*?)\s+for").unwrap();
         let order_match = re_order
@@ -644,5 +696,70 @@ mod tests {
         assert_eq!(result.amount, 64);
         assert_eq!(result.price_per_unit, 1000.0);
         assert!(result.is_buy_order);
+    }
+
+    #[test]
+    fn test_parse_bazaar_flip_message_new_format_sell() {
+        let msg = "[Coflnet]: Recommending sell order: 2x Enchanted Coal Block at 30.1K per unit(1)";
+        let result = BazaarFlipHandler::parse_bazaar_flip_message(msg).unwrap();
+        assert!(result.is_some());
+        let rec = result.unwrap();
+        assert_eq!(rec.item_name, "Enchanted Coal Block");
+        assert_eq!(rec.amount, 2);
+        assert!((rec.price_per_unit - 30100.0).abs() < 1.0);
+        assert!(!rec.is_buy_order); // sell order
+    }
+
+    #[test]
+    fn test_parse_bazaar_flip_message_new_format_buy() {
+        let msg = "[Coflnet]: Recommending buy order: 71x Hummingbird Shard at 226K per unit(1)";
+        let result = BazaarFlipHandler::parse_bazaar_flip_message(msg).unwrap();
+        assert!(result.is_some());
+        let rec = result.unwrap();
+        assert_eq!(rec.item_name, "Hummingbird Shard");
+        assert_eq!(rec.amount, 71);
+        assert!((rec.price_per_unit - 226000.0).abs() < 1.0);
+        assert!(rec.is_buy_order);
+    }
+
+    #[test]
+    fn test_parse_bazaar_flip_message_new_format_millions() {
+        let msg = "[Coflnet]: Recommending sell order: 448x Can of Worms at 67.6K per unit(1)";
+        let result = BazaarFlipHandler::parse_bazaar_flip_message(msg).unwrap();
+        assert!(result.is_some());
+        let rec = result.unwrap();
+        assert_eq!(rec.item_name, "Can of Worms");
+        assert_eq!(rec.amount, 448);
+        assert!((rec.price_per_unit - 67600.0).abs() < 1.0);
+        assert!(!rec.is_buy_order);
+    }
+
+    #[test]
+    fn test_parse_bazaar_flip_message_old_format_still_works() {
+        let msg = "[Coflnet]: Recommending an order of 4x Cindershade for 1.06M(1)";
+        let result = BazaarFlipHandler::parse_bazaar_flip_message(msg).unwrap();
+        assert!(result.is_some());
+        let rec = result.unwrap();
+        assert_eq!(rec.item_name, "Cindershade");
+        assert_eq!(rec.amount, 4);
+        assert!((rec.price_per_unit - 265000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_bazaar_flip_message_non_matching() {
+        let msg = "[Coflnet]: Your settings blocked 14 in the last minute";
+        let result = BazaarFlipHandler::parse_bazaar_flip_message(msg).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_bazaar_flip_message_with_color_codes() {
+        let msg = "§f[§4Coflnet§f]: §aRecommending sell order: §b2x §aEnchanted Coal Block§f at §630.1K§f per unit§7(1)";
+        let result = BazaarFlipHandler::parse_bazaar_flip_message(msg).unwrap();
+        assert!(result.is_some());
+        let rec = result.unwrap();
+        assert_eq!(rec.item_name, "Enchanted Coal Block");
+        assert_eq!(rec.amount, 2);
+        assert!(!rec.is_buy_order);
     }
 }
