@@ -744,6 +744,9 @@ async fn main() -> Result<()> {
                         profit_tracker_events.record_bz_profit(profit);
                         info!("[BazaarProfit] Recorded {} coins for {} {} order",
                             profit, item_name, if is_buy_order { "BUY" } else { "SELL" });
+                    } else {
+                        warn!("[BazaarProfit] No tracked order found for collected {} {} — profit not recorded",
+                            if is_buy_order { "BUY" } else { "SELL" }, item_name);
                     }
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order collected: {} ({})", item_name, order_type);
@@ -871,7 +874,7 @@ async fn main() -> Result<()> {
                     // Queue the flip command
                     command_queue_clone.enqueue(
                         CommandType::PurchaseAuction { flip },
-                        CommandPriority::Normal,
+                        CommandPriority::Critical,
                         false, // Not interruptible
                     );
                 }
@@ -1463,6 +1466,7 @@ async fn main() -> Result<()> {
                 // per-type timeout. A single loop replaces the previous per-type if/else chain.
                 let deadline = std::time::Instant::now()
                     + std::time::Duration::from_secs(timeout_secs);
+                let mut interrupted = false;
                 loop {
                     sleep(Duration::from_millis(250)).await;
                     if bot_client_clone.state().allows_commands()
@@ -1470,11 +1474,29 @@ async fn main() -> Result<()> {
                     {
                         break;
                     }
+
+                    // Check if a higher-priority command is waiting and the
+                    // current command is interruptible.  This lets AH flips
+                    // (Critical priority) preempt bazaar operations.
+                    if cmd.interruptible {
+                        if let Some(next) = command_queue_processor.peek_queued() {
+                            if next.priority < cmd.priority {
+                                warn!(
+                                    "[Queue] Interrupting {:?} ({:?}) for higher-priority {:?} ({:?})",
+                                    cmd.command_type, cmd.priority,
+                                    next.command_type, next.priority,
+                                );
+                                bot_client_clone.set_state(BotState::Idle);
+                                interrupted = true;
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // Safety reset: if the bot is still in a busy state after the timeout,
                 // force it back to Idle so the queue can continue.
-                if !bot_client_clone.state().allows_commands() {
+                if !interrupted && !bot_client_clone.state().allows_commands() {
                     warn!(
                         "[Queue] Command {:?} timed out after {}s — forcing Idle",
                         cmd.command_type, timeout_secs
@@ -1485,8 +1507,11 @@ async fn main() -> Result<()> {
                 command_queue_processor.complete_current();
 
                 // Always wait the configurable inter-command delay so Hypixel interactions
-                // don't run back-to-back.
-                sleep(Duration::from_millis(command_delay_ms)).await;
+                // don't run back-to-back.  Skip the delay when we interrupted for an
+                // AH flip so it is picked up immediately.
+                if !interrupted {
+                    sleep(Duration::from_millis(command_delay_ms)).await;
+                }
             }
             
             // Small delay to prevent busy loop

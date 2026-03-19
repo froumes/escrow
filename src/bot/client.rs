@@ -100,6 +100,10 @@ pub struct BotClient {
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
     /// Cleared when an order fills (Claimed message detected).
     bazaar_at_limit: Arc<AtomicBool>,
+    /// Set when the server rejects an order placement (e.g. "Your price isn't
+    /// competitive enough").  Cleared before each confirm-click so only the
+    /// response to the *current* placement attempt is captured.
+    bazaar_order_rejected: Arc<AtomicBool>,
     /// Cached player-inventory JSON (serialised Window object).
     /// Updated on every ContainerSetContent / ContainerSetSlot for the player
     /// inventory window (id 0) so that getInventory can be answered instantly,
@@ -210,6 +214,7 @@ impl BotClient {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
+            bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
@@ -294,6 +299,7 @@ impl BotClient {
             scoreboard_teams: self.scoreboard_teams.clone(),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
+            bazaar_order_rejected: self.bazaar_order_rejected.clone(),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -698,6 +704,10 @@ pub struct BotClientState {
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
     /// Cleared when an order fills. Prevents placing new orders while at the cap.
     pub bazaar_at_limit: Arc<AtomicBool>,
+    /// Set when the server rejects an order placement (e.g. "Your price isn't
+    /// competitive enough").  Cleared before each confirm-click so only the
+    /// response to the *current* placement attempt is captured.
+    pub bazaar_order_rejected: Arc<AtomicBool>,
     /// Time when BIN Auction View opened — start of buy-speed measurement
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
@@ -804,6 +814,7 @@ impl Default for BotClientState {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
+            bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
@@ -1610,6 +1621,13 @@ async fn event_handler(
                     info!("[Bazaar] Order filled, clearing order-limit flag");
                     state.bazaar_at_limit.store(false, Ordering::Relaxed);
                 }
+            }
+
+            // Detect bazaar order rejection ("Your price isn't competitive enough")
+            // so the confirm handler knows not to emit BazaarOrderPlaced.
+            if clean_message.contains("[Bazaar]") && clean_message.contains("price isn") && clean_message.contains("competitive") {
+                warn!("[Bazaar] Order rejected — price not competitive");
+                state.bazaar_order_rejected.store(true, Ordering::Relaxed);
             }
 
             // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
@@ -2552,16 +2570,21 @@ async fn handle_window_interaction(
                 if *state.last_window_id.read() != window_id { return; }
                 info!("[Bazaar] Confirm screen: clicking slot 13");
                 *state.bazaar_step.write() = BazaarStep::Confirm;
+                // Clear rejection flag before clicking so we only capture the
+                // response to *this* placement attempt.
+                state.bazaar_order_rejected.store(false, Ordering::Relaxed);
                 // Add randomized human-like delay before confirming (300-700ms)
                 let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 400) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 13).await;
 
-                // Wait briefly for the server to respond (limit message arrives asynchronously)
+                // Wait briefly for the server to respond (limit/rejection message arrives asynchronously)
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                 if state.bazaar_at_limit.load(Ordering::Relaxed) {
                     warn!("[Bazaar] Order rejected (at limit) — not emitting BazaarOrderPlaced");
+                } else if state.bazaar_order_rejected.load(Ordering::Relaxed) {
+                    warn!("[Bazaar] Order rejected (price not competitive) — not emitting BazaarOrderPlaced");
                 } else {
                     let item = item_name.clone();
                     let amount = *state.bazaar_amount.read();
