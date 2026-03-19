@@ -317,7 +317,6 @@ impl BotClient {
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
-            pre_click_sent: Arc::new(AtomicBool::new(false)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -759,11 +758,6 @@ pub struct BotClientState {
     pub cancel_auction_item_name: Arc<RwLock<String>>,
     /// Starting bid of the auction to cancel (for accurate identification).
     pub cancel_auction_starting_bid: Arc<RwLock<i64>>,
-    /// Whether pre-click packets were already sent for the current BIN purchase.
-    /// When true, the BIN Auction View and Confirm Purchase handlers skip their
-    /// reactive clicks (and sleep/retry loops) to avoid blocking the event loop
-    /// while the server processes the pipelined packets.
-    pub pre_click_sent: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -823,7 +817,6 @@ impl Default for BotClientState {
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
-            pre_click_sent: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1474,7 +1467,6 @@ async fn event_handler(
                 }
                 *state.bot_state.write() = BotState::Idle;
                 state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                state.pre_click_sent.store(false, Ordering::Relaxed);
                 *state.purchase_start_time.write() = None;
                 *state.pending_purchase_at_ms.write() = None;
                 state.bed_timing_active.store(false, Ordering::Relaxed);
@@ -2004,25 +1996,8 @@ async fn execute_command(
             };
             let chat_command = format!("/viewauction {}", uuid);
 
-            // Record buy-speed start time BEFORE sending — pre-click means the
-            // server may process everything before the window even arrives at
-            // the client, so the window-open handler would be too late.
-            *state.purchase_start_time.write() = Some(std::time::Instant::now());
-
             info!("Sending chat command: {}", chat_command);
             bot.write_chat_packet(&chat_command);
-
-            // Pipeline pre-click packets for BIN Auction View (slot 31) and
-            // Confirm Purchase (slot 11) with predicted window IDs.  The server
-            // assigns container IDs sequentially, so the next two windows will
-            // be last_window_id + 1 and last_window_id + 2.
-            let current_wid = *state.last_window_id.read();
-            let predicted_bin_view = current_wid.wrapping_add(1);
-            let predicted_confirm = current_wid.wrapping_add(2);
-            send_pre_click(bot, predicted_bin_view, 31);   // BIN Auction View buy button
-            send_pre_click(bot, predicted_confirm, 11);    // Confirm Purchase confirm button
-            state.pre_click_sent.store(true, Ordering::Relaxed);
-            info!("[AH] Pre-clicks sent for predicted windows {}, {}", predicted_bin_view, predicted_confirm);
 
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
             // local Instant later — and only when the auction turns out to be a
@@ -2196,11 +2171,8 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") {
-                // If pre-click was NOT sent, record buy-speed start now (fallback).
-                // When pre-clicks are active, start time is already set in execute_command.
-                if !state.pre_click_sent.load(Ordering::Relaxed) {
-                    *state.purchase_start_time.write() = Some(std::time::Instant::now());
-                }
+                // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
+                *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
                 // Check item in slot 31 to decide on purchase strategy.
                 // No pre-delay — slot 31 is always fixed (gold_nugget for normal BIN,
@@ -2212,8 +2184,6 @@ async fn handle_window_interaction(
                 };
 
                 if slot_31_kind.contains("bed") {
-                    // Bed auctions need special timing — disable pre-click mode.
-                    state.pre_click_sent.store(false, Ordering::Relaxed);
                     // Bed = auction is still in grace period.
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
@@ -2340,39 +2310,27 @@ async fn handle_window_interaction(
                             }
                         }
                     }
-                } else if state.pre_click_sent.load(Ordering::Relaxed) {
-                    // Pre-click already sent in execute_command — skip reactive click.
-                    // The server will process the pipelined packet.
-                    debug!("[AH] Skipping reactive slot 31 click (pre-click active)");
                 } else {
                     // Non-bed BIN auction — buy as fast as possible.
                     // Click slot 31 once (buy-now button).
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 }
             } else if window_title.contains("Confirm Purchase") {
-                if state.pre_click_sent.load(Ordering::Relaxed) {
-                    // Pre-click already sent — do NOT sleep or retry.
-                    // Any await here blocks the event loop and delays the
-                    // "Putting coins in escrow" chat event that calculates buy speed.
-                    state.pre_click_sent.store(false, Ordering::Relaxed);
-                    debug!("[AH] Skipping reactive slot 11 click (pre-click active)");
-                } else {
-                    // Fallback: no pre-click — click confirm (slot 11) immediately.
+                // Click confirm (slot 11) immediately for fastest buy speed.
+                click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+
+                // Short wait for the server to process and close the window.
+                tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+
+                // Safety retry loop: if the window is still open (click was lost or
+                // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
+                while state.handlers.current_window_title()
+                    .as_deref()
+                    .map(|t| t.contains("Confirm Purchase"))
+                    .unwrap_or(false)
+                {
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-
-                    // Short wait for the server to process and close the window.
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
-
-                    // Safety retry loop: if the window is still open (click was lost or
-                    // the server needs more time), keep retrying every CONFIRM_PURCHASE_RETRY_MS.
-                    while state.handlers.current_window_title()
-                        .as_deref()
-                        .map(|t| t.contains("Confirm Purchase"))
-                        .unwrap_or(false)
-                    {
-                        click_window_slot(bot, &state.last_window_id, window_id, 11).await;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
-                    }
                 }
 
                 *state.bot_state.write() = BotState::Idle;
@@ -4433,28 +4391,6 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
     
     bot.write_packet(packet);
     info!("Clicked slot {} in window {}", slot, window_id);
-}
-
-/// Send a pre-click packet for a predicted window ID.
-/// Unlike `click_window_slot`, this skips the stale-window guard because the
-/// window hasn't opened client-side yet. The server will process the click once
-/// it opens the container on its end.
-fn send_pre_click(bot: &Client, predicted_window_id: u8, slot: i16) {
-    use azalea_protocol::packets::game::s_container_click::{
-        ServerboundContainerClick,
-        HashedStack,
-    };
-    let packet = ServerboundContainerClick {
-        container_id: predicted_window_id as i32,
-        state_id: 0,
-        slot_num: slot,
-        button_num: 0,
-        click_type: ClickType::Pickup,
-        changed_slots: Default::default(),
-        carried_item: HashedStack(None),
-    };
-    bot.write_packet(packet);
-    info!("[AH] Pre-click: slot {} in predicted window {}", slot, predicted_window_id);
 }
 
 /// Click a window slot while reporting the item currently on the cursor.
