@@ -105,6 +105,13 @@ pub struct Config {
     #[serde(default)]
     pub bed_spam: bool,
 
+    /// Enable fast-buy mode. When true, the BIN Auction View buy-click is sent
+    /// twice (redundancy against packet loss) and a skip-click on the predicted
+    /// Confirm Purchase window is fired in the same tick for sub-100ms buys.
+    /// Default: false — must be explicitly enabled.
+    #[serde(default)]
+    pub fastbuy: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freemoney: Option<bool>,
     
@@ -235,6 +242,7 @@ impl Default for Config {
             enable_bazaar_flips: true,
             enable_ah_flips: true,
             bed_spam: false,
+            fastbuy: false,
             freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
@@ -447,6 +455,24 @@ proxy_credentials = "myuser:mypassword"
     fn discord_id_parses_and_returns_active() {
         let config: Config = toml::from_str(r#"discord_id = "123456789012345678""#).expect("config should parse");
         assert_eq!(config.active_discord_id(), Some("123456789012345678"));
+    }
+
+    #[test]
+    fn fastbuy_defaults_to_false() {
+        let config = Config::default();
+        assert!(!config.fastbuy);
+    }
+
+    #[test]
+    fn parses_fastbuy_true() {
+        let config: Config = toml::from_str("fastbuy = true").expect("config should parse");
+        assert!(config.fastbuy);
+    }
+
+    #[test]
+    fn parses_fastbuy_false() {
+        let config: Config = toml::from_str("fastbuy = false").expect("config should parse");
+        assert!(!config.fastbuy);
     }
 
 }
