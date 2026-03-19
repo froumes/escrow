@@ -364,6 +364,66 @@ pub async fn send_webhook_bazaar_order_placed(
     post_embed(webhook_url, payload).await;
 }
 
+pub async fn send_webhook_bazaar_order_collected(
+    ingame_name: &str,
+    item_name: &str,
+    is_buy_order: bool,
+    purse: Option<u64>,
+    webhook_url: &str,
+) {
+    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_emoji = "✅";
+    let color: u32 = if is_buy_order { 0x66FF66 } else { 0xFFCC00 };
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": format!("{} Bazaar {} Collected", order_emoji, order_type),
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": color,
+            "fields": [
+                {"name": "📊 Order Type", "value": format!("```\n{}\n```", order_type), "inline": false},
+            ],
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
+pub async fn send_webhook_bazaar_order_cancelled(
+    ingame_name: &str,
+    item_name: &str,
+    is_buy_order: bool,
+    purse: Option<u64>,
+    webhook_url: &str,
+) {
+    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_emoji = "🚫";
+    let color: u32 = 0x808080; // Gray for cancellation
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": format!("{} Bazaar {} Cancelled", order_emoji, order_type),
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": color,
+            "fields": [
+                {"name": "📊 Order Type", "value": format!("```\n{}\n```", order_type), "inline": false},
+            ],
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
 pub async fn send_webhook_auction_listed(
     ingame_name: &str,
     item_name: &str,
