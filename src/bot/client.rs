@@ -2184,67 +2184,68 @@ async fn handle_window_interaction(
                 };
 
                 if slot_31_kind.contains("bed") {
-                    if !state.freemoney {
-                        // Bed = grace-period auction.  Without freemoney mode there
-                        // is no purchaseAt timing data, so skip the auction entirely
-                        // rather than blindly spam-clicking.
-                        info!("[AH] Bed detected in slot 31 — skipping (freemoney not enabled)");
-                        *state.bot_state.write() = BotState::Idle;
-                        return;
-                    }
-
-                    // Freemoney mode: use COFL purchaseAt timing for bed auctions.
+                    // Bed = auction is still in grace period.
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
                     const BED_FREEMONEY_CLICK_INTERVAL_MS: u64 = 20;
                     const BED_WAIT_POLL_MS: u64 = 20;
                     const MAX_FAILED_CLICKS: usize = 5;
-                    let click_interval_ms = BED_FREEMONEY_CLICK_INTERVAL_MS;
+                    let click_interval_ms = if state.freemoney {
+                        BED_FREEMONEY_CLICK_INTERVAL_MS
+                    } else {
+                        state.bed_spam_click_delay.max(1)
+                    };
 
-                    // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
-                    // If purchaseAt is not available, fall through to immediate bed spam.
-                    let pre_click_lead_ms = state.bed_pre_click_ms;
-                    // Convert the raw epoch-ms timestamp to a remaining-ms delta.
-                    let remaining_ms_from_purchase_at = state.pending_purchase_at_ms.read()
-                        .and_then(|purchase_at_ms| {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .ok()
-                                .map(|d| d.as_millis() as i64)?;
-                            let diff = purchase_at_ms - now_ms;
-                            if diff <= 0 { None } else { Some(diff as u64) }
-                        });
+                    if state.freemoney {
+                        // Freemoney mode: use COFL purchaseAt timing for bed auctions.
+                        // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
+                        // If purchaseAt is not available, fall through to immediate bed spam.
+                        let pre_click_lead_ms = state.bed_pre_click_ms;
+                        // Convert the raw epoch-ms timestamp to a remaining-ms delta.
+                        let remaining_ms_from_purchase_at = state.pending_purchase_at_ms.read()
+                            .and_then(|purchase_at_ms| {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_millis() as i64)?;
+                                let diff = purchase_at_ms - now_ms;
+                                if diff <= 0 { None } else { Some(diff as u64) }
+                            });
 
-                    if let Some(remaining_ms) = remaining_ms_from_purchase_at {
-                        let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
-                        if wait_ms > 0 {
-                            info!("[AH] Bed timing (freemoney): purchaseAt in {}ms — waiting {}ms, then clicking at {}ms intervals (lead: {}ms)",
-                                remaining_ms, wait_ms, click_interval_ms, pre_click_lead_ms);
-                            let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
-                            loop {
-                                if tokio::time::Instant::now() >= wait_deadline {
-                                    break;
+                        if let Some(remaining_ms) = remaining_ms_from_purchase_at {
+                            let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
+                            if wait_ms > 0 {
+                                info!("[AH] Bed timing (freemoney): purchaseAt in {}ms — waiting {}ms, then clicking at {}ms intervals (lead: {}ms)",
+                                    remaining_ms, wait_ms, click_interval_ms, pre_click_lead_ms);
+                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                                loop {
+                                    if tokio::time::Instant::now() >= wait_deadline {
+                                        break;
+                                    }
+                                    let kind_now = {
+                                        let menu = bot.menu();
+                                        let slots = menu.slots();
+                                        slots.get(31).map(|s| {
+                                            if s.is_empty() { "air".to_string() }
+                                            else { s.kind().to_string().to_lowercase() }
+                                        }).unwrap_or_else(|| "air".to_string())
+                                    };
+                                    if !kind_now.contains("bed") {
+                                        break;
+                                    }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
                                 }
-                                let kind_now = {
-                                    let menu = bot.menu();
-                                    let slots = menu.slots();
-                                    slots.get(31).map(|s| {
-                                        if s.is_empty() { "air".to_string() }
-                                        else { s.kind().to_string().to_lowercase() }
-                                    }).unwrap_or_else(|| "air".to_string())
-                                };
-                                if !kind_now.contains("bed") {
-                                    break;
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
+                                info!("[AH] Bed timing (freemoney): entering rapid-click phase ({}ms interval)", click_interval_ms);
+                            } else {
+                                info!("[AH] Bed timing (freemoney): purchaseAt imminent — starting clicks at {}ms interval", click_interval_ms);
                             }
-                            info!("[AH] Bed timing (freemoney): entering rapid-click phase ({}ms interval)", click_interval_ms);
                         } else {
-                            info!("[AH] Bed timing (freemoney): purchaseAt imminent — starting clicks at {}ms interval", click_interval_ms);
+                            info!("[AH] Bed timing (freemoney): no purchaseAt — starting immediate bed spam at {}ms interval", click_interval_ms);
                         }
                     } else {
-                        info!("[AH] Bed timing (freemoney): no purchaseAt — starting immediate bed spam at {}ms interval", click_interval_ms);
+                        // Default mode: simple immediate bed spam at bed_spam_click_delay.
+                        info!("[AH] Bed detected in slot 31 — starting bed spam at {}ms interval", click_interval_ms);
                     }
 
                     let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
