@@ -83,7 +83,6 @@ fn should_drop_bazaar_command_during_ah_pause(
         && matches!(
             command_type,
             frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
-                | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
         )
 }
 
@@ -339,7 +338,7 @@ async fn main() -> Result<()> {
     bot_client.freemoney = config.freemoney_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
-    bot_client.bazaar_order_cancel_minutes = config.bazaar_order_cancel_minutes;
+    bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
     *bot_client.ingame_name.write() = ingame_name.clone();
 
     // Shared profit tracker for AH and Bazaar realized profits.
@@ -800,7 +799,7 @@ async fn main() -> Result<()> {
                         command_queue_clone.enqueue(
                             frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
                             frikadellen_baf::types::CommandPriority::High,
-                            false,
+                            true,
                         );
                     }
                 }
@@ -894,7 +893,7 @@ async fn main() -> Result<()> {
                     // During ClaimingSold / ClaimingPurchased the flip is queued and will
                     // execute once the claim command finishes — matching TypeScript behaviour.
                     let bot_state = bot_client_for_ws.state();
-                    if matches!(bot_state, frikadellen_baf::types::BotState::Startup | frikadellen_baf::types::BotState::ManagingOrders) {
+                    if matches!(bot_state, frikadellen_baf::types::BotState::Startup) {
                         debug!("Skipping bazaar flip during startup ({:?}): {}", bot_state, bazaar_flip.item_name);
                         continue;
                     }
@@ -1045,7 +1044,7 @@ async fn main() -> Result<()> {
                     {
                         if let Ok(Some(rec)) = frikadellen_baf::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
                             let bot_state = bot_client_for_ws.state();
-                            if !matches!(bot_state, frikadellen_baf::types::BotState::Startup | frikadellen_baf::types::BotState::ManagingOrders) {
+                            if !matches!(bot_state, frikadellen_baf::types::BotState::Startup) {
                                 let effective_is_buy = rec.effective_is_buy_order();
                                 let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
                                 let baf_msg = format!(
@@ -2008,7 +2007,8 @@ mod tests {
             },
             paused,
         ));
-        assert!(should_drop_bazaar_command_during_ah_pause(
+        // BazaarSellOrder should NOT be dropped during AH pause (only buy orders are dropped)
+        assert!(!should_drop_bazaar_command_during_ah_pause(
             &CommandType::BazaarSellOrder {
                 item_name: "Booster Cookie".into(),
                 item_tag: None,

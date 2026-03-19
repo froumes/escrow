@@ -87,8 +87,8 @@ pub struct Config {
     #[serde(default = "default_bazaar_order_check_interval_seconds")]
     pub bazaar_order_check_interval_seconds: u64,
     
-    #[serde(default = "default_bazaar_order_cancel_minutes")]
-    pub bazaar_order_cancel_minutes: u64,
+    #[serde(default = "default_bazaar_order_cancel_minutes_per_million", alias = "bazaar_order_cancel_minutes")]
+    pub bazaar_order_cancel_minutes_per_million: u64,
     
     #[serde(default = "default_true")]
     pub enable_bazaar_flips: bool,
@@ -196,7 +196,7 @@ fn default_bazaar_order_check_interval_seconds() -> u64 {
     30
 }
 
-fn default_bazaar_order_cancel_minutes() -> u64 {
+fn default_bazaar_order_cancel_minutes_per_million() -> u64 {
     5
 }
 
@@ -220,7 +220,7 @@ impl Default for Config {
             bed_multiple_clicks_delay: 0,
             bed_pre_click_ms: default_bed_pre_click_ms(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
-            bazaar_order_cancel_minutes: default_bazaar_order_cancel_minutes(),
+            bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
             enable_bazaar_flips: true,
             enable_ah_flips: true,
             bed_spam: false,
