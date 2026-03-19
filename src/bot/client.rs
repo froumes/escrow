@@ -117,6 +117,9 @@ pub struct BotClient {
     insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
+    /// Delay in ms after clicking slot 31 (gold nugget) before pre-clicking confirm.
+    /// 0 = disabled. Default: 100ms.
+    pub skip_click_delay_ms: u64,
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -216,6 +219,7 @@ impl BotClient {
             bed_spam_click_delay: 100,
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
+            skip_click_delay_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
@@ -309,6 +313,7 @@ impl BotClient {
             inventory_full: Arc::new(AtomicBool::new(false)),
             insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
+            skip_click_delay_ms: self.skip_click_delay_ms,
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
@@ -735,6 +740,9 @@ pub struct BotClientState {
     pub insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
+    /// Delay in ms after clicking slot 31 (gold nugget) before pre-clicking confirm.
+    /// Only for gold-nugget BIN auctions. 0 = disabled. Default: 100ms.
+    pub skip_click_delay_ms: u64,
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -809,6 +817,7 @@ impl Default for BotClientState {
             inventory_full: Arc::new(AtomicBool::new(false)),
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
+            skip_click_delay_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
@@ -2301,6 +2310,34 @@ async fn handle_window_interaction(
                     // Non-bed BIN auction — buy as fast as possible.
                     // Click slot 31 once (buy-now button).
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
+                    // Skip-click optimization: for gold_nugget items only, pre-click
+                    // the confirm button (slot 11) on the predicted next window after a
+                    // short delay.  This avoids waiting for the Confirm Purchase window
+                    // to open, saving a full round-trip.  Beds and potatoes are excluded
+                    // because they have their own timing logic.
+                    let skip_delay = state.skip_click_delay_ms;
+                    if skip_delay > 0 && slot_31_kind.contains("gold_nugget") {
+                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                        tokio::time::sleep(tokio::time::Duration::from_millis(skip_delay)).await;
+                        info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (delay {}ms)", next_wid, skip_delay);
+                        // Raw click — bypasses the stale-window guard because
+                        // the Confirm Purchase window has not opened yet.
+                        use azalea_protocol::packets::game::s_container_click::{
+                            ServerboundContainerClick,
+                            HashedStack,
+                        };
+                        let packet = ServerboundContainerClick {
+                            container_id: next_wid as i32,
+                            state_id: 0,
+                            slot_num: 11,
+                            button_num: 0,
+                            click_type: ClickType::Pickup,
+                            changed_slots: Default::default(),
+                            carried_item: HashedStack(None),
+                        };
+                        bot.write_packet(packet);
+                    }
                 }
             } else if window_title.contains("Confirm Purchase") {
                 // Click confirm (slot 11) immediately for fastest buy speed.
