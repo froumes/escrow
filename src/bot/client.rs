@@ -2318,11 +2318,15 @@ async fn handle_window_interaction(
                     // because they have their own timing logic.
                     let skip_delay = state.skip_click_delay_ms;
                     if skip_delay > 0 && slot_31_kind.contains("gold_nugget") {
+                        // Predict next window ID: Hypixel increments container IDs
+                        // sequentially. Window 0 is the player inventory and is never
+                        // used for GUI containers, so wrap 255 → 1.
                         let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
                         tokio::time::sleep(tokio::time::Duration::from_millis(skip_delay)).await;
                         info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (delay {}ms)", next_wid, skip_delay);
                         // Raw click — bypasses the stale-window guard because
                         // the Confirm Purchase window has not opened yet.
+                        // state_id 0 matches click_window_slot() used elsewhere.
                         use azalea_protocol::packets::game::s_container_click::{
                             ServerboundContainerClick,
                             HashedStack,

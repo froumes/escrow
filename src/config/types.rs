@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn default_skip_click_delay_ms() {
+    fn test_default_skip_click_delay_ms() {
         let config = Config::default();
         assert_eq!(config.skip_click_delay_ms, 100);
     }
