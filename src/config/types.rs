@@ -89,6 +89,12 @@ pub struct Config {
     
     #[serde(default = "default_bazaar_order_cancel_minutes_per_million", alias = "bazaar_order_cancel_minutes")]
     pub bazaar_order_cancel_minutes_per_million: u64,
+
+    /// Delay in milliseconds between consecutive auction listing commands
+    /// (SellToAuction). Prevents Hypixel from kicking the bot with
+    /// "Sending packets too fast!" during bulk listings. Default: 1500ms.
+    #[serde(default = "default_auction_listing_delay_ms")]
+    pub auction_listing_delay_ms: u64,
     
     #[serde(default = "default_true")]
     pub enable_bazaar_flips: bool,
@@ -200,6 +206,10 @@ fn default_bazaar_order_cancel_minutes_per_million() -> u64 {
     5
 }
 
+fn default_auction_listing_delay_ms() -> u64 {
+    1500
+}
+
 fn default_auction_duration_hours() -> u64 {
     24
 }
@@ -221,6 +231,7 @@ impl Default for Config {
             bed_pre_click_ms: default_bed_pre_click_ms(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
             bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
+            auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,
             enable_ah_flips: true,
             bed_spam: false,

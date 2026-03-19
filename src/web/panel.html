@@ -201,6 +201,7 @@ a{color:var(--accent2);text-decoration:none}
     <button class="tab-btn" onclick="switchTab('ah-profit')">AH Profit</button>
     <button class="tab-btn" onclick="switchTab('bz-profit')">BZ Profit</button>
     <button class="tab-btn" onclick="switchTab('total-profit')">Total Profit</button>
+    <button class="tab-btn" onclick="switchTab('config')">Config</button>
 </div>
 
 <div class="tab-content active" id="tab-controls">
@@ -327,6 +328,19 @@ a{color:var(--accent2);text-decoration:none}
             <div class="profit-stat-box"><div class="label">Total Profit</div><div class="value" id="total-profit-total">0</div></div>
             <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="total-uptime">—</div></div>
             <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="total-per-hour">0</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="tab-content" id="tab-config">
+    <div class="card">
+        <h2>Configuration (config.toml)</h2>
+        <p style="color:var(--text-dim);font-size:.82rem;margin-bottom:12px">Edit the configuration below and click Save. Changes take effect immediately for supported fields (toggles, delays). Other fields may require a restart.</p>
+        <div id="config-status" style="display:none;margin-bottom:10px;padding:8px 14px;border-radius:6px;font-size:.85rem"></div>
+        <textarea id="config-editor" spellcheck="false" style="width:100%;min-height:400px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;line-height:1.6;resize:vertical;outline:none;tab-size:4" placeholder="Loading config..."></textarea>
+        <div style="margin-top:12px;display:flex;gap:10px">
+            <button class="btn" style="background:var(--accent);color:#fff" onclick="saveConfig()">💾 Save Config</button>
+            <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="loadConfig()">🔄 Reload</button>
         </div>
     </div>
 </div>
@@ -876,9 +890,10 @@ function switchTab(tabId) {
     const tab = document.getElementById('tab-' + tabId);
     if (tab) tab.classList.add('active');
     const buttons = document.querySelectorAll('.tab-btn');
-    const map = {'controls':0,'ah-profit':1,'bz-profit':2,'total-profit':3};
+    const map = {'controls':0,'ah-profit':1,'bz-profit':2,'total-profit':3,'config':4};
     if (map[tabId] !== undefined && buttons[map[tabId]]) buttons[map[tabId]].classList.add('active');
-    if (tabId !== 'controls') fetchProfit();
+    if (tabId === 'config') loadConfig();
+    else if (tabId !== 'controls') fetchProfit();
 }
 
 // ── Profit Charts ────────────────────────────────────────────
@@ -1008,6 +1023,56 @@ async function fetchProfit() {
 }
 
 setInterval(fetchProfit, 15000);
+
+// ── Config Editor ────────────────────────────────────────────
+async function loadConfig() {
+    try {
+        const r = await fetch('/api/config');
+        if (r.status === 401) { showLoginOverlay(); return; }
+        if (!r.ok) { showConfigStatus('Failed to load config', true); return; }
+        const text = await r.text();
+        $('config-editor').value = text;
+        hideConfigStatus();
+    } catch(e) {
+        console.error('Config load failed', e);
+        showConfigStatus('Failed to load config: ' + e.message, true);
+    }
+}
+
+async function saveConfig() {
+    const toml = $('config-editor').value;
+    if (!toml.trim()) { showConfigStatus('Config cannot be empty', true); return; }
+    try {
+        const r = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({config_toml: toml})
+        });
+        if (r.ok) {
+            showConfigStatus('Config saved successfully!', false);
+            fetchStatus(); // refresh toggles to reflect any changes
+        } else {
+            const msg = await r.text();
+            showConfigStatus('Save failed: ' + msg, true);
+        }
+    } catch(e) {
+        console.error('Config save failed', e);
+        showConfigStatus('Save failed: ' + e.message, true);
+    }
+}
+
+function showConfigStatus(msg, isError) {
+    const el = $('config-status');
+    el.textContent = msg;
+    el.style.display = 'block';
+    el.style.background = isError ? 'rgba(255,95,86,.15)' : 'rgba(0,206,201,.15)';
+    el.style.color = isError ? 'var(--danger)' : 'var(--success)';
+    if (!isError) setTimeout(() => { el.style.display = 'none'; }, 4000);
+}
+
+function hideConfigStatus() {
+    $('config-status').style.display = 'none';
+}
 
 // ── Init ─────────────────────────────────────────────────────
 fetchStatus();
