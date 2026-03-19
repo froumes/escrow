@@ -311,14 +311,14 @@ async fn main() -> Result<()> {
     }
 
     // When multi-account is enabled, request the COFL licenses list at startup
-    // searching by the first account's IGN so we get its global license index.
+    // searching by the current account's IGN so we get its global license index.
     // Delay slightly to let the WS authenticate first.
     if ingame_names.len() > 1 {
         let ws_license = ws_client.clone();
-        let first_ign = ingame_names[0].clone();
+        let current_ign = ingame_name.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let args = format!("list {}", first_ign);
+            let args = format!("list {}", current_ign);
             let data_json = serde_json::json!(args).to_string();
             let message = serde_json::json!({
                 "type": "licenses",
@@ -327,7 +327,7 @@ async fn main() -> Result<()> {
             if let Err(e) = ws_license.send_message(&message).await {
                 warn!("[LicenseDetect] Failed to request licenses list: {}", e);
             } else {
-                info!("[LicenseDetect] Requested COFL licenses list for '{}'", first_ign);
+                info!("[LicenseDetect] Requested COFL licenses list for '{}'", current_ign);
             }
         });
     }
@@ -1002,6 +1002,9 @@ async fn main() -> Result<()> {
                                 if let Ok(mut g) = cofl_premium_ws.lock() {
                                     *g = Some((tier, expires));
                                 }
+                                // License is already active on the current account —
+                                // no need to send `/cofl license default` later.
+                                license_default_sent_ws.store(true, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1356,23 +1359,49 @@ async fn main() -> Result<()> {
                     }
                 }
                 CoflEvent::LicenseList { entries, page: _ } => {
-                    // Auto-detect the license index for the first account's IGN.
-                    // We searched by `/cofl licenses list <first_ign>`, so the
+                    // Auto-detect the license index for the current account's IGN.
+                    // We searched by `/cofl licenses list <current_ign>`, so the
                     // response contains entries with global license indices.
-                    // Look for any non-NONE license matching the first IGN.
-                    let first_ign = &ingame_names_ws[0];
+                    // Look for any non-NONE license matching the current IGN first,
+                    // then fall back to any known IGN.
+                    let current_ign = &ingame_name_ws;
                     if let Some((found_ign, global_idx, tier)) = entries.iter().find(|(name, _, tier)| {
-                        name.eq_ignore_ascii_case(first_ign) && !tier.eq_ignore_ascii_case("NONE")
+                        name.eq_ignore_ascii_case(current_ign) && !tier.eq_ignore_ascii_case("NONE")
                     }) {
                         info!("[LicenseDetect] Found {} license index {} for '{}' ", tier, global_idx, found_ign);
                         detected_cofl_license_ws.store(*global_idx, Ordering::Relaxed);
-                    } else if let Some((found_ign, _, _)) = entries.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(first_ign)) {
+                    } else if let Some((found_ign, global_idx, tier)) = entries.iter().find(|(name, _, tier)| {
+                        // Check all configured IGNs as a fallback
+                        ingame_names_ws.iter().any(|ign| name.eq_ignore_ascii_case(ign))
+                            && !tier.eq_ignore_ascii_case("NONE")
+                    }) {
+                        info!("[LicenseDetect] Found {} license index {} for '{}' (other account)", tier, global_idx, found_ign);
+                        detected_cofl_license_ws.store(*global_idx, Ordering::Relaxed);
+                    } else if let Some((found_ign, _, _)) = entries.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(current_ign)) {
                         info!("[LicenseDetect] Found '{}' but only has NONE licenses — no transfer needed", found_ign);
-                    } else if !entries.is_empty() {
-                        // Entries present but none match our IGN
-                        info!("[LicenseDetect] Search returned {} entries but none match '{}'", entries.len(), first_ign);
                     } else {
-                        info!("[LicenseDetect] No license entries found for '{}'", first_ign);
+                        // No active license found for any configured IGN — set the
+                        // default account so the user's subscription tier is applied.
+                        if !license_default_sent_ws.load(Ordering::Relaxed) {
+                            license_default_sent_ws.store(true, Ordering::Relaxed);
+                            let ws = ws_client_clone.clone();
+                            let ign = ingame_name_ws.clone();
+                            let chat_tx = chat_tx_ws.clone();
+                            info!("[LicenseDetect] No active license for any configured IGN — sending /cofl license default {}", ign);
+                            let baf_msg = format!(
+                                "§f[§4BAF§f]: §eNo license found — setting §b{}§e as default account...",
+                                ign
+                            );
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx.send(baf_msg);
+                            tokio::spawn(async move {
+                                if let Err(e) = ws.set_default_license(&ign).await {
+                                    warn!("[LicenseDefault] Failed to set default license: {}", e);
+                                }
+                            });
+                        } else {
+                            info!("[LicenseDetect] No license entries matched but license already handled");
+                        }
                     }
                 }
             }
