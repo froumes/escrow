@@ -262,12 +262,20 @@ a{color:var(--accent2);text-decoration:none}
     </div>
 </div>
 
-<!-- Row 3: Active Auctions (full width) -->
+<!-- Row 3: Active Auctions + Bazaar Orders (side by side) -->
+<div class="grid">
 <div class="card">
     <h2>Active Auctions</h2>
     <div id="auction-container">
         <p class="auction-empty">Loading...</p>
     </div>
+</div>
+<div class="card">
+    <h2>Bazaar Orders</h2>
+    <div id="bazaar-orders-container">
+        <p class="auction-empty">Loading...</p>
+    </div>
+</div>
 </div>
 
 <!-- Row 4: Chat (full width) -->
@@ -553,6 +561,15 @@ async function fetchAuctions() {
     } catch(e) { console.error('Auctions fetch failed', e); }
 }
 
+async function fetchBazaarOrders() {
+    try {
+        const r = await fetch('/api/bazaar_orders');
+        if (r.status === 401) return;
+        const d = await r.json();
+        renderBazaarOrders(Array.isArray(d) ? d : []);
+    } catch(e) { console.error('Bazaar orders fetch failed', e); }
+}
+
 /** Format seconds remaining into a human-readable string */
 function formatTimeRemaining(secs) {
     if (secs <= 0) return 'Expired';
@@ -572,7 +589,7 @@ function renderAuctions(auctions) {
     }
     const table = document.createElement('table');
     table.className = 'auction-table';
-    table.innerHTML = '<thead><tr><th></th><th>Item</th><th>Bid</th><th>Type</th><th>Time Left</th><th></th></tr></thead>';
+    table.innerHTML = '<thead><tr><th></th><th>Item</th><th>Price</th><th>Time Left</th><th></th></tr></thead>';
     const tbody = document.createElement('tbody');
     auctions.forEach(a => {
         const tr = document.createElement('tr');
@@ -589,7 +606,6 @@ function renderAuctions(auctions) {
             '</td>' +
             '<td>' + escapedName + '</td>' +
             '<td class="auction-bid"><span title="coins">' + bid.toLocaleString() + ' ✦</span></td>' +
-            '<td>' + (a.bin ? '<span class="auction-bin">BIN</span>' : 'Auction') + '</td>' +
             '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>' +
             '<td></td>';
         // Create cancel button via DOM to avoid XSS
@@ -626,6 +642,56 @@ function renderAuctions(auctions) {
     table.appendChild(tbody);
     container.innerHTML = '';
     container.appendChild(table);
+}
+
+function renderBazaarOrders(orders) {
+    const container = $('bazaar-orders-container');
+    if (orders.length === 0) {
+        container.innerHTML = '<p class="auction-empty">No active bazaar orders</p>';
+        return;
+    }
+    const table = document.createElement('table');
+    table.className = 'auction-table';
+    table.innerHTML = '<thead><tr><th>Type</th><th>Item</th><th>Qty</th><th>Price/u</th><th>Total</th><th>Status</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    orders.forEach(o => {
+        const tr = document.createElement('tr');
+        const isBuy = o.is_buy_order;
+        const total = o.price_per_unit * o.amount;
+        const statusClass = o.status === 'filled' ? ' style="color:var(--success)"' : '';
+        const statusLabel = o.status === 'filled' ? '✅ Filled' : '⏳ Open';
+        const typeLabel = isBuy
+            ? '<span style="color:var(--success);font-weight:700">BUY</span>'
+            : '<span style="color:var(--danger);font-weight:700">SELL</span>';
+        const age = o.placed_at ? formatTimeAge(o.placed_at) : '';
+        const escapedName = escapeHtml(o.item_name);
+        tr.innerHTML =
+            '<td>' + typeLabel + '</td>' +
+            '<td>' + escapedName + '</td>' +
+            '<td>' + o.amount + '</td>' +
+            '<td class="auction-bid">' + formatShortCoins(o.price_per_unit) + '</td>' +
+            '<td class="auction-bid">' + formatShortCoins(total) + '</td>' +
+            '<td' + statusClass + '>' + statusLabel + (age ? ' <span style="color:var(--text-dim);font-size:.72rem">(' + age + ')</span>' : '') + '</td>';
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    container.innerHTML = '';
+    container.appendChild(table);
+}
+
+function formatTimeAge(unixSecs) {
+    const now = Math.floor(Date.now() / 1000);
+    const diff = now - unixSecs;
+    if (diff < 60) return diff + 's ago';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    return Math.floor(diff / 3600) + 'h ago';
+}
+
+function formatShortCoins(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return n.toLocaleString();
 }
 
 /** Get an icon URL for an inventory item */
@@ -945,10 +1011,12 @@ setInterval(fetchProfit, 15000);
 fetchStatus();
 fetchInventory();
 fetchAuctions();
+fetchBazaarOrders();
 connectChat();
 setInterval(fetchStatus, 3000);
 setInterval(fetchInventory, 10000);
 setInterval(fetchAuctions, 30000);
+setInterval(fetchBazaarOrders, 10000);
 </script>
 </body>
 </html>
