@@ -97,6 +97,13 @@ impl CommandQueue {
         }
     }
 
+    /// Peek at the next command waiting in the queue (ignoring the
+    /// currently-executing command).  Used by the processor loop to detect
+    /// higher-priority commands that should preempt the running one.
+    pub fn peek_queued(&self) -> Option<QueuedCommand> {
+        self.queue.read().front().cloned()
+    }
+
     /// Clear all bazaar orders from queue
     pub fn clear_bazaar_orders(&self) {
         let mut queue = self.queue.write();
@@ -161,5 +168,85 @@ impl CommandQueue {
 impl Default for CommandQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_bazaar_buy() -> CommandType {
+        CommandType::BazaarBuyOrder {
+            item_name: "Coal".into(),
+            item_tag: None,
+            amount: 64,
+            price_per_unit: 10.0,
+        }
+    }
+
+    fn dummy_purchase_auction() -> CommandType {
+        use crate::types::Flip;
+        CommandType::PurchaseAuction {
+            flip: Flip {
+                item_name: "Diamond".into(),
+                starting_bid: 800,
+                target: 1000,
+                finder: Some("SNIPER".into()),
+                profit_perc: None,
+                purchase_at_ms: None,
+                uuid: Some("abc".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn critical_priority_comes_before_normal() {
+        let q = CommandQueue::new();
+        // Enqueue a normal-priority bazaar buy
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        // Enqueue a critical-priority AH flip
+        q.enqueue(dummy_purchase_auction(), CommandPriority::Critical, false);
+
+        // Critical should be at front
+        let front = q.peek().unwrap();
+        assert_eq!(front.priority, CommandPriority::Critical);
+    }
+
+    #[test]
+    fn peek_queued_ignores_current_command() {
+        let q = CommandQueue::new();
+        // Enqueue two commands
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        q.enqueue(dummy_purchase_auction(), CommandPriority::Critical, false);
+
+        // Start current (pops the Critical one since it's first)
+        let started = q.start_current().unwrap();
+        assert_eq!(started.priority, CommandPriority::Critical);
+
+        // peek_queued should return the remaining Normal command, not the
+        // currently-executing Critical one
+        let next = q.peek_queued().unwrap();
+        assert_eq!(next.priority, CommandPriority::Normal);
+    }
+
+    #[test]
+    fn peek_queued_returns_none_when_empty() {
+        let q = CommandQueue::new();
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        let _ = q.start_current(); // pop it
+        assert!(q.peek_queued().is_none());
+    }
+
+    #[test]
+    fn interrupt_clears_current_command() {
+        let q = CommandQueue::new();
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        let started = q.start_current().unwrap();
+        assert!(started.interruptible);
+        assert!(q.can_interrupt_current());
+
+        q.interrupt_current();
+        // After interruption, there is no current command
+        assert!(q.is_empty());
     }
 }
