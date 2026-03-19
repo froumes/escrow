@@ -667,14 +667,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
-                    // Track bazaar profit: buy orders are costs, sell orders are revenue.
-                    // price_per_unit is f64 (may have decimal), so we multiply then truncate.
-                    let total = (price_per_unit * amount as f64) as i64;
-                    if is_buy_order {
-                        profit_tracker_events.record_bz_profit(-total);
-                    } else {
-                        profit_tracker_events.record_bz_profit(total);
-                    }
+                    // NOTE: Profit is NOT recorded here — it is tracked when orders are
+                    // actually collected (BazaarOrderCollected). Recording at placement
+                    // time inflates profits because cancelled orders would count.
                     let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
@@ -729,6 +724,48 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_auction_cancelled(
                                 &name, &item, starting_bid, purse, &url,
+                            ).await;
+                        });
+                    }
+                }
+                frikadellen_baf::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order } => {
+                    let order_type = if is_buy_order { "BUY" } else { "SELL" };
+                    info!("[BazaarOrders] Order collected: {} ({})", item_name, order_type);
+                    let baf_msg = format!(
+                        "§f[§4BAF§f]: §a✅ [BZ] {}§7 order collected: §r{}",
+                        if is_buy_order { "BUY" } else { "SELL" }, item_name
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        let url = webhook_url.to_string();
+                        let name = ingame_name_for_events.clone();
+                        let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
+                        tokio::spawn(async move {
+                            frikadellen_baf::webhook::send_webhook_bazaar_order_collected(
+                                &name, &item, is_buy_order, purse, &url,
+                            ).await;
+                        });
+                    }
+                }
+                frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order } => {
+                    let order_type = if is_buy_order { "BUY" } else { "SELL" };
+                    info!("[BazaarOrders] Order cancelled: {} ({})", item_name, order_type);
+                    let baf_msg = format!(
+                        "§f[§4BAF§f]: §c🚫 [BZ] {}§7 order cancelled: §r{}",
+                        if is_buy_order { "BUY" } else { "SELL" }, item_name
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        let url = webhook_url.to_string();
+                        let name = ingame_name_for_events.clone();
+                        let item = item_name.clone();
+                        let purse = bot_client_clone.get_purse();
+                        tokio::spawn(async move {
+                            frikadellen_baf::webhook::send_webhook_bazaar_order_cancelled(
+                                &name, &item, is_buy_order, purse, &url,
                             ).await;
                         });
                     }

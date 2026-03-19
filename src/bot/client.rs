@@ -173,6 +173,16 @@ pub enum BotEvent {
     },
     /// A bazaar buy/sell order was fully filled and is ready to collect
     BazaarOrderFilled,
+    /// A bazaar order was collected (filled items/coins claimed) during ManageOrders.
+    BazaarOrderCollected {
+        item_name: String,
+        is_buy_order: bool,
+    },
+    /// A bazaar order was cancelled during ManageOrders.
+    BazaarOrderCancelled {
+        item_name: String,
+        is_buy_order: bool,
+    },
     /// An auction was cancelled via the web GUI
     AuctionCancelled {
         item_name: String,
@@ -1985,7 +1995,7 @@ async fn execute_command(
                 }
             };
             let chat_command = format!("/viewauction {}", uuid);
-            
+
             info!("Sending chat command: {}", chat_command);
             bot.write_chat_packet(&chat_command);
 
@@ -2178,10 +2188,7 @@ async fn handle_window_interaction(
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
-                    // Freemoney mode: click every 20ms, starting bed_pre_click_ms before purchaseAt.
-                    // Default mode: immediate bed spam at bed_spam_click_delay interval.
                     const BED_FREEMONEY_CLICK_INTERVAL_MS: u64 = 20;
-                    // Poll granularity for the purchaseAt wait loop (check-before-sleep).
                     const BED_WAIT_POLL_MS: u64 = 20;
                     const MAX_FAILED_CLICKS: usize = 5;
                     let click_interval_ms = if state.freemoney {
@@ -2191,7 +2198,7 @@ async fn handle_window_interaction(
                     };
 
                     if state.freemoney {
-                        // Freemoney mode: use COFL purchaseAt exclusively.
+                        // Freemoney mode: use COFL purchaseAt timing for bed auctions.
                         // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
                         // If purchaseAt is not available, fall through to immediate bed spam.
                         let pre_click_lead_ms = state.bed_pre_click_ms;
@@ -2213,7 +2220,6 @@ async fn handle_window_interaction(
                                     remaining_ms, wait_ms, click_interval_ms, pre_click_lead_ms);
                                 let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
                                 loop {
-                                    // Check BEFORE sleeping so we don't overshoot the deadline
                                     if tokio::time::Instant::now() >= wait_deadline {
                                         break;
                                     }
@@ -2232,16 +2238,13 @@ async fn handle_window_interaction(
                                 }
                                 info!("[AH] Bed timing (freemoney): entering rapid-click phase ({}ms interval)", click_interval_ms);
                             } else {
-                                // purchaseAt is already past or imminent — start clicking immediately
                                 info!("[AH] Bed timing (freemoney): purchaseAt imminent — starting clicks at {}ms interval", click_interval_ms);
                             }
                         } else {
-                            // No purchaseAt available — fall back to immediate bed spam
                             info!("[AH] Bed timing (freemoney): no purchaseAt — starting immediate bed spam at {}ms interval", click_interval_ms);
                         }
                     } else {
                         // Default mode: simple immediate bed spam at bed_spam_click_delay.
-                        // No pre-click timing or purchaseAt calculation.
                         info!("[AH] Bed detected in slot 31 — starting bed spam at {}ms interval", click_interval_ms);
                     }
 
@@ -2267,29 +2270,23 @@ async fn handle_window_interaction(
                         };
 
                         if current_kind == "air" || current_kind.contains("air") {
-                            // Window closed — stop
                             info!("[AH] Bed timing: window closed");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
-                            // Grace period ended — click to purchase.
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             if *state.last_window_id.read() == window_id {
                                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                             }
-                            // Stay in Purchasing so Confirm Purchase handler fires
                             break;
                         } else if current_kind.contains("bed") {
-                            // Still in grace period — pre-click so a packet arrives at the
-                            // server right as the transition happens.
                             debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
                             if *state.last_window_id.read() == window_id {
                                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                             }
                         } else {
-                            // Unexpected slot state
                             failed_clicks += 1;
                             debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
@@ -3233,6 +3230,10 @@ async fn handle_window_interaction(
                                     } else {
                                         info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
                                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
+                                        let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                            item_name: order_name.clone(),
+                                            is_buy_order: order_is_buy,
+                                        });
                                         // Wait briefly, then check if inventory became full
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
@@ -3253,6 +3254,10 @@ async fn handle_window_interaction(
                                                 info!("[ManageOrders] Clicking Cancel at slot {} after collecting \"{}\"", cancel_after_collect, order_name);
                                                 click_window_slot(bot, &state.last_window_id, window_id, cancel_after_collect as i16).await;
                                                 cancelled += 1;
+                                                let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                                    item_name: order_name.clone(),
+                                                    is_buy_order: order_is_buy,
+                                                });
                                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                             }
                                         }
@@ -3272,6 +3277,10 @@ async fn handle_window_interaction(
                                         info!("[ManageOrders] Clicking Cancel at slot {}", cs);
                                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                                         cancelled += 1;
+                                        let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                            item_name: order_name.clone(),
+                                            is_buy_order: order_is_buy,
+                                        });
                                         // Wait for the window content to revert to the order list
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                     }
@@ -3373,6 +3382,12 @@ async fn handle_window_interaction(
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
+                        if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                            let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                item_name: order_name.clone(),
+                                is_buy_order: *ctx_is_buy,
+                            });
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         // After collecting, also cancel if in startup mode or age-based
                         if cancel_open || cancel_due_to_age {
@@ -3381,6 +3396,12 @@ async fn handle_window_interaction(
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
                                     click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
                                     *state.manage_orders_cancelled.write() += 1;
+                                    if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                        let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                            item_name: order_name.clone(),
+                                            is_buy_order: *ctx_is_buy,
+                                        });
+                                    }
                                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 }
                             }
@@ -3399,6 +3420,12 @@ async fn handle_window_interaction(
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                             *state.manage_orders_cancelled.write() += 1;
+                            if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                    item_name: order_name.clone(),
+                                    is_buy_order: *ctx_is_buy,
+                                });
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             // If Hypixel closed all bazaar windows without reopening "Your Bazaar
                             // Orders" (e.g. last order was cancelled), re-navigate to /bz so the
