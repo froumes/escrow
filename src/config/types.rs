@@ -83,13 +83,6 @@ pub struct Config {
     /// using `bed_spam_click_delay` and this value is ignored.
     #[serde(default = "default_bed_pre_click_ms")]
     pub bed_pre_click_ms: u64,
-
-    /// Delay in ms after clicking slot 31 (gold nugget) before pre-clicking
-    /// slot 11 on the predicted next window ID. Only applies to normal BIN
-    /// auctions (gold nugget in slot 31); beds and potatoes are unaffected.
-    /// 0 = disabled (no pre-click). Default: 100ms.
-    #[serde(default = "default_skip_click_delay_ms")]
-    pub skip_click_delay_ms: u64,
     
     #[serde(default = "default_bazaar_order_check_interval_seconds")]
     pub bazaar_order_check_interval_seconds: u64,
@@ -199,10 +192,6 @@ fn default_bed_pre_click_ms() -> u64 {
     30
 }
 
-fn default_skip_click_delay_ms() -> u64 {
-    100
-}
-
 fn default_bazaar_order_check_interval_seconds() -> u64 {
     30
 }
@@ -230,7 +219,6 @@ impl Default for Config {
             bed_spam_click_delay: default_bed_spam_click_delay(),
             bed_multiple_clicks_delay: 0,
             bed_pre_click_ms: default_bed_pre_click_ms(),
-            skip_click_delay_ms: default_skip_click_delay_ms(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
             bazaar_order_cancel_minutes: default_bazaar_order_cancel_minutes(),
             enable_bazaar_flips: true,
@@ -330,24 +318,6 @@ mod tests {
     fn parses_bed_pre_click_ms() {
         let config: Config = toml::from_str("bed_pre_click_ms = 300").expect("config should parse");
         assert_eq!(config.bed_pre_click_ms, 300);
-    }
-
-    #[test]
-    fn test_default_skip_click_delay_ms() {
-        let config = Config::default();
-        assert_eq!(config.skip_click_delay_ms, 100);
-    }
-
-    #[test]
-    fn parses_skip_click_delay_ms() {
-        let config: Config = toml::from_str("skip_click_delay_ms = 50").expect("config should parse");
-        assert_eq!(config.skip_click_delay_ms, 50);
-    }
-
-    #[test]
-    fn skip_click_delay_ms_zero_disables() {
-        let config: Config = toml::from_str("skip_click_delay_ms = 0").expect("config should parse");
-        assert_eq!(config.skip_click_delay_ms, 0);
     }
 
     #[test]
