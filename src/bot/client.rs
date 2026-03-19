@@ -115,7 +115,7 @@ pub struct BotClient {
     auto_cookie_hours: Arc<RwLock<u64>>,
     /// Hidden config gate for purchaseAt bed timing mode.
     pub freemoney: bool,
-    /// Enable fast-buy: double first-click + skip-click on confirm window.
+    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
     pub fastbuy: bool,
     /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
@@ -734,7 +734,7 @@ pub struct BotClientState {
     pub auto_cookie_hours: Arc<RwLock<u64>>,
     /// Hidden config gate for purchaseAt bed timing mode.
     pub freemoney: bool,
-    /// Enable fast-buy: double first-click + skip-click on confirm window.
+    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
     pub fastbuy: bool,
     /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
@@ -2437,32 +2437,19 @@ async fn handle_window_interaction(
                     // Click slot 31 (buy-now button).
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
 
-                    if state.fastbuy {
-                        // Fastbuy mode: send the buy-click a second time as redundancy
-                        // against packet loss. If the first packet is dropped and the GUI
-                        // never actually opens server-side, Hypixel may ban the account
-                        // when the skip-click arrives for a window that doesn't exist.
-                        // Sending the buy-click twice ensures the server processes at
-                        // least one copy.
-                        info!("[AH] Fastbuy: sending redundant buy-click (slot 31) to guard against packet loss");
-                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                    }
-
                     // Skip-click (window skip): for gold_nugget BIN auctions, pre-click
                     // the confirm button (slot 11) on the predicted next window
                     // immediately (no gap). Both packets arrive at the server within the
-                    // same tick, giving consistent ~100ms (2-tick) buy speeds.  Beds and
+                    // same tick, giving consistent 1-2 tick (~42ms) buy speeds.  Beds and
                     // potatoes are excluded — they have their own timing logic.
                     //
-                    // Only used when fastbuy is explicitly enabled in config because
-                    // skip-clicking a window that hasn't opened server-side (due to
-                    // packet loss) can cause a ban.
+                    // Only used when fastbuy is explicitly enabled in config.
                     if state.fastbuy && slot_31_kind.contains("gold_nugget") {
                         // Predict next window ID: Hypixel increments container IDs
                         // sequentially. Window 0 is the player inventory and is never
                         // used for GUI containers, so wrap 255 → 1.
                         let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        info!("[AH] Fastbuy skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
+                        info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
                         state.skip_click_sent.store(true, Ordering::Relaxed);
                         // Raw click — bypasses the stale-window guard because
                         // the Confirm Purchase window has not opened yet.
