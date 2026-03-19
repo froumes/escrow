@@ -995,9 +995,7 @@ async fn main() -> Result<()> {
                     // account tier is applied to the current account.
                     if !license_default_sent_ws.load(Ordering::Relaxed) {
                         let clean_msg = frikadellen_baf::utils::remove_minecraft_colors(&msg);
-                        if clean_msg.contains("don't have a license for")
-                            || clean_msg.contains("You don't have a license for")
-                        {
+                        if clean_msg.contains("don't have a license for") {
                             license_default_sent_ws.store(true, Ordering::Relaxed);
                             let ws = ws_client_clone.clone();
                             let ign = ingame_name_ws.clone();
