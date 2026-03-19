@@ -105,7 +105,8 @@ pub struct Config {
     #[serde(default)]
     pub bed_spam: bool,
 
-    /// Hidden: enable fast-buy skip-click on predicted Confirm Purchase window.
+    /// Advanced: enable fast-buy skip-click on predicted Confirm Purchase window.
+    /// Not shown in serialized configs unless explicitly set by the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fastbuy: Option<bool>,
 
