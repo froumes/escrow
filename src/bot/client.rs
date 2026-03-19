@@ -4510,6 +4510,7 @@ fn last_logged_order_info(is_buy: bool, item_name: &str) -> Option<(i64, f64)> {
     None
 }
 
+#[cfg(test)]
 fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
     last_logged_order_info(is_buy, item_name).map(|(ts, _)| ts)
 }

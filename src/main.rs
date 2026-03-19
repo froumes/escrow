@@ -1938,16 +1938,14 @@ async fn main() -> Result<()> {
         let profit_tracker_webhook = profit_tracker.clone();
         let webhook_url = webhook_url.to_string();
         let name = ingame_name.clone();
-        let anonymize_flag = anonymize_webhook_name.clone();
         let started = std::time::Instant::now();
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(30 * 60)).await;
                 let (ah, bz) = profit_tracker_webhook.totals();
                 let uptime = started.elapsed().as_secs();
-                let anonymize = anonymize_flag.load(Ordering::Relaxed);
                 frikadellen_baf::webhook::send_webhook_profit_summary(
-                    &name, ah, bz, uptime, anonymize, &webhook_url,
+                    &name, ah, bz, uptime, &webhook_url,
                 )
                 .await;
             }
