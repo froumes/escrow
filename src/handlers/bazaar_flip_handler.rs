@@ -245,7 +245,7 @@ impl BazaarFlipHandler {
             ).unwrap();
             let order_match = re_order
                 .captures(&clean_message)
-                .ok_or_else(|| anyhow!("Failed to parse new-format order from message: {}", clean_message))?;
+                .ok_or_else(|| anyhow!("Failed to parse bazaar flip recommendation from chat message: {}", clean_message))?;
 
             let amount = order_match[1].parse::<u64>()?;
             let item_name = order_match[2].trim().to_string();
@@ -266,8 +266,7 @@ impl BazaarFlipHandler {
 
             let total_price = price_per_unit * amount as f64;
 
-            let is_buy_order = !(clean_message.to_lowercase().contains("sell order")
-                || clean_message.to_lowercase().contains("sell offer"));
+            let is_buy_order = clean_message.to_lowercase().contains("buy order");
 
             return Ok(Some(BazaarFlipRecommendation {
                 item_name,
