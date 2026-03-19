@@ -310,6 +310,22 @@ impl CoflWebSocket {
         info!("[LicenseTransfer] Sent /cofl license use {} {}", license_index, target_ign);
         Ok(())
     }
+
+    /// Set the default license account to the given IGN.
+    ///
+    /// Sends `/cofl license default <ign>` via the WebSocket so that a new IGN
+    /// inherits the subscription tier from the user's default account.
+    pub async fn set_default_license(&self, ign: &str) -> Result<()> {
+        let args = format!("default {}", ign);
+        let data_json = serde_json::json!(args).to_string();
+        let message = serde_json::json!({
+            "type": "license",
+            "data": data_json
+        }).to_string();
+        self.send_message(&message).await?;
+        info!("[LicenseDefault] Sent /cofl license default {}", ign);
+        Ok(())
+    }
 }
 
 /// Prefix for license entry text lines in COFL's licenses list response: `§7> §a`

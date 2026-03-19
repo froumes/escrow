@@ -319,6 +319,7 @@ impl BotClient {
             bazaar_order_cancel_minutes: self.bazaar_order_cancel_minutes,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
+            manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
         };
@@ -758,6 +759,11 @@ pub struct BotClientState {
     pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>)>>>,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
+    /// Persistent set of processed order names (normalized, slot-index-free) across
+    /// ManageOrders window re-navigations.  Prevents re-clicking/re-emitting events
+    /// for orders that were already handled in an earlier `/bz` cycle.
+    /// Cleared at the start of each ManageOrders command.
+    pub manage_orders_processed: Arc<RwLock<std::collections::HashSet<String>>>,
     /// Item name of the auction to cancel (set by CancelAuction command).
     pub cancel_auction_item_name: Arc<RwLock<String>>,
     /// Starting bid of the auction to cancel (for accurate identification).
@@ -819,6 +825,7 @@ impl Default for BotClientState {
             bazaar_order_cancel_minutes: 5,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
+            manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
         }
@@ -2131,6 +2138,7 @@ async fn execute_command(
             *state.manage_orders_cancelled.write() = 0;
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
+            state.manage_orders_processed.write().clear();
             bot.write_chat_packet("/bz");
             *state.bot_state.write() = BotState::ManagingOrders;
         }
@@ -3140,6 +3148,10 @@ async fn handle_window_interaction(
                 // processed_orders tracks skipped open orders in collect-only mode so we don't loop forever.
                 // Include slot index to avoid collisions between multiple generic "Buy Order"/"Sell Offer" entries.
                 let mut processed_orders: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // Also consult the persistent set (keyed by normalized name without slot
+                // index) so that orders already handled in a previous /bz cycle (e.g.
+                // Branch C → re-open /bz) are not re-processed.
+                let persistent_processed = &state.manage_orders_processed;
 
                 loop {
                     // Wait for ContainerSetContent to reflect latest state
@@ -3162,7 +3174,10 @@ async fn handle_window_interaction(
                         if let Some(name) = get_item_display_name_from_slot(item) {
                             let lore = get_item_lore_from_slot(item);
                             let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
-                            if !processed_orders.contains(&order_key) {
+                            let name_key = normalize_bazaar_order_text(&name);
+                            if !processed_orders.contains(&order_key)
+                                && !persistent_processed.read().contains(&name_key)
+                            {
                                 let identity = parse_bazaar_order_identity(&name, &lore);
                                 if should_treat_as_bazaar_order_slot(&name, identity.as_ref()) {
                                     return Some((i, name, identity, order_key));
@@ -3305,6 +3320,7 @@ async fn handle_window_interaction(
                                 // Mirrors the TypeScript reference: processedItems.add(itemName)
                                 // is never cleared within a session.
                                 processed_orders.insert(processed_key);
+                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                             } else if let Some(cs) = cancel_slot {
                                 if cancel_open || cancel_due_to_age {
                                     if *state.last_window_id.read() == window_id {
@@ -3321,10 +3337,12 @@ async fn handle_window_interaction(
                                     // Track this order as processed so it cannot be re-cancelled
                                     // if the server is slow to remove it from the window.
                                     processed_orders.insert(processed_key);
+                                    persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                                 } else {
                                     // Collect-only mode: skip open orders
                                     debug!("[ManageOrders] Skipping open order \"{}\" (collect-only mode)", order_name);
                                     processed_orders.insert(processed_key);
+                                    persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                                 }
                             } else if collect_slot.is_none() && cancel_slot.is_none()
                                 && state.inventory_full.load(Ordering::Relaxed)
@@ -3344,6 +3362,7 @@ async fn handle_window_interaction(
                                 processed_orders.clear();
                             } else {
                                 processed_orders.insert(processed_key);
+                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                             }
                             // Loop continues to find remaining orders
                         }
@@ -3362,6 +3381,16 @@ async fn handle_window_interaction(
                     Some((_is_buy, name, identity)) => (name.clone(), identity.clone()),
                     None => (String::new(), None),
                 };
+
+                // Check persistent set — if this order was already handled in a
+                // previous cycle, skip it to avoid duplicate events/webhooks.
+                let name_key = normalize_bazaar_order_text(&order_name);
+                if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
+                    debug!("[ManageOrders] Order \"{}\" already processed — skipping Order options", order_name);
+                    if *state.last_window_id.read() == window_id {
+                        bot.write_chat_packet("/bz");
+                    }
+                } else {
 
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
@@ -3491,10 +3520,27 @@ async fn handle_window_interaction(
                         bot.write_chat_packet("/bz");
                     }
                 }
+                // Mark this order as persistently processed so it won't be
+                // re-clicked/re-emitted if /bz is re-opened and the order
+                // is still visible in the list (Hypixel UI lag).
+                if !name_key.is_empty() {
+                    state.manage_orders_processed.write().insert(name_key);
+                }
+                }
                 // After clicking Cancel/Collect, Hypixel should reopen "Your Bazaar Orders"
                 // as a new window. The ManagingOrders handler will be called again to continue
                 // processing remaining orders. If Hypixel closed all windows instead (last
                 // order processed), the /bz re-navigation above keeps the flow running.
+            } else {
+                // Unexpected window title while in ManagingOrders state.
+                // Re-navigate to /bz to get back on track.
+                warn!(
+                    "[ManageOrders] Unexpected window \"{}\" — re-opening /bz",
+                    window_title
+                );
+                if *state.last_window_id.read() == window_id {
+                    bot.write_chat_packet("/bz");
+                }
             }
         }
         BotState::SellingInventoryBz => {

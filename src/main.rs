@@ -245,6 +245,9 @@ async fn main() -> Result<()> {
     // bot does not attempt purchases before COFL auth is complete.
     let cofl_authenticated = Arc::new(AtomicBool::new(false));
 
+    // Set once after auto-sending `/cofl license default <ign>` to prevent repeat attempts.
+    let license_default_sent = Arc::new(AtomicBool::new(false));
+
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
         // Check if session is expired
@@ -802,6 +805,8 @@ async fn main() -> Result<()> {
     let detected_cofl_license_ws = detected_cofl_license.clone();
     let cofl_authenticated_ws = cofl_authenticated.clone();
     let ingame_names_ws = ingame_names.clone();
+    let license_default_sent_ws = license_default_sent.clone();
+    let ingame_name_ws = ingame_name.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -983,6 +988,31 @@ async fn main() -> Result<()> {
                                     *g = Some((tier, expires));
                                 }
                             }
+                        }
+                    }
+                    // Detect "You don't have a license for <ign>" and auto-send
+                    // `/cofl license default <current_ign>` so the user's default
+                    // account tier is applied to the current account.
+                    if !license_default_sent_ws.load(Ordering::Relaxed) {
+                        let clean_msg = frikadellen_baf::utils::remove_minecraft_colors(&msg);
+                        if clean_msg.contains("don't have a license for")
+                            || clean_msg.contains("You don't have a license for")
+                        {
+                            license_default_sent_ws.store(true, Ordering::Relaxed);
+                            let ws = ws_client_clone.clone();
+                            let ign = ingame_name_ws.clone();
+                            info!("[LicenseDefault] No license detected — sending /cofl license default {}", ign);
+                            let baf_msg = format!(
+                                "§f[§4BAF§f]: §eNo license for §b{}§e — setting as default account...",
+                                ign
+                            );
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx_ws.send(baf_msg);
+                            tokio::spawn(async move {
+                                if let Err(e) = ws.set_default_license(&ign).await {
+                                    warn!("[LicenseDefault] Failed to set default license: {}", e);
+                                }
+                            });
                         }
                     }
                     // Display COFL chat messages with proper color formatting
