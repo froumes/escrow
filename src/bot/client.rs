@@ -2362,34 +2362,6 @@ async fn handle_window_interaction(
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                     info!("[AH] Fastbuy: sending redundant buy-click (slot 31) to guard against packet loss");
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-
-                    // Speculative skip-click: send the Confirm click (slot 11)
-                    // on the predicted NEXT window ID immediately alongside the
-                    // slot 31 clicks — before waiting for SetSlot confirmation.
-                    // This ensures all three packets land in the same TCP burst
-                    // so the server processes buy + confirm in the SAME tick,
-                    // cutting buy speed from ~260ms (2 round-trips) to ~130ms.
-                    //
-                    // If slot 31 turns out to be a bed or non-buyable item, the
-                    // predicted window never opens and the click is harmlessly
-                    // ignored by the server.  The bed / non-buyable handlers
-                    // already clear the skip_click_sent flag.
-                    let speculative_next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                    info!("[AH] Fastbuy: speculative skip-click on predicted window {} (same TCP burst as buy)", speculative_next_wid);
-                    state.skip_click_sent.store(true, Ordering::Relaxed);
-                    use azalea_protocol::packets::game::s_container_click::{
-                        ServerboundContainerClick as SpecClick,
-                        HashedStack as SpecHashed,
-                    };
-                    bot.write_packet(SpecClick {
-                        container_id: speculative_next_wid as i32,
-                        state_id: 0,
-                        slot_num: 11,
-                        button_num: 0,
-                        click_type: ClickType::Pickup,
-                        changed_slots: Default::default(),
-                        carried_item: SpecHashed(None),
-                    });
                 }
 
                 // Wait for ContainerSetContent / ContainerSetSlot to populate
@@ -2544,34 +2516,29 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                     }
 
-                    // Skip-click: only a gold_nugget in slot 31 opens the
-                    // Confirm Purchase screen — so this is the ONLY case where
-                    // pre-clicking slot 11 on the predicted next window is safe.
-                    //
-                    // In fastbuy mode the speculative skip-click was already sent
-                    // in the same TCP burst as the slot 31 clicks (above), so we
-                    // only need to send it here for the default (non-fastbuy) path.
-                    if !state.skip_click_sent.load(Ordering::Relaxed) {
-                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
-                        state.skip_click_sent.store(true, Ordering::Relaxed);
-                        use azalea_protocol::packets::game::s_container_click::{
-                            ServerboundContainerClick,
-                            HashedStack,
-                        };
-                        let packet = ServerboundContainerClick {
-                            container_id: next_wid as i32,
-                            state_id: 0,
-                            slot_num: 11,
-                            button_num: 0,
-                            click_type: ClickType::Pickup,
-                            changed_slots: Default::default(),
-                            carried_item: HashedStack(None),
-                        };
-                        bot.write_packet(packet);
-                    } else {
-                        info!("[AH] Skip-click already sent speculatively in fastbuy burst — confirmed gold_nugget");
-                    }
+                    // Skip-click: gold_nugget in slot 31 guarantees the Confirm
+                    // Purchase window will open — so pre-clicking slot 11 on the
+                    // predicted next window is safe.  We only send this AFTER
+                    // confirming gold_nugget to avoid clicking a window that might
+                    // not exist (bed / non-buyable), which would be an impossible
+                    // action that could trigger anti-cheat.
+                    let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                    info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (gold_nugget confirmed)", next_wid);
+                    state.skip_click_sent.store(true, Ordering::Relaxed);
+                    use azalea_protocol::packets::game::s_container_click::{
+                        ServerboundContainerClick,
+                        HashedStack,
+                    };
+                    let packet = ServerboundContainerClick {
+                        container_id: next_wid as i32,
+                        state_id: 0,
+                        slot_num: 11,
+                        button_num: 0,
+                        click_type: ClickType::Pickup,
+                        changed_slots: Default::default(),
+                        carried_item: HashedStack(None),
+                    };
+                    bot.write_packet(packet);
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
                     // Slot 31 is a non-buyable item (potato = already bought,
@@ -3476,6 +3443,7 @@ async fn handle_window_interaction(
                             // No more unprocessed orders — done
                             *state.manage_orders_cancelled.write() += cancelled;
                             info!("[ManageOrders] Done — cancelled {} order(s)", *state.manage_orders_cancelled.read());
+                            *state.manage_orders_deadline.write() = None;
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
@@ -4826,6 +4794,7 @@ fn check_manage_orders_deadline(
             bot.write_packet(ServerboundContainerClose {
                 container_id: window_id as i32,
             });
+            *state.manage_orders_deadline.write() = None;
             *state.bot_state.write() = BotState::Idle;
             return true;
         }
