@@ -2298,26 +2298,22 @@ async fn handle_window_interaction(
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // Click slot 31 (buy-now button) IMMEDIATELY — the server already
-                // knows the slot contents when it sends OpenScreen; we don't need to
-                // wait for ContainerSetContent to arrive on the client.  This
-                // eliminates 10-200ms+ of polling delay that was the main cause of
-                // inconsistent buy speeds across accounts.
+                // ---- Fastbuy path (OpenScreen trigger) ----
+                // When fastbuy is explicitly enabled in config, click slot 31
+                // IMMEDIATELY on OpenScreen — the server already knows the slot
+                // contents.  Also pre-click slot 11 on the predicted Confirm
+                // Purchase window so both packets arrive within the same server
+                // tick.
                 //
-                // For beds this click is harmless (server rejects during grace
-                // period).  For potatoes/air it's a no-op.
-                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-
-                // Skip-click (fastbuy only): pre-click slot 11 on the predicted
-                // Confirm Purchase window in the same tick.  Sent immediately after
-                // the buy-click so both packets arrive within the same server tick.
-                // For beds/potatoes the skip-click harmlessly targets a window that
-                // never opens; skip_click_sent is cleared below if we detect a bed.
-                //
-                // Only used when fastbuy is explicitly enabled in config.
+                // ---- Default path (SetSlot trigger) ----
+                // Wait for ContainerSetContent / ContainerSetSlot to populate
+                // slot 31 before clicking.  This avoids clicking during a bed
+                // grace period which can trigger a ban.
                 if state.fastbuy {
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
                     let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                    info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
+                    info!("[AH] Fastbuy: clicking slot 31 + skip-click slot 11 on predicted window {}", next_wid);
                     state.skip_click_sent.store(true, Ordering::Relaxed);
                     use azalea_protocol::packets::game::s_container_click::{
                         ServerboundContainerClick,
@@ -2335,8 +2331,9 @@ async fn handle_window_interaction(
                     bot.write_packet(packet);
                 }
 
-                // Poll for slot 31 contents — only needed for bed detection.
-                // The buy-click (and skip-click) were already sent above.
+                // Poll for slot 31 contents (ContainerSetContent / SetSlot).
+                // Fastbuy: only needed for bed detection (buy-click already sent).
+                // Default: determines what action to take.
                 let slot_31_kind = {
                     let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
                     let mut kind;
@@ -2472,9 +2469,34 @@ async fn handle_window_interaction(
                             }
                         }
                     }
+                } else if slot_31_kind.contains("gold_nugget") {
+                    // ---- Buyable auction ----
+                    if !state.fastbuy {
+                        // Default (non-fastbuy): click slot 31 now that SetSlot
+                        // has confirmed gold_nugget is present.
+                        info!("[AH] Slot 31 = gold_nugget — clicking buy button (SetSlot trigger)");
+                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                    }
+                    // For fastbuy: buy-click (and skip-click) were already sent
+                    // on OpenScreen — nothing more to do.
+                } else if !slot_31_kind.contains("air") {
+                    // ---- Non-buyable auction ----
+                    // Slot 31 is a non-buyable item (potato = already bought,
+                    // poisonous_potato = can't afford, stained_glass_pane = edge
+                    // case, or "You didn't participate" / "auction not found").
+                    // Abort immediately instead of waiting for the 5s watchdog.
+                    warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
+                    state.skip_click_sent.store(false, Ordering::Relaxed);
+                    *state.purchase_start_time.write() = None;
+                    *state.pending_purchase_at_ms.write() = None;
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    *state.bot_state.write() = BotState::Idle;
                 }
-                // For non-bed auctions: buy-click (and skip-click if fastbuy)
-                // were already sent above — nothing more to do.
+                // air = slot 31 never populated within the poll deadline.
+                // The terminal-failure chat handler or 5s GUI watchdog will
+                // clean up.
             } else if window_title.contains("Confirm Purchase") {
                 // If a skip-click was already sent for this window, don't fire a
                 // redundant reactive click — the pre-click packet should already be
