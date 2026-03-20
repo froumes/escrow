@@ -329,6 +329,7 @@ impl BotClient {
             manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
+            manage_orders_deadline: Arc::new(RwLock::new(None)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -787,6 +788,10 @@ pub struct BotClientState {
     pub cancel_auction_item_name: Arc<RwLock<String>>,
     /// Starting bid of the auction to cancel (for accurate identification).
     pub cancel_auction_starting_bid: Arc<RwLock<i64>>,
+    /// Deadline for the current ManageOrders run. Set at the start of each
+    /// ManageOrders command so that all window handlers (Branch A/B/C) can
+    /// bail out early instead of waiting for the external 60-second timeout.
+    pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
 }
 
 impl Default for BotClientState {
@@ -851,6 +856,7 @@ impl Default for BotClientState {
             manage_orders_processed: Arc::new(RwLock::new(std::collections::HashSet::new())),
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
+            manage_orders_deadline: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1733,6 +1739,15 @@ async fn event_handler(
                 state.inventory_full.store(true, Ordering::Relaxed);
             }
 
+            // Detect "You have X items stashed away!" — Hypixel sends this when
+            // collected items went to stash because the inventory was full.
+            // Treat it the same as inventory_full so ManageOrders stops trying
+            // to collect BUY orders that have no room.
+            if clean_message.contains("items stashed away") {
+                warn!("[ManageOrders] Items stashed — inventory effectively full");
+                state.inventory_full.store(true, Ordering::Relaxed);
+            }
+
             // Detect "You don't have anything to sell!" during SellingInventoryBz
             // — Hypixel sends this when inventory has no instasellable items.
             if clean_message.contains("don't have anything to sell")
@@ -2251,6 +2266,12 @@ async fn execute_command(
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
+            // Set an internal deadline so the handler can bail out cleanly
+            // (closing windows) instead of burning through the full 60-second
+            // external command-processor timeout.
+            *state.manage_orders_deadline.write() = Some(
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(45)
+            );
             let initial_wid = *state.last_window_id.read();
             bot.write_chat_packet("/bz");
             *state.bot_state.write() = BotState::ManagingOrders;
@@ -2322,25 +2343,50 @@ async fn handle_window_interaction(
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // ---- Fastbuy path (OpenScreen trigger) ----
-                // When fastbuy is explicitly enabled in config, click slot 31
-                // IMMEDIATELY on OpenScreen — the server already knows the slot
-                // contents.  The skip-click for slot 11 on the predicted Confirm
-                // Purchase window is deferred until the poll confirms gold_nugget
-                // to avoid sending a skip-click for non-buyable auctions (potato,
-                // poisonous_potato, etc.) which causes bans.
+                // ---- Buy click (always sent immediately) ----
+                // Click slot 31 twice on the EXISTING BIN Auction View window as
+                // redundancy against packet loss.  The server already knows the
+                // slot contents from OpenScreen — this is always safe.
+                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                info!("[AH] Sending redundant buy-click (slot 31) to guard against packet loss");
+                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
+                // ---- Skip-click (confirm on predicted next window) ----
+                // Pre-click slot 11 on the predicted Confirm Purchase window.
+                // If the auction is buyable (gold_nugget), the server creates
+                // the Confirm window from the slot 31 click and the skip-click
+                // confirms it — all processed within the same or next tick.
+                // If slot 31 turns out to be bed/non-buyable, the predicted
+                // window never opens and the skip-click is harmlessly ignored
+                // (the server has no container with that ID).  The bed and
+                // non-buyable handlers clear skip_click_sent on recovery.
                 //
-                // ---- Default path (SetSlot trigger) ----
-                // Wait for ContainerSetContent / ContainerSetSlot to populate
-                // slot 31 before clicking.  This avoids clicking during a bed
-                // grace period which can trigger a ban.
-                if state.fastbuy {
-                    // Fastbuy: click slot 31 twice on the EXISTING window as
-                    // redundancy against packet loss.  This is always safe —
-                    // the BIN Auction View window is already open server-side.
-                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                    info!("[AH] Fastbuy: sending redundant buy-click (slot 31) to guard against packet loss");
-                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                // Fastbuy:  skip-click sent in the SAME burst (no await) so
+                //           both arrive in the same server tick → ~50-100ms.
+                // Default:  50ms delay after buy click gives the server one tick
+                //           to create the Confirm window → ~100-150ms.
+                {
+                    let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                    if state.fastbuy {
+                        info!("[AH] Fastbuy skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
+                    } else {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (after 50ms)", next_wid);
+                    }
+                    state.skip_click_sent.store(true, Ordering::Relaxed);
+                    use azalea_protocol::packets::game::s_container_click::{
+                        ServerboundContainerClick as SkipClick,
+                        HashedStack as SkipHashed,
+                    };
+                    bot.write_packet(SkipClick {
+                        container_id: next_wid as i32,
+                        state_id: 0,
+                        slot_num: 11,
+                        button_num: 0,
+                        click_type: ClickType::Pickup,
+                        changed_slots: Default::default(),
+                        carried_item: SkipHashed(None),
+                    });
                 }
 
                 // Wait for ContainerSetContent / ContainerSetSlot to populate
@@ -2489,34 +2535,10 @@ async fn handle_window_interaction(
                     }
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction ----
-                    if !state.fastbuy {
-                        // Default: click slot 31 now that SetSlot confirmed
-                        // gold_nugget.  Fastbuy already clicked on OpenScreen.
-                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                    }
-
-                    // Skip-click: only a gold_nugget in slot 31 opens the
-                    // Confirm Purchase screen — so this is the ONLY case where
-                    // pre-clicking slot 11 on the predicted next window is safe.
-                    // Both packets arrive within the same server tick, giving
-                    // ~100ms (2-tick) buy speeds.
-                    let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                    info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
-                    state.skip_click_sent.store(true, Ordering::Relaxed);
-                    use azalea_protocol::packets::game::s_container_click::{
-                        ServerboundContainerClick,
-                        HashedStack,
-                    };
-                    let packet = ServerboundContainerClick {
-                        container_id: next_wid as i32,
-                        state_id: 0,
-                        slot_num: 11,
-                        button_num: 0,
-                        click_type: ClickType::Pickup,
-                        changed_slots: Default::default(),
-                        carried_item: HashedStack(None),
-                    };
-                    bot.write_packet(packet);
+                    // Slot 31 click and skip-click were already sent above
+                    // (before the poll).  gold_nugget confirmation means the
+                    // purchase should already be processing on the server.
+                    info!("[AH] gold_nugget confirmed — buy + skip already sent");
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
                     // Slot 31 is a non-buyable item (potato = already bought,
@@ -3351,6 +3373,13 @@ async fn handle_window_interaction(
             // used when triggered by BazaarOrderFilled or periodic checks) only filled orders
             // are collected and open orders are left untouched.
             // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → handle each.
+
+            // Check the internal deadline at every window event.  If exceeded, close
+            // this window and return to Idle so the command queue isn't blocked.
+            if check_manage_orders_deadline(bot, state, window_id) {
+                return;
+            }
+
             let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
             if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
                 // Main bazaar page — click "Manage Orders" at slot 50
@@ -3372,6 +3401,12 @@ async fn handle_window_interaction(
                 loop {
                     // Wait for ContainerSetContent to reflect latest state
                     tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+                    // Check internal deadline inside the loop to bail out early
+                    // instead of burning through the full 60-second external timeout.
+                    if check_manage_orders_deadline(bot, state, window_id) {
+                        return;
+                    }
 
                     // If a newer window has opened (e.g. Hypixel auto-opened the next
                     // "Your Bazaar Orders" screen), stop this loop — the new handler will
@@ -3408,6 +3443,7 @@ async fn handle_window_interaction(
                             // No more unprocessed orders — done
                             *state.manage_orders_cancelled.write() += cancelled;
                             info!("[ManageOrders] Done — cancelled {} order(s)", *state.manage_orders_cancelled.read());
+                            *state.manage_orders_deadline.write() = None;
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
@@ -3614,9 +3650,7 @@ async fn handle_window_interaction(
                 let name_key = normalize_bazaar_order_text(&order_name);
                 if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
                     debug!("[ManageOrders] Order \"{}\" already processed — skipping Order options", order_name);
-                    if *state.last_window_id.read() == window_id {
-                        bot.write_chat_packet("/bz");
-                    }
+                    close_window_and_reopen_bz(bot, state, window_id).await;
                 } else {
 
                 let action_deadline =
@@ -3703,8 +3737,8 @@ async fn handle_window_interaction(
                         // Orders" (e.g. last order was processed), re-navigate to /bz so the
                         // ManagingOrders flow continues and correctly reaches Idle when empty.
                         if *state.last_window_id.read() == window_id {
-                            info!("[ManageOrders] No new window after collect in Order options — re-opening /bz");
-                            bot.write_chat_packet("/bz");
+                            info!("[ManageOrders] No new window after collect in Order options — closing window and re-opening /bz");
+                            close_window_and_reopen_bz(bot, state, window_id).await;
                         }
                     }
                 } else if let Some(cs) = cancel_slot {
@@ -3727,8 +3761,8 @@ async fn handle_window_interaction(
                             // Orders" (e.g. last order was cancelled), re-navigate to /bz so the
                             // ManagingOrders flow continues and correctly reaches Idle when empty.
                             if *state.last_window_id.read() == window_id {
-                                info!("[ManageOrders] No new window after cancel in Order options — re-opening /bz");
-                                bot.write_chat_packet("/bz");
+                                info!("[ManageOrders] No new window after cancel in Order options — closing window and re-opening /bz");
+                                close_window_and_reopen_bz(bot, state, window_id).await;
                             }
                         }
                     } else {
@@ -3738,10 +3772,8 @@ async fn handle_window_interaction(
                         // this open one).  Without this the bot stays stuck in
                         // ManagingOrders with the Order options window open until the
                         // command timeout fires.
-                        if *state.last_window_id.read() == window_id {
-                            info!("[ManageOrders] Re-opening /bz after skipping open order in Order options");
-                            bot.write_chat_packet("/bz");
-                        }
+                        info!("[ManageOrders] Re-opening /bz after skipping open order in Order options");
+                        close_window_and_reopen_bz(bot, state, window_id).await;
                     }
                 } else {
                     // Neither Collect nor Cancel found — likely a transient GUI
@@ -3749,9 +3781,7 @@ async fn handle_window_interaction(
                     // the ManagingOrders flow can retry instead of hanging until the
                     // command timeout.
                     warn!("[ManageOrders] No actionable button in Order options — re-opening /bz");
-                    if *state.last_window_id.read() == window_id {
-                        bot.write_chat_packet("/bz");
-                    }
+                    close_window_and_reopen_bz(bot, state, window_id).await;
                 }
                 // Mark this order as persistently processed so it won't be
                 // re-clicked/re-emitted if /bz is re-opened and the order
@@ -3768,12 +3798,10 @@ async fn handle_window_interaction(
                 // Unexpected window title while in ManagingOrders state.
                 // Re-navigate to /bz to get back on track.
                 warn!(
-                    "[ManageOrders] Unexpected window \"{}\" — re-opening /bz",
+                    "[ManageOrders] Unexpected window \"{}\" — closing and re-opening /bz",
                     window_title
                 );
-                if *state.last_window_id.read() == window_id {
-                    bot.write_chat_packet("/bz");
-                }
+                close_window_and_reopen_bz(bot, state, window_id).await;
             }
         }
         BotState::SellingInventoryBz => {
@@ -4729,6 +4757,44 @@ async fn wait_for_cancel_confirmation(
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
+    }
+}
+
+/// Check the internal ManageOrders deadline.  If exceeded, close the current window
+/// and return the bot to Idle so the command queue isn't blocked for the full 60-second
+/// external timeout.  Returns `true` when the deadline was hit (caller should `return`).
+fn check_manage_orders_deadline(
+    bot: &Client,
+    state: &BotClientState,
+    window_id: u8,
+) -> bool {
+    if let Some(deadline) = *state.manage_orders_deadline.read() {
+        if tokio::time::Instant::now() >= deadline {
+            warn!("[ManageOrders] Internal deadline exceeded — closing window and going Idle");
+            bot.write_packet(ServerboundContainerClose {
+                container_id: window_id as i32,
+            });
+            *state.manage_orders_deadline.write() = None;
+            *state.bot_state.write() = BotState::Idle;
+            return true;
+        }
+    }
+    false
+}
+
+/// Close the current window and re-navigate to /bz so the ManagingOrders flow
+/// can continue from a clean state.  A small delay between the close and the
+/// chat command gives the server time to process the ContainerClose before the
+/// new /bz command arrives.
+async fn close_window_and_reopen_bz(
+    bot: &Client,
+    state: &BotClientState,
+    window_id: u8,
+) {
+    if *state.last_window_id.read() == window_id {
+        bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        bot.write_chat_packet("/bz");
     }
 }
 
