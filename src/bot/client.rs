@@ -2335,10 +2335,10 @@ async fn handle_window_interaction(
                 // slot 31 before clicking.  This avoids clicking during a bed
                 // grace period which can trigger a ban.
                 if state.fastbuy {
+                    // Fastbuy: click slot 31 twice on the EXISTING window as
+                    // redundancy against packet loss.  This is always safe —
+                    // the BIN Auction View window is already open server-side.
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                    // Send a second buy-click as redundancy against packet loss.
-                    // If the first packet is dropped, the skip-click later would
-                    // hit a window that never opened server-side, causing a ban.
                     info!("[AH] Fastbuy: sending redundant buy-click (slot 31) to guard against packet loss");
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 }
@@ -2490,18 +2490,16 @@ async fn handle_window_interaction(
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction ----
                     if !state.fastbuy {
-                        // Default (non-fastbuy): click slot 31 now that SetSlot
-                        // has confirmed gold_nugget is present.
+                        // Default: click slot 31 now that SetSlot confirmed
+                        // gold_nugget.  Fastbuy already clicked on OpenScreen.
                         click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                     }
 
-                    // Skip-click: pre-click the confirm button (slot 11) on the
-                    // predicted next window immediately (no gap).  Both packets
-                    // arrive at the server within the same tick, giving consistent
-                    // ~100ms (2-tick) buy speeds.  Only sent after confirming
-                    // gold_nugget — beds and non-buyable items (potato, etc.) are
-                    // excluded to prevent bans from clicking a window that never
-                    // opens server-side.
+                    // Skip-click: only a gold_nugget in slot 31 opens the
+                    // Confirm Purchase screen — so this is the ONLY case where
+                    // pre-clicking slot 11 on the predicted next window is safe.
+                    // Both packets arrive within the same server tick, giving
+                    // ~100ms (2-tick) buy speeds.
                     let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
                     info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
                     state.skip_click_sent.store(true, Ordering::Relaxed);
