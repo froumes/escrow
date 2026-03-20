@@ -135,6 +135,10 @@ pub struct BotClient {
     pub bazaar_order_cancel_minutes_per_million: u64,
     /// Updated whenever the bot opens the Manage/My Auctions GUI.
     cached_my_auctions_json: Arc<RwLock<Option<String>>>,
+    /// Time when the flip was received from COFL — start of buy-speed measurement.
+    /// Shared with `BotClientState` so the event handler can compute elapsed time
+    /// when "Putting coins in escrow" arrives.
+    purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -228,6 +232,7 @@ impl BotClient {
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
+            purchase_start_time: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -302,7 +307,7 @@ impl BotClient {
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
             bazaar_order_rejected: self.bazaar_order_rejected.clone(),
-            purchase_start_time: Arc::new(RwLock::new(None)),
+            purchase_start_time: self.purchase_start_time.clone(),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
@@ -509,6 +514,13 @@ impl BotClient {
         self.bazaar_at_limit.load(Ordering::Relaxed)
     }
 
+    /// Record the current instant as the buy-speed start time.
+    /// Called from the main loop when an auction flip is received from COFL,
+    /// so buy speed measures **flip-receive → coins-in-escrow**.
+    pub fn mark_purchase_start(&self) {
+        *self.purchase_start_time.write() = Some(std::time::Instant::now());
+    }
+
     /// Documentation for sending chat messages
     /// 
     /// **Important**: This method cannot be called directly because the azalea Client
@@ -713,9 +725,10 @@ pub struct BotClientState {
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
     pub bazaar_order_rejected: Arc<AtomicBool>,
-    /// Time when BIN Auction View opened — start of buy-speed measurement
+    /// Time when the flip was received from COFL — start of buy-speed measurement.
+    /// Shared with `BotClient` so main.rs can set it when the flip arrives.
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
-    /// Buy speed in ms: from BIN Auction View open to "Putting coins in escrow..."
+    /// Buy speed in ms: from flip received to "Putting coins in escrow..."
     pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
@@ -1537,13 +1550,13 @@ async fn event_handler(
             if clean_message.contains("You purchased") && clean_message.contains("coins!") {
                 // "You purchased <item> for <price> coins!"
                 if let Some((item_name, price)) = parse_purchased_message(&clean_message) {
-                    // Include the buy speed measured from BIN Auction View open to escrow message
+                    // Include the buy speed measured from flip received to escrow message
                     let buy_speed_ms = state.last_buy_speed_ms.write().take();
                     let _ = state.event_tx.send(BotEvent::ItemPurchased { item_name, price, buy_speed_ms });
                 }
             } else if clean_message.contains("Putting coins in escrow") {
                 // "Putting coins in escrow..." — purchase accepted by server.
-                // Calculate buy speed from when BIN Auction View opened (matching TypeScript).
+                // Calculate buy speed from when the flip was received from COFL.
                 if let Some(start) = state.purchase_start_time.write().take() {
                     let speed_ms = start.elapsed().as_millis() as u64;
                     *state.last_buy_speed_ms.write() = Some(speed_ms);
@@ -2340,8 +2353,9 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
-                // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
-                *state.purchase_start_time.write() = Some(std::time::Instant::now());
+                // purchase_start_time is already set when the flip was received
+                // from COFL (via BotClient::mark_purchase_start), so buy speed
+                // measures flip-receive → coins-in-escrow.
 
                 // ---- Wait for slot 31 before clicking ----
                 // Do NOT click slot 31 or send skip-click until we know what
