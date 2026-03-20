@@ -3650,11 +3650,7 @@ async fn handle_window_interaction(
                 let name_key = normalize_bazaar_order_text(&order_name);
                 if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
                     debug!("[ManageOrders] Order \"{}\" already processed — skipping Order options", order_name);
-                    if *state.last_window_id.read() == window_id {
-                        bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        bot.write_chat_packet("/bz");
-                    }
+                    close_window_and_reopen_bz(bot, state, window_id).await;
                 } else {
 
                 let action_deadline =
@@ -3742,9 +3738,7 @@ async fn handle_window_interaction(
                         // ManagingOrders flow continues and correctly reaches Idle when empty.
                         if *state.last_window_id.read() == window_id {
                             info!("[ManageOrders] No new window after collect in Order options — closing window and re-opening /bz");
-                            bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            bot.write_chat_packet("/bz");
+                            close_window_and_reopen_bz(bot, state, window_id).await;
                         }
                     }
                 } else if let Some(cs) = cancel_slot {
@@ -3768,9 +3762,7 @@ async fn handle_window_interaction(
                             // ManagingOrders flow continues and correctly reaches Idle when empty.
                             if *state.last_window_id.read() == window_id {
                                 info!("[ManageOrders] No new window after cancel in Order options — closing window and re-opening /bz");
-                                bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                bot.write_chat_packet("/bz");
+                                close_window_and_reopen_bz(bot, state, window_id).await;
                             }
                         }
                     } else {
@@ -3780,12 +3772,8 @@ async fn handle_window_interaction(
                         // this open one).  Without this the bot stays stuck in
                         // ManagingOrders with the Order options window open until the
                         // command timeout fires.
-                        if *state.last_window_id.read() == window_id {
-                            info!("[ManageOrders] Re-opening /bz after skipping open order in Order options");
-                            bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            bot.write_chat_packet("/bz");
-                        }
+                        info!("[ManageOrders] Re-opening /bz after skipping open order in Order options");
+                        close_window_and_reopen_bz(bot, state, window_id).await;
                     }
                 } else {
                     // Neither Collect nor Cancel found — likely a transient GUI
@@ -3793,11 +3781,7 @@ async fn handle_window_interaction(
                     // the ManagingOrders flow can retry instead of hanging until the
                     // command timeout.
                     warn!("[ManageOrders] No actionable button in Order options — re-opening /bz");
-                    if *state.last_window_id.read() == window_id {
-                        bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        bot.write_chat_packet("/bz");
-                    }
+                    close_window_and_reopen_bz(bot, state, window_id).await;
                 }
                 // Mark this order as persistently processed so it won't be
                 // re-clicked/re-emitted if /bz is re-opened and the order
@@ -3817,11 +3801,7 @@ async fn handle_window_interaction(
                     "[ManageOrders] Unexpected window \"{}\" — closing and re-opening /bz",
                     window_title
                 );
-                if *state.last_window_id.read() == window_id {
-                    bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    bot.write_chat_packet("/bz");
-                }
+                close_window_and_reopen_bz(bot, state, window_id).await;
             }
         }
         BotState::SellingInventoryBz => {
@@ -4800,6 +4780,22 @@ fn check_manage_orders_deadline(
         }
     }
     false
+}
+
+/// Close the current window and re-navigate to /bz so the ManagingOrders flow
+/// can continue from a clean state.  A small delay between the close and the
+/// chat command gives the server time to process the ContainerClose before the
+/// new /bz command arrives.
+async fn close_window_and_reopen_bz(
+    bot: &Client,
+    state: &BotClientState,
+    window_id: u8,
+) {
+    if *state.last_window_id.read() == window_id {
+        bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        bot.write_chat_packet("/bz");
+    }
 }
 
 /// Click a window slot while reporting the item currently on the cursor.
