@@ -787,6 +787,10 @@ pub struct BotClientState {
     pub cancel_auction_item_name: Arc<RwLock<String>>,
     /// Starting bid of the auction to cancel (for accurate identification).
     pub cancel_auction_starting_bid: Arc<RwLock<i64>>,
+    /// Deadline for the current ManageOrders run. Set at the start of each
+    /// ManageOrders command so that all window handlers (Branch A/B/C) can
+    /// bail out early instead of waiting for the external 60-second timeout.
+    pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
 }
 
 impl Default for BotClientState {
