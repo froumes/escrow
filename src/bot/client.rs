@@ -2380,7 +2380,9 @@ async fn handle_window_interaction(
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
                     // No buy-click or skip-click was sent (we waited for
-                    // confirmation first).  Bed spam below handles clicking.
+                    // confirmation first).  The bed-spam loop below
+                    // repeatedly clicks slot 31 until the grace period ends
+                    // and the item becomes purchasable (gold_nugget appears).
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
@@ -2530,9 +2532,11 @@ async fn handle_window_interaction(
                     }
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
-                    // Slot 31 is a non-buyable item (feather = loading/not
-                    // purchasable, potato = already bought, poisonous_potato =
-                    // can't afford, stained_glass_pane = edge case, etc.).
+                    // Slot 31 is a non-purchasable item placed by the server:
+                    // feather = auction not available / cannot be purchased,
+                    // potato = already bought by someone else,
+                    // poisonous_potato = can't afford,
+                    // stained_glass_pane = edge case.
                     // No clicks were sent (we waited for confirmation first),
                     // so just close the window cleanly.
                     // Use write lock for atomic check-and-set to prevent a
