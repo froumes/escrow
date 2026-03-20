@@ -2343,52 +2343,13 @@ async fn handle_window_interaction(
                 // Record buy-speed start time (matches TypeScript: purchaseStartTime = Date.now())
                 *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-                // ---- Buy click (always sent immediately) ----
-                // Click slot 31 twice on the EXISTING BIN Auction View window as
-                // redundancy against packet loss.  The server already knows the
-                // slot contents from OpenScreen — this is always safe.
-                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                info!("[AH] Sending redundant buy-click (slot 31) to guard against packet loss");
-                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-
-                // ---- Skip-click (confirm on predicted next window) ----
-                // Pre-click slot 11 on the predicted Confirm Purchase window.
-                // If the auction is buyable (gold_nugget), the server creates
-                // the Confirm window from the slot 31 click and the skip-click
-                // confirms it — all processed within the same or next tick.
-                // If slot 31 turns out to be bed/non-buyable, the predicted
-                // window never opens and the skip-click is harmlessly ignored
-                // (the server has no container with that ID).  The bed and
-                // non-buyable handlers clear skip_click_sent on recovery.
+                // ---- Wait for slot 31 before clicking ----
+                // Do NOT click slot 31 or send skip-click until we know what
+                // item the server placed there.  Clicking on a non-interactive
+                // item (e.g. feather = loading placeholder) is an "impossible
+                // action" that can trigger Hypixel anti-cheat.  The buy-click
+                // and skip-click are sent AFTER gold_nugget is confirmed.
                 //
-                // Fastbuy:  skip-click sent in the SAME burst (no await) so
-                //           both arrive in the same server tick → ~50-100ms.
-                // Default:  50ms delay after buy click gives the server one tick
-                //           to create the Confirm window → ~100-150ms.
-                {
-                    let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                    if state.fastbuy {
-                        info!("[AH] Fastbuy skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
-                    } else {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (after 50ms)", next_wid);
-                    }
-                    state.skip_click_sent.store(true, Ordering::Relaxed);
-                    use azalea_protocol::packets::game::s_container_click::{
-                        ServerboundContainerClick as SkipClick,
-                        HashedStack as SkipHashed,
-                    };
-                    bot.write_packet(SkipClick {
-                        container_id: next_wid as i32,
-                        state_id: 0,
-                        slot_num: 11,
-                        button_num: 0,
-                        click_type: ClickType::Pickup,
-                        changed_slots: Default::default(),
-                        carried_item: SkipHashed(None),
-                    });
-                }
-
                 // Wait for ContainerSetContent / ContainerSetSlot to populate
                 // slot 31.  Uses a Notify that fires instantly when the packet
                 // arrives instead of polling every 10ms.
@@ -2418,9 +2379,10 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // Clear any speculative skip-click — bed flow produces a
-                    // different window sequence so the predicted window ID is wrong.
-                    state.skip_click_sent.store(false, Ordering::Relaxed);
+                    // No buy-click or skip-click was sent (we waited for
+                    // confirmation first).  The bed-spam loop below
+                    // repeatedly clicks slot 31 until the grace period ends
+                    // and the item becomes purchasable (gold_nugget appears).
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
@@ -2535,16 +2497,48 @@ async fn handle_window_interaction(
                     }
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction ----
-                    // Slot 31 click and skip-click were already sent above
-                    // (before the poll).  gold_nugget confirmation means the
-                    // purchase should already be processing on the server.
-                    info!("[AH] gold_nugget confirmed — buy + skip already sent");
+                    // Now that we know slot 31 is gold_nugget (the buy button),
+                    // send the buy-click + skip-click.  Sending these AFTER
+                    // confirmation avoids clicking non-interactive items like
+                    // feather (loading placeholder) which is an "impossible
+                    // action" that can trigger Hypixel anti-cheat.
+                    info!("[AH] gold_nugget confirmed — sending buy + skip");
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
+                    // Skip-click: pre-click slot 11 on predicted Confirm Purchase window.
+                    {
+                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                        if state.fastbuy {
+                            info!("[AH] Fastbuy skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
+                        } else {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (after 50ms)", next_wid);
+                        }
+                        state.skip_click_sent.store(true, Ordering::Relaxed);
+                        use azalea_protocol::packets::game::s_container_click::{
+                            ServerboundContainerClick as SkipClick,
+                            HashedStack as SkipHashed,
+                        };
+                        bot.write_packet(SkipClick {
+                            container_id: next_wid as i32,
+                            state_id: 0,
+                            slot_num: 11,
+                            button_num: 0,
+                            click_type: ClickType::Pickup,
+                            changed_slots: Default::default(),
+                            carried_item: SkipHashed(None),
+                        });
+                    }
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
-                    // Slot 31 is a non-buyable item (potato = already bought,
-                    // poisonous_potato = can't afford, stained_glass_pane = edge
-                    // case, or "You didn't participate" / "auction not found").
-                    // Abort immediately instead of waiting for the 5s watchdog.
+                    // Slot 31 is a non-purchasable item placed by the server:
+                    // feather = auction not available / cannot be purchased,
+                    // potato = already bought by someone else,
+                    // poisonous_potato = can't afford,
+                    // stained_glass_pane = edge case.
+                    // No clicks were sent (we waited for confirmation first),
+                    // so just close the window cleanly.
                     // Use write lock for atomic check-and-set to prevent a
                     // double-close race with the terminal-failure chat handler.
                     let should_close = {
@@ -2558,7 +2552,6 @@ async fn handle_window_interaction(
                     };
                     if should_close {
                         warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
-                        state.skip_click_sent.store(false, Ordering::Relaxed);
                         *state.purchase_start_time.write() = None;
                         *state.pending_purchase_at_ms.write() = None;
                         bot.write_packet(ServerboundContainerClose {
