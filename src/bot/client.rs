@@ -308,6 +308,7 @@ impl BotClient {
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
+            slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             freemoney: self.freemoney,
@@ -728,6 +729,9 @@ pub struct BotClientState {
     /// Set when a skip-click (pre-click on predicted Confirm Purchase window) is sent.
     /// The Confirm Purchase handler checks this to avoid sending a duplicate reactive click.
     pub skip_click_sent: Arc<AtomicBool>,
+    /// Notified when ContainerSetSlot / ContainerSetContent arrives so the purchase
+    /// handler can react instantly instead of polling every 10ms.
+    pub slot_data_notify: Arc<tokio::sync::Notify>,
     /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
@@ -826,6 +830,7 @@ impl Default for BotClientState {
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
+            slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
@@ -1546,22 +1551,35 @@ async fn event_handler(
             {
                 // Abort immediately on terminal purchase failure messages so we don't keep a
                 // stale purchasing window open for 5s and overlap the next queued command.
-                let window_id = *state.last_window_id.read();
-                warn!(
-                    "[AH] Terminal purchase failure detected: \"{}\" — closing window {}",
-                    clean_message, window_id
-                );
-                if window_id > 0 {
-                    bot.write_packet(ServerboundContainerClose {
-                        container_id: window_id as i32,
-                    });
+                // Use write lock for atomic check-and-set to prevent a double-close race
+                // with the slot-31 non-buyable handler (both can fire concurrently when
+                // e.g. a potato + "You didn't participate" arrive at the same time).
+                let should_close = {
+                    let mut bs = state.bot_state.write();
+                    if *bs == BotState::Purchasing {
+                        *bs = BotState::Idle;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_close {
+                    let window_id = *state.last_window_id.read();
+                    warn!(
+                        "[AH] Terminal purchase failure detected: \"{}\" — closing window {}",
+                        clean_message, window_id
+                    );
+                    if window_id > 0 {
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                    }
+                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                    state.skip_click_sent.store(false, Ordering::Relaxed);
+                    *state.purchase_start_time.write() = None;
+                    *state.pending_purchase_at_ms.write() = None;
+                    state.bed_timing_active.store(false, Ordering::Relaxed);
                 }
-                *state.bot_state.write() = BotState::Idle;
-                state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                state.skip_click_sent.store(false, Ordering::Relaxed);
-                *state.purchase_start_time.write() = None;
-                *state.pending_purchase_at_ms.write() = None;
-                state.bed_timing_active.store(false, Ordering::Relaxed);
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
                 // Always claim sold auctions. The active_auction_listings filter was
@@ -1863,11 +1881,17 @@ async fn event_handler(
                     // This keeps the cache up-to-date for instant getInventory replies
                     // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
                     rebuild_cached_inventory_json(&bot, &state);
+                    // Wake the purchase handler instantly so it can react to slot 31
+                    // data without polling delay.
+                    state.slot_data_notify.notify_waiters();
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
                     // Rebuild the cached player-inventory JSON on full content updates.
                     rebuild_cached_inventory_json(&bot, &state);
+                    // Wake the purchase handler instantly so it can react to slot 31
+                    // data without polling delay.
+                    state.slot_data_notify.notify_waiters();
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
@@ -2301,9 +2325,10 @@ async fn handle_window_interaction(
                 // ---- Fastbuy path (OpenScreen trigger) ----
                 // When fastbuy is explicitly enabled in config, click slot 31
                 // IMMEDIATELY on OpenScreen — the server already knows the slot
-                // contents.  Also pre-click slot 11 on the predicted Confirm
-                // Purchase window so both packets arrive within the same server
-                // tick.
+                // contents.  The skip-click for slot 11 on the predicted Confirm
+                // Purchase window is deferred until the poll confirms gold_nugget
+                // to avoid sending a skip-click for non-buyable auctions (potato,
+                // poisonous_potato, etc.) which causes bans.
                 //
                 // ---- Default path (SetSlot trigger) ----
                 // Wait for ContainerSetContent / ContainerSetSlot to populate
@@ -2311,29 +2336,16 @@ async fn handle_window_interaction(
                 // grace period which can trigger a ban.
                 if state.fastbuy {
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-
-                    let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                    info!("[AH] Fastbuy: clicking slot 31 + skip-click slot 11 on predicted window {}", next_wid);
-                    state.skip_click_sent.store(true, Ordering::Relaxed);
-                    use azalea_protocol::packets::game::s_container_click::{
-                        ServerboundContainerClick,
-                        HashedStack,
-                    };
-                    let packet = ServerboundContainerClick {
-                        container_id: next_wid as i32,
-                        state_id: 0,
-                        slot_num: 11,
-                        button_num: 0,
-                        click_type: ClickType::Pickup,
-                        changed_slots: Default::default(),
-                        carried_item: HashedStack(None),
-                    };
-                    bot.write_packet(packet);
+                    // Send a second buy-click as redundancy against packet loss.
+                    // If the first packet is dropped, the skip-click later would
+                    // hit a window that never opened server-side, causing a ban.
+                    info!("[AH] Fastbuy: sending redundant buy-click (slot 31) to guard against packet loss");
+                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 }
 
-                // Poll for slot 31 contents (ContainerSetContent / SetSlot).
-                // Fastbuy: only needed for bed detection (buy-click already sent).
-                // Default: determines what action to take.
+                // Wait for ContainerSetContent / ContainerSetSlot to populate
+                // slot 31.  Uses a Notify that fires instantly when the packet
+                // arrives instead of polling every 10ms.
                 let slot_31_kind = {
                     let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
                     let mut kind;
@@ -2347,7 +2359,13 @@ async fn handle_window_interaction(
                         if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
                             break;
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        // Wait for the next SetSlot / ContainerSetContent packet
+                        // (or timeout after remaining deadline).
+                        let remaining = poll_deadline - tokio::time::Instant::now();
+                        tokio::select! {
+                            _ = state.slot_data_notify.notified() => {}
+                            _ = tokio::time::sleep(remaining) => {}
+                        }
                     }
                     kind
                 };
@@ -2474,25 +2492,59 @@ async fn handle_window_interaction(
                     if !state.fastbuy {
                         // Default (non-fastbuy): click slot 31 now that SetSlot
                         // has confirmed gold_nugget is present.
-                        info!("[AH] Slot 31 = gold_nugget — clicking buy button (SetSlot trigger)");
                         click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                     }
-                    // For fastbuy: buy-click (and skip-click) were already sent
-                    // on OpenScreen — nothing more to do.
+
+                    // Skip-click: pre-click the confirm button (slot 11) on the
+                    // predicted next window immediately (no gap).  Both packets
+                    // arrive at the server within the same tick, giving consistent
+                    // ~100ms (2-tick) buy speeds.  Only sent after confirming
+                    // gold_nugget — beds and non-buyable items (potato, etc.) are
+                    // excluded to prevent bans from clicking a window that never
+                    // opens server-side.
+                    let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                    info!("[AH] Skip-click: pre-clicking slot 11 on predicted window {} (no gap)", next_wid);
+                    state.skip_click_sent.store(true, Ordering::Relaxed);
+                    use azalea_protocol::packets::game::s_container_click::{
+                        ServerboundContainerClick,
+                        HashedStack,
+                    };
+                    let packet = ServerboundContainerClick {
+                        container_id: next_wid as i32,
+                        state_id: 0,
+                        slot_num: 11,
+                        button_num: 0,
+                        click_type: ClickType::Pickup,
+                        changed_slots: Default::default(),
+                        carried_item: HashedStack(None),
+                    };
+                    bot.write_packet(packet);
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
                     // Slot 31 is a non-buyable item (potato = already bought,
                     // poisonous_potato = can't afford, stained_glass_pane = edge
                     // case, or "You didn't participate" / "auction not found").
                     // Abort immediately instead of waiting for the 5s watchdog.
-                    warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
-                    state.skip_click_sent.store(false, Ordering::Relaxed);
-                    *state.purchase_start_time.write() = None;
-                    *state.pending_purchase_at_ms.write() = None;
-                    bot.write_packet(ServerboundContainerClose {
-                        container_id: window_id as i32,
-                    });
-                    *state.bot_state.write() = BotState::Idle;
+                    // Use write lock for atomic check-and-set to prevent a
+                    // double-close race with the terminal-failure chat handler.
+                    let should_close = {
+                        let mut bs = state.bot_state.write();
+                        if *bs == BotState::Purchasing {
+                            *bs = BotState::Idle;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_close {
+                        warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
+                        state.skip_click_sent.store(false, Ordering::Relaxed);
+                        *state.purchase_start_time.write() = None;
+                        *state.pending_purchase_at_ms.write() = None;
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                    }
                 }
                 // air = slot 31 never populated within the poll deadline.
                 // The terminal-failure chat handler or 5s GUI watchdog will
