@@ -514,8 +514,7 @@ async fn main() -> Result<()> {
                     );
                     // Look up stored flip data and update with real buy price + purchase time.
                     // Also grab the color-coded item name from the flip for colorful output.
-                    // Buy speed comes from the event (BIN Auction View open → escrow message),
-                    // which is more accurate than the flip-receive-to-purchase tracker timing.
+                    // Buy speed comes from the event (flip received → escrow message).
                     let (opt_target, opt_profit, colored_name, opt_auction_uuid, opt_finder) = {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
@@ -871,6 +870,10 @@ async fn main() -> Result<()> {
                             tracker.insert(key, (flip.clone(), 0, now, now));
                         }
                     }
+
+                    // Record buy-speed start time at flip-receive so the measurement
+                    // covers the full path: flip received → coins in escrow.
+                    bot_client_for_ws.mark_purchase_start();
 
                     // Queue the flip command
                     command_queue_clone.enqueue(
