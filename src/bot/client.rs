@@ -2469,15 +2469,34 @@ async fn handle_window_interaction(
                             }
                         }
                     }
+                } else if slot_31_kind.contains("gold_nugget") {
+                    // ---- Buyable auction ----
+                    if !state.fastbuy {
+                        // Default (non-fastbuy): click slot 31 now that SetSlot
+                        // has confirmed gold_nugget is present.
+                        info!("[AH] Slot 31 = gold_nugget — clicking buy button (SetSlot trigger)");
+                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                    }
+                    // For fastbuy: buy-click (and skip-click) were already sent
+                    // on OpenScreen — nothing more to do.
+                } else if !slot_31_kind.contains("air") {
+                    // ---- Non-buyable auction ----
+                    // Slot 31 is a non-buyable item (potato = already bought,
+                    // poisonous_potato = can't afford, stained_glass_pane = edge
+                    // case, or "You didn't participate" / "auction not found").
+                    // Abort immediately instead of waiting for the 5s watchdog.
+                    warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
+                    state.skip_click_sent.store(false, Ordering::Relaxed);
+                    *state.purchase_start_time.write() = None;
+                    *state.pending_purchase_at_ms.write() = None;
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    *state.bot_state.write() = BotState::Idle;
                 }
-                // ---- Default (non-fastbuy): click slot 31 now that SetSlot
-                // has confirmed gold_nugget is present. ----
-                if !state.fastbuy && slot_31_kind.contains("gold_nugget") {
-                    info!("[AH] Slot 31 = gold_nugget — clicking buy button (SetSlot trigger)");
-                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                }
-                // For fastbuy non-bed auctions: buy-click (and skip-click)
-                // were already sent on OpenScreen — nothing more to do.
+                // air = slot 31 never populated within the poll deadline.
+                // The terminal-failure chat handler or 5s GUI watchdog will
+                // clean up.
             } else if window_title.contains("Confirm Purchase") {
                 // If a skip-click was already sent for this window, don't fire a
                 // redundant reactive click — the pre-click packet should already be
