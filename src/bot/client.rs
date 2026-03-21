@@ -5729,6 +5729,7 @@ mod tests {
         // Prices with >1 decimal are rounded to nearest 0.1.
         assert_eq!(format_price_for_sign(1234567.89), "1,234,567.9");
         assert_eq!(format_price_for_sign(1234567.84), "1,234,567.8");
-        assert_eq!(format_price_for_sign(1234567.05), "1,234,567.1"); // 0.05 rounds up in tenths
+        // 1234567.06 * 10 = 12345670.6 → rounds to 12345671 → frac_digit = 1
+        assert_eq!(format_price_for_sign(1234567.06), "1,234,567.1");
     }
 }

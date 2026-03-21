@@ -1821,7 +1821,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Periodic "My Auctions" check to claim sold/expired auctions that don't emit chat events.
     // --- Periodic chatBatch upload to Coflnet ---
     // Sends accumulated Hypixel chat messages as a JSON array so Coflnet's
     // ChatBatchCommand can process purchases, collections, and other events.
@@ -1851,6 +1850,7 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Periodic "My Auctions" check to claim sold/expired auctions that don't emit chat events.
     if config.enable_ah_flips {
         let bot_client_ah_claim = bot_client.clone();
         let command_queue_ah_claim = command_queue.clone();
