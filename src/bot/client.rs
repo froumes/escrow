@@ -47,6 +47,10 @@ const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
+/// Delay before retrying the auction flow after closing a window to remove a
+/// stuck item from the auction slot.  500 ms gives Hypixel time to process the
+/// container-close packet and return the item to inventory.
+const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 500;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -1698,7 +1702,7 @@ async fn event_handler(
                     let bot_clone = bot.clone();
                     let state_clone = state.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(AUCTION_RETRY_AFTER_STUCK_ITEM_MS)).await;
                         // Only retry if still in Selling state (not interrupted by another command)
                         if *state_clone.bot_state.read() == BotState::Selling {
                             info!("[Auction] Retrying auction after removing stuck item — sending /ah");
@@ -1715,8 +1719,11 @@ async fn event_handler(
                 let bid  = *state.auction_starting_bid.read();
                 let dur  = *state.auction_duration_hours.read();
 
-                // Safety check: verify the listed item matches what we intended.
-                // Extract the actual item name from "BIN Auction started for <item>!"
+                // Diagnostic safety check: verify the listed item roughly matches what
+                // we intended.  Hypixel includes reforge/star prefixes (e.g. "Withered
+                // Valkyrie ✪✪✪✪✪➌") that may not appear in our item_name, so we do a
+                // best-effort bidirectional substring comparison.  This is purely a log
+                // diagnostic — the auction is already created at this point.
                 if let Some(actual_item) = clean_message
                     .split("BIN Auction started for ")
                     .nth(1)
