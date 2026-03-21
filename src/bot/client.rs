@@ -2565,23 +2565,31 @@ async fn handle_window_interaction(
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction ----
                     // Now that we know slot 31 is gold_nugget (the buy button),
-                    // send the buy-click + skip-click.  Sending these AFTER
-                    // confirmation avoids clicking non-interactive items like
-                    // feather (loading placeholder) which is an "impossible
-                    // action" that can trigger Hypixel anti-cheat.
-                    info!("[AH] gold_nugget confirmed — sending buy + skip");
-                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                    // send the buy-click.  Sending AFTER confirmation avoids
+                    // clicking non-interactive items like feather (loading
+                    // placeholder) which is an "impossible action" that can
+                    // trigger Hypixel anti-cheat.
+                    if state.fastbuy {
+                        info!("[AH] gold_nugget confirmed — sending buy + skip (fastbuy)");
+                    } else {
+                        info!("[AH] gold_nugget confirmed — sending buy click");
+                    }
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
 
-                    // Skip-click: pre-click slot 11 on predicted Confirm Purchase window.
-                    {
+                    // Skip-click: only when fastbuy is explicitly enabled,
+                    // pre-click slot 11 on the predicted Confirm Purchase
+                    // window in the same TCP burst as the buy-click.
+                    // When fastbuy is off the Confirm Purchase handler will
+                    // click confirm reactively when the window opens.
+                    if state.fastbuy {
+                        // Redundant second buy click to guard against packet
+                        // loss — only needed when we also send the skip-click,
+                        // because a lost buy-click + queued confirm-click on a
+                        // window that never opens is an impossible action.
+                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
                         let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        if state.fastbuy {
-                            info!("[AH] Fastbuy skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
-                        } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (after 50ms)", next_wid);
-                        }
+                        info!("[AH] Fastbuy: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
                         state.skip_click_sent.store(true, Ordering::Relaxed);
                         use azalea_protocol::packets::game::s_container_click::{
                             ServerboundContainerClick as SkipClick,
