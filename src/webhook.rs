@@ -354,12 +354,32 @@ pub async fn send_webhook_bazaar_order_collected(
     is_buy_order: bool,
     amount: Option<u64>,
     price_per_unit: Option<f64>,
+    profit: Option<i64>,
     purse: Option<u64>,
     webhook_url: &str,
 ) {
     let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
-    let order_emoji = "✅";
-    let color: u32 = if is_buy_order { 0x66FF66 } else { 0xFFCC00 };
+    let color: u32 = if is_buy_order {
+        0x66FF66
+    } else {
+        match profit {
+            Some(p) if p < 0 => 0xFF4444,
+            _ => 0xFFCC00,
+        }
+    };
+    let order_emoji = match profit {
+        Some(p) if p < 0 => "❌",
+        _ => "✅",
+    };
+    let title_suffix = if !is_buy_order {
+        match profit {
+            Some(p) if p >= 0 => " (Profit)",
+            Some(_) => " (Loss)",
+            None => "",
+        }
+    } else {
+        ""
+    };
     let safe_item = sanitize_item_name(item_name);
 
     let mut fields = vec![
@@ -375,10 +395,19 @@ pub async fn send_webhook_bazaar_order_collected(
             fields.push(serde_json::json!({"name": "💰 Total", "value": format!("```fix\n{} coins\n```", format_number(total)), "inline": true}));
         }
     }
+    if let Some(p) = profit {
+        let sign = if p >= 0 { "+" } else { "-" };
+        let abs_profit = if p >= 0 { p as f64 } else { (-p) as f64 };
+        fields.push(serde_json::json!({
+            "name": if p >= 0 { "💰 Profit" } else { "💸 Loss" },
+            "value": format!("```diff\n{}{} coins\n```", sign, format_number(abs_profit)),
+            "inline": true
+        }));
+    }
 
     let payload = serde_json::json!({
         "embeds": [{
-            "title": format!("{} Bazaar {} Collected", order_emoji, order_type),
+            "title": format!("{} Bazaar {} Collected{}", order_emoji, order_type, title_suffix),
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": color,
             "fields": fields,
