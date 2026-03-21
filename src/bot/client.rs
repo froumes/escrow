@@ -54,6 +54,10 @@ const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// stuck item from the auction slot.  500 ms gives Hypixel time to process the
 /// container-close packet and return the item to inventory.
 const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 500;
+/// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
+/// Individual slot updates are coalesced within this window to avoid excessive CPU
+/// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
+const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -2074,15 +2078,15 @@ async fn event_handler(
                     rebuild_cached_inventory_json(&bot, &state);
                     // Debounce the window-JSON rebuild: individual slot updates can fire
                     // dozens of times per GUI interaction.  Coalesce them into a single
-                    // rebuild 100 ms after the last update to avoid excessive CPU from
+                    // rebuild after the debounce window to avoid excessive CPU from
                     // repeated NBT extraction + JSON serialisation.
                     if !state.window_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
                         let bot_clone = bot.clone();
                         let state_clone = state.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            state_clone.window_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CACHE_REBUILD_DEBOUNCE_MS)).await;
                             rebuild_cached_window_json(&bot_clone, &state_clone);
+                            state_clone.window_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
                         });
                     }
                 }
