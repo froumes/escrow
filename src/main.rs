@@ -68,6 +68,37 @@ fn is_ban_disconnect(reason: &str) -> bool {
         || lower.contains("ban id:")
 }
 
+/// Parse a Coflnet `/cofl profit` response and return the total profit in coins.
+///
+/// Expected format (color-stripped):
+/// `"According to our data <ign> made <amount> in the last <days> days across <N> auctions"`
+///
+/// `<amount>` may be a short notation like `82.7M`, `1.5B`, `250K`, or a plain number.
+fn parse_cofl_profit_response(clean_msg: &str) -> Option<i64> {
+    let rest = clean_msg.strip_prefix("According to our data ")?;
+    let made_idx = rest.find(" made ")?;
+    let after_made = &rest[made_idx + 6..];
+    let end = after_made.find(" in the last ")?;
+    let amount_str = after_made[..end].trim();
+    parse_short_number(amount_str)
+}
+
+/// Parse a human-readable short number like `82.7M`, `1.5B`, `250K`, or `500`.
+fn parse_short_number(s: &str) -> Option<i64> {
+    let s = s.replace(',', "");
+    let (num_part, multiplier) = if let Some(n) = s.strip_suffix('B').or_else(|| s.strip_suffix('b')) {
+        (n, 1_000_000_000f64)
+    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        (n, 1_000_000f64)
+    } else if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+        (n, 1_000f64)
+    } else {
+        (s.as_str(), 1f64)
+    };
+    let val: f64 = num_part.parse().ok()?;
+    Some((val * multiplier) as i64)
+}
+
 fn should_enqueue_periodic_auction_claim(
     bot_state: frikadellen_baf::types::BotState,
     queue_empty: bool,
@@ -414,6 +445,7 @@ async fn main() -> Result<()> {
     let enable_bazaar_flips_events = enable_bazaar_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
+    let session_start = std::time::Instant::now();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -428,6 +460,14 @@ async fn main() -> Result<()> {
                     print_mc_chat(&msg);
                     // Broadcast to web panel clients
                     let _ = chat_tx_events.send(msg.clone());
+
+                    // Parse Coflnet profit response:
+                    // "According to our data <ign> made <amount> in the last <days> days across <N> auctions"
+                    let clean = frikadellen_baf::utils::remove_minecraft_colors(&msg);
+                    if let Some(profit) = parse_cofl_profit_response(&clean) {
+                        profit_tracker_events.set_ah_total(profit);
+                        tracing::info!("[CoflProfit] Updated AH total from Coflnet: {} coins", profit);
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
                     debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
@@ -673,6 +713,25 @@ async fn main() -> Result<()> {
                                 &name, &item, price, &b, opt_profit, opt_buy_price,
                                 opt_time_secs, purse, uuid_str.as_deref(), &url,
                             ).await;
+                        });
+                    }
+                    // Query Coflnet for authoritative session profit after each sale.
+                    // `/cofl profit <ign> <days>` returns the total AH profit over
+                    // the session window so the tracker stays in sync with Coflnet.
+                    {
+                        let days = session_start.elapsed().as_secs_f64() / 86400.0;
+                        let ign = ingame_name_for_events.clone();
+                        let args = format!("{} {:.4}", ign, days);
+                        let data_json = serde_json::json!(args).to_string();
+                        let message = serde_json::json!({
+                            "type": "profit",
+                            "data": data_json
+                        }).to_string();
+                        let ws = ws_client_for_events.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = ws.send_message(&message).await {
+                                tracing::warn!("[CoflProfit] Failed to send /cofl profit: {}", e);
+                            }
                         });
                     }
                 }
@@ -2066,7 +2125,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_short_number, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
     use frikadellen_baf::types::{BotState, CommandType};
 
     #[test]
@@ -2132,5 +2191,44 @@ mod tests {
             &CommandType::ManageOrders { cancel_open: true },
             paused,
         ));
+    }
+
+    #[test]
+    fn parse_cofl_profit_response_82m() {
+        let msg = "According to our data TestUser made 82.7M in the last 0.05 days across 6 auctions";
+        assert_eq!(parse_cofl_profit_response(msg), Some(82_700_000));
+    }
+
+    #[test]
+    fn parse_cofl_profit_response_1b() {
+        let msg = "According to our data Player123 made 1.5B in the last 2.3 days across 142 auctions";
+        assert_eq!(parse_cofl_profit_response(msg), Some(1_500_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_profit_response_plain() {
+        let msg = "According to our data SomeIGN made 500 in the last 0.01 days across 1 auctions";
+        assert_eq!(parse_cofl_profit_response(msg), Some(500));
+    }
+
+    #[test]
+    fn parse_cofl_profit_response_250k() {
+        let msg = "According to our data IGN made 250K in the last 0.1 days across 3 auctions";
+        assert_eq!(parse_cofl_profit_response(msg), Some(250_000));
+    }
+
+    #[test]
+    fn parse_cofl_profit_response_no_match() {
+        assert_eq!(parse_cofl_profit_response("Some random chat message"), None);
+    }
+
+    #[test]
+    fn parse_short_number_values() {
+        assert_eq!(parse_short_number("82.7M"), Some(82_700_000));
+        assert_eq!(parse_short_number("1.5B"), Some(1_500_000_000));
+        assert_eq!(parse_short_number("250K"), Some(250_000));
+        assert_eq!(parse_short_number("500"), Some(500));
+        assert_eq!(parse_short_number("1,500,000"), Some(1_500_000));
+        assert_eq!(parse_short_number("abc"), None);
     }
 }

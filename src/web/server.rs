@@ -185,8 +185,12 @@ async fn check_auth(
 
     let path = req.uri().path().to_string();
 
-    // Always allow the panel page, login endpoint, and public profit without auth
-    if path == "/" || path == "/api/login" || path == "/api/profit/public" {
+    // Always allow the panel page, login endpoint, public profit, and OG image without auth
+    if path == "/"
+        || path == "/api/login"
+        || path == "/api/profit/public"
+        || path == "/api/og-image.png"
+    {
         return next.run(req).await;
     }
 
@@ -243,6 +247,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/", get(index_page))
         .route("/api/login", axum::routing::post(login))
         .route("/api/profit/public", get(get_profit_public))
+        .route("/api/og-image.png", get(get_og_image))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -344,6 +349,11 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
         "<meta property=\"og:title\" content=\"{og_title}\">\n\
          <meta property=\"og:description\" content=\"{og_description}\">\n\
          <meta property=\"og:type\" content=\"website\">\n\
+         <meta property=\"og:image\" content=\"/api/og-image.png\">\n\
+         <meta property=\"og:image:width\" content=\"1200\">\n\
+         <meta property=\"og:image:height\" content=\"630\">\n\
+         <meta name=\"twitter:card\" content=\"summary_large_image\">\n\
+         <meta name=\"twitter:image\" content=\"/api/og-image.png\">\n\
          <meta name=\"theme-color\" content=\"#6c5ce7\">",
     );
 
@@ -1139,6 +1149,30 @@ async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfit
         ah_points: s.profit_tracker.ah_points(),
         bz_points: s.profit_tracker.bz_points(),
     })
+}
+
+/// Public OG image endpoint — no authentication required.
+/// Generates a 1200×630 PNG stats card for Discord / social media embeds.
+async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
+    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let total = ah_total + bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
+    let hours = uptime as f64 / 3600.0;
+    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+
+    let png = super::og_image::generate_og_image(total, per_hour, uptime);
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=30",
+            ),
+        ],
+        png,
+    )
 }
 
 async fn chat_ws_handler(
