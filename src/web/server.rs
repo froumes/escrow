@@ -252,6 +252,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
         .route("/api/inventory", get(get_inventory))
+        .route("/api/game-view", get(get_game_view))
         .route("/api/toggle_ah", axum::routing::post(toggle_ah))
         .route("/api/toggle_bazaar", axum::routing::post(toggle_bazaar))
         .route("/api/toggle_anonymize", axum::routing::post(toggle_anonymize))
@@ -469,6 +470,13 @@ async fn get_inventory(State(s): State<WebSharedState>) -> impl IntoResponse {
     match s.bot_client.get_cached_inventory_json() {
         Some(json) => (StatusCode::OK, json),
         None => (StatusCode::OK, r#"{"slots":[]}"#.to_string()),
+    }
+}
+
+async fn get_game_view(State(s): State<WebSharedState>) -> impl IntoResponse {
+    match s.bot_client.get_cached_window_json() {
+        Some(json) => (StatusCode::OK, json),
+        None => (StatusCode::OK, r#"{"open":false,"botState":"Unknown","windowId":null,"title":null,"slots":[]}"#.to_string()),
     }
 }
 
