@@ -794,14 +794,20 @@ async fn main() -> Result<()> {
                 frikadellen_baf::bot::BotEvent::BazaarOrderFilled => {
                     // A bazaar buy/sell order was filled — trigger a ManageOrders run
                     // immediately so the items are collected without waiting for the next
-                    // periodic check.  Only enqueue if bazaar flips are enabled.
+                    // periodic check.  Only enqueue if bazaar flips are enabled and no
+                    // ManageOrders is already queued/running (prevents duplicate processing
+                    // that causes double cancel/collect Hypixel chat messages).
                     if enable_bazaar_flips_events.load(Ordering::Relaxed) {
-                         info!("[BazaarOrders] Order filled — queuing ManageOrders");
-                        command_queue_clone.enqueue(
-                            frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
-                            frikadellen_baf::types::CommandPriority::High,
-                            true,
-                        );
+                        if command_queue_clone.has_manage_orders() {
+                            info!("[BazaarOrders] Order filled — ManageOrders already queued/running, skipping duplicate");
+                        } else {
+                            info!("[BazaarOrders] Order filled — queuing ManageOrders");
+                            command_queue_clone.enqueue(
+                                frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
+                                frikadellen_baf::types::CommandPriority::High,
+                                true,
+                            );
+                        }
                     }
                 }
             }
@@ -1747,7 +1753,7 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(120)).await;
             loop {
                 sleep(Duration::from_secs(order_interval)).await;
-                if bot_client_orders.state().allows_commands() {
+                if bot_client_orders.state().allows_commands() && !command_queue_orders.has_manage_orders() {
                     debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
                     command_queue_orders.enqueue(
                         CommandType::ManageOrders { cancel_open: false },

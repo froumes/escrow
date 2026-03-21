@@ -159,6 +159,18 @@ impl CommandQueue {
         self.queue.read().len()
     }
 
+    /// Returns true if a ManageOrders command is already queued or currently
+    /// executing.  Used to avoid duplicate ManageOrders runs that produce
+    /// duplicate Hypixel chat messages and wasted GUI interactions.
+    pub fn has_manage_orders(&self) -> bool {
+        if let Some(ref cur) = *self.current_command.read() {
+            if matches!(cur.command_type, CommandType::ManageOrders { .. }) {
+                return true;
+            }
+        }
+        self.queue.read().iter().any(|c| matches!(c.command_type, CommandType::ManageOrders { .. }))
+    }
+
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
         self.queue.read().is_empty() && self.current_command.read().is_none()
@@ -248,5 +260,36 @@ mod tests {
         q.interrupt_current();
         // After interruption, there is no current command
         assert!(q.is_empty());
+    }
+
+    fn dummy_manage_orders() -> CommandType {
+        CommandType::ManageOrders { cancel_open: false }
+    }
+
+    #[test]
+    fn has_manage_orders_detects_queued() {
+        let q = CommandQueue::new();
+        assert!(!q.has_manage_orders());
+
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        assert!(!q.has_manage_orders());
+
+        q.enqueue(dummy_manage_orders(), CommandPriority::Normal, false);
+        assert!(q.has_manage_orders());
+    }
+
+    #[test]
+    fn has_manage_orders_detects_running() {
+        let q = CommandQueue::new();
+        q.enqueue(dummy_manage_orders(), CommandPriority::High, false);
+        assert!(q.has_manage_orders());
+
+        // Start executing it — should still be detected as current
+        let _ = q.start_current();
+        assert!(q.has_manage_orders());
+
+        // Complete it — should no longer be detected
+        q.complete_current();
+        assert!(!q.has_manage_orders());
     }
 }
