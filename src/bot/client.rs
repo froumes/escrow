@@ -135,7 +135,7 @@ pub struct BotClient {
     pub bazaar_order_cancel_minutes_per_million: u64,
     /// Updated whenever the bot opens the Manage/My Auctions GUI.
     cached_my_auctions_json: Arc<RwLock<Option<String>>>,
-    /// Time when the flip was received from COFL — start of buy-speed measurement.
+    /// Time when /viewauction was sent — start of buy-speed measurement.
     /// Shared with `BotClientState` so the event handler can compute elapsed time
     /// when "Putting coins in escrow" arrives.
     purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
@@ -515,8 +515,8 @@ impl BotClient {
     }
 
     /// Record the current instant as the buy-speed start time.
-    /// Called from the main loop when an auction flip is received from COFL,
-    /// so buy speed measures **flip-receive → coins-in-escrow**.
+    /// Called from execute_command right before /viewauction is sent,
+    /// so buy speed measures **command-send → coins-in-escrow**.
     pub fn mark_purchase_start(&self) {
         *self.purchase_start_time.write() = Some(std::time::Instant::now());
     }
@@ -725,10 +725,10 @@ pub struct BotClientState {
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
     pub bazaar_order_rejected: Arc<AtomicBool>,
-    /// Time when the flip was received from COFL — start of buy-speed measurement.
+    /// Time when /viewauction was sent — start of buy-speed measurement.
     /// Shared with `BotClient` so main.rs can set it when the flip arrives.
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
-    /// Buy speed in ms: from flip received to "Putting coins in escrow..."
+    /// Buy speed in ms: from /viewauction sent to "Putting coins in escrow..."
     pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
@@ -1556,7 +1556,7 @@ async fn event_handler(
                 }
             } else if clean_message.contains("Putting coins in escrow") {
                 // "Putting coins in escrow..." — purchase accepted by server.
-                // Calculate buy speed from when the flip was received from COFL.
+                // Calculate buy speed from when /viewauction was sent.
                 if let Some(start) = state.purchase_start_time.write().take() {
                     let speed_ms = start.elapsed().as_millis() as u64;
                     *state.last_buy_speed_ms.write() = Some(speed_ms);
@@ -2150,6 +2150,14 @@ async fn execute_command(
             let chat_command = format!("/viewauction {}", uuid);
 
             info!("Sending chat command: {}", chat_command);
+
+            // Record buy-speed start time right before sending /viewauction
+            // so the measurement covers command-send → coins-in-escrow (the
+            // relevant metric), NOT flip-receive → escrow which includes
+            // unrelated queue wait time.
+            // Safe: commands execute sequentially from the queue processor.
+            *state.purchase_start_time.write() = Some(std::time::Instant::now());
+
             bot.write_chat_packet(&chat_command);
 
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
@@ -2355,9 +2363,9 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
-                // purchase_start_time is already set when the flip was received
-                // from COFL (via BotClient::mark_purchase_start), so buy speed
-                // measures flip-receive → coins-in-escrow.
+                // purchase_start_time is set in execute_command when
+                // /viewauction is sent, so buy speed measures
+                // command-send → coins-in-escrow.
 
                 // ---- Wait for slot 31 before clicking ----
                 // Do NOT click slot 31 or send skip-click until we know what
@@ -2373,6 +2381,14 @@ async fn handle_window_interaction(
                     let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
                     let mut kind;
                     loop {
+                        // Register the Notify listener BEFORE reading slots.
+                        // notify_waiters() drops the notification when no task
+                        // is waiting, so if ContainerSetContent fires between
+                        // the slot read and the select! below, the notification
+                        // would be lost and we'd stall for the full 500ms
+                        // deadline.  Registering first guarantees we capture it.
+                        let notified = state.slot_data_notify.notified();
+
                         let menu = bot.menu();
                         let slots = menu.slots();
                         kind = slots.get(31).map(|s| {
@@ -2382,11 +2398,9 @@ async fn handle_window_interaction(
                         if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
                             break;
                         }
-                        // Wait for the next SetSlot / ContainerSetContent packet
-                        // (or timeout after remaining deadline).
                         let remaining = poll_deadline - tokio::time::Instant::now();
                         tokio::select! {
-                            _ = state.slot_data_notify.notified() => {}
+                            _ = notified => {}
                             _ = tokio::time::sleep(remaining) => {}
                         }
                     }
@@ -2582,15 +2596,28 @@ async fn handle_window_interaction(
                 // If a skip-click was already sent for this window, don't fire a
                 // redundant reactive click — the pre-click packet should already be
                 // queued on the server for the same tick.
-                if state.skip_click_sent.swap(false, Ordering::Relaxed) {
+                let skip_was_sent = state.skip_click_sent.swap(false, Ordering::Relaxed);
+                if skip_was_sent {
                     info!("[AH] Skip-click was sent — skipping reactive confirm click");
                 } else {
                     // No skip-click — click confirm (slot 11) immediately.
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 }
 
-                // Short wait for the server to process and close the window.
-                tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+                // When skip-click was sent, the server already has the confirm
+                // click queued from the same TCP burst as the buy-click.  Give
+                // it a generous window to process before sending redundant
+                // retries.  With low-latency connections (<5 ms ping) the
+                // server closes the window within 1-2 ticks (50-100 ms).
+                // 300 ms is intentionally conservative: it covers higher-
+                // latency connections and busy Hypixel lobby ticks while still
+                // retrying well before the 5-second GUI watchdog fires.
+                //
+                // Without skip-click the initial wait is shorter because the
+                // click was just sent above and we want to retry quickly if it
+                // was lost.
+                let initial_wait_ms = if skip_was_sent { 300u64 } else { CONFIRM_PURCHASE_RETRY_MS };
+                tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
                 // Safety retry loop: if the window is still open (pre-click failed,
                 // click was lost, or the server needs more time), keep retrying.
@@ -3492,6 +3519,9 @@ async fn handle_window_interaction(
                                 container_id: window_id as i32,
                             });
                             *state.manage_orders_deadline.write() = None;
+                            // Clear the order-limit flag since orders may have been
+                            // collected/cancelled, freeing slots for new flips.
+                            state.bazaar_at_limit.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
@@ -4826,6 +4856,8 @@ fn check_manage_orders_deadline(
                 container_id: window_id as i32,
             });
             *state.manage_orders_deadline.write() = None;
+            // Clear the order-limit flag so new flips aren't blocked after timeout.
+            state.bazaar_at_limit.store(false, Ordering::Relaxed);
             *state.bot_state.write() = BotState::Idle;
             return true;
         }

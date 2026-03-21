@@ -59,7 +59,8 @@ pub struct WebSharedState {
     pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
     /// Shared profit tracker for AH and Bazaar realized profits.
     pub profit_tracker: Arc<crate::profit::ProfitTracker>,
-    /// Whether to anonymize the username in profit webhooks — toggled at runtime.
+    /// Session-only anonymize toggle for the web panel (defaults to OFF).
+    /// Not persisted to config — resets to OFF on each process start.
     pub anonymize_webhook_name: Arc<AtomicBool>,
     /// Tracks active bazaar orders for the web panel and profit calculation.
     pub bazaar_tracker: Arc<BazaarOrderTracker>,

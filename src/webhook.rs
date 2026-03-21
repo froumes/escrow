@@ -352,6 +352,8 @@ pub async fn send_webhook_bazaar_order_collected(
     ingame_name: &str,
     item_name: &str,
     is_buy_order: bool,
+    amount: Option<u64>,
+    price_per_unit: Option<f64>,
     purse: Option<u64>,
     webhook_url: &str,
 ) {
@@ -359,14 +361,27 @@ pub async fn send_webhook_bazaar_order_collected(
     let order_emoji = "✅";
     let color: u32 = if is_buy_order { 0x66FF66 } else { 0xFFCC00 };
     let safe_item = sanitize_item_name(item_name);
+
+    let mut fields = vec![
+        serde_json::json!({"name": "📊 Order Type", "value": format!("```\n{}\n```", order_type), "inline": false}),
+    ];
+    if let Some(amt) = amount {
+        fields.push(serde_json::json!({"name": "📦 Amount", "value": format!("```fix\n{}x\n```", amt), "inline": true}));
+    }
+    if let Some(ppu) = price_per_unit {
+        fields.push(serde_json::json!({"name": "💵 Price/Unit", "value": format!("```fix\n{} coins\n```", format_number(ppu)), "inline": true}));
+        if let Some(amt) = amount {
+            let total = ppu * amt as f64;
+            fields.push(serde_json::json!({"name": "💰 Total", "value": format!("```fix\n{} coins\n```", format_number(total)), "inline": true}));
+        }
+    }
+
     let payload = serde_json::json!({
         "embeds": [{
             "title": format!("{} Bazaar {} Collected", order_emoji, order_type),
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": color,
-            "fields": [
-                {"name": "📊 Order Type", "value": format!("```\n{}\n```", order_type), "inline": false},
-            ],
+            "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
                 "text": format!("BAF • {}{}", ingame_name,
