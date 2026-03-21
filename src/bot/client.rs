@@ -1927,8 +1927,25 @@ async fn event_handler(
                         });
                     }
 
-                    // Handle window interactions based on current state and window title
-                    handle_window_interaction(&bot, &state, window_id as u8, &parsed_title).await;
+                    // Handle window interactions in a spawned task so this event
+                    // handler returns immediately.  This is critical for the
+                    // purchase flow: if ContainerSetContent arrives in a
+                    // separate packet frame, its handler must be able to fire
+                    // slot_data_notify.notify_waiters() without waiting for the
+                    // OpenScreen handler to finish.
+                    {
+                        let bot_s = bot.clone();
+                        let state_s = state.clone();
+                        let title_s = parsed_title.clone();
+                        tokio::spawn(async move {
+                            let result = std::panic::AssertUnwindSafe(
+                                handle_window_interaction(&bot_s, &state_s, window_id as u8, &title_s)
+                            );
+                            if let Err(e) = futures::FutureExt::catch_unwind(result).await {
+                                error!("[WindowHandler] panic in handle_window_interaction: {:?}", e);
+                            }
+                        });
+                    }
                 }
                 
                 ClientboundGamePacket::ContainerClose(_) => {
@@ -1944,21 +1961,23 @@ async fn event_handler(
                 }
                 
                 ClientboundGamePacket::ContainerSetSlot(_slot_update) => {
+                    // Wake the purchase handler FIRST so it can react to slot 31
+                    // data on another thread without waiting for the inventory
+                    // JSON rebuild.
+                    state.slot_data_notify.notify_waiters();
                     // Rebuild the cached player-inventory JSON whenever a slot changes.
                     // This keeps the cache up-to-date for instant getInventory replies
                     // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
                     rebuild_cached_inventory_json(&bot, &state);
-                    // Wake the purchase handler instantly so it can react to slot 31
-                    // data without polling delay.
-                    state.slot_data_notify.notify_waiters();
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
+                    // Wake the purchase handler FIRST so it can react to slot 31
+                    // data on another thread without waiting for the inventory
+                    // JSON rebuild.
+                    state.slot_data_notify.notify_waiters();
                     // Rebuild the cached player-inventory JSON on full content updates.
                     rebuild_cached_inventory_json(&bot, &state);
-                    // Wake the purchase handler instantly so it can react to slot 31
-                    // data without polling delay.
-                    state.slot_data_notify.notify_waiters();
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
@@ -2565,23 +2584,31 @@ async fn handle_window_interaction(
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction ----
                     // Now that we know slot 31 is gold_nugget (the buy button),
-                    // send the buy-click + skip-click.  Sending these AFTER
-                    // confirmation avoids clicking non-interactive items like
-                    // feather (loading placeholder) which is an "impossible
-                    // action" that can trigger Hypixel anti-cheat.
-                    info!("[AH] gold_nugget confirmed — sending buy + skip");
-                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                    // send the buy-click.  Sending AFTER confirmation avoids
+                    // clicking non-interactive items like feather (loading
+                    // placeholder) which is an "impossible action" that can
+                    // trigger Hypixel anti-cheat.
+                    if state.fastbuy {
+                        info!("[AH] gold_nugget confirmed — sending buy + skip (fastbuy)");
+                    } else {
+                        info!("[AH] gold_nugget confirmed — sending buy click");
+                    }
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
 
-                    // Skip-click: pre-click slot 11 on predicted Confirm Purchase window.
-                    {
+                    // Skip-click: only when fastbuy is explicitly enabled,
+                    // pre-click slot 11 on the predicted Confirm Purchase
+                    // window in the same TCP burst as the buy-click.
+                    // When fastbuy is off the Confirm Purchase handler will
+                    // click confirm reactively when the window opens.
+                    if state.fastbuy {
+                        // Redundant second buy click to guard against packet
+                        // loss — only needed when we also send the skip-click,
+                        // because a lost buy-click + queued confirm-click on a
+                        // window that never opens is an impossible action.
+                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+
                         let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        if state.fastbuy {
-                            info!("[AH] Fastbuy skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
-                        } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (after 50ms)", next_wid);
-                        }
+                        info!("[AH] Fastbuy: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
                         state.skip_click_sent.store(true, Ordering::Relaxed);
                         use azalea_protocol::packets::game::s_container_click::{
                             ServerboundContainerClick as SkipClick,

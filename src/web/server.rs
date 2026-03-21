@@ -125,6 +125,19 @@ struct ProfitResponse {
     uptime_seconds: u64,
 }
 
+/// Public (unauthenticated) profit summary — no IGN, no account info.
+/// Used by the login page and OpenGraph embeds.
+#[derive(Serialize)]
+struct PublicProfitResponse {
+    ah_total: i64,
+    bz_total: i64,
+    total: i64,
+    per_hour: f64,
+    uptime_seconds: u64,
+    ah_points: Vec<(u64, i64)>,
+    bz_points: Vec<(u64, i64)>,
+}
+
 #[derive(Serialize)]
 struct AuctionEntry {
     uuid: String,
@@ -172,8 +185,8 @@ async fn check_auth(
 
     let path = req.uri().path().to_string();
 
-    // Always allow the panel page and the login endpoint without auth
-    if path == "/" || path == "/api/login" {
+    // Always allow the panel page, login endpoint, and public profit without auth
+    if path == "/" || path == "/api/login" || path == "/api/profit/public" {
         return next.run(req).await;
     }
 
@@ -229,6 +242,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
     let app = Router::new()
         .route("/", get(index_page))
         .route("/api/login", axum::routing::post(login))
+        .route("/api/profit/public", get(get_profit_public))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -281,8 +295,62 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
 
 // ── Route handlers ───────────────────────────────────────────
 
-async fn index_page() -> Html<&'static str> {
-    Html(include_str!("panel.html"))
+/// Helper to format large numbers for OG tags (e.g. 1.5M, 250K)
+fn format_og_number(val: f64) -> String {
+    let abs = val.abs();
+    let formatted = if abs >= 1e9 {
+        format!("{:.1}B", val / 1e9)
+    } else if abs >= 1e6 {
+        format!("{:.1}M", val / 1e6)
+    } else if abs >= 1e3 {
+        format!("{:.1}K", val / 1e3)
+    } else {
+        format!("{:.0}", val)
+    };
+    formatted
+}
+
+/// Helper to format uptime for OG tags
+fn format_og_uptime(secs: u64) -> String {
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    if d > 0 {
+        format!("{}d {}h {}m", d, h, m)
+    } else if h > 0 {
+        format!("{}h {}m", h, m)
+    } else {
+        format!("{}m", m)
+    }
+}
+
+async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
+    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let total = ah_total + bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
+    let hours = uptime as f64 / 3600.0;
+    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+
+    let og_title = "Frikadellen BAF — Control Panel";
+    let og_description = format!(
+        "💰 Total Profit: {} coins | ⏱️ P/H: {} coins/h | 🕐 Uptime: {}",
+        format_og_number(total as f64),
+        format_og_number(per_hour),
+        format_og_uptime(uptime),
+    );
+
+    // Inject OG meta tags at the designated marker in the HTML template
+    let og_tags = format!(
+        "<meta property=\"og:title\" content=\"{og_title}\">\n\
+         <meta property=\"og:description\" content=\"{og_description}\">\n\
+         <meta property=\"og:type\" content=\"website\">\n\
+         <meta name=\"theme-color\" content=\"#6c5ce7\">",
+    );
+
+    let html = include_str!("panel.html")
+        .replacen("<!-- OG_META_TAGS -->", &og_tags, 1);
+
+    Html(html)
 }
 
 async fn login(
@@ -1050,6 +1118,26 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
         ah_total,
         bz_total,
         uptime_seconds: s.started_at.elapsed().as_secs(),
+    })
+}
+
+/// Public profit endpoint — no authentication required.
+/// Returns anonymized profit data (no IGN, no account info) for the
+/// login page display and OpenGraph embeds.
+async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfitResponse> {
+    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let total = ah_total + bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
+    let hours = uptime as f64 / 3600.0;
+    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+    Json(PublicProfitResponse {
+        ah_total,
+        bz_total,
+        total,
+        per_hour,
+        uptime_seconds: uptime,
+        ah_points: s.profit_tracker.ah_points(),
+        bz_points: s.profit_tracker.bz_points(),
     })
 }
 
