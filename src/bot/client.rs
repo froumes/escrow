@@ -54,6 +54,10 @@ const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// stuck item from the auction slot.  500 ms gives Hypixel time to process the
 /// container-close packet and return the item to inventory.
 const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 500;
+/// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
+/// Individual slot updates are coalesced within this window to avoid excessive CPU
+/// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
+const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -153,6 +157,9 @@ pub struct BotClient {
     pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
     /// Cached GUI window JSON for the web panel game view.
     cached_window_json: Arc<RwLock<Option<String>>>,
+    /// Set when inventory is full (stashed items / no space to claim).
+    /// Shared with `BotClientState` so `main.rs` can check before enqueuing ManageOrders.
+    inventory_full: Arc<AtomicBool>,
 }
 #[derive(Debug, Clone)]
 pub enum BotEvent {
@@ -248,6 +255,7 @@ impl BotClient {
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
+            inventory_full: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -338,7 +346,7 @@ impl BotClient {
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            inventory_full: Arc::new(AtomicBool::new(false)),
+            inventory_full: self.inventory_full.clone(),
             insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
             active_auction_listings: self.active_auction_listings.clone(),
@@ -354,6 +362,7 @@ impl BotClient {
             bazaar_flips_paused: self.bazaar_flips_paused.clone(),
             chat_batch_buffer: self.chat_batch_buffer.clone(),
             cached_window_json: self.cached_window_json.clone(),
+            window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -536,6 +545,12 @@ impl BotClient {
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
     pub fn is_bazaar_at_limit(&self) -> bool {
         self.bazaar_at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if inventory is full (items stashed / no space to claim).
+    /// Used by `main.rs` to skip ManageOrders when collection would fail.
+    pub fn is_inventory_full(&self) -> bool {
+        self.inventory_full.load(Ordering::Relaxed)
     }
 
     /// Drain the buffered chat messages for a chatBatch upload.
@@ -849,6 +864,10 @@ pub struct BotClientState {
     /// Updated on every OpenScreen / ContainerSetContent / ContainerClose event.
     /// The web panel polls this to show what the bot is currently "seeing".
     pub cached_window_json: Arc<RwLock<Option<String>>>,
+    /// Debounce flag for `rebuild_cached_window_json` on `ContainerSetSlot` events.
+    /// When true, a rebuild task is already scheduled; additional slot updates are
+    /// coalesced into that single rebuild to avoid 100 % CPU during rapid updates.
+    pub window_cache_rebuild_scheduled: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -918,6 +937,7 @@ impl Default for BotClientState {
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
+            window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -2056,7 +2076,19 @@ async fn event_handler(
                     // This keeps the cache up-to-date for instant getInventory replies
                     // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
                     rebuild_cached_inventory_json(&bot, &state);
-                    rebuild_cached_window_json(&bot, &state);
+                    // Debounce the window-JSON rebuild: individual slot updates can fire
+                    // dozens of times per GUI interaction.  Coalesce them into a single
+                    // rebuild after the debounce window to avoid excessive CPU from
+                    // repeated NBT extraction + JSON serialisation.
+                    if !state.window_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
+                        let bot_clone = bot.clone();
+                        let state_clone = state.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CACHE_REBUILD_DEBOUNCE_MS)).await;
+                            rebuild_cached_window_json(&bot_clone, &state_clone);
+                            state_clone.window_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                        });
+                    }
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {

@@ -888,7 +888,9 @@ async fn main() -> Result<()> {
                     // ManageOrders is already queued/running (prevents duplicate processing
                     // that causes double cancel/collect Hypixel chat messages).
                     if enable_bazaar_flips_events.load(Ordering::Relaxed) {
-                        if command_queue_clone.has_manage_orders() {
+                        if bot_client_clone.is_inventory_full() {
+                            debug!("[BazaarOrders] Order filled — inventory full, skipping ManageOrders to avoid packet spam");
+                        } else if command_queue_clone.has_manage_orders() {
                             info!("[BazaarOrders] Order filled — ManageOrders already queued/running, skipping duplicate");
                         } else {
                             info!("[BazaarOrders] Order filled — queuing ManageOrders");
@@ -1869,6 +1871,15 @@ async fn main() -> Result<()> {
                 if bazaar_flips_paused_orders.load(Ordering::Relaxed) {
                     debug!("[BazaarOrders] Skipping periodic order check — AH flips incoming");
                     continue;
+                }
+                // When inventory is full, ManageOrders can't collect buy orders
+                // and repeatedly opening/closing the bazaar GUI generates packet
+                // spam that risks a kick.  Extend the interval instead of
+                // skipping entirely so ManageOrders can still trigger InstaSelling
+                // to free space (and clear the inventory_full flag at start).
+                if bot_client_orders.is_inventory_full() {
+                    debug!("[BazaarOrders] Inventory full — waiting extra 90s before next order check");
+                    sleep(Duration::from_secs(90)).await;
                 }
                 if bot_client_orders.state().allows_commands() && !command_queue_orders.has_manage_orders() {
                     debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
