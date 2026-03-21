@@ -28,7 +28,8 @@ pub struct BazaarOrderTracker {
     orders: Arc<RwLock<Vec<TrackedBazaarOrder>>>,
     /// Stores (price_per_unit, amount) for the most recently collected buy order
     /// per item, so that profit can be computed when the corresponding sell offer
-    /// is collected.
+    /// is collected. If multiple buy orders for the same item are collected before
+    /// a sell, only the last buy cost is retained.
     last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
 }
 

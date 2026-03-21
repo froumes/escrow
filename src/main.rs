@@ -826,7 +826,7 @@ async fn main() -> Result<()> {
                         {
                             let sell_total = sell_order.price_per_unit * sell_order.amount as f64;
                             let buy_total = buy_ppu * buy_amt as f64;
-                            Some((sell_total - buy_total) as i64)
+                            Some((sell_total - buy_total).round() as i64)
                         } else {
                             None
                         }
