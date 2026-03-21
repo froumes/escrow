@@ -1927,8 +1927,25 @@ async fn event_handler(
                         });
                     }
 
-                    // Handle window interactions based on current state and window title
-                    handle_window_interaction(&bot, &state, window_id as u8, &parsed_title).await;
+                    // Handle window interactions in a spawned task so this event
+                    // handler returns immediately.  This is critical for the
+                    // purchase flow: if ContainerSetContent arrives in a
+                    // separate packet frame, its handler must be able to fire
+                    // slot_data_notify.notify_waiters() without waiting for the
+                    // OpenScreen handler to finish.
+                    {
+                        let bot_s = bot.clone();
+                        let state_s = state.clone();
+                        let title_s = parsed_title.clone();
+                        tokio::spawn(async move {
+                            let result = std::panic::AssertUnwindSafe(
+                                handle_window_interaction(&bot_s, &state_s, window_id as u8, &title_s)
+                            );
+                            if let Err(e) = futures::FutureExt::catch_unwind(result).await {
+                                error!("[WindowHandler] panic in handle_window_interaction: {:?}", e);
+                            }
+                        });
+                    }
                 }
                 
                 ClientboundGamePacket::ContainerClose(_) => {
@@ -1944,21 +1961,23 @@ async fn event_handler(
                 }
                 
                 ClientboundGamePacket::ContainerSetSlot(_slot_update) => {
+                    // Wake the purchase handler FIRST so it can react to slot 31
+                    // data on another thread without waiting for the inventory
+                    // JSON rebuild.
+                    state.slot_data_notify.notify_waiters();
                     // Rebuild the cached player-inventory JSON whenever a slot changes.
                     // This keeps the cache up-to-date for instant getInventory replies
                     // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
                     rebuild_cached_inventory_json(&bot, &state);
-                    // Wake the purchase handler instantly so it can react to slot 31
-                    // data without polling delay.
-                    state.slot_data_notify.notify_waiters();
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
+                    // Wake the purchase handler FIRST so it can react to slot 31
+                    // data on another thread without waiting for the inventory
+                    // JSON rebuild.
+                    state.slot_data_notify.notify_waiters();
                     // Rebuild the cached player-inventory JSON on full content updates.
                     rebuild_cached_inventory_json(&bot, &state);
-                    // Wake the purchase handler instantly so it can react to slot 31
-                    // data without polling delay.
-                    state.slot_data_notify.notify_waiters();
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
