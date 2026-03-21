@@ -2381,6 +2381,14 @@ async fn handle_window_interaction(
                     let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
                     let mut kind;
                     loop {
+                        // Register the Notify listener BEFORE reading slots.
+                        // notify_waiters() drops the notification when no task
+                        // is waiting, so if ContainerSetContent fires between
+                        // the slot read and the select! below, the notification
+                        // would be lost and we'd stall for the full 500ms
+                        // deadline.  Registering first guarantees we capture it.
+                        let notified = state.slot_data_notify.notified();
+
                         let menu = bot.menu();
                         let slots = menu.slots();
                         kind = slots.get(31).map(|s| {
@@ -2390,11 +2398,9 @@ async fn handle_window_interaction(
                         if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
                             break;
                         }
-                        // Wait for the next SetSlot / ContainerSetContent packet
-                        // (or timeout after remaining deadline).
                         let remaining = poll_deadline - tokio::time::Instant::now();
                         tokio::select! {
-                            _ = state.slot_data_notify.notified() => {}
+                            _ = notified => {}
                             _ = tokio::time::sleep(remaining) => {}
                         }
                     }
@@ -2590,15 +2596,28 @@ async fn handle_window_interaction(
                 // If a skip-click was already sent for this window, don't fire a
                 // redundant reactive click — the pre-click packet should already be
                 // queued on the server for the same tick.
-                if state.skip_click_sent.swap(false, Ordering::Relaxed) {
+                let skip_was_sent = state.skip_click_sent.swap(false, Ordering::Relaxed);
+                if skip_was_sent {
                     info!("[AH] Skip-click was sent — skipping reactive confirm click");
                 } else {
                     // No skip-click — click confirm (slot 11) immediately.
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 }
 
-                // Short wait for the server to process and close the window.
-                tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+                // When skip-click was sent, the server already has the confirm
+                // click queued from the same TCP burst as the buy-click.  Give
+                // it a generous window to process before sending redundant
+                // retries.  With low-latency connections (<5 ms ping) the
+                // server closes the window within 1-2 ticks (50-100 ms).
+                // 300 ms is intentionally conservative: it covers higher-
+                // latency connections and busy Hypixel lobby ticks while still
+                // retrying well before the 5-second GUI watchdog fires.
+                //
+                // Without skip-click the initial wait is shorter because the
+                // click was just sent above and we want to retry quickly if it
+                // was lost.
+                let initial_wait_ms = if skip_was_sent { 300u64 } else { CONFIRM_PURCHASE_RETRY_MS };
+                tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
                 // Safety retry loop: if the window is still open (pre-click failed,
                 // click was lost, or the server needs more time), keep retrying.
