@@ -718,21 +718,24 @@ async fn main() -> Result<()> {
                     // Query Coflnet for authoritative session profit after each sale.
                     // `/cofl profit <ign> <days>` returns the total AH profit over
                     // the session window so the tracker stays in sync with Coflnet.
+                    // Skip if session is too short for meaningful data (< ~15 min).
                     {
                         let days = session_start.elapsed().as_secs_f64() / 86400.0;
-                        let ign = ingame_name_for_events.clone();
-                        let args = format!("{} {:.4}", ign, days);
-                        let data_json = serde_json::json!(args).to_string();
-                        let message = serde_json::json!({
-                            "type": "profit",
-                            "data": data_json
-                        }).to_string();
-                        let ws = ws_client_for_events.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = ws.send_message(&message).await {
-                                tracing::warn!("[CoflProfit] Failed to send /cofl profit: {}", e);
-                            }
-                        });
+                        if days >= 0.01 {
+                            let ign = ingame_name_for_events.clone();
+                            let args = format!("{} {:.4}", ign, days);
+                            let data_json = serde_json::json!(args).to_string();
+                            let message = serde_json::json!({
+                                "type": "profit",
+                                "data": data_json
+                            }).to_string();
+                            let ws = ws_client_for_events.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = ws.send_message(&message).await {
+                                    tracing::warn!("[CoflProfit] Failed to send /cofl profit: {}", e);
+                                }
+                            });
+                        }
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {

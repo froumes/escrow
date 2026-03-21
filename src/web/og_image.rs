@@ -348,8 +348,10 @@ pub fn generate_og_image(total_profit: i64, per_hour: f64, uptime_secs: u64) -> 
 
     // ── Encode to PNG ────────────────────────────────────────
     let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, image::ImageFormat::Png)
-        .expect("PNG encoding should not fail");
+    if let Err(e) = img.write_to(&mut buf, image::ImageFormat::Png) {
+        tracing::error!("[OGImage] PNG encoding failed: {}", e);
+        return Vec::new();
+    }
     buf.into_inner()
 }
 
@@ -422,6 +424,7 @@ mod tests {
     #[ignore] // Only run manually to inspect the image
     fn save_og_image_to_disk() {
         let bytes = generate_og_image(1_500_000, 250_000.0, 7265);
-        std::fs::write("/tmp/og_image_test.png", &bytes).unwrap();
+        let path = std::env::temp_dir().join("og_image_test.png");
+        std::fs::write(&path, &bytes).unwrap();
     }
 }
