@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
     // Shared enable flags — web panel can toggle these at runtime.
     let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
     let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
-    let anonymize_webhook_name = Arc::new(AtomicBool::new(config.anonymize_webhook_name));
+    let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
 
     // Broadcast channel for chat messages → web panel clients.
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
@@ -738,7 +738,8 @@ async fn main() -> Result<()> {
                 frikadellen_baf::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order } => {
                     // Remove from tracker and record realized bazaar profit.
                     // BUY collected = money spent (negative), SELL collected = money earned (positive).
-                    if let Some(order) = bazaar_tracker_events.remove_order(&item_name, is_buy_order) {
+                    let order_data = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                    if let Some(ref order) = order_data {
                         let total = order.price_per_unit * order.amount as f64;
                         let profit = if is_buy_order { -(total as i64) } else { total as i64 };
                         profit_tracker_events.record_bz_profit(profit);
@@ -761,9 +762,14 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
+                        // Pass order details (amount, price, total) to webhook when available.
+                        let opt_amount = order_data.as_ref().map(|o| o.amount);
+                        let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_bazaar_order_collected(
-                                &name, &item, is_buy_order, purse, &url,
+                                &name, &item, is_buy_order,
+                                opt_amount, opt_ppu,
+                                purse, &url,
                             ).await;
                         });
                     }
@@ -877,11 +883,10 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Record buy-speed start time at flip-receive so the measurement
-                    // covers the full path: flip received → coins in escrow.
-                    bot_client_for_ws.mark_purchase_start();
-
                     // Queue the flip command
+                    // Buy-speed start time is now set in execute_command when
+                    // /viewauction is sent, so the measurement covers the
+                    // relevant path: command-send → coins-in-escrow.
                     command_queue_clone.enqueue(
                         CommandType::PurchaseAuction { flip },
                         CommandPriority::Critical,
@@ -1465,8 +1470,10 @@ async fn main() -> Result<()> {
                 let timeout_secs: u64 = match cmd.command_type {
                     frikadellen_baf::types::CommandType::ClaimPurchasedItem
                     | frikadellen_baf::types::CommandType::ClaimSoldItem
-                    | frikadellen_baf::types::CommandType::CheckCookie
-                    | frikadellen_baf::types::CommandType::ManageOrders { .. } => 60,
+                    | frikadellen_baf::types::CommandType::CheckCookie => 60,
+                    // ManageOrders has a 45s internal deadline; keep external
+                    // timeout just above that so the internal cleanup fires first.
+                    frikadellen_baf::types::CommandType::ManageOrders { .. } => 50,
                     frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                     | frikadellen_baf::types::CommandType::BazaarSellOrder { .. } => 20,
                     frikadellen_baf::types::CommandType::SellToAuction { .. } => 15,

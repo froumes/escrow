@@ -135,7 +135,7 @@ pub struct BotClient {
     pub bazaar_order_cancel_minutes_per_million: u64,
     /// Updated whenever the bot opens the Manage/My Auctions GUI.
     cached_my_auctions_json: Arc<RwLock<Option<String>>>,
-    /// Time when the flip was received from COFL — start of buy-speed measurement.
+    /// Time when /viewauction was sent — start of buy-speed measurement.
     /// Shared with `BotClientState` so the event handler can compute elapsed time
     /// when "Putting coins in escrow" arrives.
     purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
@@ -515,8 +515,8 @@ impl BotClient {
     }
 
     /// Record the current instant as the buy-speed start time.
-    /// Called from the main loop when an auction flip is received from COFL,
-    /// so buy speed measures **flip-receive → coins-in-escrow**.
+    /// Called from execute_command right before /viewauction is sent,
+    /// so buy speed measures **command-send → coins-in-escrow**.
     pub fn mark_purchase_start(&self) {
         *self.purchase_start_time.write() = Some(std::time::Instant::now());
     }
@@ -725,10 +725,10 @@ pub struct BotClientState {
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
     pub bazaar_order_rejected: Arc<AtomicBool>,
-    /// Time when the flip was received from COFL — start of buy-speed measurement.
+    /// Time when /viewauction was sent — start of buy-speed measurement.
     /// Shared with `BotClient` so main.rs can set it when the flip arrives.
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
-    /// Buy speed in ms: from flip received to "Putting coins in escrow..."
+    /// Buy speed in ms: from /viewauction sent to "Putting coins in escrow..."
     pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
@@ -1556,7 +1556,7 @@ async fn event_handler(
                 }
             } else if clean_message.contains("Putting coins in escrow") {
                 // "Putting coins in escrow..." — purchase accepted by server.
-                // Calculate buy speed from when the flip was received from COFL.
+                // Calculate buy speed from when /viewauction was sent.
                 if let Some(start) = state.purchase_start_time.write().take() {
                     let speed_ms = start.elapsed().as_millis() as u64;
                     *state.last_buy_speed_ms.write() = Some(speed_ms);
@@ -2150,6 +2150,13 @@ async fn execute_command(
             let chat_command = format!("/viewauction {}", uuid);
 
             info!("Sending chat command: {}", chat_command);
+
+            // Record buy-speed start time right before sending /viewauction
+            // so the measurement covers command-send → coins-in-escrow (the
+            // relevant metric), NOT flip-receive → escrow which includes
+            // unrelated queue wait time.
+            *state.purchase_start_time.write() = Some(std::time::Instant::now());
+
             bot.write_chat_packet(&chat_command);
 
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
@@ -2355,9 +2362,9 @@ async fn handle_window_interaction(
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
-                // purchase_start_time is already set when the flip was received
-                // from COFL (via BotClient::mark_purchase_start), so buy speed
-                // measures flip-receive → coins-in-escrow.
+                // purchase_start_time is set in execute_command when
+                // /viewauction is sent, so buy speed measures
+                // command-send → coins-in-escrow.
 
                 // ---- Wait for slot 31 before clicking ----
                 // Do NOT click slot 31 or send skip-click until we know what
@@ -3492,6 +3499,9 @@ async fn handle_window_interaction(
                                 container_id: window_id as i32,
                             });
                             *state.manage_orders_deadline.write() = None;
+                            // Clear the order-limit flag since orders may have been
+                            // collected/cancelled, freeing slots for new flips.
+                            state.bazaar_at_limit.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
                             break;
                         }
@@ -4826,6 +4836,8 @@ fn check_manage_orders_deadline(
                 container_id: window_id as i32,
             });
             *state.manage_orders_deadline.write() = None;
+            // Clear the order-limit flag so new flips aren't blocked after timeout.
+            state.bazaar_at_limit.store(false, Ordering::Relaxed);
             *state.bot_state.write() = BotState::Idle;
             return true;
         }

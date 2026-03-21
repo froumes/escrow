@@ -168,8 +168,10 @@ pub struct Config {
 
     /// Whether to anonymize the username in the web GUI panel and profit summary webhooks.
     /// When true, account names and avatars in the web panel are hidden, and the IGN is
-    /// replaced with random characters in webhooks.  Defaults to true.
-    #[serde(default = "default_true")]
+    /// replaced with random characters in webhooks.  Defaults to false.
+    /// **Deprecated**: This config value is ignored. Anonymization is now a session-only
+    /// toggle in the web panel that always defaults to OFF on page load.
+    #[serde(default)]
     pub anonymize_webhook_name: bool,
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -254,7 +256,7 @@ impl Default for Config {
             web_gui_password: None,
             hypixel_api_key: None,
             share_legendary_flips: true,
-            anonymize_webhook_name: true,
+            anonymize_webhook_name: false,
             sessions: HashMap::new(),
         }
     }
