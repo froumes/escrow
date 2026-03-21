@@ -686,7 +686,7 @@ async fn main() -> Result<()> {
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                    if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
@@ -761,7 +761,7 @@ async fn main() -> Result<()> {
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                    if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
@@ -789,7 +789,7 @@ async fn main() -> Result<()> {
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                    if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();

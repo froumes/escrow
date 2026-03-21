@@ -1138,13 +1138,16 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
     lore_lines
 }
 
-/// Find the first slot index matching the given name (case-insensitive)
-/// Format a f64 price with comma-separated thousands for sign input.
-/// e.g. 60000000.2 → "60,000,000.2", 8.0 → "8.0", 1234567.89 → "1,234,567.9"
+/// Format a f64 price with comma-separated thousands for bazaar sign input.
+/// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
+/// Whole numbers omit the decimal: 7500000.0 → "7,500,000" (not "7,500,000.0").
+/// Fractional prices keep one decimal: 60000000.2 → "60,000,000.2".
 fn format_price_for_sign(price: f64) -> String {
-    let rounded = (price * 10.0).round() / 10.0;
-    let int_part = rounded.floor() as i64;
-    let frac = (rounded - int_part as f64).abs();
+    // Work in tenths-of-a-coin as an integer to avoid floating-point precision
+    // issues when splitting integer and fractional parts of large prices.
+    let tenths = (price * 10.0).round() as i64;
+    let int_part = tenths / 10;
+    let frac_digit = (tenths % 10).unsigned_abs();
     let int_str = int_part.to_string();
     // Insert commas every 3 digits from the right
     let digits: Vec<char> = int_str.chars().collect();
@@ -1156,9 +1159,13 @@ fn format_price_for_sign(price: f64) -> String {
         }
         with_commas.push(c);
     }
-    // Always show one decimal place
-    let frac_digit = (frac * 10.0).round() as u32;
-    format!("{}.{}", with_commas, frac_digit)
+    // Omit ".0" for whole-number prices — avoids Hypixel rounding up due to
+    // floating-point imprecision in the decimal part.
+    if frac_digit == 0 {
+        with_commas
+    } else {
+        format!("{}.{}", with_commas, frac_digit)
+    }
 }
 
 /// Normalize a string for fuzzy item-name matching: lowercase, strip Minecraft
@@ -5695,5 +5702,33 @@ mod tests {
             make_named_item("Wheat"),
         ];
         assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), None);
+    }
+
+    #[test]
+    fn test_format_price_for_sign_whole_number() {
+        // Whole-number prices must NOT include a ".0" suffix.
+        assert_eq!(format_price_for_sign(7500000.0), "7,500,000");
+        assert_eq!(format_price_for_sign(100.0), "100");
+        assert_eq!(format_price_for_sign(8.0), "8");
+        assert_eq!(format_price_for_sign(1662.0), "1,662");
+        assert_eq!(format_price_for_sign(60000000.0), "60,000,000");
+        assert_eq!(format_price_for_sign(50000002.0), "50,000,002");
+    }
+
+    #[test]
+    fn test_format_price_for_sign_with_decimal() {
+        // Fractional prices keep one decimal digit.
+        assert_eq!(format_price_for_sign(60000000.2), "60,000,000.2");
+        assert_eq!(format_price_for_sign(1234567.9), "1,234,567.9");
+        assert_eq!(format_price_for_sign(100.5), "100.5");
+        assert_eq!(format_price_for_sign(50000000.1), "50,000,000.1");
+    }
+
+    #[test]
+    fn test_format_price_for_sign_rounds_to_one_decimal() {
+        // Prices with >1 decimal are rounded to nearest 0.1.
+        assert_eq!(format_price_for_sign(1234567.89), "1,234,567.9");
+        assert_eq!(format_price_for_sign(1234567.84), "1,234,567.8");
+        assert_eq!(format_price_for_sign(1234567.05), "1,234,567.1"); // 0.05 rounds up in tenths
     }
 }
