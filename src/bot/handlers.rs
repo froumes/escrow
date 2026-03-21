@@ -63,15 +63,16 @@ impl BotEventHandlers {
 
         // Log important Hypixel system messages at info level so they appear
         // in the terminal and log files, making bot behaviour easier to follow.
+        // Uses specific prefixes/patterns to avoid false positives on player chat.
         if clean.contains("[Bazaar]")
-            || clean.contains("Auction")
-            || clean.contains("You don't have")
-            || clean.contains("items stashed away")
-            || clean.contains("You cannot")
-            || clean.contains("Claiming")
-            || clean.contains("Cancelled!")
-            || clean.contains("You collected")
-            || clean.contains("BIN Auction started")
+            || clean.starts_with("You don't have")
+            || clean.contains("items stashed away!")
+            || clean.starts_with("You cannot")
+            || clean.starts_with("Cancelled!")
+            || clean.starts_with("You collected")
+            || clean.starts_with("BIN Auction started")
+            || clean.starts_with("Claiming")
+            || clean.starts_with("Your auction")
         {
             info!("[HypixelChat] {}", clean);
         } else if !is_cofl {
