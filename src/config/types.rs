@@ -147,6 +147,12 @@ pub struct Config {
     /// `Some(url)` = active webhook.
     pub webhook_url: Option<String>,
 
+    /// Separate Discord webhook URL for bazaar-specific notifications
+    /// (order placed, collected, cancelled). Leave empty to use the regular
+    /// `webhook_url` for all notifications.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub bazaar_webhook_url: Option<String>,
+
     /// Discord user ID for pinging on legendary/divine flips and bans.
     /// Leave empty to disable pings.
     #[serde(default, with = "opt_string_as_empty")]
@@ -252,6 +258,7 @@ impl Default for Config {
             proxy_address: None,
             proxy_credentials: None,
             webhook_url: None,
+            bazaar_webhook_url: None,
             discord_id: None,
             web_gui_password: None,
             hypixel_api_key: None,
@@ -274,6 +281,15 @@ impl Config {
     /// Returns the webhook URL only if it is non-empty.
     pub fn active_webhook_url(&self) -> Option<&str> {
         self.webhook_url.as_deref().filter(|u| !u.is_empty())
+    }
+
+    /// Returns the bazaar-specific webhook URL if set, otherwise falls back
+    /// to the regular `webhook_url`. Returns `None` if neither is configured.
+    pub fn active_bazaar_webhook_url(&self) -> Option<&str> {
+        self.bazaar_webhook_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .or_else(|| self.active_webhook_url())
     }
 
     /// Returns the Discord user ID only if it is non-empty.
@@ -477,6 +493,40 @@ proxy_credentials = "myuser:mypassword"
     fn parses_fastbuy_false() {
         let config: Config = toml::from_str("fastbuy = false").expect("config should parse");
         assert!(!config.fastbuy_enabled());
+    }
+
+    #[test]
+    fn bazaar_webhook_url_defaults_to_none() {
+        let config: Config = toml::from_str("").expect("config should parse");
+        assert_eq!(config.bazaar_webhook_url, None);
+        assert_eq!(config.active_bazaar_webhook_url(), None);
+    }
+
+    #[test]
+    fn bazaar_webhook_url_falls_back_to_regular() {
+        let config: Config = toml::from_str(r#"webhook_url = "https://discord.com/api/webhooks/main""#)
+            .expect("config should parse");
+        assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+    }
+
+    #[test]
+    fn bazaar_webhook_url_overrides_regular() {
+        let config: Config = toml::from_str(
+            r#"webhook_url = "https://discord.com/api/webhooks/main"
+bazaar_webhook_url = "https://discord.com/api/webhooks/bazaar""#
+        ).expect("config should parse");
+        assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/bazaar"));
+        // Regular webhook is unchanged
+        assert_eq!(config.active_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+    }
+
+    #[test]
+    fn bazaar_webhook_url_empty_string_falls_back() {
+        let config: Config = toml::from_str(
+            r#"webhook_url = "https://discord.com/api/webhooks/main"
+bazaar_webhook_url = """#
+        ).expect("config should parse");
+        assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/main"));
     }
 
 }

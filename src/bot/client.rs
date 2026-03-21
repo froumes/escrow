@@ -139,6 +139,11 @@ pub struct BotClient {
     /// Shared with `BotClientState` so the event handler can compute elapsed time
     /// when "Putting coins in escrow" arrives.
     purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Shared AH-pause flag so ManageOrders can self-abort when AH flips are incoming.
+    pub bazaar_flips_paused: Arc<AtomicBool>,
+    /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
+    /// Drained periodically and sent as `{"type":"chatBatch","data":"[...]"}`.
+    pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -233,6 +238,8 @@ impl BotClient {
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             purchase_start_time: Arc::new(RwLock::new(None)),
+            bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
+            chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -335,6 +342,8 @@ impl BotClient {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
+            bazaar_flips_paused: self.bazaar_flips_paused.clone(),
+            chat_batch_buffer: self.chat_batch_buffer.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -512,6 +521,13 @@ impl BotClient {
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
     pub fn is_bazaar_at_limit(&self) -> bool {
         self.bazaar_at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Drain the buffered chat messages for a chatBatch upload.
+    /// Returns the messages collected since the last drain (may be empty).
+    pub fn drain_chat_batch(&self) -> Vec<String> {
+        let mut buf = self.chat_batch_buffer.write();
+        std::mem::take(&mut *buf)
     }
 
     /// Record the current instant as the buy-speed start time.
@@ -805,6 +821,11 @@ pub struct BotClientState {
     /// ManageOrders command so that all window handlers (Branch A/B/C) can
     /// bail out early instead of waiting for the external 60-second timeout.
     pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
+    /// Shared AH-pause flag — when true, ManageOrders aborts early so AH
+    /// flips can proceed without interference.
+    pub bazaar_flips_paused: Arc<AtomicBool>,
+    /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
+    pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
 }
 
 impl Default for BotClientState {
@@ -870,6 +891,8 @@ impl Default for BotClientState {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
+            bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
+            chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -1115,13 +1138,16 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
     lore_lines
 }
 
-/// Find the first slot index matching the given name (case-insensitive)
-/// Format a f64 price with comma-separated thousands for sign input.
-/// e.g. 60000000.2 → "60,000,000.2", 8.0 → "8.0", 1234567.89 → "1,234,567.9"
+/// Format a f64 price with comma-separated thousands for bazaar sign input.
+/// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
+/// Whole numbers omit the decimal: 7500000.0 → "7,500,000" (not "7,500,000.0").
+/// Fractional prices keep one decimal: 60000000.2 → "60,000,000.2".
 fn format_price_for_sign(price: f64) -> String {
-    let rounded = (price * 10.0).round() / 10.0;
-    let int_part = rounded.floor() as i64;
-    let frac = (rounded - int_part as f64).abs();
+    // Work in tenths-of-a-coin as an integer to avoid floating-point precision
+    // issues when splitting integer and fractional parts of large prices.
+    let tenths = (price * 10.0).round() as i64;
+    let int_part = tenths / 10;
+    let frac_digit = (tenths % 10).unsigned_abs();
     let int_str = int_part.to_string();
     // Insert commas every 3 digits from the right
     let digits: Vec<char> = int_str.chars().collect();
@@ -1133,9 +1159,13 @@ fn format_price_for_sign(price: f64) -> String {
         }
         with_commas.push(c);
     }
-    // Always show one decimal place
-    let frac_digit = (frac * 10.0).round() as u32;
-    format!("{}.{}", with_commas, frac_digit)
+    // Omit ".0" for whole-number prices — avoids Hypixel rounding up due to
+    // floating-point imprecision in the decimal part.
+    if frac_digit == 0 {
+        with_commas
+    } else {
+        format!("{}.{}", with_commas, frac_digit)
+    }
 }
 
 /// Normalize a string for fuzzy item-name matching: lowercase, strip Minecraft
@@ -1544,6 +1574,13 @@ async fn event_handler(
                 debug!("Failed to send ChatMessage event - receiver dropped");
             }
 
+            // Buffer the message for periodic chatBatch upload to Coflnet.
+            // Uses clean text (color codes stripped) matching the Coflnet mod protocol.
+            let clean_for_batch = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
+            if !clean_for_batch.trim().is_empty() {
+                state.chat_batch_buffer.write().push(clean_for_batch);
+            }
+
             // Detect purchase/sold messages and emit events
             let clean_message = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
 
@@ -1874,7 +1911,7 @@ async fn event_handler(
                             let is_interactive = matches!(cur_state,
                                 BotState::Purchasing | BotState::Bazaar | BotState::Selling
                                 | BotState::ClaimingPurchased | BotState::ClaimingSold
-                                | BotState::ManagingOrders | BotState::InstaSelling
+                                | BotState::InstaSelling
                                 | BotState::CancellingAuction | BotState::SellingInventoryBz
                             );
                             // Only fire if no new command started since this window was opened.
@@ -4862,6 +4899,18 @@ fn check_manage_orders_deadline(
             return true;
         }
     }
+    // Also abort if AH flips are incoming — ManageOrders would block the
+    // AH purchase flow.  The order will be re-queued after the AH pause.
+    if state.bazaar_flips_paused.load(Ordering::Relaxed) {
+        info!("[ManageOrders] AH flips incoming — aborting ManageOrders to free queue");
+        bot.write_packet(ServerboundContainerClose {
+            container_id: window_id as i32,
+        });
+        *state.manage_orders_deadline.write() = None;
+        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+        *state.bot_state.write() = BotState::Idle;
+        return true;
+    }
     false
 }
 
@@ -5653,5 +5702,34 @@ mod tests {
             make_named_item("Wheat"),
         ];
         assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), None);
+    }
+
+    #[test]
+    fn test_format_price_for_sign_whole_number() {
+        // Whole-number prices must NOT include a ".0" suffix.
+        assert_eq!(format_price_for_sign(7500000.0), "7,500,000");
+        assert_eq!(format_price_for_sign(100.0), "100");
+        assert_eq!(format_price_for_sign(8.0), "8");
+        assert_eq!(format_price_for_sign(1662.0), "1,662");
+        assert_eq!(format_price_for_sign(60000000.0), "60,000,000");
+        assert_eq!(format_price_for_sign(50000002.0), "50,000,002");
+    }
+
+    #[test]
+    fn test_format_price_for_sign_with_decimal() {
+        // Fractional prices keep one decimal digit.
+        assert_eq!(format_price_for_sign(60000000.2), "60,000,000.2");
+        assert_eq!(format_price_for_sign(1234567.9), "1,234,567.9");
+        assert_eq!(format_price_for_sign(100.5), "100.5");
+        assert_eq!(format_price_for_sign(50000000.1), "50,000,000.1");
+    }
+
+    #[test]
+    fn test_format_price_for_sign_rounds_to_one_decimal() {
+        // Prices with >1 decimal are rounded to nearest 0.1.
+        assert_eq!(format_price_for_sign(1234567.89), "1,234,567.9");
+        assert_eq!(format_price_for_sign(1234567.84), "1,234,567.8");
+        // 1234567.06 * 10 = 12345670.6 → rounds to 12345671 → frac_digit = 1
+        assert_eq!(format_price_for_sign(1234567.06), "1,234,567.1");
     }
 }
