@@ -46,6 +46,9 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
+/// Brief delay after closing a stale window so Hypixel processes the
+/// container-close packet before the next command is sent.
+const WINDOW_CLOSE_DELAY_MS: u64 = 150;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
 /// stuck item from the auction slot.  500 ms gives Hypixel time to process the
@@ -1867,8 +1870,14 @@ async fn event_handler(
             if clean_message.contains("don't have anything to sell")
                 && *state.bot_state.read() == BotState::SellingInventoryBz
             {
-                info!("[SellInventoryBz] Nothing to sell — going idle");
+                info!("[SellInventoryBz] Nothing to sell — closing window and going idle");
                 *state.bazaar_step.write() = BazaarStep::Initial;
+                let wid = *state.last_window_id.read();
+                if wid > 0 {
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: wid as i32,
+                    });
+                }
                 *state.bot_state.write() = BotState::Idle;
             }
 
@@ -2256,6 +2265,20 @@ async fn execute_command(
 
     info!("Executing command: {:?}", command.command_type);
 
+    // Safety net: close any stale GUI window that is still open before executing
+    // a new command.  Sending chat commands (e.g. /pickupstash, /ah, /bz) while a
+    // window is open causes Hypixel to respond "You cannot pick these items up while
+    // in an inventory" or silently fail.  Closing the window first prevents the bot
+    // from being stuck "in an inventory".
+    if let Some(open_wid) = state.handlers.current_window_id() {
+        warn!("[SafeClose] Closing stale window {} before executing {:?}", open_wid, command.command_type);
+        bot.write_packet(ServerboundContainerClose {
+            container_id: open_wid as i32,
+        });
+        state.handlers.handle_window_close().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CLOSE_DELAY_MS)).await;
+    }
+
     match &command.command_type {
         CommandType::SendChat { message } => {
             // Send chat message to Minecraft
@@ -2609,6 +2632,9 @@ async fn handle_window_interaction(
                         if tokio::time::Instant::now() >= bed_deadline {
                             warn!("[AH] Bed timing: grace period did not end — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         }
@@ -2625,6 +2651,9 @@ async fn handle_window_interaction(
                         if current_kind == "air" || current_kind.contains("air") {
                             info!("[AH] Bed timing: window closed");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
@@ -2645,6 +2674,9 @@ async fn handle_window_interaction(
                             if failed_clicks >= MAX_FAILED_CLICKS {
                                 warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
                                 state.bed_timing_active.store(false, Ordering::Relaxed);
+                                bot.write_packet(ServerboundContainerClose {
+                                    container_id: window_id as i32,
+                                });
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -2763,6 +2795,9 @@ async fn handle_window_interaction(
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
                 }
 
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -2897,6 +2932,9 @@ async fn handle_window_interaction(
                     }
                     None => {
                         warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -2972,6 +3010,9 @@ async fn handle_window_interaction(
                     });
                     info!("[Bazaar] ===== ORDER COMPLETE =====");
                 }
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3396,6 +3437,9 @@ async fn handle_window_interaction(
                             let lore_text = lore.join(" ").to_lowercase();
                             if lore_text.contains("maximum") || lore_text.contains("limit") {
                                 warn!("[Auction] Maximum auction count reached, going idle");
+                                bot.write_packet(ServerboundContainerClose {
+                                    container_id: window_id as i32,
+                                });
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -3405,6 +3449,9 @@ async fn handle_window_interaction(
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                         } else {
                             warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     } else if window_title.contains("Create Auction") && !window_title.contains("BIN") {
@@ -3444,6 +3491,9 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -3487,6 +3537,9 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -3530,6 +3583,9 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -3591,6 +3647,9 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         info!("[Auction] ===== AUCTION CREATED =====");
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
