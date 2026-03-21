@@ -45,6 +45,15 @@ impl ProfitTracker {
         }
     }
 
+    /// Replace the AH total with an authoritative value (e.g. from Coflnet
+    /// `/cofl profit`) and record a new data-point so the chart updates.
+    pub fn set_ah_total(&self, total: i64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.ah_total = total;
+            inner.ah_points.push((now_unix(), total));
+        }
+    }
+
     /// Record a realized Bazaar profit (positive or negative).
     pub fn record_bz_profit(&self, profit: i64) {
         if let Ok(mut inner) = self.inner.lock() {
