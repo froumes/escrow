@@ -139,6 +139,8 @@ pub struct BotClient {
     /// Shared with `BotClientState` so the event handler can compute elapsed time
     /// when "Putting coins in escrow" arrives.
     purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Shared AH-pause flag so ManageOrders can self-abort when AH flips are incoming.
+    pub bazaar_flips_paused: Arc<AtomicBool>,
 }
 
 /// Events that can be emitted by the bot
@@ -233,6 +235,7 @@ impl BotClient {
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             purchase_start_time: Arc::new(RwLock::new(None)),
+            bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -335,6 +338,7 @@ impl BotClient {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
+            bazaar_flips_paused: self.bazaar_flips_paused.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -805,6 +809,9 @@ pub struct BotClientState {
     /// ManageOrders command so that all window handlers (Branch A/B/C) can
     /// bail out early instead of waiting for the external 60-second timeout.
     pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
+    /// Shared AH-pause flag — when true, ManageOrders aborts early so AH
+    /// flips can proceed without interference.
+    pub bazaar_flips_paused: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -870,6 +877,7 @@ impl Default for BotClientState {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
+            bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1874,7 +1882,7 @@ async fn event_handler(
                             let is_interactive = matches!(cur_state,
                                 BotState::Purchasing | BotState::Bazaar | BotState::Selling
                                 | BotState::ClaimingPurchased | BotState::ClaimingSold
-                                | BotState::ManagingOrders | BotState::InstaSelling
+                                | BotState::InstaSelling
                                 | BotState::CancellingAuction | BotState::SellingInventoryBz
                             );
                             // Only fire if no new command started since this window was opened.
