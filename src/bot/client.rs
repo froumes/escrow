@@ -2155,6 +2155,7 @@ async fn execute_command(
             // so the measurement covers command-send → coins-in-escrow (the
             // relevant metric), NOT flip-receive → escrow which includes
             // unrelated queue wait time.
+            // Safe: commands execute sequentially from the queue processor.
             *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
             bot.write_chat_packet(&chat_command);
