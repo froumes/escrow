@@ -46,6 +46,9 @@ const TRADE_RESPONSE_DELAY_MS: u64 = 3400;
 const STARTUP_ENTRY_TIMEOUT_SECS: u64 = 60;
 /// Interval for safety retry clicks in the Confirm Purchase window (milliseconds).
 const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
+/// Brief delay after closing a stale window so Hypixel processes the
+/// container-close packet before the next command is sent.
+const WINDOW_CLOSE_DELAY_MS: u64 = 150;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
 /// stuck item from the auction slot.  500 ms gives Hypixel time to process the
@@ -148,9 +151,9 @@ pub struct BotClient {
     /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
     /// Drained periodically and sent as `{"type":"chatBatch","data":"[...]"}`.
     pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
+    /// Cached GUI window JSON for the web panel game view.
+    cached_window_json: Arc<RwLock<Option<String>>>,
 }
-
-/// Events that can be emitted by the bot
 #[derive(Debug, Clone)]
 pub enum BotEvent {
     /// Bot logged in successfully
@@ -244,6 +247,7 @@ impl BotClient {
             purchase_start_time: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
+            cached_window_json: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -349,6 +353,7 @@ impl BotClient {
             manage_orders_deadline: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: self.bazaar_flips_paused.clone(),
             chat_batch_buffer: self.chat_batch_buffer.clone(),
+            cached_window_json: self.cached_window_json.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -514,6 +519,11 @@ impl BotClient {
     /// handler which calls `JSON.stringify(bot.inventory)` directly.
     pub fn get_cached_inventory_json(&self) -> Option<String> {
         self.cached_inventory_json.read().clone()
+    }
+
+    /// Get the cached GUI window JSON for the web panel "Game View" tab.
+    pub fn get_cached_window_json(&self) -> Option<String> {
+        self.cached_window_json.read().clone()
     }
 
     /// Return the last cached "My Auctions" JSON, extracted from the in-game
@@ -835,6 +845,10 @@ pub struct BotClientState {
     pub bazaar_flips_paused: Arc<AtomicBool>,
     /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
     pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
+    /// Cached JSON of the currently-open GUI window (title, bot state, slot data).
+    /// Updated on every OpenScreen / ContainerSetContent / ContainerClose event.
+    /// The web panel polls this to show what the bot is currently "seeing".
+    pub cached_window_json: Arc<RwLock<Option<String>>>,
 }
 
 impl Default for BotClientState {
@@ -903,6 +917,7 @@ impl Default for BotClientState {
             manage_orders_deadline: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
+            cached_window_json: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1867,8 +1882,14 @@ async fn event_handler(
             if clean_message.contains("don't have anything to sell")
                 && *state.bot_state.read() == BotState::SellingInventoryBz
             {
-                info!("[SellInventoryBz] Nothing to sell — going idle");
+                info!("[SellInventoryBz] Nothing to sell — closing window and going idle");
                 *state.bazaar_step.write() = BazaarStep::Initial;
+                let wid = *state.last_window_id.read();
+                if wid > 0 {
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: wid as i32,
+                    });
+                }
                 *state.bot_state.write() = BotState::Idle;
             }
 
@@ -1946,6 +1967,7 @@ async fn event_handler(
                     *state.last_window_id.write() = window_id as u8;
                     
                     state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
+                    rebuild_cached_window_json(&bot, &state);
                     if state.event_tx.send(BotEvent::WindowOpen(window_id as u8, window_type.clone(), parsed_title.clone())).is_err() {
                         debug!("Failed to send WindowOpen event - receiver dropped");
                     }
@@ -2019,6 +2041,7 @@ async fn event_handler(
                     *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
+                    rebuild_cached_window_json(&bot, &state);
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
                         debug!("Failed to send WindowClose event - receiver dropped");
                     }
@@ -2033,6 +2056,7 @@ async fn event_handler(
                     // This keeps the cache up-to-date for instant getInventory replies
                     // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
                     rebuild_cached_inventory_json(&bot, &state);
+                    rebuild_cached_window_json(&bot, &state);
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
@@ -2042,6 +2066,7 @@ async fn event_handler(
                     state.slot_data_notify.notify_waiters();
                     // Rebuild the cached player-inventory JSON on full content updates.
                     rebuild_cached_inventory_json(&bot, &state);
+                    rebuild_cached_window_json(&bot, &state);
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
@@ -2255,6 +2280,20 @@ async fn execute_command(
     state.command_generation.fetch_add(1, Ordering::SeqCst);
 
     info!("Executing command: {:?}", command.command_type);
+
+    // Safety net: close any stale GUI window that is still open before executing
+    // a new command.  Sending chat commands (e.g. /pickupstash, /ah, /bz) while a
+    // window is open causes Hypixel to respond "You cannot pick these items up while
+    // in an inventory" or silently fail.  Closing the window first prevents the bot
+    // from being stuck "in an inventory".
+    if let Some(open_wid) = state.handlers.current_window_id() {
+        warn!("[SafeClose] Closing stale window {} before executing {:?}", open_wid, command.command_type);
+        bot.write_packet(ServerboundContainerClose {
+            container_id: open_wid as i32,
+        });
+        state.handlers.handle_window_close().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CLOSE_DELAY_MS)).await;
+    }
 
     match &command.command_type {
         CommandType::SendChat { message } => {
@@ -2609,6 +2648,9 @@ async fn handle_window_interaction(
                         if tokio::time::Instant::now() >= bed_deadline {
                             warn!("[AH] Bed timing: grace period did not end — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         }
@@ -2625,6 +2667,9 @@ async fn handle_window_interaction(
                         if current_kind == "air" || current_kind.contains("air") {
                             info!("[AH] Bed timing: window closed");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
@@ -2645,6 +2690,9 @@ async fn handle_window_interaction(
                             if failed_clicks >= MAX_FAILED_CLICKS {
                                 warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
                                 state.bed_timing_active.store(false, Ordering::Relaxed);
+                                bot.write_packet(ServerboundContainerClose {
+                                    container_id: window_id as i32,
+                                });
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -2763,6 +2811,9 @@ async fn handle_window_interaction(
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
                 }
 
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -2897,6 +2948,9 @@ async fn handle_window_interaction(
                     }
                     None => {
                         warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -2972,6 +3026,9 @@ async fn handle_window_interaction(
                     });
                     info!("[Bazaar] ===== ORDER COMPLETE =====");
                 }
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3396,6 +3453,9 @@ async fn handle_window_interaction(
                             let lore_text = lore.join(" ").to_lowercase();
                             if lore_text.contains("maximum") || lore_text.contains("limit") {
                                 warn!("[Auction] Maximum auction count reached, going idle");
+                                bot.write_packet(ServerboundContainerClose {
+                                    container_id: window_id as i32,
+                                });
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -3405,6 +3465,9 @@ async fn handle_window_interaction(
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                         } else {
                             warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     } else if window_title.contains("Create Auction") && !window_title.contains("BIN") {
@@ -3444,6 +3507,9 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -3487,6 +3553,9 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -3530,6 +3599,9 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -3591,6 +3663,9 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         info!("[Auction] ===== AUCTION CREATED =====");
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -4631,6 +4706,115 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
 
     if let Ok(json_str) = serde_json::to_string(&inventory_json) {
         *state.cached_inventory_json.write() = Some(json_str);
+    }
+}
+
+/// Rebuild the cached GUI-window JSON so the web panel "Game View" tab always
+/// shows the current state.  Called on:
+///   - OpenScreen (new window opened)
+///   - ContainerSetContent (window contents fully replaced)
+///   - ContainerSetSlot (individual slot updated in current window)
+///   - ContainerClose (window closed → clear the cache)
+fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
+    let window_title = state.handlers.current_window_title();
+    let window_id_opt = state.handlers.current_window_id();
+    let bot_state = format!("{:?}", *state.bot_state.read());
+
+    // If no window is open, store a "no window" JSON
+    let (window_id, title) = match (window_id_opt, window_title) {
+        (Some(id), Some(t)) => (id, t),
+        _ => {
+            let json = serde_json::json!({
+                "open": false,
+                "botState": bot_state,
+                "windowId": null,
+                "title": null,
+                "slots": [],
+            });
+            if let Ok(s) = serde_json::to_string(&json) {
+                *state.cached_window_json.write() = Some(s);
+            }
+            return;
+        }
+    };
+
+    // Read ALL window slots (GUI slots + player inventory in the window)
+    let menu = bot.menu();
+    let all_slots = menu.slots();
+
+    let mut slots_json: Vec<serde_json::Value> = Vec::with_capacity(all_slots.len());
+    for (i, item) in all_slots.iter().enumerate() {
+        if item.is_empty() {
+            slots_json.push(serde_json::json!({
+                "slot": i,
+                "empty": true,
+            }));
+        } else {
+            let display_name = get_item_display_name_from_slot(item).unwrap_or_default();
+            let colored_name = get_item_display_name_with_colors_from_slot(item);
+            let item_name = item.kind().to_string();
+
+            // Extract SkyBlock tag for icon lookup
+            let nbt_data = if let Some(item_data) = item.as_present() {
+                extract_item_nbt_components(item_data)
+            } else {
+                serde_json::Value::Null
+            };
+
+            let tag = nbt_data.get("minecraft:custom_data")
+                .and_then(|cd| {
+                    cd.get("nbt")
+                        .and_then(|n| n.get("ExtraAttributes"))
+                        .and_then(|ea| ea.get("id"))
+                        .and_then(|id| id.as_str())
+                        .or_else(|| cd.get("ExtraAttributes").and_then(|ea| ea.get("id")).and_then(|id| id.as_str()))
+                        .or_else(|| cd.get("nbt").and_then(|n| n.get("id")).and_then(|id| id.as_str()))
+                        .or_else(|| cd.get("id").and_then(|id| id.as_str()))
+                })
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if let Some(item_data) = item.as_present() {
+                        extract_skyblock_tag_from_custom_data(item_data)
+                    } else {
+                        None
+                    }
+                })
+                .map(|t| resolve_pet_tag(&t, &nbt_data));
+
+            let lore_lines = get_item_lore_with_colors_from_slot(item);
+
+            let mut slot_obj = serde_json::json!({
+                "slot": i,
+                "empty": false,
+                "name": item_name,
+                "displayName": display_name,
+                "count": item.count(),
+            });
+            if let Some(cn) = colored_name {
+                slot_obj.as_object_mut().unwrap().insert("displayNameColored".to_string(), serde_json::Value::String(cn));
+            }
+            if let Some(ref t) = tag {
+                slot_obj.as_object_mut().unwrap().insert("tag".to_string(), serde_json::Value::String(t.clone()));
+            }
+            if !lore_lines.is_empty() {
+                slot_obj.as_object_mut().unwrap().insert("lore".to_string(),
+                    serde_json::Value::Array(lore_lines.into_iter().map(serde_json::Value::String).collect()));
+            }
+            slots_json.push(slot_obj);
+        }
+    }
+
+    let json = serde_json::json!({
+        "open": true,
+        "botState": bot_state,
+        "windowId": window_id,
+        "title": title,
+        "slotCount": all_slots.len(),
+        "slots": slots_json,
+    });
+
+    if let Ok(s) = serde_json::to_string(&json) {
+        *state.cached_window_json.write() = Some(s);
     }
 }
 
