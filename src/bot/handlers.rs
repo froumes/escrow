@@ -57,14 +57,25 @@ impl BotEventHandlers {
     pub async fn handle_chat_message(&self, message: &str) {
         // Check if it's a Coflnet message
         let is_cofl = self.is_cofl_chat_message(message);
-        
-        if !is_cofl {
-            debug!("[Chat] {}", message);
-        }
 
-        // Filter specific message patterns
-        if message.contains("[Bazaar]") {
-            info!("[Bazaar] {}", message);
+        // Strip color codes for pattern matching
+        let clean = Self::remove_color_codes(message);
+
+        // Log important Hypixel system messages at info level so they appear
+        // in the terminal and log files, making bot behaviour easier to follow.
+        if clean.contains("[Bazaar]")
+            || clean.contains("Auction")
+            || clean.contains("You don't have")
+            || clean.contains("items stashed away")
+            || clean.contains("You cannot")
+            || clean.contains("Claiming")
+            || clean.contains("Cancelled!")
+            || clean.contains("You collected")
+            || clean.contains("BIN Auction started")
+        {
+            info!("[HypixelChat] {}", clean);
+        } else if !is_cofl {
+            debug!("[Chat] {}", message);
         }
     }
 

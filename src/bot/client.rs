@@ -1874,6 +1874,8 @@ async fn event_handler(
                             let is_interactive = matches!(cur_state,
                                 BotState::Purchasing | BotState::Bazaar | BotState::Selling
                                 | BotState::ClaimingPurchased | BotState::ClaimingSold
+                                | BotState::ManagingOrders | BotState::InstaSelling
+                                | BotState::CancellingAuction | BotState::SellingInventoryBz
                             );
                             // Only fire if no new command started since this window was opened.
                             let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
@@ -2828,7 +2830,10 @@ async fn handle_window_interaction(
             let item_name = match state.insta_sell_item.read().clone() {
                 Some(name) => name,
                 None => {
-                    warn!("[InstaSell] No item name stored, going idle");
+                    warn!("[InstaSell] No item name stored, closing window and going idle");
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
                     *state.bot_state.write() = BotState::Idle;
                     return;
                 }
@@ -2865,7 +2870,10 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
-                        warn!("[InstaSell] Item \"{}\" not found in bazaar search, going idle", item_name);
+                        warn!("[InstaSell] Item \"{}\" not found in bazaar search, closing window and going idle", item_name);
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.insta_sell_item.write() = None;
                         *state.bot_state.write() = BotState::Idle;
                     }
@@ -2890,7 +2898,10 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
-                        warn!("[InstaSell] \"Sell Instantly\" not found, going idle");
+                        warn!("[InstaSell] \"Sell Instantly\" not found, closing window and going idle");
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.insta_sell_item.write() = None;
                         *state.bot_state.write() = BotState::Idle;
                     }
@@ -2949,6 +2960,9 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimPurchased] Found Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
                     *state.bot_state.write() = BotState::Idle;
                     found = true;
                 }
@@ -2966,7 +2980,10 @@ async fn handle_window_interaction(
                         }
                     }
                     if !found {
-                        info!("[ClaimPurchased] Nothing to claim, going idle");
+                        info!("[ClaimPurchased] Nothing to claim, closing window and going idle");
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -2974,6 +2991,9 @@ async fn handle_window_interaction(
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3005,7 +3025,10 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    // Claim All finishes everything — go idle
+                    // Claim All finishes everything — close window and go idle
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
                     *state.bot_state.write() = BotState::Idle;
                 } else {
                     // Look for first claimable item
@@ -3020,7 +3043,10 @@ async fn handle_window_interaction(
                         }
                     }
                     if !found {
-                        info!("[ClaimSold] Nothing to claim, going idle");
+                        info!("[ClaimSold] Nothing to claim, closing window and going idle");
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -3108,7 +3134,10 @@ async fn handle_window_interaction(
                     break;
                 }
                 if !found {
-                    info!("[CancelAuction] Target auction not found in Manage Auctions, going idle");
+                    info!("[CancelAuction] Target auction not found in Manage Auctions, closing window and going idle");
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
                     *state.bot_state.write() = BotState::Idle;
                 }
             } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
@@ -3120,7 +3149,10 @@ async fn handle_window_interaction(
                     info!("[CancelAuction] Clicking Cancel Auction at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 } else {
-                    info!("[CancelAuction] Cancel Auction button not found, going idle");
+                    info!("[CancelAuction] Cancel Auction button not found, closing window and going idle");
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
                     *state.bot_state.write() = BotState::Idle;
                 }
                 // Watchdog: go idle if no follow-up window in 2s
@@ -3145,7 +3177,10 @@ async fn handle_window_interaction(
                     info!("[CancelAuction] Confirm not found by name, clicking slot 11");
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 }
-                info!("[CancelAuction] Auction cancellation confirmed, going idle");
+                info!("[CancelAuction] Auction cancellation confirmed, closing window and going idle");
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 let cancelled_name = state.cancel_auction_item_name.read().clone();
                 let cancelled_bid = *state.cancel_auction_starting_bid.read();
                 let _ = state.event_tx.send(BotEvent::AuctionCancelled {
@@ -3447,9 +3482,15 @@ async fn handle_window_interaction(
 
                     match order_slot {
                         None => {
-                            // No more unprocessed orders — done
+                            // No more unprocessed orders — done.
+                            // Close the window explicitly so the bot is not stuck
+                            // "in an inventory" (prevents /pickupstash failures and
+                            // slow buy speeds from having to close a stale GUI first).
                             *state.manage_orders_cancelled.write() += cancelled;
-                            info!("[ManageOrders] Done — cancelled {} order(s)", *state.manage_orders_cancelled.read());
+                            info!("[ManageOrders] Done — cancelled {} order(s), closing window", *state.manage_orders_cancelled.read());
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
                             *state.manage_orders_deadline.write() = None;
                             *state.bot_state.write() = BotState::Idle;
                             break;
@@ -3840,7 +3881,10 @@ async fn handle_window_interaction(
                 if *state.last_window_id.read() != window_id { return; }
                 click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                info!("[SellInventoryBz] Done — going idle");
+                info!("[SellInventoryBz] Done — closing window and going idle");
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
                 *state.bazaar_step.write() = BazaarStep::Initial;
                 *state.bot_state.write() = BotState::Idle;
             }
