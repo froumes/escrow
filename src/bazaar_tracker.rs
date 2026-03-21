@@ -5,6 +5,7 @@
 
 use parking_lot::RwLock;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,12 +26,18 @@ pub struct TrackedBazaarOrder {
 #[derive(Clone)]
 pub struct BazaarOrderTracker {
     orders: Arc<RwLock<Vec<TrackedBazaarOrder>>>,
+    /// Stores (price_per_unit, amount) for the most recently collected buy order
+    /// per item, so that profit can be computed when the corresponding sell offer
+    /// is collected. If multiple buy orders for the same item are collected before
+    /// a sell, only the last buy cost is retained.
+    last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
 }
 
 impl BazaarOrderTracker {
     pub fn new() -> Self {
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
+            last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -99,6 +106,22 @@ impl BazaarOrderTracker {
         let original_len = orders.len();
         orders.retain(|o| now.saturating_sub(o.placed_at) < max_age_secs);
         original_len - orders.len()
+    }
+
+    /// Record a collected buy order's cost so that profit can be computed
+    /// when the corresponding sell offer for the same item is collected.
+    pub fn record_buy_cost(&self, item_name: &str, price_per_unit: f64, amount: u64) {
+        self.last_buy_costs
+            .write()
+            .insert(normalize_for_match(item_name), (price_per_unit, amount));
+    }
+
+    /// Consume and return the stored buy cost for an item (if any).
+    /// Used when a sell offer is collected to compute profit/loss.
+    pub fn take_buy_cost(&self, item_name: &str) -> Option<(f64, u64)> {
+        self.last_buy_costs
+            .write()
+            .remove(&normalize_for_match(item_name))
     }
 }
 
@@ -190,6 +213,47 @@ mod tests {
         let sell = tracker.remove_order("Coal", false).unwrap();
         let profit = (sell.price_per_unit * sell.amount as f64)
             - (buy.price_per_unit * buy.amount as f64);
+        assert_eq!(profit, 1000.0);
+    }
+
+    #[test]
+    fn record_and_take_buy_cost() {
+        let tracker = BazaarOrderTracker::new();
+        tracker.record_buy_cost("Enchanted Coal Block", 500.0, 10);
+
+        let cost = tracker.take_buy_cost("Enchanted Coal Block");
+        assert!(cost.is_some());
+        let (ppu, amt) = cost.unwrap();
+        assert_eq!(ppu, 500.0);
+        assert_eq!(amt, 10);
+
+        // Second take returns None (consumed).
+        assert!(tracker.take_buy_cost("Enchanted Coal Block").is_none());
+    }
+
+    #[test]
+    fn take_buy_cost_case_insensitive() {
+        let tracker = BazaarOrderTracker::new();
+        tracker.record_buy_cost("Enchanted Coal Block", 500.0, 10);
+        assert!(tracker.take_buy_cost("enchanted coal block").is_some());
+    }
+
+    #[test]
+    fn take_buy_cost_returns_none_when_missing() {
+        let tracker = BazaarOrderTracker::new();
+        assert!(tracker.take_buy_cost("Nonexistent").is_none());
+    }
+
+    #[test]
+    fn sell_profit_from_recorded_buy_cost() {
+        let tracker = BazaarOrderTracker::new();
+        // Simulate buy order collected: 10x Coal @ 500 coins/unit
+        tracker.record_buy_cost("Coal", 500.0, 10);
+        // Simulate sell offer collected: 10x Coal @ 600 coins/unit
+        let sell_ppu = 600.0;
+        let sell_amount = 10u64;
+        let (buy_ppu, buy_amount) = tracker.take_buy_cost("Coal").unwrap();
+        let profit = (sell_ppu * sell_amount as f64) - (buy_ppu * buy_amount as f64);
         assert_eq!(profit, 1000.0);
     }
 }

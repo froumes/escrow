@@ -809,12 +809,30 @@ async fn main() -> Result<()> {
                         profit_tracker_events.record_bz_profit(profit);
                         info!("[BazaarProfit] Recorded {} coins for {} {} order",
                             profit, item_name, if is_buy_order { "BUY" } else { "SELL" });
+                        // Store buy cost so we can compute profit when the corresponding sell offer is collected.
+                        if is_buy_order {
+                            bazaar_tracker_events.record_buy_cost(&item_name, order.price_per_unit, order.amount);
+                        }
                     } else {
                         // Orders placed in a previous session or before the bot started
                         // won't be in the in-memory tracker — this is expected, not an error.
                         debug!("[BazaarProfit] No tracked order found for collected {} {} — profit not recorded (order may be from a previous session)",
                             if is_buy_order { "BUY" } else { "SELL" }, item_name);
                     }
+                    // Compute profit/loss for sell offers by comparing to the recorded buy cost.
+                    let opt_profit: Option<i64> = if !is_buy_order {
+                        if let (Some(ref sell_order), Some((buy_ppu, buy_amt))) =
+                            (&order_data, bazaar_tracker_events.take_buy_cost(&item_name))
+                        {
+                            let sell_total = sell_order.price_per_unit * sell_order.amount as f64;
+                            let buy_total = buy_ppu * buy_amt as f64;
+                            Some((sell_total - buy_total).round() as i64)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order collected: {} ({})", item_name, order_type);
                     let baf_msg = format!(
@@ -835,7 +853,7 @@ async fn main() -> Result<()> {
                             frikadellen_baf::webhook::send_webhook_bazaar_order_collected(
                                 &name, &item, is_buy_order,
                                 opt_amount, opt_ppu,
-                                purse, &url,
+                                opt_profit, purse, &url,
                             ).await;
                         });
                     }
