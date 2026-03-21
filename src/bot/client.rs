@@ -308,6 +308,7 @@ impl BotClient {
             auction_item_slot: Arc::new(RwLock::new(None)),
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
+            auction_sell_aborted: Arc::new(AtomicBool::new(false)),
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
@@ -726,6 +727,10 @@ pub struct BotClientState {
     pub auction_item_id: Arc<RwLock<Option<String>>>,
     /// Which step of the auction creation flow we're in
     pub auction_step: Arc<RwLock<AuctionStep>>,
+    /// Set when Hypixel rejects auction item placement ("You already have an item in the
+    /// auction slot!"). Checked before ConfirmSell/FinalConfirm to abort the flow and
+    /// prevent listing the wrong item.
+    pub auction_sell_aborted: Arc<AtomicBool>,
     /// Scoreboard scores: objective_name -> (owner -> (display_text, score))
     pub scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
     /// Which objective is currently displayed in the sidebar slot
@@ -857,6 +862,7 @@ impl Default for BotClientState {
             auction_item_slot: Arc::new(RwLock::new(None)),
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
+            auction_sell_aborted: Arc::new(AtomicBool::new(false)),
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
@@ -1671,6 +1677,36 @@ async fn event_handler(
                     *state.claim_sold_uuid.write() = uuid;
                     let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                 }
+            } else if clean_message.contains("You already have an item in the auction slot") {
+                // Hypixel rejected our item placement — there was already an item in the slot.
+                // Close the window (returning the stuck item to inventory) and retry the flow.
+                if *state.bot_state.read() == BotState::Selling {
+                    warn!(
+                        "[Auction] ABORTING: \"{}\" — closing window to remove stuck item and retrying",
+                        clean_message
+                    );
+                    state.auction_sell_aborted.store(true, Ordering::Relaxed);
+                    let window_id = *state.last_window_id.read();
+                    if window_id > 0 {
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                    }
+                    // Restart the auction flow: reset step and re-open /ah after a short
+                    // delay so Hypixel processes the window close first.
+                    *state.auction_step.write() = AuctionStep::Initial;
+                    let bot_clone = bot.clone();
+                    let state_clone = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        // Only retry if still in Selling state (not interrupted by another command)
+                        if *state_clone.bot_state.read() == BotState::Selling {
+                            info!("[Auction] Retrying auction after removing stuck item — sending /ah");
+                            state_clone.auction_sell_aborted.store(false, Ordering::Relaxed);
+                            bot_clone.write_chat_packet("/ah");
+                        }
+                    });
+                }
             } else if clean_message.contains("BIN Auction started for") {
                 // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
                 // was accepted.  Emit AuctionListed using the context stored in state.
@@ -1678,6 +1714,27 @@ async fn event_handler(
                 let item = state.auction_item_name.read().clone();
                 let bid  = *state.auction_starting_bid.read();
                 let dur  = *state.auction_duration_hours.read();
+
+                // Safety check: verify the listed item matches what we intended.
+                // Extract the actual item name from "BIN Auction started for <item>!"
+                if let Some(actual_item) = clean_message
+                    .split("BIN Auction started for ")
+                    .nth(1)
+                    .and_then(|s| s.strip_suffix('!'))
+                {
+                    let actual_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(actual_item)
+                        .trim().to_lowercase();
+                    let intended_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item)
+                        .trim().to_lowercase();
+                    if !intended_clean.is_empty() && !actual_clean.contains(&intended_clean) && !intended_clean.contains(&actual_clean) {
+                        error!(
+                            "[Auction] ITEM MISMATCH! Intended: \"{}\" but Hypixel listed: \"{}\". \
+                             This may indicate the wrong item was sold!",
+                            item, actual_item
+                        );
+                    }
+                }
+
                 // Track this as our active listing for coop sale filtering
                 if !item.is_empty() {
                     let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
@@ -2038,6 +2095,10 @@ async fn event_handler(
                     } else if bot_state == BotState::Selling {
                         // Auction sign handler — matches TypeScript's setAuctionDuration and
                         // bot._client.once('open_sign_entity') for price in sellHandler.ts
+                        if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                            warn!("[Auction] Sign opened but auction sell aborted — skipping");
+                            return Ok(());
+                        }
                         let step = *state.auction_step.read();
                         let pos = pkt.pos;
                         let is_front = pkt.is_front_text;
@@ -2301,6 +2362,7 @@ async fn execute_command(
             *state.auction_item_slot.write() = *item_slot;
             *state.auction_item_id.write() = item_id.clone();
             *state.auction_step.write() = AuctionStep::Initial;
+            state.auction_sell_aborted.store(false, Ordering::Relaxed);
             // Open auction house — window handler takes over from here
             bot.write_chat_packet("/ah");
             *state.bot_state.write() = BotState::Selling;
@@ -3297,6 +3359,17 @@ async fn handle_window_interaction(
 
             info!("[Auction] Window: \"{}\" | step: {:?}", window_title, step);
 
+            // If the sell was aborted (e.g. stuck item in auction slot), do not
+            // proceed — close the window and bail.  The retry task spawned by the
+            // chat handler will re-open /ah once the window is closed.
+            if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                warn!("[Auction] Window opened but auction sell aborted — closing window {}", window_id);
+                bot.write_packet(ServerboundContainerClose {
+                    container_id: window_id as i32,
+                });
+                return;
+            }
+
             match step {
                 AuctionStep::Initial => {
                     // "Auction House" opened — click slot 15 (nav to Manage Auctions)
@@ -3477,6 +3550,15 @@ async fn handle_window_interaction(
                     // "Create BIN Auction" opened third time (setPrice=true, durationSet=true in TS)
                     // Click slot 29 to proceed to "Confirm BIN Auction"
                     if window_title.contains("Create BIN Auction") {
+                        // Check if the sell was aborted (e.g. wrong item in auction slot)
+                        if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                            warn!("[Auction] ConfirmSell aborted — wrong item detected, closing window");
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
+                            // Stay in Selling state so the retry task can re-open /ah
+                            return;
+                        }
                         info!("[Auction] Both price and duration set, clicking slot 29 (confirm item)");
                         *state.auction_step.write() = AuctionStep::FinalConfirm;
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -3488,6 +3570,15 @@ async fn handle_window_interaction(
                     // AuctionListed event is emitted from the chat handler when Hypixel sends
                     // "BIN Auction started for ..." (matches TypeScript sellHandler.ts).
                     if window_title.contains("Confirm BIN Auction") || window_title.contains("Confirm") {
+                        // Check if the sell was aborted (e.g. wrong item in auction slot)
+                        if state.auction_sell_aborted.load(Ordering::Relaxed) {
+                            warn!("[Auction] FinalConfirm aborted — wrong item detected, closing window");
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
+                            // Stay in Selling state so the retry task can re-open /ah
+                            return;
+                        }
                         info!("[Auction] Confirm BIN Auction window, clicking slot 11 (final confirm)");
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         click_window_slot(bot, &state.last_window_id, window_id, 11).await;
