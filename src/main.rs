@@ -83,6 +83,7 @@ fn should_drop_bazaar_command_during_ah_pause(
         && matches!(
             command_type,
             frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
+            | frikadellen_baf::types::CommandType::ManageOrders { .. }
         )
 }
 
@@ -340,6 +341,7 @@ async fn main() -> Result<()> {
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
     bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
+    bot_client.bazaar_flips_paused = bazaar_flips_paused.clone();
     *bot_client.ingame_name.write() = ingame_name.clone();
 
     // Shared profit tracker for AH and Bazaar realized profits.
@@ -746,7 +748,9 @@ async fn main() -> Result<()> {
                         info!("[BazaarProfit] Recorded {} coins for {} {} order",
                             profit, item_name, if is_buy_order { "BUY" } else { "SELL" });
                     } else {
-                        warn!("[BazaarProfit] No tracked order found for collected {} {} — profit not recorded",
+                        // Orders placed in a previous session or before the bot started
+                        // won't be in the in-memory tracker — this is expected, not an error.
+                        debug!("[BazaarProfit] No tracked order found for collected {} {} — profit not recorded (order may be from a previous session)",
                             if is_buy_order { "BUY" } else { "SELL" }, item_name);
                     }
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
@@ -1353,6 +1357,7 @@ async fn main() -> Result<()> {
                         let ws = ws_client_clone.clone();
                         let enable_bz = enable_bazaar_flips_ws.clone();
                         let chat_tx_resume = chat_tx_ws.clone();
+                        let command_queue_resume = command_queue_clone.clone();
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
@@ -1361,6 +1366,16 @@ async fn main() -> Result<()> {
                             print_mc_chat(&baf_msg);
                             let _ = chat_tx_resume.send(baf_msg);
                             info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
+                            // Queue a ManageOrders run to handle any deferred order
+                            // management (filled orders that need collecting, etc.).
+                            if !command_queue_resume.has_manage_orders() {
+                                info!("[BazaarFlips] Queuing deferred ManageOrders after AH flip window");
+                                command_queue_resume.enqueue(
+                                    CommandType::ManageOrders { cancel_open: false },
+                                    CommandPriority::Normal,
+                                    false,
+                                );
+                            }
                             // Re-request bazaar flips to get fresh recommendations after the pause
                             if enable_bz.load(Ordering::Relaxed) {
                                 let msg = serde_json::json!({
@@ -1435,6 +1450,7 @@ async fn main() -> Result<()> {
     let macro_paused_proc = macro_paused.clone();
     let command_delay_ms = config.command_delay_ms;
     let auction_listing_delay_ms = config.auction_listing_delay_ms;
+    let chat_tx_proc = chat_tx.clone();
     tokio::spawn(async move {
         use frikadellen_baf::types::BotState;
         loop {
@@ -1448,13 +1464,20 @@ async fn main() -> Result<()> {
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);
 
-                // During AH pause, drop incoming bazaar buy/sell recommendation orders.
-                // ManageOrders is preserved so filled orders can still be collected/cancelled.
+                // During AH pause, drop incoming bazaar buy orders and defer
+                // ManageOrders — they will be re-queued when bazaar flips resume.
                 if should_drop_bazaar_command_during_ah_pause(
                     &cmd.command_type,
                     bazaar_flips_paused_proc.load(Ordering::Relaxed),
                 ) {
-                    debug!("[Queue] Dropping bazaar command {:?} — AH flip window active", cmd.command_type);
+                    if matches!(cmd.command_type, frikadellen_baf::types::CommandType::ManageOrders { .. }) {
+                        info!("[Queue] Deferring ManageOrders — AH flip window active, will re-queue on resume");
+                        let baf_msg = "§f[§4BAF§f]: §e⏸ Order management deferred — AH flips incoming, will resume after".to_string();
+                        print_mc_chat(&baf_msg);
+                        let _ = chat_tx_proc.send(baf_msg);
+                    } else {
+                        debug!("[Queue] Dropping bazaar command {:?} — AH flip window active", cmd.command_type);
+                    }
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
@@ -1753,6 +1776,7 @@ async fn main() -> Result<()> {
     if config.enable_bazaar_flips {
         let bot_client_orders = bot_client.clone();
         let command_queue_orders = command_queue.clone();
+        let bazaar_flips_paused_orders = bazaar_flips_paused.clone();
         let order_interval = config.bazaar_order_check_interval_seconds;
         tokio::spawn(async move {
             use frikadellen_baf::types::{CommandType, CommandPriority};
@@ -1760,6 +1784,12 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(120)).await;
             loop {
                 sleep(Duration::from_secs(order_interval)).await;
+                // Skip during AH pause — ManageOrders would be deferred anyway
+                // and will be re-queued when bazaar flips resume.
+                if bazaar_flips_paused_orders.load(Ordering::Relaxed) {
+                    debug!("[BazaarOrders] Skipping periodic order check — AH flips incoming");
+                    continue;
+                }
                 if bot_client_orders.state().allows_commands() && !command_queue_orders.has_manage_orders() {
                     debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
                     command_queue_orders.enqueue(
@@ -1792,6 +1822,35 @@ async fn main() -> Result<()> {
     }
 
     // Periodic "My Auctions" check to claim sold/expired auctions that don't emit chat events.
+    // --- Periodic chatBatch upload to Coflnet ---
+    // Sends accumulated Hypixel chat messages as a JSON array so Coflnet's
+    // ChatBatchCommand can process purchases, collections, and other events.
+    {
+        let bot_client_chat_batch = bot_client.clone();
+        let ws_client_chat_batch = ws_client.clone();
+        tokio::spawn(async move {
+            // Wait a bit for the bot to connect before starting uploads.
+            sleep(Duration::from_secs(30)).await;
+            loop {
+                sleep(Duration::from_secs(2)).await;
+                let batch = bot_client_chat_batch.drain_chat_batch();
+                if batch.is_empty() {
+                    continue;
+                }
+                let data_json = serde_json::to_string(&batch).unwrap_or_else(|_| "[]".to_string());
+                let msg = serde_json::json!({
+                    "type": "chatBatch",
+                    "data": data_json
+                }).to_string();
+                if let Err(e) = ws_client_chat_batch.send_message(&msg).await {
+                    debug!("[ChatBatch] Failed to send chatBatch to Coflnet: {}", e);
+                } else {
+                    debug!("[ChatBatch] Sent {} message(s) to Coflnet", batch.len());
+                }
+            }
+        });
+    }
+
     if config.enable_ah_flips {
         let bot_client_ah_claim = bot_client.clone();
         let command_queue_ah_claim = command_queue.clone();
@@ -2063,13 +2122,13 @@ mod tests {
             &CommandType::ClaimSoldItem,
             paused,
         ));
-        // ManageOrders must NOT be dropped during AH pause — filled orders still
-        // need to be collected and stale orders cancelled.
-        assert!(!should_drop_bazaar_command_during_ah_pause(
+        // ManageOrders IS deferred during AH pause — it would block the AH
+        // flip purchase.  A new ManageOrders is re-queued when flips resume.
+        assert!(should_drop_bazaar_command_during_ah_pause(
             &CommandType::ManageOrders { cancel_open: false },
             paused,
         ));
-        assert!(!should_drop_bazaar_command_during_ah_pause(
+        assert!(should_drop_bazaar_command_during_ah_pause(
             &CommandType::ManageOrders { cancel_open: true },
             paused,
         ));

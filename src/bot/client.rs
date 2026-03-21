@@ -141,6 +141,9 @@ pub struct BotClient {
     purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Shared AH-pause flag so ManageOrders can self-abort when AH flips are incoming.
     pub bazaar_flips_paused: Arc<AtomicBool>,
+    /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
+    /// Drained periodically and sent as `{"type":"chatBatch","data":"[...]"}`.
+    pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
 }
 
 /// Events that can be emitted by the bot
@@ -236,6 +239,7 @@ impl BotClient {
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
+            chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -339,6 +343,7 @@ impl BotClient {
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: self.bazaar_flips_paused.clone(),
+            chat_batch_buffer: self.chat_batch_buffer.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -516,6 +521,13 @@ impl BotClient {
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
     pub fn is_bazaar_at_limit(&self) -> bool {
         self.bazaar_at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Drain the buffered chat messages for a chatBatch upload.
+    /// Returns the messages collected since the last drain (may be empty).
+    pub fn drain_chat_batch(&self) -> Vec<String> {
+        let mut buf = self.chat_batch_buffer.write();
+        std::mem::take(&mut *buf)
     }
 
     /// Record the current instant as the buy-speed start time.
@@ -812,6 +824,8 @@ pub struct BotClientState {
     /// Shared AH-pause flag — when true, ManageOrders aborts early so AH
     /// flips can proceed without interference.
     pub bazaar_flips_paused: Arc<AtomicBool>,
+    /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
+    pub chat_batch_buffer: Arc<RwLock<Vec<String>>>,
 }
 
 impl Default for BotClientState {
@@ -878,6 +892,7 @@ impl Default for BotClientState {
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
+            chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -1550,6 +1565,13 @@ async fn event_handler(
             state.handlers.handle_chat_message(&message).await;
             if state.event_tx.send(BotEvent::ChatMessage(message.clone())).is_err() {
                 debug!("Failed to send ChatMessage event - receiver dropped");
+            }
+
+            // Buffer the message for periodic chatBatch upload to Coflnet.
+            // Uses clean text (color codes stripped) matching the Coflnet mod protocol.
+            let clean_for_batch = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
+            if !clean_for_batch.trim().is_empty() {
+                state.chat_batch_buffer.write().push(clean_for_batch);
             }
 
             // Detect purchase/sold messages and emit events
@@ -4869,6 +4891,18 @@ fn check_manage_orders_deadline(
             *state.bot_state.write() = BotState::Idle;
             return true;
         }
+    }
+    // Also abort if AH flips are incoming — ManageOrders would block the
+    // AH purchase flow.  The order will be re-queued after the AH pause.
+    if state.bazaar_flips_paused.load(Ordering::Relaxed) {
+        info!("[ManageOrders] AH flips incoming — aborting ManageOrders to free queue");
+        bot.write_packet(ServerboundContainerClose {
+            container_id: window_id as i32,
+        });
+        *state.manage_orders_deadline.write() = None;
+        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+        *state.bot_state.write() = BotState::Idle;
+        return true;
     }
     false
 }
