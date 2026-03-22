@@ -5599,7 +5599,7 @@ async fn run_startup_workflow(
     }
 
     // Grab a clone of the command queue. If none is set (unit tests / standalone),
-    // fall back to the legacy direct-drive approach would be complex, so we just
+    // falling back to the legacy direct-drive approach would be complex, so we just
     // skip — the queue is always set in production via main.rs.
     let queue = {
         let guard = command_queue.read();
