@@ -95,6 +95,13 @@ impl BazaarOrderTracker {
         self.orders.read().clone()
     }
 
+    /// Returns `true` if at least one tracked order has status `"filled"`.
+    /// Used by the periodic ManageOrders timer to skip GUI cycles when there
+    /// is nothing to collect.
+    pub fn has_filled_orders(&self) -> bool {
+        self.orders.read().iter().any(|o| o.status == "filled")
+    }
+
     /// Remove orders older than `max_age_secs` seconds.
     /// Returns the number of stale orders removed.
     pub fn remove_stale_orders(&self, max_age_secs: u64) -> usize {
@@ -149,8 +156,26 @@ mod tests {
     fn mark_filled() {
         let tracker = BazaarOrderTracker::new();
         tracker.add_order("Diamond".into(), 64, 100.0, true);
+        assert!(!tracker.has_filled_orders());
         tracker.mark_filled("Diamond", true);
         assert_eq!(tracker.get_orders()[0].status, "filled");
+        assert!(tracker.has_filled_orders());
+    }
+
+    #[test]
+    fn has_filled_orders_empty() {
+        let tracker = BazaarOrderTracker::new();
+        assert!(!tracker.has_filled_orders());
+    }
+
+    #[test]
+    fn has_filled_orders_cleared_on_remove() {
+        let tracker = BazaarOrderTracker::new();
+        tracker.add_order("Coal".into(), 10, 500.0, true);
+        tracker.mark_filled("Coal", true);
+        assert!(tracker.has_filled_orders());
+        tracker.remove_order("Coal", true);
+        assert!(!tracker.has_filled_orders());
     }
 
     #[test]
