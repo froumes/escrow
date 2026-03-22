@@ -53,11 +53,15 @@ const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
 /// stuck item from the auction slot.  Gives Hypixel time to process the
 /// container-close packet and return the item to inventory.
-const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 1000;
+const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 2000;
 /// Maximum number of retry attempts when "You already have an item in the auction
 /// slot!" keeps recurring.  After this many retries the bot gives up and goes Idle
 /// instead of looping indefinitely and risking a "Sending packets too fast!" kick.
 const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
+/// Maximum number of consecutive times the bazaar category-page close/reopen cycle
+/// is allowed before giving up and going Idle.  Prevents infinite /bz loops when the
+/// server keeps returning a sub-page (e.g. "Bazaar ➜ Oddities").
+const MAX_BAZAAR_CATEGORY_PAGE_RETRIES: u8 = 5;
 /// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
@@ -364,6 +368,7 @@ impl BotClient {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
+            bazaar_category_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             bazaar_flips_paused: self.bazaar_flips_paused.clone(),
             chat_batch_buffer: self.chat_batch_buffer.clone(),
             cached_window_json: self.cached_window_json.clone(),
@@ -864,6 +869,10 @@ pub struct BotClientState {
     /// ManageOrders command so that all window handlers (Branch A/B/C) can
     /// bail out early instead of waiting for the external 60-second timeout.
     pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
+    /// Consecutive bazaar category-page close/reopen attempts.  Reset when the
+    /// main Bazaar page opens successfully; triggers Idle when it exceeds
+    /// MAX_BAZAAR_CATEGORY_PAGE_RETRIES.
+    pub bazaar_category_retries: Arc<std::sync::atomic::AtomicU8>,
     /// Shared AH-pause flag — when true, ManageOrders aborts early so AH
     /// flips can proceed without interference.
     pub bazaar_flips_paused: Arc<AtomicBool>,
@@ -944,6 +953,7 @@ impl Default for BotClientState {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
+            bazaar_category_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
@@ -1921,11 +1931,11 @@ async fn event_handler(
                 state.inventory_full.store(true, Ordering::Relaxed);
             }
 
-            // Detect "You have X items stashed away!" — Hypixel sends this when
+            // Detect "You have X item(s) stashed away!" — Hypixel sends this when
             // collected items went to stash because the inventory was full.
             // Treat it the same as inventory_full so ManageOrders stops trying
             // to collect BUY orders that have no room.
-            if clean_message.contains("items stashed away") {
+            if clean_message.contains("stashed away") {
                 warn!("[ManageOrders] Items stashed — inventory effectively full");
                 state.inventory_full.store(true, Ordering::Relaxed);
             }
@@ -2519,6 +2529,7 @@ async fn execute_command(
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
+            state.bazaar_category_retries.store(0, Ordering::Relaxed);
             // Set an internal deadline so the handler can bail out cleanly
             // (closing windows) instead of burning through the full 60-second
             // external command-processor timeout.
@@ -2565,6 +2576,7 @@ async fn execute_command(
         CommandType::SellInventoryBz => {
             info!("[SellInventoryBz] Opening /bz to sell inventory instantly");
             *state.bazaar_step.write() = BazaarStep::Initial;
+            state.bazaar_category_retries.store(0, Ordering::Relaxed);
             bot.write_chat_packet("/bz");
             *state.bot_state.write() = BotState::SellingInventoryBz;
         }
@@ -3592,6 +3604,12 @@ async fn handle_window_interaction(
                         // "Create Auction" in Manage Auctions (skipping the type-select step).
                         // Run SelectBIN logic inline so the flow continues without getting stuck.
                         info!("[Auction] ClickCreate: jumped straight to Create BIN Auction, handling as SelectBIN");
+                        // Clear a stuck item in the auction preview slot (same guard as SelectBIN).
+                        if slots.len() > 13 && !slots[13].is_empty() {
+                            warn!("[Auction] Slot 13 already occupied — clicking to clear stuck item before placing ours");
+                            click_window_slot(bot, &state.last_window_id, window_id, 13).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
                         let player_start = *menu.player_slots_range().start();
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
                             if mj_slot >= 9 && mj_slot <= 44 {
@@ -3630,6 +3648,17 @@ async fn handle_window_interaction(
                     // "Create BIN Auction" opened first time (setPrice=false in TS)
                     // Find item by slot or by name, click it, then click slot 31 for price sign
                     if window_title.contains("Create BIN Auction") {
+                        // Proactive fix: if the auction item preview slot (slot 13) already
+                        // has an item (e.g. from a previously failed auction creation or a
+                        // purchased item auto-placed by the server), click it first to clear
+                        // the slot so our item can be placed without triggering "You already
+                        // have an item in the auction slot!".
+                        if slots.len() > 13 && !slots[13].is_empty() {
+                            warn!("[Auction] Slot 13 already occupied — clicking to clear stuck item before placing ours");
+                            click_window_slot(bot, &state.last_window_id, window_id, 13).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+
                         // Calculate inventory slot: mineflayer_slot - 9 + window_player_start
                         let player_start = *menu.player_slots_range().start();
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
@@ -3760,14 +3789,29 @@ async fn handle_window_interaction(
                 if is_bazaar_category_page(window_title) {
                     // Category sub-page (e.g. "Bazaar ➜ Oddities") — cannot contain
                     // the Manage Orders button.  Close and re-open /bz to reach the
-                    // main Bazaar page.
+                    // main Bazaar page, but cap retries to avoid infinite loop.
+                    let attempt = state.bazaar_category_retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= MAX_BAZAAR_CATEGORY_PAGE_RETRIES {
+                        warn!(
+                            "[ManageOrders] Category page \"{}\" persisted after {} retries — giving up",
+                            window_title, attempt
+                        );
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                        *state.manage_orders_deadline.write() = None;
+                        *state.bot_state.write() = BotState::Idle;
+                        return;
+                    }
                     warn!(
-                        "[ManageOrders] Category page \"{}\" — closing and re-opening /bz",
-                        window_title
+                        "[ManageOrders] Category page \"{}\" — closing and re-opening /bz (attempt {}/{})",
+                        window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
                     );
                     close_window_and_reopen_bz(bot, state, window_id).await;
                     return;
                 }
+                // Reached the main Bazaar page — reset category-page retry counter.
+                state.bazaar_category_retries.store(0, Ordering::Relaxed);
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
@@ -4223,10 +4267,27 @@ async fn handle_window_interaction(
 
             if step == BazaarStep::Initial && window_title.contains("Bazaar") {
                 if is_bazaar_category_page(window_title) {
-                    warn!("[SellInventoryBz] Category page \"{}\" — closing and re-opening /bz", window_title);
+                    let attempt = state.bazaar_category_retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= MAX_BAZAAR_CATEGORY_PAGE_RETRIES {
+                        warn!(
+                            "[SellInventoryBz] Category page \"{}\" persisted after {} retries — giving up",
+                            window_title, attempt
+                        );
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                        *state.bot_state.write() = BotState::Idle;
+                        return;
+                    }
+                    warn!(
+                        "[SellInventoryBz] Category page \"{}\" — closing and re-opening /bz (attempt {}/{})",
+                        window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                    );
                     close_window_and_reopen_bz(bot, state, window_id).await;
                     return;
                 }
+                // Reached the main Bazaar page — reset category-page retry counter.
+                state.bazaar_category_retries.store(0, Ordering::Relaxed);
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
