@@ -63,6 +63,9 @@ const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
 /// is allowed before giving up and going Idle.  Prevents infinite /bz loops when the
 /// server keeps returning a sub-page (e.g. "Bazaar ➜ Oddities").
 const MAX_BAZAAR_CATEGORY_PAGE_RETRIES: u8 = 5;
+/// Fallback slot index for "Go Back" in Bazaar category pages when dynamic name
+/// lookup fails.  Hypixel's default layout places it at slot 48.
+const GO_BACK_FALLBACK_SLOT: usize = 48;
 /// Fallback slot index for "Manage Orders" in the Bazaar GUI when dynamic name
 /// lookup fails.  Hypixel's default layout places it at slot 50.
 const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
@@ -3875,22 +3878,12 @@ async fn handle_window_interaction(
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                     if *state.last_window_id.read() != window_id { return; }
                     let slots = bot.menu().slots();
-                    if let Some(i) = find_slot_by_name(&slots, "Go Back") {
-                        info!(
-                            "[ManageOrders] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
-                            window_title, i, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    } else {
-                        // Slots loaded but "Go Back" still missing — close and
-                        // reopen /bz to retry.  The retry counter (incremented
-                        // above) caps the total attempts.
-                        warn!(
-                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
-                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        close_window_and_reopen_bz(bot, state, window_id).await;
-                    }
+                    let go_back_slot = find_slot_by_name(&slots, "Go Back").unwrap_or(GO_BACK_FALLBACK_SLOT);
+                    info!(
+                        "[ManageOrders] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
+                        window_title, go_back_slot, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                    );
+                    click_window_slot(bot, &state.last_window_id, window_id, go_back_slot as i16).await;
                     return;
                 }
                 // Reached the main Bazaar page — reset category-page retry counter.
@@ -4366,22 +4359,12 @@ async fn handle_window_interaction(
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                     if *state.last_window_id.read() != window_id { return; }
                     let slots = bot.menu().slots();
-                    if let Some(i) = find_slot_by_name(&slots, "Go Back") {
-                        info!(
-                            "[SellInventoryBz] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
-                            window_title, i, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    } else {
-                        // Slots loaded but "Go Back" still missing — close and
-                        // reopen /bz to retry.  The retry counter (incremented
-                        // above) caps the total attempts.
-                        warn!(
-                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
-                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        close_window_and_reopen_bz(bot, state, window_id).await;
-                    }
+                    let go_back_slot = find_slot_by_name(&slots, "Go Back").unwrap_or(GO_BACK_FALLBACK_SLOT);
+                    info!(
+                        "[SellInventoryBz] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
+                        window_title, go_back_slot, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                    );
+                    click_window_slot(bot, &state.last_window_id, window_id, go_back_slot as i16).await;
                     return;
                 }
                 // Reached the main Bazaar page — reset category-page retry counter.
