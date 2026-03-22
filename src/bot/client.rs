@@ -3805,11 +3805,17 @@ async fn handle_window_interaction(
                         );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     } else {
+                        // /bz remembers the last viewed category, so close+reopen would
+                        // return to the same page — give up immediately instead of looping.
                         warn!(
-                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
-                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, giving up",
+                            window_title
                         );
-                        close_window_and_reopen_bz(bot, state, window_id).await;
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                        *state.manage_orders_deadline.write() = None;
+                        *state.bot_state.write() = BotState::Idle;
                     }
                     return;
                 }
@@ -4293,11 +4299,16 @@ async fn handle_window_interaction(
                         );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     } else {
+                        // /bz remembers the last viewed category, so close+reopen would
+                        // return to the same page — give up immediately instead of looping.
                         warn!(
-                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
-                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, giving up",
+                            window_title
                         );
-                        close_window_and_reopen_bz(bot, state, window_id).await;
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                        *state.bot_state.write() = BotState::Idle;
                     }
                     return;
                 }
@@ -5429,7 +5440,7 @@ async fn clear_auction_preview_slot(
 ) {
     if slots.len() > 13 && !slots[13].is_empty() {
         let kind = slots[13].kind().to_string().to_lowercase();
-        if kind.contains("glass_pane") || kind.contains("barrier") {
+        if kind.contains("glass_pane") || kind.contains("barrier") || kind.contains("stone_button") {
             debug!("[Auction] Slot 13 is GUI filler ({}) — not a stuck item, skipping", kind);
             return;
         }
