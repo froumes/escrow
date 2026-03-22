@@ -69,6 +69,9 @@ const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
 const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
+/// Timeout (seconds) for `wait_for_collect_confirmation` and
+/// `wait_for_cancel_confirmation` to consider an action unprocessed.
+const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -1494,6 +1497,29 @@ fn normalize_bazaar_order_text(text: &str) -> String {
         .to_lowercase()
 }
 
+/// Parse a "[Bazaar] Your Buy Order/Sell Offer for X was filled!" notification.
+/// Returns `(item_name, is_buy_order)` or `None` if the message doesn't match.
+fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
+    if !message.contains("[Bazaar]") || !message.contains("was filled") {
+        return None;
+    }
+    let is_buy = message.contains("Buy Order");
+    let is_sell = message.contains("Sell Offer");
+    if !is_buy && !is_sell {
+        return None;
+    }
+    let prefix = if is_buy { "Buy Order for " } else { "Sell Offer for " };
+    let item_name = message.split(prefix).nth(1)
+        .and_then(|s| s.split(" was filled").next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if item_name.is_empty() {
+        return None;
+    }
+    Some((item_name, is_buy))
+}
+
 /// Extract the clean item name from a ManageOrders order slot display name.
 /// Uses the parsed `order_identity` (which already contains the clean name) when
 /// available, otherwise strips BUY/SELL/Buy Order/Sell Offer prefixes.
@@ -1985,19 +2011,7 @@ async fn event_handler(
 
             // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
             // ManageOrders run so the filled items are collected promptly.
-            if clean_message.contains("[Bazaar]")
-                && clean_message.contains("was filled")
-                && (clean_message.contains("Buy Order") || clean_message.contains("Sell Offer"))
-            {
-                let is_buy = clean_message.contains("Buy Order");
-                // Parse item name from "[Bazaar] Your Buy Order for <ITEM> was filled!"
-                let filled_item = if is_buy {
-                    clean_message.split("Buy Order for ").nth(1)
-                } else {
-                    clean_message.split("Sell Offer for ").nth(1)
-                }.and_then(|s| s.split(" was filled").next())
-                 .unwrap_or("")
-                 .to_string();
+            if let Some((filled_item, is_buy)) = parse_bazaar_filled_notification(&clean_message) {
                 info!("[BazaarOrders] Order fill notification — {} \"{}\"", if is_buy { "BUY" } else { "SELL" }, filled_item);
                 let _ = state.event_tx.send(BotEvent::BazaarOrderFilled {
                     item_name: filled_item,
@@ -5357,7 +5371,7 @@ async fn wait_for_cancel_confirmation(
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         // Window changed — server processed the action
@@ -5384,7 +5398,7 @@ async fn wait_for_collect_confirmation(
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         // Window changed — server processed the action
@@ -5731,6 +5745,34 @@ mod tests {
     use azalea_inventory::components::MapId;
     use azalea_inventory::ItemStack;
     use azalea_inventory::ItemStackData;
+
+    #[test]
+    fn test_parse_bazaar_filled_buy_order() {
+        let msg = "[Bazaar] Your Buy Order for Kuudra Mandible was filled!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, Some(("Kuudra Mandible".to_string(), true)));
+    }
+
+    #[test]
+    fn test_parse_bazaar_filled_sell_offer() {
+        let msg = "[Bazaar] Your Sell Offer for Perfect Ruby Gemstone was filled!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, Some(("Perfect Ruby Gemstone".to_string(), false)));
+    }
+
+    #[test]
+    fn test_parse_bazaar_filled_no_match() {
+        let msg = "[Bazaar] Order placed successfully!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_bazaar_filled_not_bazaar() {
+        let msg = "Your Buy Order for Diamond was filled!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn test_parse_purchased_message() {
