@@ -883,7 +883,12 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                frikadellen_baf::bot::BotEvent::BazaarOrderFilled => {
+                frikadellen_baf::bot::BotEvent::BazaarOrderFilled { item_name, is_buy_order } => {
+                    // Mark the order as filled in the tracker so the periodic timer
+                    // can skip ManageOrders when nothing needs collection.
+                    if !item_name.is_empty() {
+                        bazaar_tracker_events.mark_filled(&item_name, is_buy_order);
+                    }
                     // A bazaar buy/sell order was filled — trigger a ManageOrders run
                     // immediately so the items are collected without waiting for the next
                     // periodic check.  Only enqueue if bazaar flips are enabled and no
@@ -1875,6 +1880,7 @@ async fn main() -> Result<()> {
         let bot_client_orders = bot_client.clone();
         let command_queue_orders = command_queue.clone();
         let bazaar_flips_paused_orders = bazaar_flips_paused.clone();
+        let bazaar_tracker_orders = bazaar_tracker.clone();
         let order_interval = config.bazaar_order_check_interval_seconds;
         tokio::spawn(async move {
             use frikadellen_baf::types::{CommandType, CommandPriority};
@@ -1886,6 +1892,16 @@ async fn main() -> Result<()> {
                 // and will be re-queued when bazaar flips resume.
                 if bazaar_flips_paused_orders.load(Ordering::Relaxed) {
                     debug!("[BazaarOrders] Skipping periodic order check — AH flips incoming");
+                    continue;
+                }
+                // Skip when the tracker has no filled orders to collect.
+                // The BazaarOrderFilled event already triggers an immediate
+                // ManageOrders run, so the periodic timer only needs to fire
+                // when a fill notification was missed or on startup.  This
+                // avoids constant GUI cycling that generates packet spam and
+                // slows down the macro.
+                if !bazaar_tracker_orders.has_filled_orders() {
+                    debug!("[BazaarOrders] No filled orders in tracker — skipping periodic ManageOrders");
                     continue;
                 }
                 // When inventory is full, ManageOrders can't collect buy orders

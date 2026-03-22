@@ -69,6 +69,9 @@ const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
 const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
+/// Timeout (seconds) for `wait_for_collect_confirmation` and
+/// `wait_for_cancel_confirmation` to consider an action unprocessed.
+const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -225,8 +228,13 @@ pub enum BotEvent {
         starting_bid: u64,
         duration_hours: u64,
     },
-    /// A bazaar buy/sell order was fully filled and is ready to collect
-    BazaarOrderFilled,
+    /// A bazaar buy/sell order was fully filled and is ready to collect.
+    /// Carries the parsed item name and order type so the tracker can mark
+    /// the order as filled without opening the GUI.
+    BazaarOrderFilled {
+        item_name: String,
+        is_buy_order: bool,
+    },
     /// A bazaar order was collected (filled items/coins claimed) during ManageOrders.
     BazaarOrderCollected {
         item_name: String,
@@ -1489,6 +1497,29 @@ fn normalize_bazaar_order_text(text: &str) -> String {
         .to_lowercase()
 }
 
+/// Parse a "[Bazaar] Your Buy Order/Sell Offer for X was filled!" notification.
+/// Returns `(item_name, is_buy_order)` or `None` if the message doesn't match.
+fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
+    if !message.contains("[Bazaar]") || !message.contains("was filled") {
+        return None;
+    }
+    let is_buy = message.contains("Buy Order");
+    let is_sell = message.contains("Sell Offer");
+    if !is_buy && !is_sell {
+        return None;
+    }
+    let prefix = if is_buy { "Buy Order for " } else { "Sell Offer for " };
+    let item_name = message.split(prefix).nth(1)
+        .and_then(|s| s.split(" was filled").next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if item_name.is_empty() {
+        return None;
+    }
+    Some((item_name, is_buy))
+}
+
 /// Extract the clean item name from a ManageOrders order slot display name.
 /// Uses the parsed `order_identity` (which already contains the clean name) when
 /// available, otherwise strips BUY/SELL/Buy Order/Sell Offer prefixes.
@@ -1980,12 +2011,12 @@ async fn event_handler(
 
             // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
             // ManageOrders run so the filled items are collected promptly.
-            if clean_message.contains("[Bazaar]")
-                && clean_message.contains("was filled")
-                && (clean_message.contains("Buy Order") || clean_message.contains("Sell Offer"))
-            {
-                info!("[BazaarOrders] Order fill notification — emitting BazaarOrderFilled");
-                let _ = state.event_tx.send(BotEvent::BazaarOrderFilled);
+            if let Some((filled_item, is_buy)) = parse_bazaar_filled_notification(&clean_message) {
+                info!("[BazaarOrders] Order fill notification — {} \"{}\"", if is_buy { "BUY" } else { "SELL" }, filled_item);
+                let _ = state.event_tx.send(BotEvent::BazaarOrderFilled {
+                    item_name: filled_item,
+                    is_buy_order: is_buy,
+                });
             }
 
             // Detect "You don't have the space required to claim that!" and set the
@@ -4002,12 +4033,18 @@ async fn handle_window_interaction(
                                     } else {
                                         info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
                                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                                        let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                            item_name: clean_order_item_name(&order_name, &order_identity),
-                                            is_buy_order: order_is_buy,
-                                        });
-                                        // Wait briefly, then check if inventory became full
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        // Wait for server confirmation before emitting the
+                                        // collected event — previously the event fired
+                                        // immediately, producing false "order collected"
+                                        // messages when the click was not processed.
+                                        if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
+                                            let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                                item_name: clean_order_item_name(&order_name, &order_identity),
+                                                is_buy_order: order_is_buy,
+                                            });
+                                        } else {
+                                            warn!("[ManageOrders] Collect click for \"{}\" was not confirmed by server — skipping event", order_name);
+                                        }
                                         if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
                                             // Collect failed: check for instasell opportunity
                                             warn!("[ManageOrders] Inventory full after collect attempt for \"{}\"", order_name);
@@ -4177,13 +4214,18 @@ async fn handle_window_interaction(
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                        if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
-                            let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
-                                is_buy_order: *ctx_is_buy,
-                            });
+                        // Wait for server confirmation before emitting the collected
+                        // event — prevents false "order collected" messages.
+                        if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
+                            if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                    item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
+                                    is_buy_order: *ctx_is_buy,
+                                });
+                            }
+                        } else {
+                            warn!("[ManageOrders] Collect click for \"{}\" was not confirmed by server in Order options — skipping event", order_name);
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         // After collecting, also cancel if in startup mode or age-based
                         if cancel_open || cancel_due_to_age {
                             if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
@@ -5329,7 +5371,7 @@ async fn wait_for_cancel_confirmation(
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         // Window changed — server processed the action
@@ -5339,6 +5381,35 @@ async fn wait_for_cancel_confirmation(
         // Cancel button gone — cancellation confirmed
         let slots = bot.menu().slots();
         if find_slot_by_name(&slots, "Cancel").is_none() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// After clicking a Collect button in a bazaar order management window, wait for
+/// confirmation that the server processed the collection.  Returns `true` when
+/// the Collect button disappears from the window (or the window itself changes),
+/// `false` on timeout (meaning the collect click was likely not processed).
+async fn wait_for_collect_confirmation(
+    bot: &Client,
+    last_window_id: &Arc<RwLock<u8>>,
+    window_id: u8,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Window changed — server processed the action
+        if *last_window_id.read() != window_id {
+            return true;
+        }
+        // Collect button gone — collection confirmed
+        let slots = bot.menu().slots();
+        if find_slot_by_name(&slots, "Collect").is_none()
+            && find_slot_by_name(&slots, "Claim").is_none()
+        {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -5674,6 +5745,34 @@ mod tests {
     use azalea_inventory::components::MapId;
     use azalea_inventory::ItemStack;
     use azalea_inventory::ItemStackData;
+
+    #[test]
+    fn test_parse_bazaar_filled_buy_order() {
+        let msg = "[Bazaar] Your Buy Order for Kuudra Mandible was filled!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, Some(("Kuudra Mandible".to_string(), true)));
+    }
+
+    #[test]
+    fn test_parse_bazaar_filled_sell_offer() {
+        let msg = "[Bazaar] Your Sell Offer for Perfect Ruby Gemstone was filled!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, Some(("Perfect Ruby Gemstone".to_string(), false)));
+    }
+
+    #[test]
+    fn test_parse_bazaar_filled_no_match() {
+        let msg = "[Bazaar] Order placed successfully!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_bazaar_filled_not_bazaar() {
+        let msg = "Your Buy Order for Diamond was filled!";
+        let result = parse_bazaar_filled_notification(msg);
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn test_parse_purchased_message() {
