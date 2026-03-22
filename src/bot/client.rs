@@ -119,6 +119,10 @@ pub struct BotClient {
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
     /// Cleared when an order fills (Claimed message detected).
     bazaar_at_limit: Arc<AtomicBool>,
+    /// Set when "Maximum auction count reached" is detected in the Manage Auctions GUI.
+    /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
+    /// SellToAuction → /ah → limit-detected → idle loops.
+    auction_at_limit: Arc<AtomicBool>,
     /// Set when the server rejects an order placement (e.g. "Your price isn't
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
@@ -246,6 +250,7 @@ impl BotClient {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
+            auction_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
@@ -339,6 +344,7 @@ impl BotClient {
             scoreboard_teams: self.scoreboard_teams.clone(),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
+            auction_at_limit: self.auction_at_limit.clone(),
             bazaar_order_rejected: self.bazaar_order_rejected.clone(),
             purchase_start_time: self.purchase_start_time.clone(),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
@@ -555,6 +561,12 @@ impl BotClient {
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
     pub fn is_bazaar_at_limit(&self) -> bool {
         self.bazaar_at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the auction house limit has been hit and not yet cleared.
+    /// Used by `main.rs` to skip SellToAuction commands when at the cap.
+    pub fn is_auction_at_limit(&self) -> bool {
+        self.auction_at_limit.load(Ordering::Relaxed)
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
@@ -785,6 +797,10 @@ pub struct BotClientState {
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
     /// Cleared when an order fills. Prevents placing new orders while at the cap.
     pub bazaar_at_limit: Arc<AtomicBool>,
+    /// Set when "Maximum auction count reached" is detected in the Manage Auctions GUI.
+    /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
+    /// SellToAuction → /ah → limit-detected → idle loops.
+    pub auction_at_limit: Arc<AtomicBool>,
     /// Set when the server rejects an order placement (e.g. "Your price isn't
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
@@ -924,6 +940,7 @@ impl Default for BotClientState {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
+            auction_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
@@ -1585,6 +1602,7 @@ async fn event_handler(
                 let manage_orders_cancel_open_wd = state.manage_orders_cancel_open.clone();
                 let auto_cookie_wd = state.auto_cookie_hours.clone();
                 let command_generation_wd = state.command_generation.clone();
+                let bazaar_category_retries_wd = state.bazaar_category_retries.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let already_done = *teleported_wd.read();
@@ -1598,7 +1616,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, manage_orders_cancel_open_wd, auto_cookie_wd, command_generation_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, manage_orders_cancel_open_wd, auto_cookie_wd, command_generation_wd, bazaar_category_retries_wd).await;
                     }
                 });
             }
@@ -1742,6 +1760,11 @@ async fn event_handler(
                         }
                     }
                     *state.claim_sold_uuid.write() = uuid;
+                    // An auction sold — a slot is now free; clear the auction-limit flag.
+                    if state.auction_at_limit.load(Ordering::Relaxed) {
+                        info!("[Auction] Auction sold, clearing auction-limit flag");
+                        state.auction_at_limit.store(false, Ordering::Relaxed);
+                    }
                     let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                 }
             } else if clean_message.contains("You already have an item in the auction slot") {
@@ -1825,6 +1848,8 @@ async fn event_handler(
                     let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
                     state.active_auction_listings.write().insert(item_key);
                 }
+                // Listing succeeded — clear any stale auction-limit flag.
+                state.auction_at_limit.store(false, Ordering::Relaxed);
                 if !item.is_empty() {
                     info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
                     let _ = state.event_tx.send(BotEvent::AuctionListed {
@@ -2001,6 +2026,7 @@ async fn event_handler(
                         let manage_orders_cancel_open_startup = state.manage_orders_cancel_open.clone();
                         let auto_cookie_startup = state.auto_cookie_hours.clone();
                         let command_generation_startup = state.command_generation.clone();
+                        let bazaar_category_retries_startup = state.bazaar_category_retries.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
                             bot_clone.write_chat_packet("/is");
@@ -2008,7 +2034,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, manage_orders_cancel_open_startup, auto_cookie_startup, command_generation_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, manage_orders_cancel_open_startup, auto_cookie_startup, command_generation_startup, bazaar_category_retries_startup).await;
                         });
                     }
                 }
@@ -3531,6 +3557,7 @@ async fn handle_window_interaction(
                             let lore_text = lore.join(" ").to_lowercase();
                             if lore_text.contains("maximum") || lore_text.contains("limit") {
                                 warn!("[Auction] Maximum auction count reached, going idle");
+                                state.auction_at_limit.store(true, Ordering::Relaxed);
                                 bot.write_packet(ServerboundContainerClose {
                                     container_id: window_id as i32,
                                 });
@@ -3824,13 +3851,9 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
-                if let Some(i) = find_slot_by_name(&slots, "Manage Orders") {
-                    info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})", i);
-                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                } else {
-                    warn!("[ManageOrders] 'Manage Orders' button not found in bazaar window — closing and re-opening /bz");
-                    close_window_and_reopen_bz(bot, state, window_id).await;
-                }
+                let manage_slot = find_slot_by_name(&slots, "Manage Orders").unwrap_or(50);
+                info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})", manage_slot);
+                click_window_slot(bot, &state.last_window_id, window_id, manage_slot as i16).await;
             } else if is_bazaar_orders_window_title(window_title) {
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
                 info!("[ManageOrders] Processing existing orders ({})...", mode_str);
@@ -4317,15 +4340,10 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
-                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now");
-                if let Some(i) = sell_inv_slot {
-                    info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot {}", i);
-                    *state.bazaar_step.write() = BazaarStep::SearchResults;
-                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                } else {
-                    warn!("[SellInventoryBz] 'Sell Inventory Now' not found — closing and re-opening /bz");
-                    close_window_and_reopen_bz(bot, state, window_id).await;
-                }
+                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now").unwrap_or(47);
+                info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot {}", sell_inv_slot);
+                *state.bazaar_step.write() = BazaarStep::SearchResults;
+                click_window_slot(bot, &state.last_window_id, window_id, sell_inv_slot as i16).await;
             } else if step == BazaarStep::SearchResults {
                 // Confirmation page — click slot 11 ("Selling whole inventory")
                 info!("[SellInventoryBz] Confirmation window open — clicking slot 11 to sell");
@@ -5501,6 +5519,7 @@ async fn run_startup_workflow(
     manage_orders_cancel_open: Arc<AtomicBool>,
     auto_cookie_hours: Arc<RwLock<u64>>,
     command_generation: Arc<std::sync::atomic::AtomicU64>,
+    bazaar_category_retries: Arc<std::sync::atomic::AtomicU8>,
 ) {
     // Do not run startup steps while another interactive flow is active.
     // Wait briefly for idle/grace period; abort if the bot stays busy.
@@ -5578,6 +5597,7 @@ async fn run_startup_workflow(
     *manage_orders_cancelled.write() = 0;
     // Startup mode: cancel all open orders in addition to collecting filled ones
     manage_orders_cancel_open.store(true, Ordering::Relaxed);
+    bazaar_category_retries.store(0, Ordering::Relaxed);
     bot.write_chat_packet("/bz");
     *bot_state.write() = BotState::ManagingOrders;
 
