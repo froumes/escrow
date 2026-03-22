@@ -1565,6 +1565,18 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // Skip SellToAuction commands when the auction house is at the
+                // listing limit — avoids the repeated /ah → "Maximum auction count
+                // reached" → idle → next SellToAuction spam loop.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::SellToAuction { .. })
+                    && bot_client_clone.is_auction_at_limit()
+                {
+                    debug!("[Queue] Dropping SellToAuction — auction limit reached: {:?}", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
                 // Send command to bot for execution
                 if let Err(e) = bot_client_clone.send_command(cmd.clone()) {
                     warn!("Failed to send command to bot: {}", e);
