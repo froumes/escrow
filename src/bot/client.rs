@@ -62,6 +62,12 @@ const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
 /// is allowed before giving up and going Idle.  Prevents infinite /bz loops when the
 /// server keeps returning a sub-page (e.g. "Bazaar ➜ Oddities").
 const MAX_BAZAAR_CATEGORY_PAGE_RETRIES: u8 = 5;
+/// Fallback slot index for "Manage Orders" in the Bazaar GUI when dynamic name
+/// lookup fails.  Hypixel's default layout places it at slot 50.
+const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
+/// Fallback slot index for "Sell Inventory Now" in the Bazaar GUI when dynamic
+/// name lookup fails.  Hypixel's default layout places it at slot 47.
+const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
 /// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
@@ -3851,7 +3857,7 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
-                let manage_slot = find_slot_by_name(&slots, "Manage Orders").unwrap_or(50);
+                let manage_slot = find_slot_by_name(&slots, "Manage Orders").unwrap_or(MANAGE_ORDERS_FALLBACK_SLOT);
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})", manage_slot);
                 click_window_slot(bot, &state.last_window_id, window_id, manage_slot as i16).await;
             } else if is_bazaar_orders_window_title(window_title) {
@@ -4340,7 +4346,7 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
-                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now").unwrap_or(47);
+                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now").unwrap_or(SELL_INVENTORY_NOW_FALLBACK_SLOT);
                 info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot {}", sell_inv_slot);
                 *state.bazaar_step.write() = BazaarStep::SearchResults;
                 click_window_slot(bot, &state.last_window_id, window_id, sell_inv_slot as i16).await;
