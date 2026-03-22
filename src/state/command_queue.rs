@@ -175,6 +175,17 @@ impl CommandQueue {
     pub fn is_empty(&self) -> bool {
         self.queue.read().is_empty() && self.current_command.read().is_none()
     }
+
+    /// Returns true if a command with the given ID is still queued or currently executing.
+    /// Used by the startup workflow to wait until a specific enqueued command has completed.
+    pub fn contains_command_id(&self, id: &Uuid) -> bool {
+        if let Some(ref cur) = *self.current_command.read() {
+            if cur.id == *id {
+                return true;
+            }
+        }
+        self.queue.read().iter().any(|c| c.id == *id)
+    }
 }
 
 impl Default for CommandQueue {
