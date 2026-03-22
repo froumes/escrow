@@ -71,7 +71,9 @@ const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
 const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
 /// Timeout (seconds) for `wait_for_collect_confirmation` and
 /// `wait_for_cancel_confirmation` to consider an action unprocessed.
-const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
+/// Raised from 5 → 8 to accommodate Hypixel server lag that caused
+/// frequent false "not confirmed" warnings and skipped events.
+const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 8;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -3956,6 +3958,18 @@ async fn handle_window_interaction(
                                 .map(|(is_buy, _)| *is_buy)
                                 .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
+                            // When inventory is full and the order is a BUY, skip clicking
+                            // the slot entirely — we cannot collect items and the GUI
+                            // round-trip generates packet spam that risks a kick.
+                            // Exception: cancel_open mode still needs to click to cancel.
+                            if order_is_buy && state.inventory_full.load(Ordering::Relaxed) && !cancel_open {
+                                warn!("[ManageOrders] Inventory full — skipping BUY order \"{}\" (no slot click)", order_name);
+                                log_pending_claim(&order_name);
+                                processed_orders.insert(processed_key);
+                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
+                                continue;
+                            }
+
                             // Store order context so Branch C (Order options window) can
                             // apply the same cancel_due_to_age logic.
                             *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone()));
@@ -5458,6 +5472,7 @@ fn check_manage_orders_deadline(
 /// can continue from a clean state.  A delay between the close and the
 /// chat command gives the server time to process the ContainerClose before the
 /// new /bz command arrives, and avoids "Sending packets too fast!" kicks.
+/// Raised from 500 → 800 ms to reduce kick frequency under heavy GUI cycling.
 async fn close_window_and_reopen_bz(
     bot: &Client,
     state: &BotClientState,
@@ -5465,7 +5480,7 @@ async fn close_window_and_reopen_bz(
 ) {
     if *state.last_window_id.read() == window_id {
         bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
         bot.write_chat_packet("/bz");
     }
 }
