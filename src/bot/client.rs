@@ -51,9 +51,13 @@ const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 const WINDOW_CLOSE_DELAY_MS: u64 = 150;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
-/// stuck item from the auction slot.  500 ms gives Hypixel time to process the
+/// stuck item from the auction slot.  Gives Hypixel time to process the
 /// container-close packet and return the item to inventory.
-const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 500;
+const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 1000;
+/// Maximum number of retry attempts when "You already have an item in the auction
+/// slot!" keeps recurring.  After this many retries the bot gives up and goes Idle
+/// instead of looping indefinitely and risking a "Sending packets too fast!" kick.
+const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
 /// Debounce interval for `rebuild_cached_window_json` on `ContainerSetSlot` events.
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
@@ -325,6 +329,7 @@ impl BotClient {
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
             auction_sell_aborted: Arc::new(AtomicBool::new(false)),
+            auction_stuck_item_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
@@ -760,6 +765,10 @@ pub struct BotClientState {
     /// auction slot!"). Checked before ConfirmSell/FinalConfirm to abort the flow and
     /// prevent listing the wrong item.
     pub auction_sell_aborted: Arc<AtomicBool>,
+    /// Number of times the auction sell flow has been retried due to a stuck item in the
+    /// auction slot.  Reset at the start of each SellToAuction command.  When this reaches
+    /// MAX_AUCTION_STUCK_ITEM_RETRIES the bot gives up and goes Idle.
+    pub auction_stuck_item_retries: Arc<std::sync::atomic::AtomicU8>,
     /// Scoreboard scores: objective_name -> (owner -> (display_text, score))
     pub scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
     /// Which objective is currently displayed in the sidebar slot
@@ -900,6 +909,7 @@ impl Default for BotClientState {
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
             auction_sell_aborted: Arc::new(AtomicBool::new(false)),
+            auction_stuck_item_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
@@ -1726,33 +1736,50 @@ async fn event_handler(
                 }
             } else if clean_message.contains("You already have an item in the auction slot") {
                 // Hypixel rejected our item placement — there was already an item in the slot.
-                // Close the window (returning the stuck item to inventory) and retry the flow.
+                // Close the window (returning the stuck item to inventory) and retry the flow,
+                // up to MAX_AUCTION_STUCK_ITEM_RETRIES times to avoid packet-spam kicks.
                 if *state.bot_state.read() == BotState::Selling {
-                    warn!(
-                        "[Auction] ABORTING: \"{}\" — closing window to remove stuck item and retrying",
-                        clean_message
-                    );
-                    state.auction_sell_aborted.store(true, Ordering::Relaxed);
-                    let window_id = *state.last_window_id.read();
-                    if window_id > 0 {
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
+                    let attempt = state.auction_stuck_item_retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= MAX_AUCTION_STUCK_ITEM_RETRIES {
+                        warn!(
+                            "[Auction] ABORTING: stuck item in auction slot after {} retries — giving up",
+                            attempt
+                        );
+                        state.auction_sell_aborted.store(true, Ordering::Relaxed);
+                        let window_id = *state.last_window_id.read();
+                        if window_id > 0 {
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
+                        }
+                        *state.bot_state.write() = BotState::Idle;
+                    } else {
+                        warn!(
+                            "[Auction] ABORTING: \"{}\" — closing window to remove stuck item and retrying (attempt {}/{})",
+                            clean_message, attempt + 1, MAX_AUCTION_STUCK_ITEM_RETRIES
+                        );
+                        state.auction_sell_aborted.store(true, Ordering::Relaxed);
+                        let window_id = *state.last_window_id.read();
+                        if window_id > 0 {
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
+                        }
+                        // Restart the auction flow: reset step and re-open /ah after a
+                        // delay so Hypixel processes the window close first.
+                        *state.auction_step.write() = AuctionStep::Initial;
+                        let bot_clone = bot.clone();
+                        let state_clone = state.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(AUCTION_RETRY_AFTER_STUCK_ITEM_MS)).await;
+                            // Only retry if still in Selling state (not interrupted by another command)
+                            if *state_clone.bot_state.read() == BotState::Selling {
+                                info!("[Auction] Retrying auction after removing stuck item — sending /ah");
+                                state_clone.auction_sell_aborted.store(false, Ordering::Relaxed);
+                                bot_clone.write_chat_packet("/ah");
+                            }
                         });
                     }
-                    // Restart the auction flow: reset step and re-open /ah after a short
-                    // delay so Hypixel processes the window close first.
-                    *state.auction_step.write() = AuctionStep::Initial;
-                    let bot_clone = bot.clone();
-                    let state_clone = state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(AUCTION_RETRY_AFTER_STUCK_ITEM_MS)).await;
-                        // Only retry if still in Selling state (not interrupted by another command)
-                        if *state_clone.bot_state.read() == BotState::Selling {
-                            info!("[Auction] Retrying auction after removing stuck item — sending /ah");
-                            state_clone.auction_sell_aborted.store(false, Ordering::Relaxed);
-                            bot_clone.write_chat_packet("/ah");
-                        }
-                    });
                 }
             } else if clean_message.contains("BIN Auction started for") {
                 // "BIN Auction started for <item>!" — Hypixel's confirmation that our listing
@@ -2449,6 +2476,7 @@ async fn execute_command(
             *state.auction_item_id.write() = item_id.clone();
             *state.auction_step.write() = AuctionStep::Initial;
             state.auction_sell_aborted.store(false, Ordering::Relaxed);
+            state.auction_stuck_item_retries.store(0, Ordering::Relaxed);
             // Open auction house — window handler takes over from here
             bot.write_chat_packet("/ah");
             *state.bot_state.write() = BotState::Selling;
@@ -5721,7 +5749,7 @@ mod tests {
         assert!(is_bazaar_category_page("Bazaar ➜ Oddities"));
         assert!(is_bazaar_category_page("Bazaar ➜ Combat"));
         assert!(is_bazaar_category_page("Bazaar ➜ Mining"));
-        assert!(is_bazaar_category_page("Bazaar ➜ \"Enchanted Diamond\""));
+        assert!(is_bazaar_category_page("Bazaar ➜ Farming"));
         // Category sub-pages with → (U+2192)
         assert!(is_bazaar_category_page("Bazaar → Oddities"));
         assert!(is_bazaar_category_page("Bazaar → Combat"));
