@@ -3780,8 +3780,10 @@ async fn handle_window_interaction(
                 // instead of relying on a hardcoded slot index.
                 if is_bazaar_category_page(window_title) {
                     // Category sub-page (e.g. "Bazaar ➜ Oddities") — cannot contain
-                    // the Manage Orders button.  Close and re-open /bz to reach the
-                    // main Bazaar page, but cap retries to avoid infinite loop.
+                    // the Manage Orders button.  Click "Go Back" to reach the main
+                    // Bazaar page.  /bz remembers the last viewed category so
+                    // close+reopen just returns here; clicking "Go Back" navigates
+                    // within the menu hierarchy instead.
                     let attempt = state.bazaar_category_retries.fetch_add(1, Ordering::Relaxed);
                     if attempt >= MAX_BAZAAR_CATEGORY_PAGE_RETRIES {
                         warn!(
@@ -3795,11 +3797,20 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                         return;
                     }
-                    warn!(
-                        "[ManageOrders] Category page \"{}\" — closing and re-opening /bz (attempt {}/{})",
-                        window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                    );
-                    close_window_and_reopen_bz(bot, state, window_id).await;
+                    let slots = bot.menu().slots();
+                    if let Some(i) = find_slot_by_name(&slots, "Go Back") {
+                        info!(
+                            "[ManageOrders] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
+                            window_title, i, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                        );
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                    } else {
+                        warn!(
+                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
+                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                        );
+                        close_window_and_reopen_bz(bot, state, window_id).await;
+                    }
                     return;
                 }
                 // Reached the main Bazaar page — reset category-page retry counter.
@@ -4259,6 +4270,9 @@ async fn handle_window_interaction(
 
             if step == BazaarStep::Initial && window_title.contains("Bazaar") {
                 if is_bazaar_category_page(window_title) {
+                    // Category sub-page — click "Go Back" to reach the main Bazaar
+                    // page.  /bz remembers the last category so close+reopen just
+                    // returns here; "Go Back" navigates within the menu hierarchy.
                     let attempt = state.bazaar_category_retries.fetch_add(1, Ordering::Relaxed);
                     if attempt >= MAX_BAZAAR_CATEGORY_PAGE_RETRIES {
                         warn!(
@@ -4271,11 +4285,20 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                         return;
                     }
-                    warn!(
-                        "[SellInventoryBz] Category page \"{}\" — closing and re-opening /bz (attempt {}/{})",
-                        window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                    );
-                    close_window_and_reopen_bz(bot, state, window_id).await;
+                    let slots = bot.menu().slots();
+                    if let Some(i) = find_slot_by_name(&slots, "Go Back") {
+                        info!(
+                            "[SellInventoryBz] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
+                            window_title, i, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                        );
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                    } else {
+                        warn!(
+                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
+                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
+                        );
+                        close_window_and_reopen_bz(bot, state, window_id).await;
+                    }
                     return;
                 }
                 // Reached the main Bazaar page — reset category-page retry counter.
@@ -5391,10 +5414,13 @@ async fn close_window_and_reopen_bz(
 }
 
 /// If the auction item preview slot (slot 13) in "Create BIN Auction" is already
-/// occupied (e.g. from a previously failed auction creation or a purchased item
-/// auto-placed by the server), click it to return the stuck item to inventory so
-/// our item can be placed without triggering "You already have an item in the
-/// auction slot!".
+/// occupied by a real item (e.g. from a previously failed auction creation or a
+/// purchased item auto-placed by the server), click it to return the stuck item
+/// to inventory so our item can be placed without triggering "You already have an
+/// item in the auction slot!".
+///
+/// Glass panes and other GUI filler/decoration items are ignored — Hypixel uses
+/// them as placeholder visuals and clicking them is a no-op that wastes time.
 async fn clear_auction_preview_slot(
     bot: &Client,
     state: &BotClientState,
@@ -5402,7 +5428,12 @@ async fn clear_auction_preview_slot(
     slots: &[azalea_inventory::ItemStack],
 ) {
     if slots.len() > 13 && !slots[13].is_empty() {
-        warn!("[Auction] Slot 13 already occupied — clicking to clear stuck item before placing ours");
+        let kind = slots[13].kind().to_string().to_lowercase();
+        if kind.contains("glass_pane") || kind.contains("barrier") {
+            debug!("[Auction] Slot 13 is GUI filler ({}) — not a stuck item, skipping", kind);
+            return;
+        }
+        warn!("[Auction] Slot 13 already occupied ({}) — clicking to clear stuck item before placing ours", kind);
         click_window_slot(bot, &state.last_window_id, window_id, 13).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
