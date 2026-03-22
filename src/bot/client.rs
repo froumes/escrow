@@ -1377,6 +1377,14 @@ fn is_bazaar_orders_window_title(window_title: &str) -> bool {
         || lower.contains("bazaar orders")
 }
 
+/// Returns true if the window title indicates a Bazaar category sub-page
+/// (e.g. "Bazaar ➜ Oddities", "Bazaar → Combat") rather than the main Bazaar page.
+/// Hypixel uses the arrow character to denote navigation into a sub-page.
+fn is_bazaar_category_page(window_title: &str) -> bool {
+    // Check for both common arrow characters: ➜ (U+279C) and → (U+2192)
+    window_title.contains("Bazaar") && (window_title.contains('➜') || window_title.contains('→'))
+}
+
 fn starts_with_phrase_delimited(text: &str, phrase: &str) -> bool {
     if !text.starts_with(phrase) {
         return false;
@@ -3710,7 +3718,7 @@ async fn handle_window_interaction(
             // are cancelled after collecting filled ones. In collect-only mode (cancel_open=false,
             // used when triggered by BazaarOrderFilled or periodic checks) only filled orders
             // are collected and open orders are left untouched.
-            // Flow: Bazaar window → click slot 50 (Manage Orders) → iterate orders → handle each.
+            // Flow: Bazaar window → find & click "Manage Orders" → iterate orders → handle each.
 
             // Check the internal deadline at every window event.  If exceeded, close
             // this window and return to Idle so the command queue isn't blocked.
@@ -3720,10 +3728,30 @@ async fn handle_window_interaction(
 
             let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
             if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
-                // Main bazaar page — click "Manage Orders" at slot 50
-                info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot 50)");
+                // Bazaar page — find "Manage Orders" button dynamically.
+                // Hypixel may rearrange slots across updates, so we search by name
+                // instead of relying on a hardcoded slot index.
+                if is_bazaar_category_page(window_title) {
+                    // Category sub-page (e.g. "Bazaar ➜ Oddities") — cannot contain
+                    // the Manage Orders button.  Close and re-open /bz to reach the
+                    // main Bazaar page.
+                    warn!(
+                        "[ManageOrders] Category page \"{}\" — closing and re-opening /bz",
+                        window_title
+                    );
+                    close_window_and_reopen_bz(bot, state, window_id).await;
+                    return;
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                click_window_slot(bot, &state.last_window_id, window_id, 50).await;
+                if *state.last_window_id.read() != window_id { return; }
+                let slots = bot.menu().slots();
+                if let Some(i) = find_slot_by_name(&slots, "Manage Orders") {
+                    info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})", i);
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                } else {
+                    warn!("[ManageOrders] 'Manage Orders' button not found in bazaar window — closing and re-opening /bz");
+                    close_window_and_reopen_bz(bot, state, window_id).await;
+                }
             } else if is_bazaar_orders_window_title(window_title) {
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
                 info!("[ManageOrders] Processing existing orders ({})...", mode_str);
@@ -4152,11 +4180,11 @@ async fn handle_window_interaction(
             }
         }
         BotState::SellingInventoryBz => {
-            // Sell whole inventory instantly via /bz → "Sell Inventory Now" (slot 47)
+            // Sell whole inventory instantly via /bz → "Sell Inventory Now"
             // → "Selling whole inventory" (slot 11).
             //
             // Flow (reuses bazaar_step for sub-state):
-            //   Initial          — bazaar main page: click "Sell Inventory Now" at slot 47
+            //   Initial          — bazaar main page: find & click "Sell Inventory Now"
             //   SearchResults    — confirmation page: click slot 11 to confirm
             //
             // If inventory has no instasellable items, Hypixel sends
@@ -4168,11 +4196,23 @@ async fn handle_window_interaction(
             }
 
             if step == BazaarStep::Initial && window_title.contains("Bazaar") {
-                info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot 47");
+                if is_bazaar_category_page(window_title) {
+                    warn!("[SellInventoryBz] Category page \"{}\" — closing and re-opening /bz", window_title);
+                    close_window_and_reopen_bz(bot, state, window_id).await;
+                    return;
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
-                *state.bazaar_step.write() = BazaarStep::SearchResults;
-                click_window_slot(bot, &state.last_window_id, window_id, 47).await;
+                let slots = bot.menu().slots();
+                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now");
+                if let Some(i) = sell_inv_slot {
+                    info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot {}", i);
+                    *state.bazaar_step.write() = BazaarStep::SearchResults;
+                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                } else {
+                    warn!("[SellInventoryBz] 'Sell Inventory Now' not found — closing and re-opening /bz");
+                    close_window_and_reopen_bz(bot, state, window_id).await;
+                }
             } else if step == BazaarStep::SearchResults {
                 // Confirmation page — click slot 11 ("Selling whole inventory")
                 info!("[SellInventoryBz] Confirmation window open — clicking slot 11 to sell");
@@ -5256,9 +5296,9 @@ fn check_manage_orders_deadline(
 }
 
 /// Close the current window and re-navigate to /bz so the ManagingOrders flow
-/// can continue from a clean state.  A small delay between the close and the
+/// can continue from a clean state.  A delay between the close and the
 /// chat command gives the server time to process the ContainerClose before the
-/// new /bz command arrives.
+/// new /bz command arrives, and avoids "Sending packets too fast!" kicks.
 async fn close_window_and_reopen_bz(
     bot: &Client,
     state: &BotClientState,
@@ -5266,7 +5306,7 @@ async fn close_window_and_reopen_bz(
 ) {
     if *state.last_window_id.read() == window_id {
         bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         bot.write_chat_packet("/bz");
     }
 }
@@ -5673,6 +5713,23 @@ mod tests {
         assert!(is_bazaar_orders_window_title("Your Orders"));
         assert!(is_bazaar_orders_window_title("Your Bazaar Orders"));
         assert!(!is_bazaar_orders_window_title("Bazaar"));
+    }
+
+    #[test]
+    fn test_is_bazaar_category_page() {
+        // Category sub-pages with ➜ (U+279C)
+        assert!(is_bazaar_category_page("Bazaar ➜ Oddities"));
+        assert!(is_bazaar_category_page("Bazaar ➜ Combat"));
+        assert!(is_bazaar_category_page("Bazaar ➜ Mining"));
+        assert!(is_bazaar_category_page("Bazaar ➜ \"Enchanted Diamond\""));
+        // Category sub-pages with → (U+2192)
+        assert!(is_bazaar_category_page("Bazaar → Oddities"));
+        assert!(is_bazaar_category_page("Bazaar → Combat"));
+        // Main bazaar page (no arrow) should NOT match
+        assert!(!is_bazaar_category_page("Bazaar"));
+        // Order management windows should NOT match
+        assert!(!is_bazaar_category_page("Manage Orders"));
+        assert!(!is_bazaar_category_page("Your Bazaar Orders"));
     }
 
     #[test]
