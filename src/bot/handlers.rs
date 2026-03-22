@@ -66,7 +66,7 @@ impl BotEventHandlers {
         // Uses specific prefixes/patterns to avoid false positives on player chat.
         if clean.contains("[Bazaar]")
             || clean.starts_with("You don't have")
-            || clean.contains("items stashed away!")
+            || clean.contains("stashed away")
             || clean.starts_with("You cannot")
             || clean.starts_with("Cancelled!")
             || clean.starts_with("You collected")
