@@ -3830,6 +3830,10 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                         return;
                     }
+                    // Wait for slot data to arrive (ContainerSetContent is a
+                    // separate packet after OpenScreen).
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    if *state.last_window_id.read() != window_id { return; }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, "Go Back") {
                         info!(
@@ -3838,17 +3842,14 @@ async fn handle_window_interaction(
                         );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     } else {
-                        // /bz remembers the last viewed category, so close+reopen would
-                        // return to the same page — give up immediately instead of looping.
+                        // Slots loaded but "Go Back" still missing — close and
+                        // reopen /bz to retry.  The retry counter (incremented
+                        // above) caps the total attempts.
                         warn!(
-                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, giving up",
-                            window_title
+                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
+                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
                         );
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
-                        });
-                        *state.manage_orders_deadline.write() = None;
-                        *state.bot_state.write() = BotState::Idle;
+                        close_window_and_reopen_bz(bot, state, window_id).await;
                     }
                     return;
                 }
@@ -4320,6 +4321,10 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                         return;
                     }
+                    // Wait for slot data to arrive (ContainerSetContent is a
+                    // separate packet after OpenScreen).
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    if *state.last_window_id.read() != window_id { return; }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, "Go Back") {
                         info!(
@@ -4328,16 +4333,14 @@ async fn handle_window_interaction(
                         );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     } else {
-                        // /bz remembers the last viewed category, so close+reopen would
-                        // return to the same page — give up immediately instead of looping.
+                        // Slots loaded but "Go Back" still missing — close and
+                        // reopen /bz to retry.  The retry counter (incremented
+                        // above) caps the total attempts.
                         warn!(
-                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, giving up",
-                            window_title
+                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
+                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
                         );
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
-                        });
-                        *state.bot_state.write() = BotState::Idle;
+                        close_window_and_reopen_bz(bot, state, window_id).await;
                     }
                     return;
                 }
