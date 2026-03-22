@@ -373,6 +373,7 @@ async fn main() -> Result<()> {
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
     bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
     bot_client.bazaar_flips_paused = bazaar_flips_paused.clone();
+    bot_client.enable_bazaar_flips = enable_bazaar_flips.clone();
     bot_client.set_command_queue(command_queue.clone());
     *bot_client.ingame_name.write() = ingame_name.clone();
 
