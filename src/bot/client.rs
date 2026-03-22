@@ -1739,32 +1739,30 @@ async fn event_handler(
                 // Close the window (returning the stuck item to inventory) and retry the flow,
                 // up to MAX_AUCTION_STUCK_ITEM_RETRIES times to avoid packet-spam kicks.
                 if *state.bot_state.read() == BotState::Selling {
+                    // fetch_add returns the *previous* value, so attempt 0..2 are the
+                    // 3 retry attempts (when MAX is 3); attempt 3 triggers the give-up.
                     let attempt = state.auction_stuck_item_retries.fetch_add(1, Ordering::Relaxed);
+
+                    // Common to both paths: abort current flow and close the window.
+                    state.auction_sell_aborted.store(true, Ordering::Relaxed);
+                    let window_id = *state.last_window_id.read();
+                    if window_id > 0 {
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                    }
+
                     if attempt >= MAX_AUCTION_STUCK_ITEM_RETRIES {
                         warn!(
                             "[Auction] ABORTING: stuck item in auction slot after {} retries — giving up",
                             attempt
                         );
-                        state.auction_sell_aborted.store(true, Ordering::Relaxed);
-                        let window_id = *state.last_window_id.read();
-                        if window_id > 0 {
-                            bot.write_packet(ServerboundContainerClose {
-                                container_id: window_id as i32,
-                            });
-                        }
                         *state.bot_state.write() = BotState::Idle;
                     } else {
                         warn!(
                             "[Auction] ABORTING: \"{}\" — closing window to remove stuck item and retrying (attempt {}/{})",
                             clean_message, attempt + 1, MAX_AUCTION_STUCK_ITEM_RETRIES
                         );
-                        state.auction_sell_aborted.store(true, Ordering::Relaxed);
-                        let window_id = *state.last_window_id.read();
-                        if window_id > 0 {
-                            bot.write_packet(ServerboundContainerClose {
-                                container_id: window_id as i32,
-                            });
-                        }
                         // Restart the auction flow: reset step and re-open /ah after a
                         // delay so Hypixel processes the window close first.
                         *state.auction_step.write() = AuctionStep::Initial;
