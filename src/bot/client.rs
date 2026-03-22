@@ -59,10 +59,6 @@ const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 2000;
 /// slot!" keeps recurring.  After this many retries the bot gives up and goes Idle
 /// instead of looping indefinitely and risking a "Sending packets too fast!" kick.
 const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
-/// Maximum number of consecutive times the bazaar category-page close/reopen cycle
-/// is allowed before giving up and going Idle.  Prevents infinite /bz loops when the
-/// server keeps returning a sub-page (e.g. "Bazaar ➜ Oddities").
-const MAX_BAZAAR_CATEGORY_PAGE_RETRIES: u8 = 5;
 /// Fallback slot index for "Manage Orders" in the Bazaar GUI when dynamic name
 /// lookup fails.  Hypixel's default layout places it at slot 50.
 const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
@@ -187,6 +183,9 @@ pub struct BotClient {
     /// to block bazaar flips during startup (since bot state cycles through
     /// Idle between queued startup commands).
     startup_in_progress: Arc<AtomicBool>,
+    /// Whether bazaar flips are enabled in the config.  Used by the startup
+    /// workflow to decide whether to cancel all open bazaar orders.
+    pub enable_bazaar_flips: Arc<AtomicBool>,
 }
 #[derive(Debug, Clone)]
 pub enum BotEvent {
@@ -286,6 +285,7 @@ impl BotClient {
             inventory_full: Arc::new(AtomicBool::new(false)),
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
+            enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -391,13 +391,13 @@ impl BotClient {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
-            bazaar_category_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             bazaar_flips_paused: self.bazaar_flips_paused.clone(),
             chat_batch_buffer: self.chat_batch_buffer.clone(),
             cached_window_json: self.cached_window_json.clone(),
             window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
             command_queue: self.command_queue.clone(),
             startup_in_progress: self.startup_in_progress.clone(),
+            enable_bazaar_flips: self.enable_bazaar_flips.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -916,10 +916,6 @@ pub struct BotClientState {
     /// ManageOrders command so that all window handlers (Branch A/B/C) can
     /// bail out early instead of waiting for the external 60-second timeout.
     pub manage_orders_deadline: Arc<RwLock<Option<tokio::time::Instant>>>,
-    /// Consecutive bazaar category-page close/reopen attempts.  Reset when the
-    /// main Bazaar page opens successfully; triggers Idle when it exceeds
-    /// MAX_BAZAAR_CATEGORY_PAGE_RETRIES.
-    pub bazaar_category_retries: Arc<std::sync::atomic::AtomicU8>,
     /// Shared AH-pause flag — when true, ManageOrders aborts early so AH
     /// flips can proceed without interference.
     pub bazaar_flips_paused: Arc<AtomicBool>,
@@ -939,6 +935,9 @@ pub struct BotClientState {
     /// bazaar flips even when bot state briefly cycles through Idle between
     /// queued startup commands.
     pub startup_in_progress: Arc<AtomicBool>,
+    /// Whether bazaar flips are enabled.  Shared with `BotClient` so the
+    /// startup workflow can decide whether to cancel all open bazaar orders.
+    pub enable_bazaar_flips: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -1007,13 +1006,13 @@ impl Default for BotClientState {
             cancel_auction_item_name: Arc::new(RwLock::new(String::new())),
             cancel_auction_starting_bid: Arc::new(RwLock::new(0)),
             manage_orders_deadline: Arc::new(RwLock::new(None)),
-            bazaar_category_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
             window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
+            enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -1453,14 +1452,6 @@ fn is_bazaar_orders_window_title(window_title: &str) -> bool {
         || lower.contains("bazaar orders")
 }
 
-/// Returns true if the window title indicates a Bazaar category sub-page
-/// (e.g. "Bazaar ➜ Oddities", "Bazaar → Combat") rather than the main Bazaar page.
-/// Hypixel uses the arrow character to denote navigation into a sub-page.
-fn is_bazaar_category_page(window_title: &str) -> bool {
-    // Check for both common arrow characters: ➜ (U+279C) and → (U+2192)
-    window_title.contains("Bazaar") && (window_title.contains('➜') || window_title.contains('→'))
-}
-
 fn starts_with_phrase_delimited(text: &str, phrase: &str) -> bool {
     if !text.starts_with(phrase) {
         return false;
@@ -1641,6 +1632,7 @@ async fn event_handler(
                 let auto_cookie_wd = state.auto_cookie_hours.clone();
                 let command_queue_wd = state.command_queue.clone();
                 let startup_in_progress_wd = state.startup_in_progress.clone();
+                let enable_bazaar_flips_wd = state.enable_bazaar_flips.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let already_done = *teleported_wd.read();
@@ -1654,7 +1646,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_queue_wd, startup_in_progress_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_queue_wd, startup_in_progress_wd, enable_bazaar_flips_wd).await;
                     }
                 });
             }
@@ -2073,6 +2065,7 @@ async fn event_handler(
                         let auto_cookie_startup = state.auto_cookie_hours.clone();
                         let command_queue_startup = state.command_queue.clone();
                         let startup_in_progress_startup = state.startup_in_progress.clone();
+                        let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
                             bot_clone.write_chat_packet("/is");
@@ -2080,7 +2073,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_queue_startup, startup_in_progress_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_queue_startup, startup_in_progress_startup, enable_bazaar_flips_startup).await;
                         });
                     }
                 }
@@ -2601,7 +2594,6 @@ async fn execute_command(
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
-            state.bazaar_category_retries.store(0, Ordering::Relaxed);
             // Set an internal deadline so the handler can bail out cleanly
             // (closing windows) instead of burning through the full 60-second
             // external command-processor timeout.
@@ -2648,7 +2640,6 @@ async fn execute_command(
         CommandType::SellInventoryBz => {
             info!("[SellInventoryBz] Opening /bz to sell inventory instantly");
             *state.bazaar_step.write() = BazaarStep::Initial;
-            state.bazaar_category_retries.store(0, Ordering::Relaxed);
             bot.write_chat_packet("/bz");
             *state.bot_state.write() = BotState::SellingInventoryBz;
         }
@@ -3848,53 +3839,9 @@ async fn handle_window_interaction(
 
             let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
             if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
-                // Bazaar page — find "Manage Orders" button dynamically.
-                // Hypixel may rearrange slots across updates, so we search by name
-                // instead of relying on a hardcoded slot index.
-                if is_bazaar_category_page(window_title) {
-                    // Category sub-page (e.g. "Bazaar ➜ Oddities") — cannot contain
-                    // the Manage Orders button.  Click "Go Back" to reach the main
-                    // Bazaar page.  /bz remembers the last viewed category so
-                    // close+reopen just returns here; clicking "Go Back" navigates
-                    // within the menu hierarchy instead.
-                    let attempt = state.bazaar_category_retries.fetch_add(1, Ordering::Relaxed);
-                    if attempt >= MAX_BAZAAR_CATEGORY_PAGE_RETRIES {
-                        warn!(
-                            "[ManageOrders] Category page \"{}\" persisted after {} retries — giving up",
-                            window_title, attempt
-                        );
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
-                        });
-                        *state.manage_orders_deadline.write() = None;
-                        *state.bot_state.write() = BotState::Idle;
-                        return;
-                    }
-                    // Wait for slot data to arrive (ContainerSetContent is a
-                    // separate packet after OpenScreen).
-                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    if *state.last_window_id.read() != window_id { return; }
-                    let slots = bot.menu().slots();
-                    if let Some(i) = find_slot_by_name(&slots, "Go Back") {
-                        info!(
-                            "[ManageOrders] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
-                            window_title, i, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    } else {
-                        // Slots loaded but "Go Back" still missing — close and
-                        // reopen /bz to retry.  The retry counter (incremented
-                        // above) caps the total attempts.
-                        warn!(
-                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
-                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        close_window_and_reopen_bz(bot, state, window_id).await;
-                    }
-                    return;
-                }
-                // Reached the main Bazaar page — reset category-page retry counter.
-                state.bazaar_category_retries.store(0, Ordering::Relaxed);
+                // Bazaar page (main or category) — find "Manage Orders" button
+                // dynamically.  Hypixel may rearrange slots across updates, so we
+                // search by name instead of relying on a hardcoded slot index.
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
@@ -4345,47 +4292,8 @@ async fn handle_window_interaction(
             }
 
             if step == BazaarStep::Initial && window_title.contains("Bazaar") {
-                if is_bazaar_category_page(window_title) {
-                    // Category sub-page — click "Go Back" to reach the main Bazaar
-                    // page.  /bz remembers the last category so close+reopen just
-                    // returns here; "Go Back" navigates within the menu hierarchy.
-                    let attempt = state.bazaar_category_retries.fetch_add(1, Ordering::Relaxed);
-                    if attempt >= MAX_BAZAAR_CATEGORY_PAGE_RETRIES {
-                        warn!(
-                            "[SellInventoryBz] Category page \"{}\" persisted after {} retries — giving up",
-                            window_title, attempt
-                        );
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
-                        });
-                        *state.bot_state.write() = BotState::Idle;
-                        return;
-                    }
-                    // Wait for slot data to arrive (ContainerSetContent is a
-                    // separate packet after OpenScreen).
-                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    if *state.last_window_id.read() != window_id { return; }
-                    let slots = bot.menu().slots();
-                    if let Some(i) = find_slot_by_name(&slots, "Go Back") {
-                        info!(
-                            "[SellInventoryBz] Category page \"{}\" — clicking 'Go Back' (slot {}) (attempt {}/{})",
-                            window_title, i, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    } else {
-                        // Slots loaded but "Go Back" still missing — close and
-                        // reopen /bz to retry.  The retry counter (incremented
-                        // above) caps the total attempts.
-                        warn!(
-                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
-                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
-                        );
-                        close_window_and_reopen_bz(bot, state, window_id).await;
-                    }
-                    return;
-                }
-                // Reached the main Bazaar page — reset category-page retry counter.
-                state.bazaar_category_retries.store(0, Ordering::Relaxed);
+                // Bazaar page (main or category) — find "Sell Inventory Now"
+                // button dynamically.
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 if *state.last_window_id.read() != window_id { return; }
                 let slots = bot.menu().slots();
@@ -5572,6 +5480,7 @@ async fn run_startup_workflow(
     auto_cookie_hours: Arc<RwLock<u64>>,
     command_queue: Arc<RwLock<Option<CommandQueue>>>,
     startup_in_progress: Arc<AtomicBool>,
+    enable_bazaar_flips: Arc<AtomicBool>,
 ) {
     use crate::types::{CommandType, CommandPriority};
 
@@ -5658,12 +5567,16 @@ async fn run_startup_workflow(
         info!("[Startup] Step 1/4: Cookie check skipped (AUTO_COOKIE=0)");
     }
 
-    // Step 2/4: Bazaar order management — cancel all old orders + collect filled
-    info!("[Startup] Step 2/4: Managing bazaar orders (startup: cancel + collect)...");
+    // Step 2/4: Bazaar order management — cancel all open orders when bazaar
+    // flips are enabled (they'll be re-placed with fresh recommendations), or
+    // just collect filled orders when bazaar flips are disabled.
+    let cancel_open = enable_bazaar_flips.load(Ordering::Relaxed);
+    let mode_str = if cancel_open { "cancel + collect" } else { "collect-only" };
+    info!("[Startup] Step 2/4: Managing bazaar orders (startup: {})...", mode_str);
     await_queued_command(
         &queue,
         &bot_state,
-        CommandType::ManageOrders { cancel_open: true },
+        CommandType::ManageOrders { cancel_open },
         50,
     ).await;
     let orders_cancelled = *manage_orders_cancelled.read();
@@ -5879,23 +5792,6 @@ mod tests {
         assert!(is_bazaar_orders_window_title("Your Orders"));
         assert!(is_bazaar_orders_window_title("Your Bazaar Orders"));
         assert!(!is_bazaar_orders_window_title("Bazaar"));
-    }
-
-    #[test]
-    fn test_is_bazaar_category_page() {
-        // Category sub-pages with ➜ (U+279C)
-        assert!(is_bazaar_category_page("Bazaar ➜ Oddities"));
-        assert!(is_bazaar_category_page("Bazaar ➜ Combat"));
-        assert!(is_bazaar_category_page("Bazaar ➜ Mining"));
-        assert!(is_bazaar_category_page("Bazaar ➜ Farming"));
-        // Category sub-pages with → (U+2192)
-        assert!(is_bazaar_category_page("Bazaar → Oddities"));
-        assert!(is_bazaar_category_page("Bazaar → Combat"));
-        // Main bazaar page (no arrow) should NOT match
-        assert!(!is_bazaar_category_page("Bazaar"));
-        // Order management windows should NOT match
-        assert!(!is_bazaar_category_page("Manage Orders"));
-        assert!(!is_bazaar_category_page("Your Bazaar Orders"));
     }
 
     #[test]
