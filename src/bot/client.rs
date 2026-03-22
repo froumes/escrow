@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
 
 use crate::types::{BotState, QueuedCommand};
+use crate::state::CommandQueue;
 use crate::websocket::CoflWebSocket;
 use super::handlers::BotEventHandlers;
 
@@ -178,6 +179,14 @@ pub struct BotClient {
     /// Set when inventory is full (stashed items / no space to claim).
     /// Shared with `BotClientState` so `main.rs` can check before enqueuing ManageOrders.
     inventory_full: Arc<AtomicBool>,
+    /// Shared reference to the command queue so the startup workflow can enqueue
+    /// commands (CheckCookie, ManageOrders, ClaimSoldItem, ClaimPurchasedItem)
+    /// through the proper queue instead of directly driving bot state.
+    command_queue: Arc<RwLock<Option<CommandQueue>>>,
+    /// Set to true while the startup workflow is running. Checked by flip handlers
+    /// to block bazaar flips during startup (since bot state cycles through
+    /// Idle between queued startup commands).
+    startup_in_progress: Arc<AtomicBool>,
 }
 #[derive(Debug, Clone)]
 pub enum BotEvent {
@@ -275,6 +284,8 @@ impl BotClient {
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
             inventory_full: Arc::new(AtomicBool::new(false)),
+            command_queue: Arc::new(RwLock::new(None)),
+            startup_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -385,6 +396,8 @@ impl BotClient {
             chat_batch_buffer: self.chat_batch_buffer.clone(),
             cached_window_json: self.cached_window_json.clone(),
             window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
+            command_queue: self.command_queue.clone(),
+            startup_in_progress: self.startup_in_progress.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -579,6 +592,18 @@ impl BotClient {
     /// Used by `main.rs` to skip ManageOrders when collection would fail.
     pub fn is_inventory_full(&self) -> bool {
         self.inventory_full.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the startup workflow is currently running.
+    /// Used by flip handlers to block bazaar flips during startup.
+    pub fn is_startup_in_progress(&self) -> bool {
+        self.startup_in_progress.load(Ordering::Relaxed)
+    }
+
+    /// Set the shared command queue so the startup workflow can enqueue commands.
+    /// Must be called before `connect()`.
+    pub fn set_command_queue(&self, queue: CommandQueue) {
+        *self.command_queue.write() = Some(queue);
     }
 
     /// Drain the buffered chat messages for a chatBatch upload.
@@ -908,6 +933,12 @@ pub struct BotClientState {
     /// When true, a rebuild task is already scheduled; additional slot updates are
     /// coalesced into that single rebuild to avoid 100 % CPU during rapid updates.
     pub window_cache_rebuild_scheduled: Arc<AtomicBool>,
+    /// Shared reference to the command queue for the startup workflow.
+    pub command_queue: Arc<RwLock<Option<CommandQueue>>>,
+    /// Set while the startup workflow is running so flip handlers can block
+    /// bazaar flips even when bot state briefly cycles through Idle between
+    /// queued startup commands.
+    pub startup_in_progress: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -981,6 +1012,8 @@ impl Default for BotClientState {
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
             window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
+            command_queue: Arc::new(RwLock::new(None)),
+            startup_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1605,10 +1638,9 @@ async fn event_handler(
                 let bot_wd = bot.clone();
                 let event_tx_wd = state.event_tx.clone();
                 let manage_orders_cancelled_wd = state.manage_orders_cancelled.clone();
-                let manage_orders_cancel_open_wd = state.manage_orders_cancel_open.clone();
                 let auto_cookie_wd = state.auto_cookie_hours.clone();
-                let command_generation_wd = state.command_generation.clone();
-                let bazaar_category_retries_wd = state.bazaar_category_retries.clone();
+                let command_queue_wd = state.command_queue.clone();
+                let startup_in_progress_wd = state.startup_in_progress.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     let already_done = *teleported_wd.read();
@@ -1622,7 +1654,7 @@ async fn event_handler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
                         bot_wd.write_chat_packet("/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, manage_orders_cancel_open_wd, auto_cookie_wd, command_generation_wd, bazaar_category_retries_wd).await;
+                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_queue_wd, startup_in_progress_wd).await;
                     }
                 });
             }
@@ -1742,36 +1774,45 @@ async fn event_handler(
                 // skipped. Attempting to claim a coop member's sale is harmless
                 // (the AH UI simply won't show a claim button).
                 if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
-                    let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
-                    // Housekeeping: remove from active listings if present
-                    state.active_auction_listings.write().remove(&item_key);
-                    // Try to extract the auction UUID from the JSON representation of the
-                    // chat message first — Hypixel embeds "/viewauction <UUID>" in the
-                    // clickEvent of the "CLICK" component, which is invisible in plain text
-                    // but present in the serialised FormattedText JSON.  We try the JSON
-                    // path first because for Hypixel sold messages the UUID is *only* in
-                    // the click event, so trying plain text first would always fail.
-                    let uuid = serde_json::to_string(&chat.message()).ok()
-                        .as_deref()
-                        .and_then(extract_viewauction_uuid)
-                        .or_else(|| extract_viewauction_uuid(&clean_message));
-                    if let Some(ref u) = uuid {
-                        info!("[AH] Extracted viewauction UUID for claim: {}", u);
-                        let mut sold_queue = state.claim_sold_uuid_queue.write();
-                        if !sold_queue.iter().any(|queued| queued == u) {
-                            if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
-                                sold_queue.pop_front();
+                    // Skip if the buyer is our own bot — Hypixel sends "[Auction] OurName
+                    // bought X for Y coins" as a purchase notification to the buyer as well.
+                    // Without this check the bot would treat its own purchase as a sale,
+                    // producing a false "Item Sold (Loss)" webhook with 0s time-to-sell.
+                    let own_name = state.ingame_name.read().clone();
+                    if !own_name.is_empty() && buyer.eq_ignore_ascii_case(&own_name) {
+                        debug!("[Auction] Ignoring own purchase notification: \"{}\" bought \"{}\" for {}", buyer, item_name, price);
+                    } else {
+                        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+                        // Housekeeping: remove from active listings if present
+                        state.active_auction_listings.write().remove(&item_key);
+                        // Try to extract the auction UUID from the JSON representation of the
+                        // chat message first — Hypixel embeds "/viewauction <UUID>" in the
+                        // clickEvent of the "CLICK" component, which is invisible in plain text
+                        // but present in the serialised FormattedText JSON.  We try the JSON
+                        // path first because for Hypixel sold messages the UUID is *only* in
+                        // the click event, so trying plain text first would always fail.
+                        let uuid = serde_json::to_string(&chat.message()).ok()
+                            .as_deref()
+                            .and_then(extract_viewauction_uuid)
+                            .or_else(|| extract_viewauction_uuid(&clean_message));
+                        if let Some(ref u) = uuid {
+                            info!("[AH] Extracted viewauction UUID for claim: {}", u);
+                            let mut sold_queue = state.claim_sold_uuid_queue.write();
+                            if !sold_queue.iter().any(|queued| queued == u) {
+                                if sold_queue.len() >= MAX_CLAIM_SOLD_UUID_QUEUE {
+                                    sold_queue.pop_front();
+                                }
+                                sold_queue.push_back(u.clone());
                             }
-                            sold_queue.push_back(u.clone());
                         }
+                        *state.claim_sold_uuid.write() = uuid;
+                        // An auction sold — a slot is now free; clear the auction-limit flag.
+                        if state.auction_at_limit.load(Ordering::Relaxed) {
+                            info!("[Auction] Auction sold, clearing auction-limit flag");
+                            state.auction_at_limit.store(false, Ordering::Relaxed);
+                        }
+                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                     }
-                    *state.claim_sold_uuid.write() = uuid;
-                    // An auction sold — a slot is now free; clear the auction-limit flag.
-                    if state.auction_at_limit.load(Ordering::Relaxed) {
-                        info!("[Auction] Auction sold, clearing auction-limit flag");
-                        state.auction_at_limit.store(false, Ordering::Relaxed);
-                    }
-                    let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
                 }
             } else if clean_message.contains("You already have an item in the auction slot") {
                 // Hypixel rejected our item placement — there was already an item in the slot.
@@ -2029,10 +2070,9 @@ async fn event_handler(
                         let bot_state = state.bot_state.clone();
                         let event_tx_startup = state.event_tx.clone();
                         let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
-                        let manage_orders_cancel_open_startup = state.manage_orders_cancel_open.clone();
                         let auto_cookie_startup = state.auto_cookie_hours.clone();
-                        let command_generation_startup = state.command_generation.clone();
-                        let bazaar_category_retries_startup = state.bazaar_category_retries.clone();
+                        let command_queue_startup = state.command_queue.clone();
+                        let startup_in_progress_startup = state.startup_in_progress.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
                             bot_clone.write_chat_packet("/is");
@@ -2040,7 +2080,7 @@ async fn event_handler(
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
 
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, manage_orders_cancel_open_startup, auto_cookie_startup, command_generation_startup, bazaar_category_retries_startup).await;
+                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_queue_startup, startup_in_progress_startup).await;
                         });
                     }
                 }
@@ -3830,6 +3870,10 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                         return;
                     }
+                    // Wait for slot data to arrive (ContainerSetContent is a
+                    // separate packet after OpenScreen).
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    if *state.last_window_id.read() != window_id { return; }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, "Go Back") {
                         info!(
@@ -3838,17 +3882,14 @@ async fn handle_window_interaction(
                         );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     } else {
-                        // /bz remembers the last viewed category, so close+reopen would
-                        // return to the same page — give up immediately instead of looping.
+                        // Slots loaded but "Go Back" still missing — close and
+                        // reopen /bz to retry.  The retry counter (incremented
+                        // above) caps the total attempts.
                         warn!(
-                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, giving up",
-                            window_title
+                            "[ManageOrders] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
+                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
                         );
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
-                        });
-                        *state.manage_orders_deadline.write() = None;
-                        *state.bot_state.write() = BotState::Idle;
+                        close_window_and_reopen_bz(bot, state, window_id).await;
                     }
                     return;
                 }
@@ -4320,6 +4361,10 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                         return;
                     }
+                    // Wait for slot data to arrive (ContainerSetContent is a
+                    // separate packet after OpenScreen).
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    if *state.last_window_id.read() != window_id { return; }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, "Go Back") {
                         info!(
@@ -4328,16 +4373,14 @@ async fn handle_window_interaction(
                         );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     } else {
-                        // /bz remembers the last viewed category, so close+reopen would
-                        // return to the same page — give up immediately instead of looping.
+                        // Slots loaded but "Go Back" still missing — close and
+                        // reopen /bz to retry.  The retry counter (incremented
+                        // above) caps the total attempts.
                         warn!(
-                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, giving up",
-                            window_title
+                            "[SellInventoryBz] Category page \"{}\" — 'Go Back' not found, closing and re-opening /bz (attempt {}/{})",
+                            window_title, attempt + 1, MAX_BAZAAR_CATEGORY_PAGE_RETRIES
                         );
-                        bot.write_packet(ServerboundContainerClose {
-                            container_id: window_id as i32,
-                        });
-                        *state.bot_state.write() = BotState::Idle;
+                        close_window_and_reopen_bz(bot, state, window_id).await;
                     }
                     return;
                 }
@@ -5517,16 +5560,27 @@ async fn click_window_slot_carrying(
 /// Shared startup workflow: cancel old orders, claim sold items, then emit StartupComplete.
 /// Called from both the chat-based detection path and the 30-second watchdog.
 /// Matches TypeScript BAF.ts `runStartupWorkflow` all 4 steps.
+///
+/// Commands are enqueued through the shared CommandQueue so they go through
+/// `execute_command`, which handles all required initialisation (deadlines,
+/// processed-set clearing, SafeClose of stale windows, etc.).
 async fn run_startup_workflow(
     bot: Client,
     bot_state: Arc<RwLock<BotState>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
     manage_orders_cancelled: Arc<RwLock<u64>>,
-    manage_orders_cancel_open: Arc<AtomicBool>,
     auto_cookie_hours: Arc<RwLock<u64>>,
-    command_generation: Arc<std::sync::atomic::AtomicU64>,
-    bazaar_category_retries: Arc<std::sync::atomic::AtomicU8>,
+    command_queue: Arc<RwLock<Option<CommandQueue>>>,
+    startup_in_progress: Arc<AtomicBool>,
 ) {
+    use crate::types::{CommandType, CommandPriority};
+
+    // Prevent duplicate startup runs.
+    if startup_in_progress.swap(true, Ordering::SeqCst) {
+        debug!("[Startup] Workflow already running, skipping duplicate start");
+        return;
+    }
+
     // Do not run startup steps while another interactive flow is active.
     // Wait briefly for idle/grace period; abort if the bot stays busy.
     let entry_deadline = tokio::time::Instant::now()
@@ -5536,58 +5590,65 @@ async fn run_startup_workflow(
         if matches!(current_state, BotState::GracePeriod | BotState::Idle) {
             break;
         }
-        if current_state == BotState::Startup {
-            debug!("[Startup] Workflow already running, skipping duplicate start");
-            return;
-        }
         if tokio::time::Instant::now() >= entry_deadline {
             warn!("[Startup] Skipping startup workflow: bot stayed busy in state {:?}", current_state);
+            startup_in_progress.store(false, Ordering::Relaxed);
             return;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 
-    // Snapshot command generation at workflow entry. If this value changes, execute_command
-    // has started a new queued command and startup must abort to avoid overlapping GUI flows.
-    let startup_generation = command_generation.load(Ordering::SeqCst);
+    // Grab a clone of the command queue. If none is set (unit tests / standalone),
+    // falling back to the legacy direct-drive approach would be complex, so we just
+    // skip — the queue is always set in production via main.rs.
+    let queue = {
+        let guard = command_queue.read();
+        match guard.as_ref() {
+            Some(q) => q.clone(),
+            None => {
+                warn!("[Startup] No command queue available — skipping queue-based startup");
+                startup_in_progress.store(false, Ordering::Relaxed);
+                return;
+            }
+        }
+    };
 
     info!("╔══════════════════════════════════════╗");
     info!("║        BAF Startup Workflow          ║");
     info!("╚══════════════════════════════════════╝");
 
-    // Set state = Startup to block flips/bazaar during the workflow
-    *bot_state.write() = BotState::Startup;
+    // Helper: enqueue a command and wait until the queue processor completes it.
+    // Returns true if the command completed, false on timeout.
+    async fn await_queued_command(
+        queue: &CommandQueue,
+        bot_state: &Arc<RwLock<BotState>>,
+        cmd_type: CommandType,
+        timeout_secs: u64,
+    ) -> bool {
+        let cmd_id = queue.enqueue(cmd_type, CommandPriority::Critical, false);
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(timeout_secs);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+            // Command has been fully processed by the queue processor
+            if !queue.contains_command_id(&cmd_id) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!("[Startup] Timed out waiting for command {:?}", cmd_id);
+                return false;
+            }
+        }
+    }
 
-    // Step 1/4: Cookie check — send /sbmenu, let window handler parse cookie duration.
-    // Matches TypeScript cookieHandler.ts checkAndBuyCookie().
+    // Step 1/4: Cookie check
     let cookie_hours = *auto_cookie_hours.read();
     if cookie_hours > 0 {
         info!("[Startup] Step 1/4: Checking cookie status...");
         let _ = event_tx.send(BotEvent::ChatMessage(
             "§f[§4BAF§f]: §7[Startup] §bStep 1/4: §fChecking cookie status...".to_string()
         ));
-        bot.write_chat_packet("/sbmenu");
-        *bot_state.write() = BotState::CheckingCookie;
-
-        // Wait up to 15 seconds for cookie check to finish (state → Idle when done)
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            if command_generation.load(Ordering::SeqCst) != startup_generation {
-                warn!("[Startup] Aborting workflow: another command started during cookie check");
-                return;
-            }
-            let cur = *bot_state.read();
-            if matches!(cur, BotState::Idle | BotState::Startup) || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-        }
-        if command_generation.load(Ordering::SeqCst) != startup_generation {
-            warn!("[Startup] Aborting workflow: another command started during cookie check");
-            return;
-        }
-        // Ensure we're not stuck in cookie states
-        *bot_state.write() = BotState::Startup;
+        await_queued_command(&queue, &bot_state, CommandType::CheckCookie, 60).await;
         info!("[Startup] Step 1/4: Cookie check complete");
         let _ = event_tx.send(BotEvent::ChatMessage(
             "§f[§4BAF§f]: §a[Startup] Cookie check complete".to_string()
@@ -5597,91 +5658,31 @@ async fn run_startup_workflow(
         info!("[Startup] Step 1/4: Cookie check skipped (AUTO_COOKIE=0)");
     }
 
-    // Step 2/4: Bazaar order management — open /bz, navigate to Manage Orders, cancel all old orders.
-    // Mirrors TypeScript bazaarOrderManager.ts manageStartupOrders().
+    // Step 2/4: Bazaar order management — cancel all old orders + collect filled
     info!("[Startup] Step 2/4: Managing bazaar orders (startup: cancel + collect)...");
-    *manage_orders_cancelled.write() = 0;
-    // Startup mode: cancel all open orders in addition to collecting filled ones
-    manage_orders_cancel_open.store(true, Ordering::Relaxed);
-    bazaar_category_retries.store(0, Ordering::Relaxed);
-    bot.write_chat_packet("/bz");
-    *bot_state.write() = BotState::ManagingOrders;
-
-    // Wait up to 30 seconds for order management to finish (state → Idle when done)
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if command_generation.load(Ordering::SeqCst) != startup_generation {
-            warn!("[Startup] Aborting workflow: another command started during bazaar order management");
-            return;
-        }
-        let cur = *bot_state.read();
-        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
-            break;
-        }
-    }
-    if command_generation.load(Ordering::SeqCst) != startup_generation {
-        warn!("[Startup] Aborting workflow: another command started during bazaar order management");
-        return;
-    }
-    // Ensure Idle before proceeding (in case of timeout)
-    *bot_state.write() = BotState::Idle;
+    await_queued_command(
+        &queue,
+        &bot_state,
+        CommandType::ManageOrders { cancel_open: true },
+        50,
+    ).await;
     let orders_cancelled = *manage_orders_cancelled.read();
     info!("[Startup] Step 2/4: Order management complete — {} order(s) cancelled", orders_cancelled);
 
-    // Step 3/4: Claim sold items and purchased items
+    // Step 3/4: Claim sold items
     info!("[Startup] Step 3/4: Claiming sold items...");
-    bot.write_chat_packet("/ah");
-    *bot_state.write() = BotState::ClaimingSold;
+    await_queued_command(&queue, &bot_state, CommandType::ClaimSoldItem, 60).await;
 
-    // Wait up to 30 seconds for claiming to finish (state → Idle when done)
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if command_generation.load(Ordering::SeqCst) != startup_generation {
-            warn!("[Startup] Aborting workflow: another command started during claim-sold step");
-            return;
-        }
-        let cur = *bot_state.read();
-        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
-            break;
-        }
-    }
-    if command_generation.load(Ordering::SeqCst) != startup_generation {
-        warn!("[Startup] Aborting workflow: another command started during claim-sold step");
-        return;
-    }
-    // Ensure Idle before proceeding
-    *bot_state.write() = BotState::Idle;
-
-    // Also claim any purchased items waiting in "Your Bids" (e.g. from a previous session)
-    // Matching TypeScript runStartupWorkflow which claims both sold and purchased items.
+    // Step 3b/4: Claim purchased items
     info!("[Startup] Step 3b/4: Claiming purchased items (Your Bids)...");
-    bot.write_chat_packet("/ah");
-    *bot_state.write() = BotState::ClaimingPurchased;
+    await_queued_command(&queue, &bot_state, CommandType::ClaimPurchasedItem, 60).await;
 
-    // Wait up to 30 seconds for claiming to finish (state → Idle when done)
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if command_generation.load(Ordering::SeqCst) != startup_generation {
-            warn!("[Startup] Aborting workflow: another command started during claim-purchased step");
-            return;
-        }
-        let cur = *bot_state.read();
-        if cur == BotState::Idle || tokio::time::Instant::now() >= deadline {
-            break;
-        }
-    }
-    if command_generation.load(Ordering::SeqCst) != startup_generation {
-        warn!("[Startup] Aborting workflow: another command started during claim-purchased step");
-        return;
-    }
-    // Ensure Idle before proceeding
+    // Ensure Idle before emitting completion
     *bot_state.write() = BotState::Idle;
 
     // Step 4/4: Emit StartupComplete — main.rs requests bazaar flips and sends webhook
     info!("[Startup] Step 4/4: Startup complete - bot is ready to flip!");
+    startup_in_progress.store(false, Ordering::Relaxed);
     let _ = event_tx.send(BotEvent::StartupComplete { orders_cancelled });
 }
 
