@@ -3605,11 +3605,7 @@ async fn handle_window_interaction(
                         // Run SelectBIN logic inline so the flow continues without getting stuck.
                         info!("[Auction] ClickCreate: jumped straight to Create BIN Auction, handling as SelectBIN");
                         // Clear a stuck item in the auction preview slot (same guard as SelectBIN).
-                        if slots.len() > 13 && !slots[13].is_empty() {
-                            warn!("[Auction] Slot 13 already occupied — clicking to clear stuck item before placing ours");
-                            click_window_slot(bot, &state.last_window_id, window_id, 13).await;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        }
+                        clear_auction_preview_slot(bot, state, window_id, &slots).await;
                         let player_start = *menu.player_slots_range().start();
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
                             if mj_slot >= 9 && mj_slot <= 44 {
@@ -3653,11 +3649,7 @@ async fn handle_window_interaction(
                         // purchased item auto-placed by the server), click it first to clear
                         // the slot so our item can be placed without triggering "You already
                         // have an item in the auction slot!".
-                        if slots.len() > 13 && !slots[13].is_empty() {
-                            warn!("[Auction] Slot 13 already occupied — clicking to clear stuck item before placing ours");
-                            click_window_slot(bot, &state.last_window_id, window_id, 13).await;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        }
+                        clear_auction_preview_slot(bot, state, window_id, &slots).await;
 
                         // Calculate inventory slot: mineflayer_slot - 9 + window_player_start
                         let player_start = *menu.player_slots_range().start();
@@ -5395,6 +5387,24 @@ async fn close_window_and_reopen_bz(
         bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         bot.write_chat_packet("/bz");
+    }
+}
+
+/// If the auction item preview slot (slot 13) in "Create BIN Auction" is already
+/// occupied (e.g. from a previously failed auction creation or a purchased item
+/// auto-placed by the server), click it to return the stuck item to inventory so
+/// our item can be placed without triggering "You already have an item in the
+/// auction slot!".
+async fn clear_auction_preview_slot(
+    bot: &Client,
+    state: &BotClientState,
+    window_id: u8,
+    slots: &[azalea_inventory::ItemStack],
+) {
+    if slots.len() > 13 && !slots[13].is_empty() {
+        warn!("[Auction] Slot 13 already occupied — clicking to clear stuck item before placing ours");
+        click_window_slot(bot, &state.last_window_id, window_id, 13).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 }
 
