@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -50,29 +49,6 @@ pub fn init_logger() -> Result<()> {
 
     tracing::info!("Logger initialized, writing to {:?}", logs_dir.join("latest.log"));
     Ok(())
-}
-
-pub fn append_inventory_upload_log(line: &str) {
-    let logs_dir = get_logs_dir();
-    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-        eprintln!("Failed to create logs directory for inventory upload log: {}", e);
-        return;
-    }
-
-    let log_path = logs_dir.join("inventory_upload.log");
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let entry = format!("{} {}\n", timestamp, line);
-
-    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(entry.as_bytes()) {
-                eprintln!("Failed to write inventory upload log {:?}: {}", log_path, e);
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to append to inventory upload log {:?}: {}", log_path, e);
-        }
-    }
 }
 
 pub fn get_logs_dir() -> PathBuf {

@@ -802,33 +802,43 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order } => {
-                    // Remove from tracker and record realized bazaar profit.
-                    // BUY collected = money spent (negative), SELL collected = money earned (positive).
+                    // Remove from tracker.
                     let order_data = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
                     if let Some(ref order) = order_data {
-                        let total = order.price_per_unit * order.amount as f64;
-                        let profit = if is_buy_order { -(total as i64) } else { total as i64 };
-                        profit_tracker_events.record_bz_profit(profit);
-                        info!("[BazaarProfit] Recorded {} coins for {} {} order",
-                            profit, item_name, if is_buy_order { "BUY" } else { "SELL" });
-                        // Store buy cost so we can compute profit when the corresponding sell offer is collected.
+                        // Store buy cost so we can compute profit when the sell offer is collected.
+                        // BUY collections do NOT record profit — profit is only realized on SELL.
                         if is_buy_order {
                             bazaar_tracker_events.record_buy_cost(&item_name, order.price_per_unit, order.amount);
+                            info!("[BazaarProfit] Recorded buy cost for {} — {} x {:.0} coins/unit",
+                                item_name, order.amount, order.price_per_unit);
                         }
                     } else {
-                        // Orders placed in a previous session or before the bot started
-                        // won't be in the in-memory tracker — this is expected, not an error.
-                        debug!("[BazaarProfit] No tracked order found for collected {} {} — profit not recorded (order may be from a previous session)",
+                        debug!("[BazaarProfit] No tracked order for collected {} {} (may be from a previous session)",
                             if is_buy_order { "BUY" } else { "SELL" }, item_name);
                     }
-                    // Compute profit/loss for sell offers by comparing to the recorded buy cost.
+                    // Compute profit/loss for sell offers: sell_total - buy_total - tax.
+                    // Bazaar tax is applied to sell proceeds (default 1.25%).
+                    let bazaar_tax_rate = config_for_events.bazaar_tax_rate;
                     let opt_profit: Option<i64> = if !is_buy_order {
-                        if let (Some(ref sell_order), Some((buy_ppu, buy_amt))) =
-                            (&order_data, bazaar_tracker_events.take_buy_cost(&item_name))
-                        {
+                        if let Some(ref sell_order) = order_data {
                             let sell_total = sell_order.price_per_unit * sell_order.amount as f64;
-                            let buy_total = buy_ppu * buy_amt as f64;
-                            Some((sell_total - buy_total).round() as i64)
+                            let tax = sell_total * (bazaar_tax_rate / 100.0);
+                            let sell_after_tax = sell_total - tax;
+                            if let Some((buy_ppu, buy_amt)) = bazaar_tracker_events.take_buy_cost(&item_name) {
+                                let buy_total = buy_ppu * buy_amt as f64;
+                                let profit = (sell_after_tax - buy_total).round() as i64;
+                                profit_tracker_events.record_bz_profit(profit);
+                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0}, profit: {}",
+                                    item_name, sell_total, tax, bazaar_tax_rate, buy_total, profit);
+                                Some(profit)
+                            } else {
+                                // No recorded buy cost — just record sell after tax as profit
+                                let profit = sell_after_tax.round() as i64;
+                                profit_tracker_events.record_bz_profit(profit);
+                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no buy cost recorded, profit: {}",
+                                    item_name, sell_total, tax, profit);
+                                Some(profit)
+                            }
                         } else {
                             None
                         }
@@ -843,12 +853,31 @@ async fn main() -> Result<()> {
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
+                    // Send bazaar legendary flip to public channel (100M+ profit on SELL)
+                    if !is_buy_order {
+                        if let Some(profit) = opt_profit {
+                            if profit >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64
+                                && config_for_events.share_legendary_flips
+                            {
+                                let item_for_channel = item_name.clone();
+                                let opt_amount = order_data.as_ref().map(|o| o.amount);
+                                let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
+                                tokio::spawn(async move {
+                                    frikadellen_baf::webhook::send_webhook_bazaar_flip_channel(
+                                        &item_for_channel,
+                                        opt_amount.unwrap_or(0),
+                                        opt_ppu.unwrap_or(0.0),
+                                        profit,
+                                    ).await;
+                                });
+                            }
+                        }
+                    }
                     if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
                         let url = webhook_url.to_string();
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
-                        // Pass order details (amount, price, total) to webhook when available.
                         let opt_amount = order_data.as_ref().map(|o| o.amount);
                         let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
                         tokio::spawn(async move {
@@ -1229,9 +1258,6 @@ async fn main() -> Result<()> {
                                 if is_sellinventory {
                                     if let Some(inv_json) = inv_client.get_cached_inventory_json() {
                                         info!("[Inventory] sellinventory: uploading inventory first ({} bytes)", inv_json.len());
-                                        frikadellen_baf::logging::append_inventory_upload_log(
-                                            &format!("sellinventory pre-upload ({} bytes): {}", inv_json.len(), inv_json)
-                                        );
                                         let upload_msg = serde_json::json!({
                                             "type": "uploadInventory",
                                             "data": inv_json
@@ -1278,8 +1304,6 @@ async fn main() -> Result<()> {
                         let payload_bytes = inv_json.len();
                         debug!("[Inventory] Uploading to COFL: payload {} bytes", payload_bytes);
                         info!("[Inventory] uploadInventory payload: {}", inv_json);
-                        // Log to inventory_upload.log for debugging
-                        frikadellen_baf::logging::append_inventory_upload_log(&format!("uploadInventory payload ({} bytes): {}", payload_bytes, inv_json));
                         let message = serde_json::json!({
                             "type": "uploadInventory",
                             "data": inv_json
@@ -1597,9 +1621,9 @@ async fn main() -> Result<()> {
                     frikadellen_baf::types::CommandType::ClaimPurchasedItem
                     | frikadellen_baf::types::CommandType::ClaimSoldItem
                     | frikadellen_baf::types::CommandType::CheckCookie => 60,
-                    // ManageOrders has a 45s internal deadline; keep external
-                    // timeout just above that so the internal cleanup fires first.
-                    frikadellen_baf::types::CommandType::ManageOrders { .. } => 50,
+                    // ManageOrders processes ONE order per cycle with a 10s
+                    // internal deadline; keep external timeout just above.
+                    frikadellen_baf::types::CommandType::ManageOrders { .. } => 15,
                     frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
                     | frikadellen_baf::types::CommandType::BazaarSellOrder { .. } => 20,
                     frikadellen_baf::types::CommandType::SellToAuction { .. } => 15,

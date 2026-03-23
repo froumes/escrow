@@ -787,8 +787,40 @@ function formatShortCoins(n) {
     return n.toLocaleString();
 }
 
+/** Map stained glass pane / glass pane registry names to CSS colors */
+const GLASS_PANE_COLORS = {
+    'black_stained_glass_pane': '#1d1d21', 'white_stained_glass_pane': '#f9fffe',
+    'orange_stained_glass_pane': '#f9801d', 'magenta_stained_glass_pane': '#c74ebd',
+    'light_blue_stained_glass_pane': '#3ab3da', 'yellow_stained_glass_pane': '#fed83d',
+    'lime_stained_glass_pane': '#80c71f', 'pink_stained_glass_pane': '#f38baa',
+    'gray_stained_glass_pane': '#474f52', 'light_gray_stained_glass_pane': '#9d9d97',
+    'cyan_stained_glass_pane': '#169c9c', 'purple_stained_glass_pane': '#8932b8',
+    'blue_stained_glass_pane': '#3c44aa', 'brown_stained_glass_pane': '#835432',
+    'green_stained_glass_pane': '#5e7c16', 'red_stained_glass_pane': '#b02e26',
+    'glass_pane': '#c0d8e0',
+};
+
+/** Get a data-URI for a colored glass pane, or null */
+function getGlassPaneDataUrl(registryName) {
+    const name = (registryName || '').replace('minecraft:', '');
+    const color = GLASS_PANE_COLORS[name];
+    if (!color) return null;
+    // Return a tiny inline SVG rectangle
+    return "data:image/svg+xml," + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">'
+        + '<rect width="16" height="16" rx="2" fill="' + color + '" opacity="0.85"/>'
+        + '<rect x="1" y="1" width="14" height="14" rx="1" fill="' + color + '"/>'
+        + '</svg>'
+    );
+}
+
 /** Get an icon URL for an inventory item */
 function getItemIconUrl(slot) {
+    // Glass panes: render as colored squares
+    if (slot.name) {
+        const paneUrl = getGlassPaneDataUrl(slot.name);
+        if (paneUrl) return paneUrl;
+    }
     // SkyBlock items: use Coflnet icon by tag
     if (slot.tag) {
         return 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(slot.tag);
