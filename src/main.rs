@@ -61,6 +61,20 @@ fn format_coins(amount: i64) -> String {
     if negative { format!("-{}", formatted) } else { formatted }
 }
 
+/// Format an f64 coin amount with comma separators, preserving one decimal
+/// digit when the fractional part is non-zero (e.g. 600000.5 → "600,000.5").
+fn format_coins_f64(amount: f64) -> String {
+    let tenths = (amount * 10.0).round() as i64;
+    let int_part = tenths / 10;
+    let frac_digit = (tenths % 10).abs();
+    let int_str = format_coins(int_part);
+    if frac_digit == 0 {
+        int_str
+    } else {
+        format!("{}.{}", int_str, frac_digit)
+    }
+}
+
 fn is_ban_disconnect(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     lower.contains("temporarily banned")
@@ -746,7 +760,7 @@ async fn main() -> Result<()> {
                     let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
-                        order_color, order_type, amount, item_name, format_coins(price_per_unit as i64)
+                        order_color, order_type, amount, item_name, format_coins_f64(price_per_unit)
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -1085,7 +1099,7 @@ async fn main() -> Result<()> {
                         order_color, order_label,
                         bazaar_flip.item_name,
                         bazaar_flip.amount,
-                        format_coins(bazaar_flip.price_per_unit as i64)
+                        format_coins_f64(bazaar_flip.price_per_unit)
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_ws.send(baf_msg);
@@ -1228,7 +1242,7 @@ async fn main() -> Result<()> {
                                     order_color, order_label,
                                     rec.item_name,
                                     rec.amount,
-                                    format_coins(rec.price_per_unit as i64)
+                                    format_coins_f64(rec.price_per_unit)
                                 );
                                 print_mc_chat(&baf_msg);
                                 let _ = chat_tx_ws.send(baf_msg);
