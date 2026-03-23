@@ -1737,10 +1737,15 @@ async fn main() -> Result<()> {
                     };
                     sleep(Duration::from_millis(delay)).await;
                 }
+            } else {
+                // Queue is empty — wait for a notification instead of busy-polling.
+                // Times out after 500 ms so paused-state and other periodic checks
+                // still run promptly even when no commands arrive.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    command_queue_processor.notified(),
+                ).await;
             }
-            
-            // Small delay to prevent busy loop
-            sleep(Duration::from_millis(50)).await;
         }
     });
 

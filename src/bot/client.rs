@@ -3170,7 +3170,7 @@ async fn handle_window_interaction(
                         }
                         break None;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
 
                 if let Some(i) = order_button_slot {
@@ -3205,7 +3205,7 @@ async fn handle_window_interaction(
                     if f.is_some() || tokio::time::Instant::now() >= poll_deadline {
                         break f;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
 
                 match found {
@@ -3241,7 +3241,7 @@ async fn handle_window_interaction(
                 if ca.is_some() || cp.is_some() || tokio::time::Instant::now() >= poll_deadline2 {
                     break (ca, cp);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             };
 
             // Step 3: Amount screen (buy orders only)
@@ -3349,7 +3349,7 @@ async fn handle_window_interaction(
                         break Some(i);
                     }
                     if tokio::time::Instant::now() >= poll_deadline { break None; }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
                 match item_slot {
                     Some(i) => {
@@ -3377,7 +3377,7 @@ async fn handle_window_interaction(
                         break Some(i);
                     }
                     if tokio::time::Instant::now() >= poll_deadline { break None; }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
                 match sell_slot {
                     Some(i) => {
@@ -4093,14 +4093,27 @@ async fn handle_window_interaction(
                         // • If "Order options" opens → order is open, Branch C handles it.
                         // • If the window doesn't change → the order was collected directly
                         //   by clicking the slot (Hypixel collects filled orders on click).
+                        // • If a new "Bazaar Orders" window opens (same list, new ID) →
+                        //   the order was collected and Hypixel refreshed the list.
                         let click_deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_secs(5);
                         let mut order_options_opened = false;
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
                             if *state.last_window_id.read() != window_id {
-                                // A new window opened — check if it's "Order options"
-                                order_options_opened = true;
+                                // A new window opened — check its title to distinguish
+                                // "Order options" (order is open) from a refreshed
+                                // "Bazaar Orders" list (order was collected on click).
+                                if let Some(new_title) = state.handlers.current_window_title() {
+                                    if new_title.to_lowercase().contains("order options") {
+                                        order_options_opened = true;
+                                    }
+                                    // else: Hypixel re-opened the orders list after
+                                    // collecting — treat as successful direct collection.
+                                } else {
+                                    // No title available — assume Order options for safety.
+                                    order_options_opened = true;
+                                }
                                 break;
                             }
                             if state.inventory_full.load(Ordering::Relaxed) && order_is_buy {
