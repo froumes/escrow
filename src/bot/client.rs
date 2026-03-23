@@ -4078,7 +4078,7 @@ async fn handle_window_interaction(
                 // Determine cancel_due_to_age BEFORE deciding whether to skip.
                 // This allows stale orders to be cancelled even in collect-only mode.
                 let cancel_due_to_age = !cancel_open
-                    && should_cancel_open_order_due_to_age(order_identity.clone(), state.bazaar_order_cancel_minutes_per_million);
+                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
 
                 // Check cancel retry limit early — if exceeded, close immediately.
                 let cancel_fail_key = normalize_bazaar_order_text(&order_name);
@@ -4116,8 +4116,10 @@ async fn handle_window_interaction(
                     *state.bot_state.write() = BotState::Idle;
                 } else {
                 // cancel_open mode OR cancel_due_to_age: look for Cancel/Collect buttons.
-                let mode_reason = if cancel_open { "startup cancel mode" } else { "cancel due to age" };
-                info!("[ManageOrders] Order options window opened ({}) — looking for Cancel/Collect buttons", mode_reason);
+                info!(
+                    "[ManageOrders] Order options window opened ({}) — looking for Cancel/Collect buttons",
+                    if cancel_open { "startup cancel mode" } else { "cancel due to age" }
+                );
 
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
