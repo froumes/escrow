@@ -980,6 +980,14 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Block flips until startup workflow is complete — the bot
+                    // state can briefly be Idle between queued startup commands,
+                    // so checking is_startup_in_progress() covers that gap.
+                    if bot_client_for_ws.is_startup_in_progress() {
+                        debug!("Skipping AH flip during startup: {}", flip.item_name);
+                        continue;
+                    }
+
                     // Skip if in startup/claiming state - use bot_client state (authoritative source)
                     if !bot_client_for_ws.state().allows_commands() {
                         debug!("Skipping flip — bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);

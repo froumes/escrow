@@ -263,6 +263,7 @@ a{color:var(--accent2);text-decoration:none}
         <div style="display:flex;gap:10px;margin-bottom:16px">
             <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimPurchases()">📦 Claim Purchases</button>
             <button class="btn btn-sm" style="background:var(--warn);color:#1a1a1a" onclick="collectBzOrders()">💰 Sell Instantly (BZ)</button>
+            <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimBzOrders()">📋 Claim BZ Orders</button>
         </div>
         <div class="toggle-row">
             <span class="toggle-label">Auction House Flips</span>
@@ -632,6 +633,11 @@ async function claimPurchases() {
 async function collectBzOrders() {
     if (!confirm('Sell entire inventory instantly on the Bazaar?')) return;
     await fetch('/api/collect_bz_orders', {method:'POST'});
+}
+
+async function claimBzOrders() {
+    if (!confirm('Force check and claim filled bazaar orders?')) return;
+    await fetch('/api/claim_bz_orders', {method:'POST'});
 }
 
 async function fetchInventory() {
