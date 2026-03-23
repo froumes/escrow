@@ -1279,10 +1279,10 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
     lore_lines
 }
 
-/// Format a f64 price with comma-separated thousands for bazaar sign input.
+/// Format a f64 price as a plain number for bazaar sign input.
 /// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
-/// Always uses commas for readability:
-/// 7500000.0 → "7,500,000", 60000000.2 → "60,000,000.2".
+/// No commas — Hypixel's bazaar sign parser does not support them:
+/// 7500000.0 → "7500000", 60000000.2 → "60000000.2".
 fn format_price_for_sign(price: f64) -> String {
     // Work in tenths-of-a-coin as an integer to avoid floating-point precision
     // issues when splitting integer and fractional parts of large prices.
@@ -1290,22 +1290,10 @@ fn format_price_for_sign(price: f64) -> String {
     let int_part = tenths / 10;
     let frac_digit = (tenths % 10).unsigned_abs();
 
-    // Format the integer part with commas.
-    let int_str = int_part.to_string();
-    let digits: Vec<char> = int_str.chars().collect();
-    let mut with_commas = String::new();
-    let len = digits.len();
-    for (i, &c) in digits.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            with_commas.push(',');
-        }
-        with_commas.push(c);
-    }
-
     if frac_digit == 0 {
-        with_commas
+        int_part.to_string()
     } else {
-        format!("{}.{}", with_commas, frac_digit)
+        format!("{}.{}", int_part, frac_digit)
     }
 }
 
@@ -6412,31 +6400,31 @@ mod tests {
 
     #[test]
     fn test_format_price_for_sign_whole_number() {
-        // Whole-number prices must NOT include a ".0" suffix, and use commas.
-        assert_eq!(format_price_for_sign(7500000.0), "7,500,000");
+        // Whole-number prices: plain integers, no commas, no ".0" suffix.
+        assert_eq!(format_price_for_sign(7500000.0), "7500000");
         assert_eq!(format_price_for_sign(100.0), "100");
         assert_eq!(format_price_for_sign(8.0), "8");
-        assert_eq!(format_price_for_sign(1662.0), "1,662");
-        assert_eq!(format_price_for_sign(60000000.0), "60,000,000");
-        assert_eq!(format_price_for_sign(50000002.0), "50,000,002");
+        assert_eq!(format_price_for_sign(1662.0), "1662");
+        assert_eq!(format_price_for_sign(60000000.0), "60000000");
+        assert_eq!(format_price_for_sign(50000002.0), "50000002");
     }
 
     #[test]
     fn test_format_price_for_sign_with_decimal() {
-        // Fractional prices use commas and keep one decimal digit.
-        assert_eq!(format_price_for_sign(60000000.2), "60,000,000.2");
-        assert_eq!(format_price_for_sign(1234567.9), "1,234,567.9");
+        // Fractional prices: plain number with one decimal digit, no commas.
+        assert_eq!(format_price_for_sign(60000000.2), "60000000.2");
+        assert_eq!(format_price_for_sign(1234567.9), "1234567.9");
         assert_eq!(format_price_for_sign(100.5), "100.5");
-        assert_eq!(format_price_for_sign(50000000.1), "50,000,000.1");
-        assert_eq!(format_price_for_sign(91238937.4), "91,238,937.4");
+        assert_eq!(format_price_for_sign(50000000.1), "50000000.1");
+        assert_eq!(format_price_for_sign(91238937.4), "91238937.4");
     }
 
     #[test]
     fn test_format_price_for_sign_rounds_to_one_decimal() {
         // Prices with >1 decimal are rounded to nearest 0.1.
-        assert_eq!(format_price_for_sign(1234567.89), "1,234,567.9");
-        assert_eq!(format_price_for_sign(1234567.84), "1,234,567.8");
+        assert_eq!(format_price_for_sign(1234567.89), "1234567.9");
+        assert_eq!(format_price_for_sign(1234567.84), "1234567.8");
         // 1234567.06 * 10 = 12345670.6 → rounds to 12345671 → frac_digit = 1
-        assert_eq!(format_price_for_sign(1234567.06), "1,234,567.1");
+        assert_eq!(format_price_for_sign(1234567.06), "1234567.1");
     }
 }
