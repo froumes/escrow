@@ -4015,15 +4015,13 @@ async fn handle_window_interaction(
 
                 let total_orders = sell_orders.len() + buy_orders.len();
 
-                // In collect-only mode, prefer claimable orders so we don't
-                // waste a cycle clicking open orders that have nothing to collect.
+                // In collect-only mode, ONLY click claimable orders.  Open
+                // (unfilled) orders have nothing to collect and clicking them
+                // opens "Order options" which wastes a cycle and can leave the
+                // bot stuck for the entire periodic-check interval.
                 let chosen_order: Option<OrderEntry> = if !cancel_open {
-                    // First: claimable sells, then claimable buys
                     sell_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
                         .or_else(|| buy_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned())
-                        // Fallback: any sell, then any buy (for safety / lore-parsing misses)
-                        .or_else(|| sell_orders.into_iter().next())
-                        .or_else(|| buy_orders.into_iter().next())
                 } else {
                     // cancel mode: sell first, then buy (original behaviour)
                     sell_orders.into_iter().next()
@@ -4246,6 +4244,21 @@ async fn handle_window_interaction(
                     }
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
+
+                    // Re-queue so remaining orders are processed without
+                    // waiting for the full periodic-check interval.
+                    if collect_slot_probe.is_some() {
+                        if let Some(queue) = state.command_queue.read().as_ref() {
+                            if !queue.has_manage_orders() {
+                                info!("[ManageOrders] Re-queuing ManageOrders after partial collect in Order options");
+                                queue.enqueue(
+                                    crate::types::CommandType::ManageOrders { cancel_open },
+                                    crate::types::CommandPriority::Normal,
+                                    false,
+                                );
+                            }
+                        }
+                    }
                 } else {
                 // cancel_open mode OR cancel_due_to_age: look for Cancel/Collect buttons.
                 info!(
@@ -4370,6 +4383,18 @@ async fn handle_window_interaction(
                 *state.manage_orders_deadline.write() = None;
                 state.bazaar_at_limit.store(false, Ordering::Relaxed);
                 *state.bot_state.write() = BotState::Idle;
+
+                // Re-queue so remaining orders are processed promptly.
+                if let Some(queue) = state.command_queue.read().as_ref() {
+                    if !queue.has_manage_orders() {
+                        info!("[ManageOrders] Re-queuing ManageOrders after Order options (cancel/collect)");
+                        queue.enqueue(
+                            crate::types::CommandType::ManageOrders { cancel_open },
+                            crate::types::CommandPriority::Normal,
+                            false,
+                        );
+                    }
+                }
                 }
                 }
             } else {

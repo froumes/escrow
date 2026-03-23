@@ -680,7 +680,7 @@ pub async fn send_webhook_flip_channel(
     // Append clickable footer-style links below the purchase info fields
     fields.push(serde_json::json!({
         "name": "\u{200b}",
-        "value": "[Frikadellen-BAF](https://tpm.auction) • [Discord](https://discord.gg/42DvX6T9jh)",
+        "value": "[Frikadellen-BAF](https://auctionflipper.bz) • [Discord](https://discord.gg/42DvX6T9jh)",
         "inline": false
     }));
     let safe_item = sanitize_item_name(item_name);
@@ -725,7 +725,7 @@ pub async fn send_webhook_bazaar_flip_channel(
     ];
     fields.push(serde_json::json!({
         "name": "\u{200b}",
-        "value": "[Frikadellen-BAF](https://tpm.auction) • [Discord](https://discord.gg/42DvX6T9jh)",
+        "value": "[Frikadellen-BAF](https://auctionflipper.bz) • [Discord](https://discord.gg/42DvX6T9jh)",
         "inline": false
     }));
     let payload = serde_json::json!({
