@@ -74,6 +74,10 @@ const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
 /// Raised from 5 → 8 to accommodate Hypixel server lag that caused
 /// frequent false "not confirmed" warnings and skipped events.
 const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 8;
+/// Maximum number of cancel attempts per order before giving up.
+/// After this many failed cancel clicks in Order options, the order is skipped
+/// so the bot doesn't get stuck retrying indefinitely.
+const MAX_CANCEL_RETRIES: u32 = 5;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -408,6 +412,7 @@ impl BotClient {
             command_queue: self.command_queue.clone(),
             startup_in_progress: self.startup_in_progress.clone(),
             enable_bazaar_flips: self.enable_bazaar_flips.clone(),
+            order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -948,6 +953,11 @@ pub struct BotClientState {
     /// Whether bazaar flips are enabled.  Shared with `BotClient` so the
     /// startup workflow can decide whether to cancel all open bazaar orders.
     pub enable_bazaar_flips: Arc<AtomicBool>,
+    /// Persistent counter of cancel failures per order (normalized name → count).
+    /// When a cancel attempt fails in Order options, the counter is incremented.
+    /// After `MAX_CANCEL_RETRIES` failures for the same order, the order is skipped.
+    /// Cleared on successful cancel or at the start of a `cancel_open` ManageOrders run.
+    pub order_cancel_failures: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl Default for BotClientState {
@@ -1023,6 +1033,7 @@ impl Default for BotClientState {
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
+            order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -2010,9 +2021,9 @@ async fn event_handler(
                 warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
                 state.bazaar_at_limit.store(true, Ordering::Relaxed);
             } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
-                // An order filled — a slot is now free
+                // An order was collected — a slot is now free
                 if state.bazaar_at_limit.load(Ordering::Relaxed) {
-                    info!("[Bazaar] Order filled, clearing order-limit flag");
+                    info!("[Bazaar] Order collected, clearing order-limit flag");
                     state.bazaar_at_limit.store(false, Ordering::Relaxed);
                 }
             }
@@ -2640,6 +2651,11 @@ async fn execute_command(
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
+            // On startup (cancel_open) reset the cancel-failure tracker so
+            // previously-stuck orders get a fresh set of retry attempts.
+            if *cancel_open {
+                state.order_cancel_failures.write().clear();
+            }
             // Set an internal deadline so the handler can bail out cleanly
             // (closing windows) instead of burning through the external timeout.
             // Only processes ONE order per cycle, so 10s is plenty.
@@ -4028,9 +4044,7 @@ async fn handle_window_interaction(
             } else if window_title.to_lowercase().contains("order options") {
                 // Hypixel opened "Order options" after clicking an order in the list.
                 // This means the order is OPEN (not filled — filled orders collect on click).
-                // Look for Cancel/Collect buttons and handle accordingly.
                 // After handling ONE order, close and go Idle (one order per cycle).
-                info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
 
                 let order_ctx = state.managing_order_context.read().clone();
                 let (order_name, order_identity) = match &order_ctx {
@@ -4047,7 +4061,22 @@ async fn handle_window_interaction(
                     });
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
+                } else if !cancel_open {
+                    // Collect-only mode: this order is open (not filled), so there's
+                    // nothing to collect here.  Close immediately and move on — don't
+                    // waste time trying to cancel stale orders when fills are pending.
+                    debug!("[ManageOrders] Order \"{}\" is open — skipping in collect-only mode", order_name);
+                    if !name_key.is_empty() {
+                        state.manage_orders_processed.write().insert(name_key);
+                    }
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    *state.manage_orders_deadline.write() = None;
+                    *state.bot_state.write() = BotState::Idle;
                 } else {
+                // cancel_open mode (startup): look for Cancel/Collect buttons.
+                info!("[ManageOrders] Order options window opened (startup cancel mode) — looking for Cancel/Collect buttons");
 
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
@@ -4095,6 +4124,18 @@ async fn handle_window_interaction(
                     );
                 }
 
+                // Check if this order has exceeded the cancel retry limit.
+                // If so, skip it entirely so the bot doesn't get stuck.
+                let cancel_fail_key = normalize_bazaar_order_text(&order_name);
+                let prior_failures = *state.order_cancel_failures.read().get(&cancel_fail_key).unwrap_or(&0);
+                let cancel_exceeded = prior_failures >= MAX_CANCEL_RETRIES;
+                if cancel_exceeded && (cancel_open || cancel_due_to_age) {
+                    warn!(
+                        "[ManageOrders] Order \"{}\" exceeded {} cancel attempts — skipping to try again later",
+                        order_name, MAX_CANCEL_RETRIES
+                    );
+                }
+
                 if let Some(cs) = collect_slot {
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
@@ -4109,13 +4150,14 @@ async fn handle_window_interaction(
                         } else {
                             warn!("[ManageOrders] Collect click for \"{}\" was not confirmed in Order options", order_name);
                         }
-                        if cancel_open || cancel_due_to_age {
+                        if (cancel_open || cancel_due_to_age) && !cancel_exceeded {
                             if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                 if *state.last_window_id.read() == window_id {
                                     info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
                                     click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
                                     if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                         *state.manage_orders_cancelled.write() += 1;
+                                        state.order_cancel_failures.write().remove(&cancel_fail_key);
                                         if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                             let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                                 item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
@@ -4123,19 +4165,21 @@ async fn handle_window_interaction(
                                             });
                                         }
                                     } else {
-                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options", order_name);
+                                        *state.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
+                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
                                     }
                                 }
                             }
                         }
                     }
                 } else if let Some(cs) = cancel_slot {
-                    if cancel_open || cancel_due_to_age {
+                    if (cancel_open || cancel_due_to_age) && !cancel_exceeded {
                         if *state.last_window_id.read() == window_id {
                             info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                             if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                 *state.manage_orders_cancelled.write() += 1;
+                                state.order_cancel_failures.write().remove(&cancel_fail_key);
                                 if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                         item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
@@ -4143,10 +4187,11 @@ async fn handle_window_interaction(
                                     });
                                 }
                             } else {
-                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options", order_name);
+                                *state.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
+                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
                             }
                         }
-                    } else {
+                    } else if !cancel_open && !cancel_due_to_age {
                         debug!("[ManageOrders] Skipping open order \"{}\" in Order options (collect-only mode)", order_name);
                     }
                 } else {
@@ -5404,14 +5449,14 @@ async fn click_window_slot_carrying(
 /// `execute_command`, which handles all required initialisation (deadlines,
 /// processed-set clearing, SafeClose of stale windows, etc.).
 async fn run_startup_workflow(
-    bot: Client,
+    _bot: Client,
     bot_state: Arc<RwLock<BotState>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<BotEvent>,
     manage_orders_cancelled: Arc<RwLock<u64>>,
     auto_cookie_hours: Arc<RwLock<u64>>,
     command_queue: Arc<RwLock<Option<CommandQueue>>>,
     startup_in_progress: Arc<AtomicBool>,
-    enable_bazaar_flips: Arc<AtomicBool>,
+    _enable_bazaar_flips: Arc<AtomicBool>,
 ) {
     use crate::types::{CommandType, CommandPriority};
 
@@ -5461,7 +5506,7 @@ async fn run_startup_workflow(
     // Returns true if the command completed, false on timeout.
     async fn await_queued_command(
         queue: &CommandQueue,
-        bot_state: &Arc<RwLock<BotState>>,
+        _bot_state: &Arc<RwLock<BotState>>,
         cmd_type: CommandType,
         timeout_secs: u64,
     ) -> bool {
@@ -5498,10 +5543,9 @@ async fn run_startup_workflow(
         info!("[Startup] Step 1/4: Cookie check skipped (AUTO_COOKIE=0)");
     }
 
-    // Step 2/4: Bazaar order management — cancel all open orders when bazaar
-    // flips are enabled (they'll be re-placed with fresh recommendations), or
-    // just collect filled orders when bazaar flips are disabled.
-    let cancel_open = enable_bazaar_flips.load(Ordering::Relaxed);
+    // Step 2/4: Bazaar order management — always cancel all open orders and
+    // collect filled ones on startup so the bot starts with a clean slate.
+    let cancel_open = true;
     let mode_str = if cancel_open { "cancel + collect" } else { "collect-only" };
     info!("[Startup] Step 2/4: Managing bazaar orders (startup: {})...", mode_str);
     await_queued_command(
