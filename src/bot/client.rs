@@ -4006,8 +4006,8 @@ async fn handle_window_interaction(
                 // waste a cycle clicking open orders that have nothing to collect.
                 let chosen_order: Option<OrderEntry> = if !cancel_open {
                     // First: claimable sells, then claimable buys
-                    sell_orders.iter().find(|o| o.4).cloned()
-                        .or_else(|| buy_orders.iter().find(|o| o.4).cloned())
+                    sell_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
+                        .or_else(|| buy_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned())
                         // Fallback: any sell, then any buy (for safety / lore-parsing misses)
                         .or_else(|| sell_orders.into_iter().next())
                         .or_else(|| buy_orders.into_iter().next())
@@ -4101,6 +4101,11 @@ async fn handle_window_interaction(
                         // If there are more orders to process, immediately
                         // re-queue ManageOrders so we don't wait for the
                         // periodic timer (up to 60s) between each order.
+                        // Only re-queue when the order was collected directly
+                        // (order_options_opened == false).  When Order options
+                        // opened, the Order options handler takes over and will
+                        // go Idle after it finishes — we must not re-queue here
+                        // because that handler is still active.
                         if total_orders > 1 && !order_options_opened {
                             if let Some(queue) = state.command_queue.read().as_ref() {
                                 if !queue.has_manage_orders() {
