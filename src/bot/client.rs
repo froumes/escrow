@@ -1279,11 +1279,10 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
     lore_lines
 }
 
-/// Format a f64 price with comma-separated thousands for bazaar sign input.
+/// Format a f64 price as a plain number for bazaar sign input.
 /// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
-/// Whole numbers use commas: 7500000.0 → "7,500,000".
-/// Fractional prices omit commas so the decimal is preserved by Hypixel's parser:
-/// 60000000.2 → "60000000.2" (commas + dot causes Hypixel to drop the decimal).
+/// No commas — Hypixel's bazaar sign parser does not support them:
+/// 7500000.0 → "7500000", 60000000.2 → "60000000.2".
 fn format_price_for_sign(price: f64) -> String {
     // Work in tenths-of-a-coin as an integer to avoid floating-point precision
     // issues when splitting integer and fractional parts of large prices.
@@ -1292,22 +1291,8 @@ fn format_price_for_sign(price: f64) -> String {
     let frac_digit = (tenths % 10).unsigned_abs();
 
     if frac_digit == 0 {
-        // Whole-number prices: use commas for readability.
-        let int_str = int_part.to_string();
-        let digits: Vec<char> = int_str.chars().collect();
-        let mut with_commas = String::new();
-        let len = digits.len();
-        for (i, &c) in digits.iter().enumerate() {
-            if i > 0 && (len - i) % 3 == 0 {
-                with_commas.push(',');
-            }
-            with_commas.push(c);
-        }
-        with_commas
+        int_part.to_string()
     } else {
-        // Fractional prices: plain number without commas — Hypixel's bazaar sign
-        // parser drops the decimal portion when commas are also present, causing
-        // orders to be placed at the wrong (truncated) price.
         format!("{}.{}", int_part, frac_digit)
     }
 }
@@ -4019,9 +4004,18 @@ async fn handle_window_interaction(
                 // (unfilled) orders have nothing to collect and clicking them
                 // opens "Order options" which wastes a cycle and can leave the
                 // bot stuck for the entire periodic-check interval.
+                // However, stale orders that exceed the cancel-due-to-age threshold
+                // must still be selected so they can be cancelled.
+                let cancel_mins = state.bazaar_order_cancel_minutes_per_million;
                 let chosen_order: Option<OrderEntry> = if !cancel_open {
                     sell_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
                         .or_else(|| buy_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned())
+                        .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable)| {
+                            !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
+                        }).cloned())
+                        .or_else(|| buy_orders.iter().find(|&(_, _, identity, _, claimable)| {
+                            !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
+                        }).cloned())
                 } else {
                     // cancel mode: sell first, then buy (original behaviour)
                     sell_orders.into_iter().next()
@@ -6406,19 +6400,18 @@ mod tests {
 
     #[test]
     fn test_format_price_for_sign_whole_number() {
-        // Whole-number prices must NOT include a ".0" suffix, and use commas.
-        assert_eq!(format_price_for_sign(7500000.0), "7,500,000");
+        // Whole-number prices: plain integers, no commas, no ".0" suffix.
+        assert_eq!(format_price_for_sign(7500000.0), "7500000");
         assert_eq!(format_price_for_sign(100.0), "100");
         assert_eq!(format_price_for_sign(8.0), "8");
-        assert_eq!(format_price_for_sign(1662.0), "1,662");
-        assert_eq!(format_price_for_sign(60000000.0), "60,000,000");
-        assert_eq!(format_price_for_sign(50000002.0), "50,000,002");
+        assert_eq!(format_price_for_sign(1662.0), "1662");
+        assert_eq!(format_price_for_sign(60000000.0), "60000000");
+        assert_eq!(format_price_for_sign(50000002.0), "50000002");
     }
 
     #[test]
     fn test_format_price_for_sign_with_decimal() {
-        // Fractional prices keep one decimal digit but omit commas so
-        // Hypixel's sign parser preserves the decimal.
+        // Fractional prices: plain number with one decimal digit, no commas.
         assert_eq!(format_price_for_sign(60000000.2), "60000000.2");
         assert_eq!(format_price_for_sign(1234567.9), "1234567.9");
         assert_eq!(format_price_for_sign(100.5), "100.5");
