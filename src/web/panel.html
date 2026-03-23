@@ -804,7 +804,7 @@ const GLASS_PANE_COLORS = {
 function getGlassPaneDataUrl(registryName) {
     const name = (registryName || '').replace('minecraft:', '');
     const color = GLASS_PANE_COLORS[name];
-    if (!color) return null;
+    if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return null;
     // Return a tiny inline SVG rectangle
     return "data:image/svg+xml," + encodeURIComponent(
         '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">'
