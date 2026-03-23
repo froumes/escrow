@@ -292,6 +292,30 @@ pub enum CommandType {
     SellInventoryBz,
 }
 
+impl CommandType {
+    /// Short human-readable label for logging (avoids dumping full Debug structs).
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            CommandType::BazaarBuyOrder { .. } => "bazaar buy order",
+            CommandType::BazaarSellOrder { .. } => "bazaar sell order",
+            CommandType::PurchaseAuction { .. } => "purchasing flip",
+            CommandType::SendChat { .. } => "chat command",
+            CommandType::ClaimSoldItem => "claiming sold item",
+            CommandType::ClaimPurchasedItem => "claiming purchased item",
+            CommandType::CheckCookie => "checking cookie",
+            CommandType::DiscoverOrders => "discovering orders",
+            CommandType::ExecuteOrders => "executing orders",
+            CommandType::SellToAuction { .. } => "selling to auction",
+            CommandType::ManageOrders { .. } => "managing orders",
+            CommandType::ClickSlot { .. } => "clicking slot",
+            CommandType::SwapProfile { .. } => "swapping profile",
+            CommandType::AcceptTrade { .. } => "accepting trade",
+            CommandType::CancelAuction { .. } => "cancelling auction",
+            CommandType::SellInventoryBz => "selling inventory via bazaar",
+        }
+    }
+}
+
 /// Window types that can be opened
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowType {
