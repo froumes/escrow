@@ -2532,7 +2532,7 @@ async fn execute_command(
     // in an inventory" or silently fail.  Closing the window first prevents the bot
     // from being stuck "in an inventory".
     if let Some(open_wid) = state.handlers.current_window_id() {
-        warn!("[SafeClose] Closing stale window {} before executing {:?}", open_wid, command.command_type);
+        warn!("[SafeClose] Closing window {} before executing {}", open_wid, command.command_type.display_name());
         bot.write_packet(ServerboundContainerClose {
             container_id: open_wid as i32,
         });
@@ -2939,10 +2939,22 @@ async fn handle_window_interaction(
                                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                             }
                             break;
+                        } else if current_kind.contains("potato") {
+                            info!("[AH] Bed timing: potato detected — auction not purchasable, closing");
+                            state.bed_timing_active.store(false, Ordering::Relaxed);
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
+                            *state.bot_state.write() = BotState::Idle;
+                            return;
                         } else if current_kind.contains("bed") {
-                            debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
-                            if *state.last_window_id.read() == window_id {
-                                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                            if state.freemoney {
+                                debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
+                                if *state.last_window_id.read() == window_id {
+                                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                                }
+                            } else {
+                                debug!("[AH] Bed timing: grace period active, waiting for gold_nugget");
                             }
                         } else {
                             failed_clicks += 1;
