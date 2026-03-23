@@ -199,6 +199,15 @@ impl CommandQueue {
     /// Returns a future that resolves when a new command is enqueued.
     /// Used by the command processor loop to sleep efficiently instead of
     /// polling every 50 ms.
+    ///
+    /// Callers should create and pin this future **before** checking the queue
+    /// with `start_current()` to avoid missing notifications:
+    /// ```ignore
+    /// let notified = queue.notified();
+    /// tokio::pin!(notified);
+    /// if let Some(cmd) = queue.start_current() { /* process */ }
+    /// else { notified.await; }
+    /// ```
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
