@@ -1633,6 +1633,33 @@ fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String
     is_bazaar_order_entry_name(name) || identity.is_some()
 }
 
+/// Returns `true` when the order lore indicates items/coins are ready to collect.
+///
+/// Hypixel shows "Filled: X/Y 100%!" for fully filled orders and includes
+/// "Click to claim!" or "items to claim" in the tooltip.  Partially filled
+/// orders also show "items to claim" even though they are not 100%.
+///
+/// We intentionally check for *any* claimable indicator so that both fully
+/// and partially filled orders are considered for collection.
+fn is_order_claimable_from_lore(lore: &[String]) -> bool {
+    for line in lore {
+        let clean = remove_mc_colors(line).to_lowercase();
+        // "Filled: 64/64 100%!" — fully filled
+        if clean.contains("100%") {
+            return true;
+        }
+        // "Click to claim!" — present on fully filled orders
+        if clean.contains("click to claim") {
+            return true;
+        }
+        // "You have X items to claim!" — present on filled buy orders
+        if clean.contains("to claim") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
 /// and should be aborted immediately instead of waiting for the GUI watchdog timeout.
 fn is_terminal_purchase_failure_message(message: &str) -> bool {
@@ -3940,10 +3967,14 @@ async fn handle_window_interaction(
                 let slots = bot.menu().slots();
 
                 // ── Scan all order slots and pick the highest-priority one ──
-                // Priority: SELL orders first (they free slots and deliver coins),
-                // then BUY orders.
-                let mut sell_orders: Vec<(usize, String, Option<(bool, String)>, String)> = Vec::new();
-                let mut buy_orders: Vec<(usize, String, Option<(bool, String)>, String)> = Vec::new();
+                // Priority (collect-only mode): claimable/filled orders first,
+                //   SELL before BUY within each tier.
+                // Priority (cancel mode): SELL first, then BUY (all orders).
+                //
+                // Tuple: (slot, name, identity, order_key, claimable)
+                type OrderEntry = (usize, String, Option<(bool, String)>, String, bool);
+                let mut sell_orders: Vec<OrderEntry> = Vec::new();
+                let mut buy_orders: Vec<OrderEntry> = Vec::new();
 
                 for (i, item) in slots.iter().enumerate() {
                     if let Some(name) = get_item_display_name_from_slot(item) {
@@ -3959,18 +3990,32 @@ async fn handle_window_interaction(
                         let is_buy = identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&name));
+                        let claimable = is_order_claimable_from_lore(&lore);
                         let order_key = format!("{}::{}", i, name_key);
                         if is_buy {
-                            buy_orders.push((i, name, identity, order_key));
+                            buy_orders.push((i, name, identity, order_key, claimable));
                         } else {
-                            sell_orders.push((i, name, identity, order_key));
+                            sell_orders.push((i, name, identity, order_key, claimable));
                         }
                     }
                 }
 
-                // Pick the best order: sell first, then buy
-                let chosen_order = sell_orders.into_iter().next()
-                    .or_else(|| buy_orders.into_iter().next());
+                let total_orders = sell_orders.len() + buy_orders.len();
+
+                // In collect-only mode, prefer claimable orders so we don't
+                // waste a cycle clicking open orders that have nothing to collect.
+                let chosen_order: Option<OrderEntry> = if !cancel_open {
+                    // First: claimable sells, then claimable buys
+                    sell_orders.iter().find(|o| o.4).cloned()
+                        .or_else(|| buy_orders.iter().find(|o| o.4).cloned())
+                        // Fallback: any sell, then any buy (for safety / lore-parsing misses)
+                        .or_else(|| sell_orders.into_iter().next())
+                        .or_else(|| buy_orders.into_iter().next())
+                } else {
+                    // cancel mode: sell first, then buy (original behaviour)
+                    sell_orders.into_iter().next()
+                        .or_else(|| buy_orders.into_iter().next())
+                };
 
                 match chosen_order {
                     None => {
@@ -3983,7 +4028,7 @@ async fn handle_window_interaction(
                         state.bazaar_at_limit.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
-                    Some((i, order_name, order_identity, _processed_key)) => {
+                    Some((i, order_name, order_identity, _processed_key, _claimable)) => {
                         let order_is_buy = order_identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
@@ -4052,6 +4097,22 @@ async fn handle_window_interaction(
                         }
                         *state.manage_orders_deadline.write() = None;
                         *state.bot_state.write() = BotState::Idle;
+
+                        // If there are more orders to process, immediately
+                        // re-queue ManageOrders so we don't wait for the
+                        // periodic timer (up to 60s) between each order.
+                        if total_orders > 1 && !order_options_opened {
+                            if let Some(queue) = state.command_queue.read().as_ref() {
+                                if !queue.has_manage_orders() {
+                                    info!("[ManageOrders] {} more order(s) remain — re-queuing ManageOrders", total_orders - 1);
+                                    queue.enqueue(
+                                        crate::types::CommandType::ManageOrders { cancel_open },
+                                        crate::types::CommandPriority::Normal,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             } else if window_title.to_lowercase().contains("order options") {
@@ -4102,16 +4163,60 @@ async fn handle_window_interaction(
                     state.bazaar_at_limit.store(false, Ordering::Relaxed);
                     *state.bot_state.write() = BotState::Idle;
                 } else if !cancel_open && !cancel_due_to_age {
-                    // Collect-only mode and order is NOT stale: this order is open
-                    // (not filled), so there's nothing to collect here.  Close
-                    // immediately and move on.
-                    debug!("[ManageOrders] Order \"{}\" is open — skipping in collect-only mode", order_name);
+                    // Collect-only mode and order is NOT stale.
+                    // "Order options" opened, so this order is not 100% filled (those
+                    // collect on click).  It may be PARTIALLY filled (has a Collect
+                    // button) or completely open (no Collect button).
+                    // Look for a Collect button first — if found, collect the partial
+                    // fill before closing.
+                    let probe_deadline =
+                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+                    let mut collect_slot_probe: Option<usize> = None;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        if *state.last_window_id.read() != window_id { break; }
+                        let slots_probe = bot.menu().slots();
+                        collect_slot_probe = find_slot_by_name(&slots_probe, "Collect")
+                            .or_else(|| find_slot_by_name(&slots_probe, "Claim"))
+                            .or_else(|| find_slot_by_lore_contains(&slots_probe, "click to collect"))
+                            .or_else(|| find_slot_by_lore_contains(&slots_probe, "claim your"));
+                        if collect_slot_probe.is_some() { break; }
+                        // Also check for Cancel — if present but no Collect, order is
+                        // truly open with nothing to collect.
+                        let has_cancel = find_slot_by_name(&slots_probe, "Cancel").is_some()
+                            || find_slot_by_lore_contains(&slots_probe, "click to cancel").is_some();
+                        if has_cancel { break; }
+                        if tokio::time::Instant::now() >= probe_deadline { break; }
+                    }
+
+                    if let Some(cs) = collect_slot_probe {
+                        // Partially filled order — collect before closing.
+                        info!("[ManageOrders] Partially filled order \"{}\" — clicking Collect at slot {} (collect-only)", order_name, cs);
+                        if *state.last_window_id.read() == window_id {
+                            click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
+                            if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
+                                if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                        item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
+                                        is_buy_order: *ctx_is_buy,
+                                    });
+                                }
+                            } else {
+                                warn!("[ManageOrders] Collect click for partially filled \"{}\" was not confirmed", order_name);
+                            }
+                        }
+                    } else {
+                        debug!("[ManageOrders] Order \"{}\" is open — skipping in collect-only mode", order_name);
+                    }
+
                     if !name_key.is_empty() {
                         state.manage_orders_processed.write().insert(name_key);
                     }
-                    bot.write_packet(ServerboundContainerClose {
-                        container_id: window_id as i32,
-                    });
+                    if *state.last_window_id.read() == window_id {
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                    }
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
                 } else {
@@ -5845,6 +5950,57 @@ mod tests {
         assert!(is_buy_bazaar_order_name("Buy Order: ENCHANTED DIAMOND"));
         assert!(!is_buy_bazaar_order_name("SELL ENCHANTED DIAMOND"));
         assert!(!is_buy_bazaar_order_name("Sell Offer: ENCHANTED DIAMOND"));
+    }
+
+    #[test]
+    fn test_is_order_claimable_from_lore_fully_filled() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Order amount: 64x".to_string(),
+            "Filled: 64/64 100%!".to_string(),
+            "Price per unit: 1,958.0 coins".to_string(),
+            "You have 64 items to claim!".to_string(),
+            "Click to claim!".to_string(),
+        ];
+        assert!(is_order_claimable_from_lore(&lore));
+    }
+
+    #[test]
+    fn test_is_order_claimable_from_lore_open_order() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Order amount: 64x".to_string(),
+            "Filled: 0/64 0%".to_string(),
+            "Price per unit: 1,000.0 coins".to_string(),
+        ];
+        assert!(!is_order_claimable_from_lore(&lore));
+    }
+
+    #[test]
+    fn test_is_order_claimable_from_lore_partially_filled() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Order amount: 64x".to_string(),
+            "Filled: 32/64 50%".to_string(),
+            "You have 32 items to claim!".to_string(),
+        ];
+        assert!(is_order_claimable_from_lore(&lore));
+    }
+
+    #[test]
+    fn test_is_order_claimable_from_lore_with_color_codes() {
+        let lore = vec![
+            "§7Buy Order".to_string(),
+            "§7Filled: §a64/64 §6100%!".to_string(),
+            "§aClick to claim!".to_string(),
+        ];
+        assert!(is_order_claimable_from_lore(&lore));
+    }
+
+    #[test]
+    fn test_is_order_claimable_from_lore_empty() {
+        let lore: Vec<String> = vec![];
+        assert!(!is_order_claimable_from_lore(&lore));
     }
 
     #[test]
