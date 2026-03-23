@@ -923,10 +923,11 @@ async fn main() -> Result<()> {
                     // periodic check.  Only enqueue if bazaar flips are enabled and no
                     // ManageOrders is already queued/running (prevents duplicate processing
                     // that causes double cancel/collect Hypixel chat messages).
+                    // Note: we do NOT skip when inventory is full because ManageOrders
+                    // can still collect SELL fills (which give coins, no inventory needed)
+                    // and free up bazaar slots.
                     if enable_bazaar_flips_events.load(Ordering::Relaxed) {
-                        if bot_client_clone.is_inventory_full() {
-                            debug!("[BazaarOrders] Order filled — inventory full, skipping ManageOrders to avoid packet spam");
-                        } else if command_queue_clone.has_manage_orders() {
+                        if command_queue_clone.has_manage_orders() {
                             info!("[BazaarOrders] Order filled — ManageOrders already queued/running, skipping duplicate");
                         } else {
                             info!("[BazaarOrders] Order filled — queuing ManageOrders");
@@ -959,6 +960,7 @@ async fn main() -> Result<()> {
     let ingame_names_ws = ingame_names.clone();
     let license_default_sent_ws = license_default_sent.clone();
     let ingame_name_ws = ingame_name.clone();
+    let bazaar_tracker_ws = bazaar_tracker.clone();
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1044,6 +1046,13 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Skip if there are filled orders waiting to be collected —
+                    // they still occupy a slot until ManageOrders collects them.
+                    if bazaar_tracker_ws.has_filled_orders() {
+                        debug!("Skipping bazaar flip — filled orders pending collection: {}", bazaar_flip.item_name);
+                        continue;
+                    }
+
                     // Skip if bazaar flips are paused due to incoming AH flip (matching bazaarFlipPauser.ts)
                     if bazaar_flips_paused_ws.load(Ordering::Relaxed) {
                         debug!("Bazaar flips paused (AH flip incoming), skipping: {}", bazaar_flip.item_name);
@@ -1052,6 +1061,16 @@ async fn main() -> Result<()> {
 
                     // Print colorful bazaar flip announcement
                     let effective_is_buy = bazaar_flip.effective_is_buy_order();
+
+                    // Skip BUY orders when inventory is full — items can't be
+                    // collected from the bazaar without free inventory space.
+                    // SELL orders are still accepted because they remove items
+                    // from inventory, freeing space.
+                    if effective_is_buy && bot_client_for_ws.is_inventory_full() {
+                        debug!("Skipping BUY bazaar flip — inventory full: {}", bazaar_flip.item_name);
+                        continue;
+                    }
+
                     let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
@@ -1064,12 +1083,13 @@ async fn main() -> Result<()> {
                     let _ = chat_tx_ws.send(baf_msg);
 
                     // Queue the bazaar command.
-                    // Matching TypeScript: SELL orders use HIGH priority (free up inventory),
-                    // BUY orders use NORMAL priority. Both are interruptible by AH flips.
+                    // SELL orders always get Critical priority — having items in
+                    // inventory is worse than not having them (items block BUY
+                    // collection and inventory space). BUY orders use Normal.
                     let priority = if effective_is_buy {
                         CommandPriority::Normal
                     } else {
-                        CommandPriority::High
+                        CommandPriority::Critical
                     };
                     let command_type = if effective_is_buy {
                         CommandType::BazaarBuyOrder {
@@ -1186,6 +1206,14 @@ async fn main() -> Result<()> {
                             let bot_state = bot_client_for_ws.state();
                             if !matches!(bot_state, frikadellen_baf::types::BotState::Startup) {
                                 let effective_is_buy = rec.effective_is_buy_order();
+
+                                // Skip BUY orders when inventory is full
+                                if effective_is_buy && bot_client_for_ws.is_inventory_full() {
+                                    debug!("Skipping BUY bazaar flip from chat — inventory full: {}", rec.item_name);
+                                } else if effective_is_buy && bazaar_tracker_ws.has_filled_orders() {
+                                    debug!("Skipping BUY bazaar flip from chat — filled orders pending: {}", rec.item_name);
+                                } else {
+
                                 let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
                                 let baf_msg = format!(
                                     "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
@@ -1200,7 +1228,7 @@ async fn main() -> Result<()> {
                                 let priority = if effective_is_buy {
                                     CommandPriority::Normal
                                 } else {
-                                    CommandPriority::High
+                                    CommandPriority::Critical
                                 };
                                 let command_type = if effective_is_buy {
                                     CommandType::BazaarBuyOrder {
@@ -1220,6 +1248,7 @@ async fn main() -> Result<()> {
                                 command_queue_clone.enqueue(command_type, priority, true);
                                 info!("[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
                                     order_label, rec.item_name, rec.amount, rec.price_per_unit);
+                                } // end inventory/filled check
                             }
                         }
                     }

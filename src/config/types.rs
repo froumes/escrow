@@ -219,11 +219,11 @@ fn default_bed_pre_click_ms() -> u64 {
 }
 
 fn default_bazaar_order_check_interval_seconds() -> u64 {
-    30
+    60
 }
 
 fn default_bazaar_order_cancel_minutes_per_million() -> u64 {
-    5
+    1
 }
 
 fn default_bazaar_tax_rate() -> f64 {

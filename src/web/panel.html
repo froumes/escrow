@@ -814,6 +814,12 @@ function getGlassPaneDataUrl(registryName) {
     );
 }
 
+/** Get the CSS color for a glass pane registry name, or null */
+function getGlassPaneColor(registryName) {
+    const name = (registryName || '').replace('minecraft:', '');
+    return GLASS_PANE_COLORS[name] || null;
+}
+
 /** Get an icon URL for an inventory item */
 function getItemIconUrl(slot) {
     // Glass panes: render as colored squares
@@ -1058,6 +1064,12 @@ function renderGameView(data){
         div.appendChild(numEl);
 
         if(!s.empty){
+            // Glass panes: render as colored background (filler items in Hypixel GUIs)
+            const paneColor = s.name ? getGlassPaneColor(s.name) : null;
+            if(paneColor){
+                div.style.background=paneColor;
+                div.style.borderColor=paneColor;
+            } else {
             const name=s.displayName||s.name||'?';
             const iconUrl=getItemIconUrl(s);
             if(iconUrl){
@@ -1096,6 +1108,7 @@ function renderGameView(data){
             div.addEventListener('mouseenter',e=>positionTooltip(tip,e));
             div.addEventListener('mousemove',e=>positionTooltip(tip,e));
             div.addEventListener('mouseleave',()=>{tip.style.display='none'});
+            } // end non-glass-pane
         }
         grid.appendChild(div);
     }
