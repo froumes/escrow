@@ -1626,6 +1626,14 @@ async fn main() -> Result<()> {
                 continue;
             }
 
+            // Register for notification BEFORE checking the queue.  This
+            // prevents a race where a command is enqueued between
+            // start_current() returning None and the await: the stored
+            // permit from notify_one() will make `notified` resolve
+            // immediately.
+            let notified = command_queue_processor.notified();
+            tokio::pin!(notified);
+
             // Process commands from queue
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);
@@ -1737,10 +1745,15 @@ async fn main() -> Result<()> {
                     };
                     sleep(Duration::from_millis(delay)).await;
                 }
+            } else {
+                // Queue is empty — wait for a notification instead of busy-polling.
+                // Times out after 500 ms so paused-state and other periodic checks
+                // still run promptly even when no commands arrive.
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    &mut notified,
+                ).await;
             }
-            
-            // Small delay to prevent busy loop
-            sleep(Duration::from_millis(50)).await;
         }
     });
 

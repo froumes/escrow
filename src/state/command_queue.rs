@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -14,6 +15,9 @@ const COMMAND_TIMEOUT_MS: u64 = 30_000; // 30 seconds
 pub struct CommandQueue {
     queue: Arc<RwLock<VecDeque<QueuedCommand>>>,
     current_command: Arc<RwLock<Option<QueuedCommand>>>,
+    /// Notified whenever a new command is enqueued so the processor loop can
+    /// wake up immediately instead of polling every 50 ms.
+    notify: Arc<Notify>,
 }
 
 impl CommandQueue {
@@ -21,6 +25,7 @@ impl CommandQueue {
         Self {
             queue: Arc::new(RwLock::new(VecDeque::new())),
             current_command: Arc::new(RwLock::new(None)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -44,6 +49,10 @@ impl CommandQueue {
             .unwrap_or(queue.len());
         
         queue.insert(pos, cmd);
+        drop(queue);
+
+        // Wake the command processor loop so it picks up the new command immediately.
+        self.notify.notify_one();
         
         debug!("Enqueued command {:?} with priority {:?} at position {}", id, priority, pos);
         id
@@ -185,6 +194,22 @@ impl CommandQueue {
             }
         }
         self.queue.read().iter().any(|c| c.id == *id)
+    }
+
+    /// Returns a future that resolves when a new command is enqueued.
+    /// Used by the command processor loop to sleep efficiently instead of
+    /// polling every 50 ms.
+    ///
+    /// Callers should create and pin this future **before** checking the queue
+    /// with `start_current()` to avoid missing notifications:
+    /// ```ignore
+    /// let notified = queue.notified();
+    /// tokio::pin!(notified);
+    /// if let Some(cmd) = queue.start_current() { /* process */ }
+    /// else { notified.await; }
+    /// ```
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
     }
 }
 

@@ -9,6 +9,7 @@ use azalea_protocol::packets::game::{
     s_use_item::ServerboundUseItem,
     s_set_carried_item::ServerboundSetCarriedItem,
     s_interact::InteractionHand,
+    s_chat_command::ServerboundChatCommand,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
@@ -1736,10 +1737,10 @@ async fn event_handler(
                         *joined_wd.write() = true;
                         *teleported_wd.write() = true;
                         // Retry /play sb in case the initial attempt failed (lobby not ready)
-                        bot_wd.write_chat_packet("/play sb");
+                        send_chat_command(&bot_wd, "/play sb");
                         // Wait for SkyBlock to load (5s) + island teleport delay combined
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
-                        bot_wd.write_chat_packet("/is");
+                        send_chat_command(&bot_wd, "/is");
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
                         run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_queue_wd, startup_in_progress_wd, enable_bazaar_flips_wd).await;
                     }
@@ -1765,7 +1766,7 @@ async fn event_handler(
                 let skyblock_join_time = state.skyblock_join_time.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(LOBBY_COMMAND_DELAY_SECS)).await;
-                    bot_clone.write_chat_packet("/play sb");
+                    send_chat_command(&bot_clone, "/play sb");
                 });
                 
                 // Set the join time for timeout tracking
@@ -1941,7 +1942,7 @@ async fn event_handler(
                             if *state_clone.bot_state.read() == BotState::Selling {
                                 info!("[Auction] Retrying auction after removing stuck item — sending /ah");
                                 state_clone.auction_sell_aborted.store(false, Ordering::Relaxed);
-                                bot_clone.write_chat_packet("/ah");
+                                send_chat_command(&bot_clone, "/ah");
                             }
                         });
                     }
@@ -2163,7 +2164,7 @@ async fn event_handler(
                         let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
-                            bot_clone.write_chat_packet("/is");
+                            send_chat_command(&bot_clone, "/is");
                             
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
@@ -2190,7 +2191,19 @@ async fn event_handler(
                     *state.last_window_id.write() = window_id as u8;
                     
                     state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
-                    rebuild_cached_window_json(&bot, &state);
+                    // Defer the (expensive) window-JSON rebuild so the event
+                    // handler returns faster.  On the purchase path this is
+                    // critical: ContainerSetContent may arrive in the very next
+                    // packet frame and its handler must fire
+                    // slot_data_notify.notify_waiters() without waiting for the
+                    // JSON rebuild to finish.
+                    {
+                        let cache_bot = bot.clone();
+                        let cache_state = state.clone();
+                        tokio::spawn(async move {
+                            rebuild_cached_window_json(&cache_bot, &cache_state);
+                        });
+                    }
                     if state.event_tx.send(BotEvent::WindowOpen(window_id as u8, window_type.clone(), parsed_title.clone())).is_err() {
                         debug!("Failed to send WindowOpen event - receiver dropped");
                     }
@@ -2544,7 +2557,11 @@ async fn execute_command(
         CommandType::SendChat { message } => {
             // Send chat message to Minecraft
             info!("Sending chat message: {}", message);
-            bot.write_chat_packet(message);
+            if message.starts_with('/') {
+                send_chat_command(bot, message);
+            } else {
+                bot.write_chat_packet(message);
+            }
         }
         CommandType::PurchaseAuction { flip } => {
             // Send /viewauction command
@@ -2566,7 +2583,7 @@ async fn execute_command(
             // Safe: commands execute sequentially from the queue processor.
             *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-            bot.write_chat_packet(&chat_command);
+            send_chat_command(bot, &chat_command);
 
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
             // local Instant later — and only when the auction turns out to be a
@@ -2599,7 +2616,7 @@ async fn execute_command(
                 format!("/bz {}", crate::utils::to_title_case(search_term))
             };
             info!("Sending bazaar buy order command: {}", cmd);
-            bot.write_chat_packet(&cmd);
+            send_chat_command(bot, &cmd);
             *state.bot_state.write() = BotState::Bazaar;
         }
         CommandType::BazaarSellOrder { item_name, item_tag, amount, price_per_unit } => {
@@ -2624,7 +2641,7 @@ async fn execute_command(
                 format!("/bz {}", crate::utils::to_title_case(search_term))
             };
             info!("Sending bazaar sell order command: {}", cmd);
-            bot.write_chat_packet(&cmd);
+            send_chat_command(bot, &cmd);
             *state.bot_state.write() = BotState::Bazaar;
         }
         // Advanced command types (matching TypeScript BAF.ts)
@@ -2644,14 +2661,14 @@ async fn execute_command(
         CommandType::SwapProfile { profile_name } => {
             info!("Swapping to profile: {}", profile_name);
             // TypeScript: sends /profiles command and clicks on profile
-            bot.write_chat_packet("/profiles");
+            send_chat_command(bot, "/profiles");
             // TODO: Implement profile selection from menu when window opens
             warn!("SwapProfile implementation incomplete - needs window interaction");
         }
         CommandType::AcceptTrade { player_name } => {
             info!("Accepting trade with player: {}", player_name);
             // TypeScript: sends /trade <player> command
-            bot.write_chat_packet(&format!("/trade {}", player_name));
+            send_chat_command(bot, &format!("/trade {}", player_name));
             // TODO: Implement trade window handling
             warn!("AcceptTrade implementation incomplete - needs trade window handling");
         }
@@ -2667,7 +2684,7 @@ async fn execute_command(
             state.auction_sell_aborted.store(false, Ordering::Relaxed);
             state.auction_stuck_item_retries.store(0, Ordering::Relaxed);
             // Open auction house — window handler takes over from here
-            bot.write_chat_packet("/ah");
+            send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::Selling;
         }
         CommandType::ClaimSoldItem => {
@@ -2676,10 +2693,10 @@ async fn execute_command(
                 .or_else(|| state.claim_sold_uuid.write().take());
             if let Some(uuid) = uuid {
                 info!("Claiming sold item via direct /viewauction {}", uuid);
-                bot.write_chat_packet(&format!("/viewauction {}", uuid));
+                send_chat_command(bot, &format!("/viewauction {}", uuid));
             } else {
                 info!("Claiming sold items via /ah");
-                bot.write_chat_packet("/ah");
+                send_chat_command(bot, "/ah");
             }
             *state.bot_state.write() = BotState::ClaimingSold;
         }
@@ -2688,7 +2705,7 @@ async fn execute_command(
             *state.claim_sold_uuid.write() = None;
             state.claim_sold_uuid_queue.write().clear();
             info!("Claiming purchased item via /ah");
-            bot.write_chat_packet("/ah");
+            send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::ClaimingPurchased;
         }
         CommandType::CheckCookie => {
@@ -2700,7 +2717,7 @@ async fn execute_command(
             info!("[Cookie] Checking booster cookie status via /sbmenu...");
             *state.cookie_time_secs.write() = 0;
             *state.cookie_step.write() = CookieStep::Initial;
-            bot.write_chat_packet("/sbmenu");
+            send_chat_command(bot, "/sbmenu");
             *state.bot_state.write() = BotState::CheckingCookie;
         }
         CommandType::ManageOrders { cancel_open } => {
@@ -2720,7 +2737,7 @@ async fn execute_command(
                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(10)
             );
             let initial_wid = *state.last_window_id.read();
-            bot.write_chat_packet("/bz");
+            send_chat_command(bot, "/bz");
             *state.bot_state.write() = BotState::ManagingOrders;
 
             // Safety: if no window opens within 5 seconds (e.g. chat throttle,
@@ -2736,7 +2753,7 @@ async fn execute_command(
                     if *retry_state.read() != BotState::ManagingOrders { return; }
                     if *retry_wid.read() != saved_wid { return; } // window opened, handler working
                     warn!("[ManageOrders] No window after 5 s — retrying /bz");
-                    retry_bot.write_chat_packet("/bz");
+                    send_chat_command(&retry_bot, "/bz");
 
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     if *retry_state.read() != BotState::ManagingOrders { return; }
@@ -2753,13 +2770,13 @@ async fn execute_command(
             info!("[CancelAuction] Cancelling auction: {} (bid: {})", item_name, starting_bid);
             *state.cancel_auction_item_name.write() = item_name.clone();
             *state.cancel_auction_starting_bid.write() = *starting_bid;
-            bot.write_chat_packet("/ah");
+            send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::CancellingAuction;
         }
         CommandType::SellInventoryBz => {
             info!("[SellInventoryBz] Opening /bz to sell inventory instantly");
             *state.bazaar_step.write() = BazaarStep::Initial;
-            bot.write_chat_packet("/bz");
+            send_chat_command(bot, "/bz");
             *state.bot_state.write() = BotState::SellingInventoryBz;
         }
     }
@@ -3058,18 +3075,17 @@ async fn handle_window_interaction(
                 }
 
                 // When skip-click was sent, the server already has the confirm
-                // click queued from the same TCP burst as the buy-click.  Give
-                // it a generous window to process before sending redundant
-                // retries.  With low-latency connections (<5 ms ping) the
-                // server closes the window within 1-2 ticks (50-100 ms).
-                // 300 ms is intentionally conservative: it covers higher-
-                // latency connections and busy Hypixel lobby ticks while still
-                // retrying well before the 5-second GUI watchdog fires.
+                // click queued from the same TCP burst as the buy-click.  Wait
+                // just long enough for the server to process it (2 ticks =
+                // 100 ms) before retrying.  The previous 300 ms value was
+                // overly conservative and caused a redundant retry click on
+                // low-latency connections where the purchase completes in
+                // ~50 ms but the window lingers for ~300 ms.
                 //
                 // Without skip-click the initial wait is shorter because the
                 // click was just sent above and we want to retry quickly if it
                 // was lost.
-                let initial_wait_ms = if skip_was_sent { 300u64 } else { CONFIRM_PURCHASE_RETRY_MS };
+                let initial_wait_ms = if skip_was_sent { 100u64 } else { CONFIRM_PURCHASE_RETRY_MS };
                 tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
                 // Safety retry loop: if the window is still open (pre-click failed,
@@ -3170,7 +3186,7 @@ async fn handle_window_interaction(
                         }
                         break None;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
 
                 if let Some(i) = order_button_slot {
@@ -3205,7 +3221,7 @@ async fn handle_window_interaction(
                     if f.is_some() || tokio::time::Instant::now() >= poll_deadline {
                         break f;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
 
                 match found {
@@ -3241,7 +3257,7 @@ async fn handle_window_interaction(
                 if ca.is_some() || cp.is_some() || tokio::time::Instant::now() >= poll_deadline2 {
                     break (ca, cp);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             };
 
             // Step 3: Amount screen (buy orders only)
@@ -3349,7 +3365,7 @@ async fn handle_window_interaction(
                         break Some(i);
                     }
                     if tokio::time::Instant::now() >= poll_deadline { break None; }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
                 match item_slot {
                     Some(i) => {
@@ -3377,7 +3393,7 @@ async fn handle_window_interaction(
                         break Some(i);
                     }
                     if tokio::time::Instant::now() >= poll_deadline { break None; }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
                 match sell_slot {
                     Some(i) => {
@@ -3429,7 +3445,7 @@ async fn handle_window_interaction(
                 *state.bazaar_step.write() = BazaarStep::Initial;
                 state.inventory_full.store(false, Ordering::Relaxed);
                 *state.bot_state.write() = BotState::ManagingOrders;
-                bot.write_chat_packet("/bz");
+                send_chat_command(bot, "/bz");
             }
         }
         BotState::ClaimingPurchased => {
@@ -4093,14 +4109,27 @@ async fn handle_window_interaction(
                         // • If "Order options" opens → order is open, Branch C handles it.
                         // • If the window doesn't change → the order was collected directly
                         //   by clicking the slot (Hypixel collects filled orders on click).
+                        // • If a new "Bazaar Orders" window opens (same list, new ID) →
+                        //   the order was collected and Hypixel refreshed the list.
                         let click_deadline = tokio::time::Instant::now()
                             + tokio::time::Duration::from_secs(5);
                         let mut order_options_opened = false;
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
                             if *state.last_window_id.read() != window_id {
-                                // A new window opened — check if it's "Order options"
-                                order_options_opened = true;
+                                // A new window opened — check its title to distinguish
+                                // "Order options" (order is open) from a refreshed
+                                // "Bazaar Orders" list (order was collected on click).
+                                if let Some(new_title) = state.handlers.current_window_title() {
+                                    if new_title.to_lowercase().contains("order options") {
+                                        order_options_opened = true;
+                                    }
+                                    // else: Hypixel re-opened the orders list after
+                                    // collecting — treat as successful direct collection.
+                                } else {
+                                    // No title available — assume Order options for safety.
+                                    order_options_opened = true;
+                                }
                                 break;
                             }
                             if state.inventory_full.load(Ordering::Relaxed) && order_is_buy {
@@ -4536,7 +4565,7 @@ async fn handle_window_interaction(
                                 "§f[§4BAF§f]: §6[AutoCookie] Buying booster cookie...".to_string()
                             ));
                             *state.cookie_step.write() = CookieStep::Initial;
-                            bot.write_chat_packet("/bz Booster Cookie");
+                            send_chat_command(bot, "/bz Booster Cookie");
                             *state.bot_state.write() = BotState::BuyingCookie;
                         }
                     }
@@ -5480,6 +5509,28 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
     info!("Clicked slot {} in window {}", slot, window_id);
 }
 
+/// Send a chat command directly via `write_packet(ServerboundChatCommand)`,
+/// bypassing Azalea's message-based chat system.
+///
+/// `write_chat_packet` queues a Bevy Message that is only processed in the
+/// **next** ECS Update cycle (~16.7 ms at 60 fps).  By sending
+/// `ServerboundChatCommand` through the trigger-based `write_packet` path
+/// the packet reaches the TCP socket **immediately**, eliminating a full
+/// ECS cycle of send-side latency.  On the purchase path this saves ~17 ms
+/// per command.
+///
+/// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
+/// The function strips it before putting the command string into the packet.
+fn send_chat_command(bot: &Client, content: &str) {
+    let command = content.strip_prefix('/').unwrap_or_else(|| {
+        debug!("send_chat_command called without leading '/' — sending as-is: {}", content);
+        content
+    });
+    bot.write_packet(ServerboundChatCommand {
+        command: command.to_string(),
+    });
+}
+
 /// After clicking a Cancel button in a bazaar order management window, wait for
 /// confirmation that the server processed the cancellation.  Returns `true` when
 /// the Cancel button disappears from the window (or the window itself changes),
@@ -5585,7 +5636,7 @@ async fn close_window_and_reopen_bz(
     if *state.last_window_id.read() == window_id {
         bot.write_packet(ServerboundContainerClose { container_id: window_id as i32 });
         tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
-        bot.write_chat_packet("/bz");
+        send_chat_command(bot, "/bz");
     }
 }
 
