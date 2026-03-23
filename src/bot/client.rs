@@ -1281,31 +1281,34 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
 
 /// Format a f64 price with comma-separated thousands for bazaar sign input.
 /// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
-/// Whole numbers omit the decimal: 7500000.0 → "7,500,000" (not "7,500,000.0").
-/// Fractional prices keep one decimal: 60000000.2 → "60,000,000.2".
+/// Whole numbers use commas: 7500000.0 → "7,500,000".
+/// Fractional prices omit commas so the decimal is preserved by Hypixel's parser:
+/// 60000000.2 → "60000000.2" (commas + dot causes Hypixel to drop the decimal).
 fn format_price_for_sign(price: f64) -> String {
     // Work in tenths-of-a-coin as an integer to avoid floating-point precision
     // issues when splitting integer and fractional parts of large prices.
     let tenths = (price * 10.0).round() as i64;
     let int_part = tenths / 10;
     let frac_digit = (tenths % 10).unsigned_abs();
-    let int_str = int_part.to_string();
-    // Insert commas every 3 digits from the right
-    let digits: Vec<char> = int_str.chars().collect();
-    let mut with_commas = String::new();
-    let len = digits.len();
-    for (i, &c) in digits.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            with_commas.push(',');
-        }
-        with_commas.push(c);
-    }
-    // Omit ".0" for whole-number prices — avoids Hypixel rounding up due to
-    // floating-point imprecision in the decimal part.
+
     if frac_digit == 0 {
+        // Whole-number prices: use commas for readability.
+        let int_str = int_part.to_string();
+        let digits: Vec<char> = int_str.chars().collect();
+        let mut with_commas = String::new();
+        let len = digits.len();
+        for (i, &c) in digits.iter().enumerate() {
+            if i > 0 && (len - i) % 3 == 0 {
+                with_commas.push(',');
+            }
+            with_commas.push(c);
+        }
         with_commas
     } else {
-        format!("{}.{}", with_commas, frac_digit)
+        // Fractional prices: plain number without commas — Hypixel's bazaar sign
+        // parser drops the decimal portion when commas are also present, causing
+        // orders to be placed at the wrong (truncated) price.
+        format!("{}.{}", int_part, frac_digit)
     }
 }
 
@@ -6359,7 +6362,7 @@ mod tests {
 
     #[test]
     fn test_format_price_for_sign_whole_number() {
-        // Whole-number prices must NOT include a ".0" suffix.
+        // Whole-number prices must NOT include a ".0" suffix, and use commas.
         assert_eq!(format_price_for_sign(7500000.0), "7,500,000");
         assert_eq!(format_price_for_sign(100.0), "100");
         assert_eq!(format_price_for_sign(8.0), "8");
@@ -6370,19 +6373,21 @@ mod tests {
 
     #[test]
     fn test_format_price_for_sign_with_decimal() {
-        // Fractional prices keep one decimal digit.
-        assert_eq!(format_price_for_sign(60000000.2), "60,000,000.2");
-        assert_eq!(format_price_for_sign(1234567.9), "1,234,567.9");
+        // Fractional prices keep one decimal digit but omit commas so
+        // Hypixel's sign parser preserves the decimal.
+        assert_eq!(format_price_for_sign(60000000.2), "60000000.2");
+        assert_eq!(format_price_for_sign(1234567.9), "1234567.9");
         assert_eq!(format_price_for_sign(100.5), "100.5");
-        assert_eq!(format_price_for_sign(50000000.1), "50,000,000.1");
+        assert_eq!(format_price_for_sign(50000000.1), "50000000.1");
+        assert_eq!(format_price_for_sign(91238937.4), "91238937.4");
     }
 
     #[test]
     fn test_format_price_for_sign_rounds_to_one_decimal() {
         // Prices with >1 decimal are rounded to nearest 0.1.
-        assert_eq!(format_price_for_sign(1234567.89), "1,234,567.9");
-        assert_eq!(format_price_for_sign(1234567.84), "1,234,567.8");
+        assert_eq!(format_price_for_sign(1234567.89), "1234567.9");
+        assert_eq!(format_price_for_sign(1234567.84), "1234567.8");
         // 1234567.06 * 10 = 12345670.6 → rounds to 12345671 → frac_digit = 1
-        assert_eq!(format_price_for_sign(1234567.06), "1,234,567.1");
+        assert_eq!(format_price_for_sign(1234567.06), "1234567.1");
     }
 }
