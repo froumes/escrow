@@ -14,6 +14,7 @@ use azalea_protocol::packets::game::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
+use azalea_client::inventory::{MenuOpenedEvent, SetContainerContentEvent};
 use bevy_app::AppExit;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -85,6 +86,104 @@ static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
 #[cfg(test)]
 static SOLD_BUYER_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)").expect("valid sold-buyer regex"));
+
+// ---------------------------------------------------------------------------
+// Bevy Plugin: PacketAcceleratorPlugin
+//
+// Registers ECS observers for MenuOpenedEvent and SetContainerContentEvent
+// that fire DURING the ECS frame (in apply_deferred, between PreUpdate and
+// Update).  This is significantly earlier than the Event::Packet pipeline
+// which only delivers events AFTER the frame completes:
+//
+//   Event::Packet path:
+//     PreUpdate (read_packets) → Update (packet_listener) → channel →
+//     event_copying_task → dispatch loop → spawn handler → handler runs
+//
+//   Observer path (this plugin):
+//     PreUpdate (read_packets → process_packet → commands.trigger) →
+//     apply_deferred → observer fires → Notify set
+//     → After frame: waiting task resumes immediately
+//
+// On busy servers (many entities/chunks/events), the Event::Packet path
+// can add 20-70 ms of pipeline delay on top of network RTT.  The observer
+// path eliminates this overhead for time-critical purchase operations.
+// ---------------------------------------------------------------------------
+
+/// Information about the most recently opened window, set by the ECS observer.
+#[derive(Clone, Debug)]
+pub struct WindowOpenInfo {
+    pub window_id: i32,
+    pub title: String,
+    pub timestamp: std::time::Instant,
+}
+
+/// Shared bridge between the Bevy ECS observers and async tokio tasks.
+/// The ECS observers write data here; the purchase handler reads it.
+#[derive(Clone, bevy_ecs::prelude::Resource)]
+struct PacketAcceleratorBridge {
+    /// Fired when any window opens (MenuOpenedEvent observer).
+    window_open_notify: Arc<tokio::sync::Notify>,
+    /// Most recent window open info (set by MenuOpenedEvent observer).
+    window_open_info: Arc<RwLock<Option<WindowOpenInfo>>>,
+    /// Fired when container content is set (SetContainerContentEvent observer).
+    slot_data_notify: Arc<tokio::sync::Notify>,
+}
+
+/// Bevy Plugin that registers ECS-level observers for instant packet detection.
+pub struct PacketAcceleratorPlugin {
+    bridge: PacketAcceleratorBridge,
+}
+
+impl PacketAcceleratorPlugin {
+    fn new(
+        window_open_notify: Arc<tokio::sync::Notify>,
+        window_open_info: Arc<RwLock<Option<WindowOpenInfo>>>,
+        slot_data_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            bridge: PacketAcceleratorBridge {
+                window_open_notify,
+                window_open_info,
+                slot_data_notify,
+            },
+        }
+    }
+}
+
+impl bevy_app::Plugin for PacketAcceleratorPlugin {
+    fn build(&self, app: &mut bevy_app::App) {
+        app.insert_resource(self.bridge.clone());
+        app.add_observer(on_menu_opened);
+        app.add_observer(on_container_set_content);
+    }
+}
+
+/// ECS Observer: fires during apply_deferred when the server sends OpenScreen.
+/// Sets the window info and notifies any waiting purchase handler task.
+fn on_menu_opened(
+    event: bevy_ecs::observer::On<MenuOpenedEvent>,
+    bridge: bevy_ecs::system::Res<PacketAcceleratorBridge>,
+) {
+    let title = event.event().title.to_string();
+    let window_id = event.event().window_id;
+    *bridge.window_open_info.write() = Some(WindowOpenInfo {
+        window_id,
+        title,
+        timestamp: std::time::Instant::now(),
+    });
+    bridge.window_open_notify.notify_waiters();
+}
+
+/// ECS Observer: fires during apply_deferred when the server sends
+/// ContainerSetContent.  This is the same data that populates slot 31 in
+/// the BIN Auction View.  Notifying here lets the purchase handler react
+/// to slot data without waiting for the Event::Packet pipeline.
+fn on_container_set_content(
+    _event: bevy_ecs::observer::On<SetContainerContentEvent>,
+    bridge: bevy_ecs::system::Res<PacketAcceleratorBridge>,
+) {
+    bridge.slot_data_notify.notify_waiters();
+}
 
 /// Main bot client wrapper for Azalea
 /// 
@@ -385,6 +484,8 @@ impl BotClient {
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             freemoney: self.freemoney,
@@ -418,11 +519,20 @@ impl BotClient {
         
         // Build and start the client (this blocks until disconnection)
         let handler_state_clone = handler_state.clone();
+        // Create the PacketAcceleratorPlugin sharing the same Notify/info as BotClientState.
+        // The plugin registers ECS-level observers that fire DURING the frame
+        // (in apply_deferred), bypassing the multi-hop Event::Packet channel pipeline.
+        let accelerator_plugin = PacketAcceleratorPlugin::new(
+            handler_state.window_open_notify.clone(),
+            handler_state.window_open_info.clone(),
+            handler_state.slot_data_notify.clone(),
+        );
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new()
                 .expect("Failed to create tokio runtime for bot - this should never happen unless system resources are exhausted");
             rt.block_on(async move {
                 let exit_result = ClientBuilder::new()
+                    .add_plugins(accelerator_plugin)
                     .set_handler(event_handler)
                     .set_state(handler_state_clone)
                     .start(account, "mc.hypixel.net")
@@ -873,6 +983,12 @@ pub struct BotClientState {
     /// Notified when ContainerSetSlot / ContainerSetContent arrives so the purchase
     /// handler can react instantly instead of polling every 10ms.
     pub slot_data_notify: Arc<tokio::sync::Notify>,
+    /// Notified by the ECS-level MenuOpenedEvent observer (PacketAcceleratorPlugin).
+    /// Fires during the ECS frame, bypassing the Event::Packet channel pipeline.
+    pub window_open_notify: Arc<tokio::sync::Notify>,
+    /// Most recent window open info, set by the ECS-level MenuOpenedEvent observer.
+    /// Contains window_id, title, and timestamp.
+    pub window_open_info: Arc<RwLock<Option<WindowOpenInfo>>>,
     /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
@@ -1006,6 +1122,8 @@ impl Default for BotClientState {
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
@@ -2181,22 +2299,33 @@ async fn event_handler(
             match packet.as_ref() {
                 ClientboundGamePacket::OpenScreen(open_screen) => {
                     // Record the instant the OpenScreen packet reaches our
-                    // event handler.  This is the earliest application-level
-                    // moment we can observe the server's response.
-                    let open_screen_at = std::time::Instant::now();
+                    // event handler via the Event::Packet channel pipeline.
+                    let event_handler_at = std::time::Instant::now();
 
-                    // If a purchase is in-flight, log the time from /viewauction
-                    // send to OpenScreen receipt.  This interval is dominated by
-                    // network round-trip time (RTT) plus one Azalea ECS cycle
-                    // boundary (~0-16.7 ms) and is NOT reducible at the
-                    // application level.
+                    // If a purchase is in-flight, compare the ECS observer timestamp
+                    // (set by PacketAcceleratorPlugin during apply_deferred) with the
+                    // Event::Packet handler timestamp to measure pipeline overhead.
                     if let Some(t0) = *state.purchase_start_time.read() {
-                        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        info!(
-                            "[Timing] /viewauction → OpenScreen received: {:.1}ms \
-                             (network RTT + ECS cycle)",
-                            elapsed_ms
-                        );
+                        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        // Check how much earlier the ECS observer detected this window
+                        let observer_info = state.window_open_info.read().clone();
+                        if let Some(ref info) = observer_info {
+                            let observer_ms = info.timestamp.duration_since(t0).as_secs_f64() * 1000.0;
+                            let pipeline_ms = event_handler_at
+                                .duration_since(info.timestamp)
+                                .as_secs_f64() * 1000.0;
+                            info!(
+                                "[Timing] /viewauction → window: ECS observer {:.1}ms, \
+                                 Event::Packet handler {:.1}ms (+{:.1}ms pipeline overhead)",
+                                observer_ms, total_ms, pipeline_ms
+                            );
+                        } else {
+                            info!(
+                                "[Timing] /viewauction → OpenScreen handler: {:.1}ms \
+                                 (ECS observer did not fire — check PacketAcceleratorPlugin)",
+                                total_ms
+                            );
+                        }
                     }
 
                     let window_id = open_screen.container_id;
@@ -2216,7 +2345,7 @@ async fn event_handler(
                     // should be <1 ms; if it is significantly higher, a lock
                     // contention problem exists.
                     if let Some(t0) = *state.purchase_start_time.read() {
-                        let handler_ms = open_screen_at.elapsed().as_secs_f64() * 1000.0;
+                        let handler_ms = event_handler_at.elapsed().as_secs_f64() * 1000.0;
                         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
                         info!(
                             "[Timing] OpenScreen handler overhead: {:.2}ms \
