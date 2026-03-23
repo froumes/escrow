@@ -5522,7 +5522,10 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
 /// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
 /// The function strips it before putting the command string into the packet.
 fn send_chat_command(bot: &Client, content: &str) {
-    let command = content.strip_prefix('/').unwrap_or(content);
+    let command = content.strip_prefix('/').unwrap_or_else(|| {
+        debug!("send_chat_command called without leading '/' — sending as-is: {}", content);
+        content
+    });
     bot.write_packet(ServerboundChatCommand {
         command: command.to_string(),
     });
