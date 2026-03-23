@@ -1279,10 +1279,10 @@ fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Ve
     lore_lines
 }
 
-/// Format a f64 price as a plain number for bazaar sign input.
+/// Format a f64 price with commas for bazaar sign input.
 /// Uses integer arithmetic (tenths) to avoid floating-point subtraction issues.
-/// No commas — Hypixel's bazaar sign parser does not support them:
-/// 7500000.0 → "7500000", 60000000.2 → "60000000.2".
+/// Commas are inserted into the integer part: 7500000.0 → "7,500,000",
+/// 2040950.5 → "2,040,950.5".
 fn format_price_for_sign(price: f64) -> String {
     // Work in tenths-of-a-coin as an integer to avoid floating-point precision
     // issues when splitting integer and fractional parts of large prices.
@@ -1290,11 +1290,30 @@ fn format_price_for_sign(price: f64) -> String {
     let int_part = tenths / 10;
     let frac_digit = (tenths % 10).unsigned_abs();
 
+    let int_str = format_with_commas(int_part);
     if frac_digit == 0 {
-        int_part.to_string()
+        int_str
     } else {
-        format!("{}.{}", int_part, frac_digit)
+        format!("{}.{}", int_str, frac_digit)
     }
+}
+
+/// Insert commas as thousands separators into an integer.
+/// Handles negative numbers correctly: -1234567 → "-1,234,567".
+fn format_with_commas(n: i64) -> String {
+    let is_negative = n < 0;
+    let s = n.unsigned_abs().to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    if is_negative {
+        result.insert(0, '-');
+    }
+    result
 }
 
 /// Normalize a string for fuzzy item-name matching: lowercase, strip Minecraft
@@ -5352,7 +5371,10 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
     };
     let (last_logged, total_value) = match last_logged_order_info(is_buy, &item_name) {
         Some(info) => info,
-        None => return false,
+        // No log entry for this order — it was placed before tracking started
+        // or the log was cleared.  Treat it as stale so it gets cancelled
+        // instead of sitting around forever.
+        None => return true,
     };
     let now = chrono::Utc::now().timestamp();
     let age_secs = if now > last_logged {
@@ -6400,31 +6422,31 @@ mod tests {
 
     #[test]
     fn test_format_price_for_sign_whole_number() {
-        // Whole-number prices: plain integers, no commas, no ".0" suffix.
-        assert_eq!(format_price_for_sign(7500000.0), "7500000");
+        // Whole-number prices: integers with comma separators, no ".0" suffix.
+        assert_eq!(format_price_for_sign(7500000.0), "7,500,000");
         assert_eq!(format_price_for_sign(100.0), "100");
         assert_eq!(format_price_for_sign(8.0), "8");
-        assert_eq!(format_price_for_sign(1662.0), "1662");
-        assert_eq!(format_price_for_sign(60000000.0), "60000000");
-        assert_eq!(format_price_for_sign(50000002.0), "50000002");
+        assert_eq!(format_price_for_sign(1662.0), "1,662");
+        assert_eq!(format_price_for_sign(60000000.0), "60,000,000");
+        assert_eq!(format_price_for_sign(50000002.0), "50,000,002");
     }
 
     #[test]
     fn test_format_price_for_sign_with_decimal() {
-        // Fractional prices: plain number with one decimal digit, no commas.
-        assert_eq!(format_price_for_sign(60000000.2), "60000000.2");
-        assert_eq!(format_price_for_sign(1234567.9), "1234567.9");
+        // Fractional prices: comma-separated integer part with one decimal digit.
+        assert_eq!(format_price_for_sign(60000000.2), "60,000,000.2");
+        assert_eq!(format_price_for_sign(1234567.9), "1,234,567.9");
         assert_eq!(format_price_for_sign(100.5), "100.5");
-        assert_eq!(format_price_for_sign(50000000.1), "50000000.1");
-        assert_eq!(format_price_for_sign(91238937.4), "91238937.4");
+        assert_eq!(format_price_for_sign(50000000.1), "50,000,000.1");
+        assert_eq!(format_price_for_sign(91238937.4), "91,238,937.4");
     }
 
     #[test]
     fn test_format_price_for_sign_rounds_to_one_decimal() {
         // Prices with >1 decimal are rounded to nearest 0.1.
-        assert_eq!(format_price_for_sign(1234567.89), "1234567.9");
-        assert_eq!(format_price_for_sign(1234567.84), "1234567.8");
+        assert_eq!(format_price_for_sign(1234567.89), "1,234,567.9");
+        assert_eq!(format_price_for_sign(1234567.84), "1,234,567.8");
         // 1234567.06 * 10 = 12345670.6 → rounds to 12345671 → frac_digit = 1
-        assert_eq!(format_price_for_sign(1234567.06), "1234567.1");
+        assert_eq!(format_price_for_sign(1234567.06), "1,234,567.1");
     }
 }
