@@ -2180,6 +2180,25 @@ async fn event_handler(
             // Handle specific packets for window open/close and inventory updates
             match packet.as_ref() {
                 ClientboundGamePacket::OpenScreen(open_screen) => {
+                    // Record the instant the OpenScreen packet reaches our
+                    // event handler.  This is the earliest application-level
+                    // moment we can observe the server's response.
+                    let open_screen_at = std::time::Instant::now();
+
+                    // If a purchase is in-flight, log the time from /viewauction
+                    // send to OpenScreen receipt.  This interval is dominated by
+                    // network round-trip time (RTT) plus one Azalea ECS cycle
+                    // boundary (~0-16.7 ms) and is NOT reducible at the
+                    // application level.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        info!(
+                            "[Timing] /viewauction → OpenScreen received: {:.1}ms \
+                             (network RTT + ECS cycle)",
+                            elapsed_ms
+                        );
+                    }
+
                     let window_id = open_screen.container_id;
                     let window_type = format!("{:?}", open_screen.menu_type);
                     let title = open_screen.title.to_string();
@@ -2191,6 +2210,20 @@ async fn event_handler(
                     *state.last_window_id.write() = window_id as u8;
                     
                     state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
+
+                    // Log the synchronous overhead of the OpenScreen handler
+                    // itself (title parsing + state writes + logging).  This
+                    // should be <1 ms; if it is significantly higher, a lock
+                    // contention problem exists.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        let handler_ms = open_screen_at.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        info!(
+                            "[Timing] OpenScreen handler overhead: {:.2}ms \
+                             (total since /viewauction: {:.1}ms)",
+                            handler_ms, total_ms
+                        );
+                    }
                     // Defer the (expensive) window-JSON rebuild so the event
                     // handler returns faster.  On the purchase path this is
                     // critical: ContainerSetContent may arrive in the very next
@@ -2318,6 +2351,16 @@ async fn event_handler(
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
+                    // Log when ContainerSetContent arrives during a purchase
+                    // flow — this populates slot 31 and unblocks the buy-click.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        if *state.bot_state.read() == BotState::Purchasing {
+                            info!(
+                                "[Timing] /viewauction → ContainerSetContent: {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
                     // Wake the purchase handler FIRST so it can react to slot 31
                     // data on another thread without waiting for the inventory
                     // JSON rebuild.
@@ -2808,6 +2851,17 @@ async fn handle_window_interaction(
                 // /viewauction is sent, so buy speed measures
                 // command-send → coins-in-escrow.
 
+                // Log the time from /viewauction to the spawned task
+                // actually starting.  The delta between this and the
+                // OpenScreen handler log shows the tokio::spawn overhead
+                // (typically <1 ms unless the runtime is saturated).
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    info!(
+                        "[Timing] /viewauction → interaction handler started: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
                 // ---- Wait for slot 31 before clicking ----
                 // Do NOT click slot 31 or send skip-click until we know what
                 // item the server placed there.  Clicking on a non-interactive
@@ -2847,6 +2901,20 @@ async fn handle_window_interaction(
                     }
                     kind
                 };
+
+                // Log when slot 31 data is ready — the delta between this
+                // and the interaction handler start shows how long we waited
+                // for ContainerSetContent / ContainerSetSlot.  When the
+                // server sends both OpenScreen and ContainerSetContent in the
+                // same TCP segment this is ~0 ms; otherwise it is one extra
+                // ECS cycle (~16.7 ms).
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    info!(
+                        "[Timing] /viewauction → slot 31 ready ({}): {:.1}ms",
+                        slot_31_kind,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
@@ -2994,6 +3062,12 @@ async fn handle_window_interaction(
                     // clicking non-interactive items like feather (loading
                     // placeholder) which is an "impossible action" that can
                     // trigger Hypixel anti-cheat.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        info!(
+                            "[Timing] /viewauction → buy click sent: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     if state.fastbuy {
                         info!("[AH] gold_nugget confirmed — sending buy + skip (fastbuy)");
                     } else {
@@ -3063,6 +3137,14 @@ async fn handle_window_interaction(
                 // The terminal-failure chat handler or 5s GUI watchdog will
                 // clean up.
             } else if window_title.contains("Confirm Purchase") {
+                // Log time from /viewauction to Confirm Purchase window.
+                // This is the buy-click → server-processes → OpenScreen RTT.
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    info!(
+                        "[Timing] /viewauction → Confirm Purchase opened: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 // If a skip-click was already sent for this window, don't fire a
                 // redundant reactive click — the pre-click packet should already be
                 // queued on the server for the same tick.
