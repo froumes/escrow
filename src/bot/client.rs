@@ -2208,6 +2208,8 @@ async fn event_handler(
                         let wdog_bed   = state.bed_timing_active.clone();
                         let wdog_gen   = state.command_generation.clone();
                         let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
+                        let wdog_deadline = state.manage_orders_deadline.clone();
+                        let wdog_bz_limit = state.bazaar_at_limit.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             let still_open  = *wdog_last.read() == wdog_wid;
@@ -2218,6 +2220,7 @@ async fn event_handler(
                                 | BotState::ClaimingPurchased | BotState::ClaimingSold
                                 | BotState::InstaSelling
                                 | BotState::CancellingAuction | BotState::SellingInventoryBz
+                                | BotState::ManagingOrders
                             );
                             // Only fire if no new command started since this window was opened.
                             let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
@@ -2226,6 +2229,13 @@ async fn event_handler(
                                 wdog_bot.write_packet(ServerboundContainerClose {
                                     container_id: wdog_wid as i32,
                                 });
+                                // Clean up ManagingOrders-specific state so the bot
+                                // doesn't remain stuck with a stale deadline or the
+                                // bazaar order-limit flag blocking new flips.
+                                if cur_state == BotState::ManagingOrders {
+                                    *wdog_deadline.write() = None;
+                                    wdog_bz_limit.store(false, Ordering::Relaxed);
+                                }
                                 *wdog_state.write() = BotState::Idle;
                                 wdog_spam.store(false, Ordering::Relaxed);
                             }
@@ -4098,8 +4108,17 @@ async fn handle_window_interaction(
                                 container_id: window_id as i32,
                             });
                         }
-                        *state.manage_orders_deadline.write() = None;
-                        *state.bot_state.write() = BotState::Idle;
+                        if !order_options_opened {
+                            // Only transition to Idle when the order was collected
+                            // directly (no Order options window).  When Order options
+                            // opened, the Order options handler (Branch C) takes over
+                            // and is responsible for closing, clearing the deadline,
+                            // and transitioning to Idle.  Setting Idle here races with
+                            // the Branch C handler and can cause it to miss the
+                            // ManagingOrders state, leaving the window stuck open.
+                            *state.manage_orders_deadline.write() = None;
+                            *state.bot_state.write() = BotState::Idle;
+                        }
 
                         // If there are more orders to process, immediately
                         // re-queue ManageOrders so we don't wait for the
