@@ -2190,7 +2190,19 @@ async fn event_handler(
                     *state.last_window_id.write() = window_id as u8;
                     
                     state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
-                    rebuild_cached_window_json(&bot, &state);
+                    // Defer the (expensive) window-JSON rebuild so the event
+                    // handler returns faster.  On the purchase path this is
+                    // critical: ContainerSetContent may arrive in the very next
+                    // packet frame and its handler must fire
+                    // slot_data_notify.notify_waiters() without waiting for the
+                    // JSON rebuild to finish.
+                    {
+                        let cache_bot = bot.clone();
+                        let cache_state = state.clone();
+                        tokio::spawn(async move {
+                            rebuild_cached_window_json(&cache_bot, &cache_state);
+                        });
+                    }
                     if state.event_tx.send(BotEvent::WindowOpen(window_id as u8, window_type.clone(), parsed_title.clone())).is_err() {
                         debug!("Failed to send WindowOpen event - receiver dropped");
                     }
@@ -3058,18 +3070,17 @@ async fn handle_window_interaction(
                 }
 
                 // When skip-click was sent, the server already has the confirm
-                // click queued from the same TCP burst as the buy-click.  Give
-                // it a generous window to process before sending redundant
-                // retries.  With low-latency connections (<5 ms ping) the
-                // server closes the window within 1-2 ticks (50-100 ms).
-                // 300 ms is intentionally conservative: it covers higher-
-                // latency connections and busy Hypixel lobby ticks while still
-                // retrying well before the 5-second GUI watchdog fires.
+                // click queued from the same TCP burst as the buy-click.  Wait
+                // just long enough for the server to process it (2 ticks =
+                // 100 ms) before retrying.  The previous 300 ms value was
+                // overly conservative and caused a redundant retry click on
+                // low-latency connections where the purchase completes in
+                // ~50 ms but the window lingers for ~300 ms.
                 //
                 // Without skip-click the initial wait is shorter because the
                 // click was just sent above and we want to retry quickly if it
                 // was lost.
-                let initial_wait_ms = if skip_was_sent { 300u64 } else { CONFIRM_PURCHASE_RETRY_MS };
+                let initial_wait_ms = if skip_was_sent { 100u64 } else { CONFIRM_PURCHASE_RETRY_MS };
                 tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
                 // Safety retry loop: if the window is still open (pre-click failed,
