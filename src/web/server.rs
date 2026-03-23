@@ -262,6 +262,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/cancel_auction", axum::routing::post(cancel_auction))
         .route("/api/claim_purchases", axum::routing::post(claim_purchases))
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
+        .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
         .route("/api/config", get(get_config).post(save_config))
@@ -693,6 +694,22 @@ async fn collect_bz_orders(
     );
 
     (StatusCode::OK, "Sell inventory on bazaar command queued")
+}
+
+async fn claim_bz_orders(
+    State(s): State<WebSharedState>,
+) -> impl IntoResponse {
+    info!("[WebGUI] Force claim bazaar orders requested");
+
+    let _ = s.chat_tx.send("[BAF Web] Checking and claiming bazaar orders...".to_string());
+
+    s.command_queue.enqueue(
+        CommandType::ManageOrders { cancel_open: false },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Claim bazaar orders command queued")
 }
 
 // ── Active auctions ───────────────────────────────────────────

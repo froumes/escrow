@@ -1672,6 +1672,10 @@ async fn event_handler(
             *state.teleported_to_island.write() = false;
             *state.skyblock_join_time.write() = None;
             
+            // Reset the cancel-failure tracker on login so previously-stuck
+            // orders get a fresh set of retry attempts after reconnect.
+            state.order_cancel_failures.write().clear();
+
             // Keep GracePeriod state – allows commands/flips just like TypeScript.
             // Do NOT set to Startup here; Startup is reserved for an active startup workflow.
             *state.bot_state.write() = BotState::GracePeriod;
@@ -2529,6 +2533,12 @@ async fn execute_command(
             *state.bot_state.write() = BotState::Purchasing;
         }
         CommandType::BazaarBuyOrder { item_name, item_tag, amount, price_per_unit } => {
+            // Abort immediately if at the bazaar order limit — no point opening
+            // the GUI only to have the order rejected.
+            if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                warn!("[Bazaar] Skipping BUY order for \"{}\" — already at bazaar order limit", item_name);
+                return;
+            }
             // Store order context so window/sign handlers can use it
             *state.bazaar_item_name.write() = item_name.clone();
             *state.bazaar_amount.write() = *amount;
@@ -2549,6 +2559,11 @@ async fn execute_command(
             *state.bot_state.write() = BotState::Bazaar;
         }
         CommandType::BazaarSellOrder { item_name, item_tag, amount, price_per_unit } => {
+            // Abort immediately if at the bazaar order limit
+            if state.bazaar_at_limit.load(Ordering::Relaxed) {
+                warn!("[Bazaar] Skipping SELL order for \"{}\" — already at bazaar order limit", item_name);
+                return;
+            }
             // Store order context so window/sign handlers can use it
             *state.bazaar_item_name.write() = item_name.clone();
             *state.bazaar_amount.write() = *amount;
@@ -2651,11 +2666,9 @@ async fn execute_command(
             state.inventory_full.store(false, Ordering::Relaxed);
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
-            // On startup (cancel_open) reset the cancel-failure tracker so
-            // previously-stuck orders get a fresh set of retry attempts.
-            if *cancel_open {
-                state.order_cancel_failures.write().clear();
-            }
+            // Do NOT clear order_cancel_failures here — let failures accumulate
+            // across ManageOrders cycles so MAX_CANCEL_RETRIES actually works.
+            // The counter is only cleared on login/reconnect (Login event handler).
             // Set an internal deadline so the handler can bail out cleanly
             // (closing windows) instead of burning through the external timeout.
             // Only processes ONE order per cycle, so 10s is plenty.
@@ -4061,10 +4074,37 @@ async fn handle_window_interaction(
                     });
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
-                } else if !cancel_open {
-                    // Collect-only mode: this order is open (not filled), so there's
-                    // nothing to collect here.  Close immediately and move on — don't
-                    // waste time trying to cancel stale orders when fills are pending.
+                } else {
+                // Determine cancel_due_to_age BEFORE deciding whether to skip.
+                // This allows stale orders to be cancelled even in collect-only mode.
+                let cancel_due_to_age = !cancel_open
+                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
+
+                // Check cancel retry limit early — if exceeded, close immediately.
+                let cancel_fail_key = normalize_bazaar_order_text(&order_name);
+                let prior_failures = *state.order_cancel_failures.read().get(&cancel_fail_key).unwrap_or(&0);
+                let cancel_exceeded = prior_failures >= MAX_CANCEL_RETRIES;
+
+                if cancel_exceeded && (cancel_open || cancel_due_to_age) {
+                    warn!(
+                        "[ManageOrders] Order \"{}\" exceeded {} cancel attempts — closing GUI and giving up",
+                        order_name, MAX_CANCEL_RETRIES
+                    );
+                    if !name_key.is_empty() {
+                        state.manage_orders_processed.write().insert(name_key);
+                    }
+                    if *state.last_window_id.read() == window_id {
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                    }
+                    *state.manage_orders_deadline.write() = None;
+                    state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                    *state.bot_state.write() = BotState::Idle;
+                } else if !cancel_open && !cancel_due_to_age {
+                    // Collect-only mode and order is NOT stale: this order is open
+                    // (not filled), so there's nothing to collect here.  Close
+                    // immediately and move on.
                     debug!("[ManageOrders] Order \"{}\" is open — skipping in collect-only mode", order_name);
                     if !name_key.is_empty() {
                         state.manage_orders_processed.write().insert(name_key);
@@ -4075,8 +4115,11 @@ async fn handle_window_interaction(
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
                 } else {
-                // cancel_open mode (startup): look for Cancel/Collect buttons.
-                info!("[ManageOrders] Order options window opened (startup cancel mode) — looking for Cancel/Collect buttons");
+                // cancel_open mode OR cancel_due_to_age: look for Cancel/Collect buttons.
+                info!(
+                    "[ManageOrders] Order options window opened ({}) — looking for Cancel/Collect buttons",
+                    if cancel_open { "startup cancel mode" } else { "cancel due to age" }
+                );
 
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
@@ -4114,25 +4157,10 @@ async fn handle_window_interaction(
                     }
                 }
 
-                let cancel_due_to_age = !cancel_open
-                    && cancel_slot.is_some()
-                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
-                if cancel_due_to_age {
+                if cancel_due_to_age && cancel_slot.is_some() {
                     info!(
                         "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel (Order options)",
                         order_name, state.bazaar_order_cancel_minutes_per_million
-                    );
-                }
-
-                // Check if this order has exceeded the cancel retry limit.
-                // If so, skip it entirely so the bot doesn't get stuck.
-                let cancel_fail_key = normalize_bazaar_order_text(&order_name);
-                let prior_failures = *state.order_cancel_failures.read().get(&cancel_fail_key).unwrap_or(&0);
-                let cancel_exceeded = prior_failures >= MAX_CANCEL_RETRIES;
-                if cancel_exceeded && (cancel_open || cancel_due_to_age) {
-                    warn!(
-                        "[ManageOrders] Order \"{}\" exceeded {} cancel attempts — skipping to try again later",
-                        order_name, MAX_CANCEL_RETRIES
                     );
                 }
 
@@ -4210,6 +4238,7 @@ async fn handle_window_interaction(
                 *state.manage_orders_deadline.write() = None;
                 state.bazaar_at_limit.store(false, Ordering::Relaxed);
                 *state.bot_state.write() = BotState::Idle;
+                }
                 }
             } else {
                 // Unexpected window title while in ManagingOrders state.
