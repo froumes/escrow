@@ -4044,9 +4044,7 @@ async fn handle_window_interaction(
             } else if window_title.to_lowercase().contains("order options") {
                 // Hypixel opened "Order options" after clicking an order in the list.
                 // This means the order is OPEN (not filled — filled orders collect on click).
-                // Look for Cancel/Collect buttons and handle accordingly.
                 // After handling ONE order, close and go Idle (one order per cycle).
-                info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
 
                 let order_ctx = state.managing_order_context.read().clone();
                 let (order_name, order_identity) = match &order_ctx {
@@ -4063,7 +4061,22 @@ async fn handle_window_interaction(
                     });
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
+                } else if !cancel_open {
+                    // Collect-only mode: this order is open (not filled), so there's
+                    // nothing to collect here.  Close immediately and move on — don't
+                    // waste time trying to cancel stale orders when fills are pending.
+                    debug!("[ManageOrders] Order \"{}\" is open — skipping in collect-only mode", order_name);
+                    if !name_key.is_empty() {
+                        state.manage_orders_processed.write().insert(name_key);
+                    }
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    *state.manage_orders_deadline.write() = None;
+                    *state.bot_state.write() = BotState::Idle;
                 } else {
+                // cancel_open mode (startup): look for Cancel/Collect buttons.
+                info!("[ManageOrders] Order options window opened (startup cancel mode) — looking for Cancel/Collect buttons");
 
                 let action_deadline =
                     tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
