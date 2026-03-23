@@ -90,6 +90,13 @@ pub struct Config {
     #[serde(default = "default_bazaar_order_cancel_minutes_per_million", alias = "bazaar_order_cancel_minutes")]
     pub bazaar_order_cancel_minutes_per_million: u64,
 
+    /// Bazaar sell tax rate as a percentage (e.g. 1.25 = 1.25%).
+    /// Hypixel applies 1.25% by default. The Bazaar Flipper perk from the
+    /// Community Shop reduces it by up to 0.25% (two levels × 0.125%).
+    /// Set to 1.0 if you have the max perk level.
+    #[serde(default = "default_bazaar_tax_rate")]
+    pub bazaar_tax_rate: f64,
+
     /// Delay in milliseconds between consecutive auction listing commands
     /// (SellToAuction). Prevents Hypixel from kicking the bot with
     /// "Sending packets too fast!" during bulk listings. Default: 1500ms.
@@ -219,6 +226,10 @@ fn default_bazaar_order_cancel_minutes_per_million() -> u64 {
     5
 }
 
+fn default_bazaar_tax_rate() -> f64 {
+    1.25
+}
+
 fn default_auction_listing_delay_ms() -> u64 {
     1500
 }
@@ -244,6 +255,7 @@ impl Default for Config {
             bed_pre_click_ms: default_bed_pre_click_ms(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
             bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
+            bazaar_tax_rate: default_bazaar_tax_rate(),
             auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,
             enable_ah_flips: true,

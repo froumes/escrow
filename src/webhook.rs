@@ -696,6 +696,50 @@ pub async fn send_webhook_flip_channel(
     post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
 }
 
+/// Send a bazaar legendary flip (100M+ profit) to the shared channel.
+/// Anonymized: no IGN, purse, or identifying info.
+pub async fn send_webhook_bazaar_flip_channel(
+    item_name: &str,
+    amount: u64,
+    price_per_unit: f64,
+    profit: i64,
+) {
+    let (title, color) = if profit >= DIVINE_PROFIT_THRESHOLD as i64 {
+        ("💎 Divine Bazaar Flip!", 0x00FFFFu32)
+    } else {
+        ("🌟 Legendary Bazaar Flip!", 0xFFD700u32)
+    };
+    let safe_item = sanitize_item_name(item_name);
+    let total = price_per_unit * amount as f64;
+    let sign = if profit >= 0 { "+" } else { "-" };
+    let abs_profit = if profit >= 0 { profit as f64 } else { (-profit) as f64 };
+    let mut fields = vec![
+        serde_json::json!({"name": "📦 Amount", "value": format!("```fix\n{}x\n```", amount), "inline": true}),
+        serde_json::json!({"name": "💵 Price/Unit", "value": format!("```fix\n{} coins\n```", format_number(price_per_unit)), "inline": true}),
+        serde_json::json!({"name": "💰 Total", "value": format!("```fix\n{} coins\n```", format_number(total)), "inline": true}),
+        serde_json::json!({
+            "name": "💰 Profit",
+            "value": format!("```diff\n{}{} coins\n```", sign, format_number(abs_profit)),
+            "inline": true
+        }),
+    ];
+    fields.push(serde_json::json!({
+        "name": "\u{200b}",
+        "value": "[Frikadellen-BAF](https://tpm.auction) • [Discord](https://discord.gg/42DvX6T9jh)",
+        "inline": false
+    }));
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": title,
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": color,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+        }]
+    });
+    post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
+}
+
 /// Build embed fields for purchase-style webhooks (purchase price, target, profit/ROI, buy speed, finder, auction link).
 fn build_purchase_fields(
     price: u64,

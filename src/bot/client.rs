@@ -1523,22 +1523,35 @@ fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
 }
 
 /// Extract the clean item name from a ManageOrders order slot display name.
-/// Uses the parsed `order_identity` (which already contains the clean name) when
-/// available, otherwise strips BUY/SELL/Buy Order/Sell Offer prefixes.
+/// Uses the original display name (preserving Hypixel's casing) by stripping
+/// the BUY/SELL prefix.  Falls back to `order_identity` (lowercased) then
+/// `to_title_case` to ensure webhook/chat names look correct.
 fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String)>) -> String {
-    if let Some((_, item)) = order_identity {
-        return item.clone();
-    }
-    // Fallback: try to strip the prefix ourselves
-    let normalized = normalize_bazaar_order_text(order_name);
-    for prefix in ["buy order: ", "sell offer: ", "buy ", "sell "] {
-        if let Some(rest) = normalized.strip_prefix(prefix) {
+    // First try stripping prefix from the ORIGINAL display name (preserves case)
+    let stripped = remove_mc_colors(order_name).trim().to_string();
+    for prefix in ["BUY ", "SELL ", "Buy Order: ", "Sell Offer: "] {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            let rest = rest.trim();
             if !rest.is_empty() {
-                return rest.trim().to_string();
+                return rest.to_string();
             }
         }
     }
-    order_name.to_string()
+    // Case-insensitive fallback for unexpected prefix casing
+    let lower = stripped.to_lowercase();
+    for prefix in ["buy order: ", "sell offer: ", "buy ", "sell "] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                // Apply title case to recover proper display name
+                return crate::utils::to_title_case(rest.trim());
+            }
+        }
+    }
+    // Last resort: use identity (lowercased) with title case
+    if let Some((_, item)) = order_identity {
+        return crate::utils::to_title_case(item);
+    }
+    stripped
 }
 
 fn parse_bazaar_order_identity_from_name(name: &str) -> Option<(bool, String)> {
@@ -2628,10 +2641,10 @@ async fn execute_command(
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
             // Set an internal deadline so the handler can bail out cleanly
-            // (closing windows) instead of burning through the full 60-second
-            // external command-processor timeout.
+            // (closing windows) instead of burning through the external timeout.
+            // Only processes ONE order per cycle, so 10s is plenty.
             *state.manage_orders_deadline.write() = Some(
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(45)
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(10)
             );
             let initial_wid = *state.last_window_id.read();
             bot.write_chat_packet("/bz");
@@ -3882,284 +3895,143 @@ async fn handle_window_interaction(
                 info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})", manage_slot);
                 click_window_slot(bot, &state.last_window_id, window_id, manage_slot as i16).await;
             } else if is_bazaar_orders_window_title(window_title) {
+                // ── Process ONE order per ManageOrders cycle ──
+                // On Hypixel, clicking a filled order slot directly collects items/coins.
+                // If the order is open (nothing to collect), "Order options" opens instead.
+                // We process only one order then go Idle so bazaar flips aren't blocked.
                 let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
-                info!("[ManageOrders] Processing existing orders ({})...", mode_str);
-                let mut cancelled: u64 = 0;
-                // processed_orders tracks skipped open orders in collect-only mode so we don't loop forever.
-                // Include slot index to avoid collisions between multiple generic "Buy Order"/"Sell Offer" entries.
-                let mut processed_orders: std::collections::HashSet<String> = std::collections::HashSet::new();
-                // Also consult the persistent set (keyed by normalized name without slot
-                // index) so that orders already handled in a previous /bz cycle (e.g.
-                // Branch C → re-open /bz) are not re-processed.
+                info!("[ManageOrders] Processing orders ({}) — single order per cycle", mode_str);
                 let persistent_processed = &state.manage_orders_processed;
 
-                loop {
-                    // Wait for ContainerSetContent to reflect latest state
-                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                // Wait for ContainerSetContent to populate the window
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                if check_manage_orders_deadline(bot, state, window_id) { return; }
+                if *state.last_window_id.read() != window_id { return; }
 
-                    // Check internal deadline inside the loop to bail out early
-                    // instead of burning through the full 60-second external timeout.
-                    if check_manage_orders_deadline(bot, state, window_id) {
-                        return;
-                    }
+                let slots = bot.menu().slots();
 
-                    // If a newer window has opened (e.g. Hypixel auto-opened the next
-                    // "Your Bazaar Orders" screen), stop this loop — the new handler will
-                    // take over.  Without this check every concurrent ManageOrders loop
-                    // would see the Cancel button in the newly-opened window and spam
-                    // clicks into stale/closed container IDs.
-                    if *state.last_window_id.read() != window_id {
-                        debug!("[ManageOrders] Window {} superseded by window {}, stopping", window_id, *state.last_window_id.read());
-                        break;
-                    }
+                // ── Scan all order slots and pick the highest-priority one ──
+                // Priority: SELL orders first (they free slots and deliver coins),
+                // then BUY orders.
+                let mut sell_orders: Vec<(usize, String, Option<(bool, String)>, String)> = Vec::new();
+                let mut buy_orders: Vec<(usize, String, Option<(bool, String)>, String)> = Vec::new();
 
-                    let slots = bot.menu().slots();
-
-                    // Find the first order slot (BUY xxx / SELL xxx) not yet processed
-                    let order_slot = slots.iter().enumerate().find_map(|(i, item)| {
-                        if let Some(name) = get_item_display_name_from_slot(item) {
-                            let lore = get_item_lore_from_slot(item);
-                            let order_key = format!("{}::{}", i, normalize_bazaar_order_text(&name));
-                            let name_key = normalize_bazaar_order_text(&name);
-                            if !processed_orders.contains(&order_key)
-                                && !persistent_processed.read().contains(&name_key)
-                            {
-                                let identity = parse_bazaar_order_identity(&name, &lore);
-                                if should_treat_as_bazaar_order_slot(&name, identity.as_ref()) {
-                                    return Some((i, name, identity, order_key));
-                                }
-                            }
+                for (i, item) in slots.iter().enumerate() {
+                    if let Some(name) = get_item_display_name_from_slot(item) {
+                        let lore = get_item_lore_from_slot(item);
+                        let name_key = normalize_bazaar_order_text(&name);
+                        if persistent_processed.read().contains(&name_key) {
+                            continue;
                         }
-                        None
-                    });
+                        let identity = parse_bazaar_order_identity(&name, &lore);
+                        if !should_treat_as_bazaar_order_slot(&name, identity.as_ref()) {
+                            continue;
+                        }
+                        let is_buy = identity.as_ref()
+                            .map(|(b, _)| *b)
+                            .unwrap_or_else(|| is_buy_bazaar_order_name(&name));
+                        let order_key = format!("{}::{}", i, name_key);
+                        if is_buy {
+                            buy_orders.push((i, name, identity, order_key));
+                        } else {
+                            sell_orders.push((i, name, identity, order_key));
+                        }
+                    }
+                }
 
-                    match order_slot {
-                        None => {
-                            // No more unprocessed orders — done.
-                            // Close the window explicitly so the bot is not stuck
-                            // "in an inventory" (prevents /pickupstash failures and
-                            // slow buy speeds from having to close a stale GUI first).
-                            *state.manage_orders_cancelled.write() += cancelled;
-                            info!("[ManageOrders] Done — cancelled {} order(s), closing window", *state.manage_orders_cancelled.read());
+                // Pick the best order: sell first, then buy
+                let chosen_order = sell_orders.into_iter().next()
+                    .or_else(|| buy_orders.into_iter().next());
+
+                match chosen_order {
+                    None => {
+                        // No orders to process — done.
+                        info!("[ManageOrders] No actionable orders, closing window");
+                        bot.write_packet(ServerboundContainerClose {
+                            container_id: window_id as i32,
+                        });
+                        *state.manage_orders_deadline.write() = None;
+                        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                        *state.bot_state.write() = BotState::Idle;
+                    }
+                    Some((i, order_name, order_identity, _processed_key)) => {
+                        let order_is_buy = order_identity.as_ref()
+                            .map(|(b, _)| *b)
+                            .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
+
+                        // Skip BUY orders when inventory is full (no room for items).
+                        // Exception: cancel_open mode still clicks to cancel.
+                        if order_is_buy && state.inventory_full.load(Ordering::Relaxed) && !cancel_open {
+                            warn!("[ManageOrders] Inventory full — skipping BUY order \"{}\"", order_name);
+                            log_pending_claim(&order_name);
+                            persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                             bot.write_packet(ServerboundContainerClose {
                                 container_id: window_id as i32,
                             });
                             *state.manage_orders_deadline.write() = None;
-                            // Clear the order-limit flag since orders may have been
-                            // collected/cancelled, freeing slots for new flips.
-                            state.bazaar_at_limit.store(false, Ordering::Relaxed);
                             *state.bot_state.write() = BotState::Idle;
-                            break;
+                            return;
                         }
-                        Some((i, order_name, order_identity, processed_key)) => {
-                            info!("[ManageOrders] Found order at slot {}: \"{}\"", i, order_name);
-                            let order_is_buy = order_identity
-                                .as_ref()
-                                .map(|(is_buy, _)| *is_buy)
-                                .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
-                            // When inventory is full and the order is a BUY, skip clicking
-                            // the slot entirely — we cannot collect items and the GUI
-                            // round-trip generates packet spam that risks a kick.
-                            // Exception: cancel_open mode still needs to click to cancel.
-                            if order_is_buy && state.inventory_full.load(Ordering::Relaxed) && !cancel_open {
-                                warn!("[ManageOrders] Inventory full — skipping BUY order \"{}\" (no slot click)", order_name);
-                                log_pending_claim(&order_name);
-                                processed_orders.insert(processed_key);
-                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                                continue;
+                        // Store context for the Order options handler (Branch C)
+                        *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone()));
+
+                        info!("[ManageOrders] Clicking order at slot {}: \"{}\"", i, order_name);
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+
+                        // Wait up to 5 seconds for Hypixel's response.
+                        // • If "Order options" opens → order is open, Branch C handles it.
+                        // • If the window doesn't change → the order was collected directly
+                        //   by clicking the slot (Hypixel collects filled orders on click).
+                        let click_deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_secs(5);
+                        let mut order_options_opened = false;
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                            if *state.last_window_id.read() != window_id {
+                                // A new window opened — check if it's "Order options"
+                                order_options_opened = true;
+                                break;
                             }
-
-                            // Store order context so Branch C (Order options window) can
-                            // apply the same cancel_due_to_age logic.
-                            *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone()));
-
-                            // Click the order to view its detail page
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-
-                            // Poll for a "Cancel" or "Collect" button (up to 3 seconds).
-                            // In Hypixel, clicking an order slot updates the SAME window in-place
-                            // (no new OpenScreen event) to show the order detail.
-                            // Filled orders show a "Collect" button; open orders show "Cancel".
-                            // Matches TypeScript bazaarOrderManager.ts manageStartupOrders().
-                            let action_deadline =
-                                tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
-                            let mut cancel_slot: Option<usize> = None;
-                            let mut collect_slot: Option<usize> = None;
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                // Stop if a newer window superseded this one
-                                if *state.last_window_id.read() != window_id {
-                                    break;
-                                }
-                                let slots2 = bot.menu().slots();
-                                // Match "Collect", "Claim", and "Cancel ..." buttons.
-                                collect_slot = find_slot_by_name(&slots2, "Collect")
-                                    .or_else(|| find_slot_by_name(&slots2, "Claim"))
-                                    .or_else(|| find_slot_by_lore_contains(&slots2, "click to collect"))
-                                    .or_else(|| find_slot_by_lore_contains(&slots2, "claim your"));
-                                cancel_slot = find_slot_by_name(&slots2, "Cancel")
-                                    .or_else(|| find_slot_by_lore_contains(&slots2, "click to cancel"))
-                                    .or_else(|| find_slot_by_lore_contains(&slots2, "cancel order"));
-                                if collect_slot.is_some() || cancel_slot.is_some() {
-                                    break;
-                                }
-                                // If inventory just became full from this click (filled BUY order
-                                // rejected by server) the detail view won't appear — break early
-                                // instead of burning the full 3-second timeout.
-                                if state.inventory_full.load(Ordering::Relaxed) && order_is_buy {
-                                    break;
-                                }
-                                if tokio::time::Instant::now() >= action_deadline {
-                                    warn!("[ManageOrders] No Collect/Cancel button found for \"{}\", skipping", order_name);
-                                    break;
-                                }
+                            if state.inventory_full.load(Ordering::Relaxed) && order_is_buy {
+                                break;
                             }
-
-                            let cancel_due_to_age = !cancel_open
-                                && cancel_slot.is_some()
-                                && should_cancel_open_order_due_to_age(order_identity.clone(), state.bazaar_order_cancel_minutes_per_million);
-                            if cancel_due_to_age {
-                                info!(
-                                    "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel",
-                                    order_name, state.bazaar_order_cancel_minutes_per_million
-                                );
+                            if tokio::time::Instant::now() >= click_deadline {
+                                break;
                             }
-
-                            if let Some(cs) = collect_slot {
-                                if *state.last_window_id.read() == window_id {
-                                    // inventory_full only blocks BUY order collection (items need space).
-                                    // SELL offers deliver coins which always fit — always collect those.
-                                    if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
-                                        warn!("[ManageOrders] Inventory full — cannot collect BUY items for \"{}\", checking for instasell", order_name);
-                                        // Check if a single dominant item is taking up >half of inventory —
-                                        // if so, switch to InstaSelling to free space, then retry.
-                                        if let Some(dominant) = find_dominant_inventory_item(bot) {
-                                            info!("[ManageOrders] Dominant item '{}' found (>50% of inventory) — instaselling to free space", dominant);
-                                            *state.insta_sell_item.write() = Some(dominant.clone());
-                                            *state.bazaar_step.write() = BazaarStep::Initial;
-                                            *state.bot_state.write() = BotState::InstaSelling;
-                                            bot.write_chat_packet(&format!("/bz {}", dominant));
-                                            break; // break outer order loop; InstaSelling handler takes over
-                                        }
-                                        log_pending_claim(&order_name);
-                                        // Still try remaining orders (cancel open ones) but skip collects
-                                    } else {
-                                        info!("[ManageOrders] Clicking Collect at slot {} (filled order: \"{}\")", cs, order_name);
-                                        click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                                        // Wait for server confirmation before emitting the
-                                        // collected event — previously the event fired
-                                        // immediately, producing false "order collected"
-                                        // messages when the click was not processed.
-                                        if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
-                                            let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                                item_name: clean_order_item_name(&order_name, &order_identity),
-                                                is_buy_order: order_is_buy,
-                                            });
-                                        } else {
-                                            warn!("[ManageOrders] Collect click for \"{}\" was not confirmed by server — skipping event", order_name);
-                                        }
-                                        if order_is_buy && state.inventory_full.load(Ordering::Relaxed) {
-                                            // Collect failed: check for instasell opportunity
-                                            warn!("[ManageOrders] Inventory full after collect attempt for \"{}\"", order_name);
-                                            if let Some(dominant) = find_dominant_inventory_item(bot) {
-                                                info!("[ManageOrders] Dominant item '{}' found — instaselling to free space", dominant);
-                                                *state.insta_sell_item.write() = Some(dominant.clone());
-                                                *state.bazaar_step.write() = BazaarStep::Initial;
-                                                *state.bot_state.write() = BotState::InstaSelling;
-                                                bot.write_chat_packet(&format!("/bz {}", dominant));
-                                                break;
-                                            }
-                                            log_pending_claim(&order_name);
-                                        }
-                                        if (cancel_open || cancel_due_to_age) && *state.last_window_id.read() == window_id {
-                                            if let Some(cancel_after_collect) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
-                                                info!("[ManageOrders] Clicking Cancel at slot {} after collecting \"{}\"", cancel_after_collect, order_name);
-                                                click_window_slot(bot, &state.last_window_id, window_id, cancel_after_collect as i16).await;
-                                                if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
-                                                    cancelled += 1;
-                                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                        item_name: clean_order_item_name(&order_name, &order_identity),
-                                                        is_buy_order: order_is_buy,
-                                                    });
-                                                } else {
-                                                    warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server — skipping event", order_name);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Track this order as processed so it cannot be re-collected if
-                                // the server is slow to remove it from the window.  Clearing the
-                                // set (the previous behaviour) erased this guard and allowed the
-                                // bot to click Collect twice on the same slot — an "impossible
-                                // action" that triggers Hypixel's anti-cheat (ban).
-                                // Mirrors the TypeScript reference: processedItems.add(itemName)
-                                // is never cleared within a session.
-                                processed_orders.insert(processed_key);
-                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                            } else if let Some(cs) = cancel_slot {
-                                if cancel_open || cancel_due_to_age {
-                                    if *state.last_window_id.read() == window_id {
-                                        info!("[ManageOrders] Clicking Cancel at slot {}", cs);
-                                        click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                                        if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
-                                            cancelled += 1;
-                                            let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                item_name: clean_order_item_name(&order_name, &order_identity),
-                                                is_buy_order: order_is_buy,
-                                            });
-                                        } else {
-                                            warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server — skipping event", order_name);
-                                        }
-                                    }
-                                    // Track this order as processed so it cannot be re-cancelled
-                                    // if the server is slow to remove it from the window.
-                                    processed_orders.insert(processed_key);
-                                    persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                                } else {
-                                    // Collect-only mode: skip open orders
-                                    debug!("[ManageOrders] Skipping open order \"{}\" (collect-only mode)", order_name);
-                                    processed_orders.insert(processed_key);
-                                    persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                                }
-                            } else if collect_slot.is_none() && cancel_slot.is_none()
-                                && state.inventory_full.load(Ordering::Relaxed)
-                                && order_is_buy
-                            {
-                                // Clicking the order triggered "inventory full" and no detail view
-                                // opened (server rejected the collect). Try instasell if dominant item.
-                                if let Some(dominant) = find_dominant_inventory_item(bot) {
-                                    info!("[ManageOrders] No button + inventory full + dominant item '{}' — instaselling", dominant);
-                                    *state.insta_sell_item.write() = Some(dominant.clone());
-                                    *state.bazaar_step.write() = BazaarStep::Initial;
-                                    *state.bot_state.write() = BotState::InstaSelling;
-                                    bot.write_chat_packet(&format!("/bz {}", dominant));
-                                    break;
-                                }
-                                log_pending_claim(&order_name);
-                                // Mark order as processed to avoid infinite re-processing.
-                                // (Previously this called processed_orders.clear() which
-                                // caused the loop to revisit already-handled orders until
-                                // the 60-second ManageOrders timeout fired.)
-                                processed_orders.insert(processed_key);
-                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                            } else {
-                                processed_orders.insert(processed_key);
-                                persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                            }
-                            // Loop continues to find remaining orders
                         }
+
+                        if !order_options_opened {
+                            // No "Order options" window → order was collected by clicking.
+                            // Emit the collected event.
+                            info!("[ManageOrders] Order \"{}\" collected (no Order options opened)", order_name);
+                            let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                item_name: clean_order_item_name(&order_name, &order_identity),
+                                is_buy_order: order_is_buy,
+                            });
+                            persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
+                            state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                        }
+                        // else: "Order options" opened — Branch C handler takes over.
+                        // It will handle collect/cancel/skip and then go Idle.
+
+                        // Close this window and go Idle (one order per cycle).
+                        if *state.last_window_id.read() == window_id {
+                            bot.write_packet(ServerboundContainerClose {
+                                container_id: window_id as i32,
+                            });
+                        }
+                        *state.manage_orders_deadline.write() = None;
+                        *state.bot_state.write() = BotState::Idle;
                     }
                 }
             } else if window_title.to_lowercase().contains("order options") {
-                // Hypixel opened a separate "Order options" window after clicking
-                // an order in the Manage Orders list (instead of updating in-place).
-                // Look for Cancel/Collect buttons here and act accordingly.
-                // Mirrors upstream TypeScript bazaarOrderManager.ts pollForCancelButton().
+                // Hypixel opened "Order options" after clicking an order in the list.
+                // This means the order is OPEN (not filled — filled orders collect on click).
+                // Look for Cancel/Collect buttons and handle accordingly.
+                // After handling ONE order, close and go Idle (one order per cycle).
                 info!("[ManageOrders] Order options window opened — looking for Cancel/Collect buttons");
 
-                // Retrieve the order context stored when the order was clicked in Branch B.
                 let order_ctx = state.managing_order_context.read().clone();
                 let (order_name, order_identity) = match &order_ctx {
                     Some((_is_buy, name, identity)) => (name.clone(), identity.clone()),
@@ -4167,12 +4039,14 @@ async fn handle_window_interaction(
                 };
                 let order_identity_for_clean = order_ctx.as_ref().and_then(|(_, _, id)| id.clone());
 
-                // Check persistent set — if this order was already handled in a
-                // previous cycle, skip it to avoid duplicate events/webhooks.
                 let name_key = normalize_bazaar_order_text(&order_name);
                 if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
-                    debug!("[ManageOrders] Order \"{}\" already processed — skipping Order options", order_name);
-                    close_window_and_reopen_bz(bot, state, window_id).await;
+                    debug!("[ManageOrders] Order \"{}\" already processed — closing", order_name);
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
+                    *state.manage_orders_deadline.write() = None;
+                    *state.bot_state.write() = BotState::Idle;
                 } else {
 
                 let action_deadline =
@@ -4196,8 +4070,6 @@ async fn handle_window_interaction(
                         break;
                     }
                     if tokio::time::Instant::now() >= action_deadline {
-                        // Log visible slot names to aid future debugging of
-                        // unrecognised button layouts.
                         let slot_names: Vec<String> = slots2
                             .iter()
                             .enumerate()
@@ -4206,14 +4078,13 @@ async fn handle_window_interaction(
                             })
                             .collect();
                         warn!(
-                            "[ManageOrders] No Collect/Cancel button found in Order options window — visible slots: [{}]",
+                            "[ManageOrders] No Collect/Cancel button found in Order options — visible slots: [{}]",
                             slot_names.join(", ")
                         );
                         break;
                     }
                 }
 
-                // Apply the same age-based cancel logic as Branch B.
                 let cancel_due_to_age = !cancel_open
                     && cancel_slot.is_some()
                     && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
@@ -4228,8 +4099,6 @@ async fn handle_window_interaction(
                     if *state.last_window_id.read() == window_id {
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                        // Wait for server confirmation before emitting the collected
-                        // event — prevents false "order collected" messages.
                         if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
                             if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
                                 let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
@@ -4238,9 +4107,8 @@ async fn handle_window_interaction(
                                 });
                             }
                         } else {
-                            warn!("[ManageOrders] Collect click for \"{}\" was not confirmed by server in Order options — skipping event", order_name);
+                            warn!("[ManageOrders] Collect click for \"{}\" was not confirmed in Order options", order_name);
                         }
-                        // After collecting, also cancel if in startup mode or age-based
                         if cancel_open || cancel_due_to_age {
                             if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
                                 if *state.last_window_id.read() == window_id {
@@ -4255,17 +4123,10 @@ async fn handle_window_interaction(
                                             });
                                         }
                                     } else {
-                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server in Order options — skipping event", order_name);
+                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options", order_name);
                                     }
                                 }
                             }
-                        }
-                        // If Hypixel closed all bazaar windows without reopening "Your Bazaar
-                        // Orders" (e.g. last order was processed), re-navigate to /bz so the
-                        // ManagingOrders flow continues and correctly reaches Idle when empty.
-                        if *state.last_window_id.read() == window_id {
-                            info!("[ManageOrders] No new window after collect in Order options — closing window and re-opening /bz");
-                            close_window_and_reopen_bz(bot, state, window_id).await;
                         }
                     }
                 } else if let Some(cs) = cancel_slot {
@@ -4282,45 +4143,29 @@ async fn handle_window_interaction(
                                     });
                                 }
                             } else {
-                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed by server in Order options — skipping event", order_name);
-                            }
-                            // If Hypixel closed all bazaar windows without reopening "Your Bazaar
-                            // Orders" (e.g. last order was cancelled), re-navigate to /bz so the
-                            // ManagingOrders flow continues and correctly reaches Idle when empty.
-                            if *state.last_window_id.read() == window_id {
-                                info!("[ManageOrders] No new window after cancel in Order options — closing window and re-opening /bz");
-                                close_window_and_reopen_bz(bot, state, window_id).await;
+                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options", order_name);
                             }
                         }
                     } else {
-                        debug!("[ManageOrders] Skipping cancel in Order options (collect-only mode, order not old enough)");
-                        // Re-navigate to /bz so the ManagingOrders flow continues to
-                        // process remaining orders (there may be filled orders after
-                        // this open one).  Without this the bot stays stuck in
-                        // ManagingOrders with the Order options window open until the
-                        // command timeout fires.
-                        info!("[ManageOrders] Re-opening /bz after skipping open order in Order options");
-                        close_window_and_reopen_bz(bot, state, window_id).await;
+                        debug!("[ManageOrders] Skipping open order \"{}\" in Order options (collect-only mode)", order_name);
                     }
                 } else {
-                    // Neither Collect nor Cancel found — likely a transient GUI
-                    // glitch or unexpected window content.  Re-navigate to /bz so
-                    // the ManagingOrders flow can retry instead of hanging until the
-                    // command timeout.
-                    warn!("[ManageOrders] No actionable button in Order options — re-opening /bz");
-                    close_window_and_reopen_bz(bot, state, window_id).await;
+                    warn!("[ManageOrders] No actionable button in Order options for \"{}\"", order_name);
                 }
-                // Mark this order as persistently processed so it won't be
-                // re-clicked/re-emitted if /bz is re-opened and the order
-                // is still visible in the list (Hypixel UI lag).
+
+                // Mark as processed, close, and go Idle (one order per cycle)
                 if !name_key.is_empty() {
                     state.manage_orders_processed.write().insert(name_key);
                 }
+                if *state.last_window_id.read() == window_id {
+                    bot.write_packet(ServerboundContainerClose {
+                        container_id: window_id as i32,
+                    });
                 }
-                // After clicking Cancel/Collect, Hypixel should reopen "Your Bazaar Orders"
-                // as a new window. The ManagingOrders handler will be called again to continue
-                // processing remaining orders. If Hypixel closed all windows instead (last
-                // order processed), the /bz re-navigation above keeps the flow running.
+                *state.manage_orders_deadline.write() = None;
+                state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                *state.bot_state.write() = BotState::Idle;
+                }
             } else {
                 // Unexpected window title while in ManagingOrders state.
                 // Re-navigate to /bz to get back on track.

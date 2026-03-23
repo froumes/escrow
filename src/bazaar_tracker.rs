@@ -2,15 +2,24 @@
 //!
 //! Orders are added on [`BazaarOrderPlaced`] events and removed when
 //! [`BazaarOrderCollected`] or [`BazaarOrderCancelled`] events fire.
+//!
+//! Orders and buy costs are persisted to disk so profit tracking survives
+//! across bot restarts.
 
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, warn};
+
+/// File name for persisted orders (stored next to the executable / in the logs dir).
+const ORDERS_FILE: &str = "bazaar_orders.json";
+/// File name for persisted buy costs.
+const BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
 
 /// A single tracked bazaar order visible on the web panel.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedBazaarOrder {
     pub item_name: String,
     pub amount: u64,
@@ -35,6 +44,18 @@ pub struct BazaarOrderTracker {
 
 impl BazaarOrderTracker {
     pub fn new() -> Self {
+        let tracker = Self {
+            orders: Arc::new(RwLock::new(Vec::new())),
+            last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+        };
+        tracker.load_from_disk();
+        tracker
+    }
+
+    /// Create a tracker that does NOT load from / save to disk.
+    /// Used in unit tests to avoid cross-test interference.
+    #[cfg(test)]
+    pub fn new_in_memory() -> Self {
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
             last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
@@ -61,6 +82,7 @@ impl BazaarOrderTracker {
             status: "open".to_string(),
             placed_at: now,
         });
+        self.save_orders_to_disk();
     }
 
     /// Mark the most recent matching open order as `"filled"`.
@@ -73,13 +95,15 @@ impl BazaarOrderTracker {
         }) {
             order.status = "filled".to_string();
         }
+        drop(orders);
+        self.save_orders_to_disk();
     }
 
     /// Remove a matching order (on collect or cancel) and return its data
     /// so the caller can use price/amount for profit calculation.
     pub fn remove_order(&self, item_name: &str, is_buy_order: bool) -> Option<TrackedBazaarOrder> {
         let mut orders = self.orders.write();
-        if let Some(pos) = orders.iter().rposition(|o| {
+        let result = if let Some(pos) = orders.iter().rposition(|o| {
             (o.status == "open" || o.status == "filled")
                 && o.is_buy_order == is_buy_order
                 && normalize_for_match(&o.item_name) == normalize_for_match(item_name)
@@ -87,7 +111,10 @@ impl BazaarOrderTracker {
             Some(orders.remove(pos))
         } else {
             None
-        }
+        };
+        drop(orders);
+        self.save_orders_to_disk();
+        result
     }
 
     /// Return a snapshot of all tracked orders.
@@ -112,7 +139,12 @@ impl BazaarOrderTracker {
         let mut orders = self.orders.write();
         let original_len = orders.len();
         orders.retain(|o| now.saturating_sub(o.placed_at) < max_age_secs);
-        original_len - orders.len()
+        let removed = original_len - orders.len();
+        drop(orders);
+        if removed > 0 {
+            self.save_orders_to_disk();
+        }
+        removed
     }
 
     /// Record a collected buy order's cost so that profit can be computed
@@ -121,14 +153,96 @@ impl BazaarOrderTracker {
         self.last_buy_costs
             .write()
             .insert(normalize_for_match(item_name), (price_per_unit, amount));
+        self.save_buy_costs_to_disk();
     }
 
     /// Consume and return the stored buy cost for an item (if any).
     /// Used when a sell offer is collected to compute profit/loss.
     pub fn take_buy_cost(&self, item_name: &str) -> Option<(f64, u64)> {
-        self.last_buy_costs
+        let result = self.last_buy_costs
             .write()
-            .remove(&normalize_for_match(item_name))
+            .remove(&normalize_for_match(item_name));
+        self.save_buy_costs_to_disk();
+        result
+    }
+
+    // ── Persistence helpers ──
+
+    fn persistence_dir() -> std::path::PathBuf {
+        crate::logging::get_logs_dir()
+    }
+
+    fn save_orders_to_disk(&self) {
+        #[cfg(test)]
+        return;
+        #[cfg(not(test))]
+        {
+        let orders = self.orders.read().clone();
+        let path = Self::persistence_dir().join(ORDERS_FILE);
+        if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
+            warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
+            return;
+        }
+        match serde_json::to_string(&orders) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => warn!("[BazaarTracker] Failed to serialize orders: {}", e),
+        }
+        }
+    }
+
+    fn save_buy_costs_to_disk(&self) {
+        #[cfg(test)]
+        return;
+        #[cfg(not(test))]
+        {
+        let costs = self.last_buy_costs.read().clone();
+        let path = Self::persistence_dir().join(BUY_COSTS_FILE);
+        if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
+            warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
+            return;
+        }
+        match serde_json::to_string(&costs) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => warn!("[BazaarTracker] Failed to serialize buy costs: {}", e),
+        }
+        }
+    }
+
+    fn load_from_disk(&self) {
+        let orders_path = Self::persistence_dir().join(ORDERS_FILE);
+        if orders_path.exists() {
+            match std::fs::read_to_string(&orders_path) {
+                Ok(json) => match serde_json::from_str::<Vec<TrackedBazaarOrder>>(&json) {
+                    Ok(orders) => {
+                        debug!("[BazaarTracker] Loaded {} orders from disk", orders.len());
+                        *self.orders.write() = orders;
+                    }
+                    Err(e) => warn!("[BazaarTracker] Failed to parse {}: {}", orders_path.display(), e),
+                },
+                Err(e) => warn!("[BazaarTracker] Failed to read {}: {}", orders_path.display(), e),
+            }
+        }
+        let costs_path = Self::persistence_dir().join(BUY_COSTS_FILE);
+        if costs_path.exists() {
+            match std::fs::read_to_string(&costs_path) {
+                Ok(json) => match serde_json::from_str::<HashMap<String, (f64, u64)>>(&json) {
+                    Ok(costs) => {
+                        debug!("[BazaarTracker] Loaded {} buy costs from disk", costs.len());
+                        *self.last_buy_costs.write() = costs;
+                    }
+                    Err(e) => warn!("[BazaarTracker] Failed to parse {}: {}", costs_path.display(), e),
+                },
+                Err(e) => warn!("[BazaarTracker] Failed to read {}: {}", costs_path.display(), e),
+            }
+        }
     }
 }
 
@@ -142,7 +256,7 @@ mod tests {
 
     #[test]
     fn add_and_remove_order() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Enchanted Coal Block".into(), 4, 30100.0, false);
         assert_eq!(tracker.get_orders().len(), 1);
 
@@ -154,7 +268,7 @@ mod tests {
 
     #[test]
     fn mark_filled() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Diamond".into(), 64, 100.0, true);
         assert!(!tracker.has_filled_orders());
         tracker.mark_filled("Diamond", true);
@@ -164,13 +278,13 @@ mod tests {
 
     #[test]
     fn has_filled_orders_empty() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         assert!(!tracker.has_filled_orders());
     }
 
     #[test]
     fn has_filled_orders_cleared_on_remove() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Coal".into(), 10, 500.0, true);
         tracker.mark_filled("Coal", true);
         assert!(tracker.has_filled_orders());
@@ -180,7 +294,7 @@ mod tests {
 
     #[test]
     fn remove_filled_order() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Diamond".into(), 64, 100.0, true);
         tracker.mark_filled("Diamond", true);
         let removed = tracker.remove_order("Diamond", true);
@@ -190,7 +304,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_match() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Enchanted Coal Block".into(), 4, 30100.0, false);
         let removed = tracker.remove_order("enchanted coal block", false);
         assert!(removed.is_some());
@@ -199,13 +313,13 @@ mod tests {
 
     #[test]
     fn remove_returns_none_for_missing() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         assert!(tracker.remove_order("Nonexistent", true).is_none());
     }
 
     #[test]
     fn remove_stale_orders() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         // Manually insert an order with a very old timestamp
         {
             let mut orders = tracker.orders.write();
@@ -230,7 +344,7 @@ mod tests {
 
     #[test]
     fn profit_calculation_from_removed_orders() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Coal".into(), 10, 500.0, true);
         tracker.add_order("Coal".into(), 10, 600.0, false);
 
@@ -243,7 +357,7 @@ mod tests {
 
     #[test]
     fn record_and_take_buy_cost() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.record_buy_cost("Enchanted Coal Block", 500.0, 10);
 
         let cost = tracker.take_buy_cost("Enchanted Coal Block");
@@ -258,20 +372,20 @@ mod tests {
 
     #[test]
     fn take_buy_cost_case_insensitive() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         tracker.record_buy_cost("Enchanted Coal Block", 500.0, 10);
         assert!(tracker.take_buy_cost("enchanted coal block").is_some());
     }
 
     #[test]
     fn take_buy_cost_returns_none_when_missing() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         assert!(tracker.take_buy_cost("Nonexistent").is_none());
     }
 
     #[test]
     fn sell_profit_from_recorded_buy_cost() {
-        let tracker = BazaarOrderTracker::new();
+        let tracker = BazaarOrderTracker::new_in_memory();
         // Simulate buy order collected: 10x Coal @ 500 coins/unit
         tracker.record_buy_cost("Coal", 500.0, 10);
         // Simulate sell offer collected: 10x Coal @ 600 coins/unit
