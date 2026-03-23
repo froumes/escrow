@@ -15,6 +15,7 @@
         <a href="#" class="logo"><span>Frikadellen</span> BAF</a>
         <ul class="nav-links">
             <li><a href="#features">Features</a></li>
+            <li><a href="#screenshots">Screenshots</a></li>
             <li><a href="#how-it-works">How It Works</a></li>
             <li><a href="#config">Configuration</a></li>
             <li><a href="#install">Install</a></li>
@@ -43,6 +44,24 @@
         <span>↓</span>
     </div>
 </header>
+
+<!-- ── Video Showcase ──────────────────────────────────────────── -->
+<section id="showcase">
+    <div class="container">
+        <h2 class="section-title">See It In Action</h2>
+        <p class="section-subtitle">Watch the macro flip in real-time.</p>
+        <div class="video-wrapper">
+            <!-- TODO: Replace VIDEO_ID_HERE with your YouTube video ID (e.g. dQw4w9WgXcQ) -->
+            <iframe
+                src="https://www.youtube.com/embed/VIDEO_ID_HERE?autoplay=1&mute=1&loop=1&playlist=VIDEO_ID_HERE&rel=0"
+                title="Frikadellen BAF Showcase"
+                style="border:none"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                allowfullscreen
+            ></iframe>
+        </div>
+    </div>
+</section>
 
 <!-- ── Features ────────────────────────────────────────────────── -->
 <section id="features">
@@ -79,7 +98,7 @@
             <div class="feature-card">
                 <div class="feature-icon">🌐</div>
                 <h3>Web Control Panel</h3>
-                <p>Built-in web interface to pause/resume the macro, toggle AH &amp; Bazaar flips, view inventory, switch accounts, and chat — all from your browser.</p>
+                <p>Built-in web dashboard to pause/resume, toggle AH &amp; Bazaar flips, view inventory, manage auctions, switch accounts, and chat — all from your browser.</p>
             </div>
 
             <div class="feature-card">
@@ -88,6 +107,114 @@
                 <p>Rich embed notifications for every purchase, sale, and profit update — complete with item names, prices, and buy-speed metrics.</p>
             </div>
 
+            <div class="feature-card">
+                <div class="feature-icon">🎯</div>
+                <h3>Smart Order Management</h3>
+                <p>Automatic collection of filled orders, cancellation of stale orders, and partial-fill detection — no coins left on the table.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🛡️</div>
+                <h3>Built-in Safety</h3>
+                <p>GUI watchdog auto-closes stuck windows, packet-rate limiting prevents kicks, and graceful error recovery keeps the bot running 24/7.</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">📈</div>
+                <h3>Profit Tracking</h3>
+                <p>Real-time profit logging for both AH flips and bazaar orders with buy cost tracking, tax calculations, and session summaries.</p>
+            </div>
+
+        </div>
+
+        <!-- ── Full Feature List ──────────────────────────────── -->
+        <div class="feature-list-section">
+            <h3 class="feature-list-title">Complete Feature List</h3>
+            <div class="feature-list-grid">
+                <div class="feature-list-col">
+                    <h4>Auction House</h4>
+                    <ul class="feature-list">
+                        <li>Coflnet sniper integration</li>
+                        <li>Sub-second BIN purchasing</li>
+                        <li>Automatic relisting at target price</li>
+                        <li>Sold auction auto-claiming</li>
+                        <li>Auction cancellation support</li>
+                        <li>Grace-period bed timing</li>
+                        <li>Configurable buy speed tuning</li>
+                        <li>AH listing limit detection</li>
+                    </ul>
+                </div>
+                <div class="feature-list-col">
+                    <h4>Bazaar</h4>
+                    <ul class="feature-list">
+                        <li>Automated buy &amp; sell orders</li>
+                        <li>Fill detection &amp; collection</li>
+                        <li>Partial-fill handling</li>
+                        <li>Stale order auto-cancellation</li>
+                        <li>Order age-based cancel threshold</li>
+                        <li>Configurable tax rate</li>
+                        <li>Instant-sell inventory mode</li>
+                        <li>Order profit tracking</li>
+                    </ul>
+                </div>
+                <div class="feature-list-col">
+                    <h4>Management</h4>
+                    <ul class="feature-list">
+                        <li>Web control panel (real-time)</li>
+                        <li>Multi-account rotation</li>
+                        <li>Discord webhook notifications</li>
+                        <li>In-game chat from browser</li>
+                        <li>Inventory viewer with item icons</li>
+                        <li>Active auctions dashboard</li>
+                        <li>Bazaar orders dashboard</li>
+                        <li>Anonymize mode for streaming</li>
+                    </ul>
+                </div>
+                <div class="feature-list-col">
+                    <h4>Reliability</h4>
+                    <ul class="feature-list">
+                        <li>Auto-reconnect on disconnect</li>
+                        <li>GUI watchdog (5s auto-close)</li>
+                        <li>Packet-rate limiting</li>
+                        <li>Command queue with priorities</li>
+                        <li>AH flip preemption for bazaar</li>
+                        <li>Startup order cleanup</li>
+                        <li>Cookie/booster detection</li>
+                        <li>Persistent order state (JSON)</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ── Screenshots ─────────────────────────────────────────────── -->
+<section id="screenshots">
+    <div class="container">
+        <h2 class="section-title">Screenshots</h2>
+        <p class="section-subtitle">See what the macro looks like in action.</p>
+
+        <div class="screenshot-grid">
+            <div class="screenshot-card">
+                <div class="screenshot-label">Web Panel — Controls &amp; Dashboard</div>
+                <img src="https://github.com/user-attachments/assets/8600abbd-34ea-4fd2-ad7d-9754ef390d39" alt="Web control panel showing status, controls, inventory, active auctions, bazaar orders, and chat" loading="lazy">
+            </div>
+            <div class="screenshot-card">
+                <div class="screenshot-label">Login Screen</div>
+                <img src="https://github.com/user-attachments/assets/55a28e4b-ec5e-4896-af9b-b62e28190909" alt="Login screen for the web control panel" loading="lazy">
+            </div>
+            <div class="screenshot-card">
+                <div class="screenshot-label">Live Game View</div>
+                <img src="https://github.com/user-attachments/assets/cbca2c75-ff56-45f8-bad1-3fb0a7e8cfd2" alt="Live game view showing in-game render" loading="lazy">
+            </div>
+            <div class="screenshot-card">
+                <div class="screenshot-label">Divine Flip 💎</div>
+                <img src="https://github.com/user-attachments/assets/95897563-ebc4-47c6-bfd1-0c30c8df715b" alt="A divine-tier flip notification" loading="lazy">
+            </div>
+            <div class="screenshot-card">
+                <div class="screenshot-label">Public Big Flips Webhook</div>
+                <img src="https://github.com/user-attachments/assets/0fcb24fe-6a14-4a27-9926-5928bb08725b" alt="Discord webhook showing big flip notifications" loading="lazy">
+            </div>
         </div>
     </div>
 </section>
@@ -213,7 +340,7 @@
             <p>Coflnet-powered Auction House &amp; Bazaar flipper for Hypixel SkyBlock</p>
         </div>
         <div class="footer-links">
-            <a href="https://trexito.com" target="_blank" rel="noopener">trexito.com</a>
+            <a href="https://auctionflipper.bz" target="_blank" rel="noopener">auctionflipper.bz</a>
             <a href="https://github.com/TreXito/frikadellen-baf-121" target="_blank" rel="noopener">GitHub</a>
             <a href="https://discord.gg/42DvX6T9jh" target="_blank" rel="noopener">Discord</a>
             <a href="https://github.com/TreXito/frikadellen-baf-121/releases" target="_blank" rel="noopener">Releases</a>

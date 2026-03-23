@@ -22,7 +22,7 @@ window.addEventListener('scroll', () => {
 
 // ── Reveal on Scroll (IntersectionObserver) ───────────────
 const revealElements = document.querySelectorAll(
-    '.feature-card, .step, .config-block, .terminal'
+    '.feature-card, .step, .config-block, .terminal, .screenshot-card, .video-wrapper, .feature-list-section'
 );
 
 const revealObserver = new IntersectionObserver((entries) => {
