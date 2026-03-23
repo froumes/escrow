@@ -155,7 +155,34 @@ impl bevy_app::Plugin for PacketAcceleratorPlugin {
         app.insert_resource(self.bridge.clone());
         app.add_observer(on_menu_opened);
         app.add_observer(on_container_set_content);
+        // Add a system in Update that logs slow ECS frames.  On busy servers
+        // the schedule may take >16.7 ms (dropping below 60 fps), which is
+        // the dominant source of window-detection latency.
+        app.add_systems(bevy_app::Update, ecs_frame_timing_system);
     }
+}
+
+/// Bevy system that tracks ECS frame durations and warns about slow frames.
+/// Runs once per Update cycle (nominally 60 fps).  If a frame takes longer
+/// than 20 ms, the schedule is falling behind 60 fps and the resulting
+/// per-frame latency directly increases window/packet detection time.
+fn ecs_frame_timing_system(
+    mut last_frame_time: bevy_ecs::system::Local<Option<std::time::Instant>>,
+) {
+    let now = std::time::Instant::now();
+    if let Some(last) = *last_frame_time {
+        let frame_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+        if frame_ms > 25.0 {
+            warn!(
+                "[ECS] Slow frame: {:.1}ms (>{:.0}fps target of 16.7ms). \
+                 Window detection latency is increased by ~{:.0}ms.",
+                frame_ms,
+                1000.0 / frame_ms,
+                frame_ms - 16.7
+            );
+        }
+    }
+    *last_frame_time = Some(now);
 }
 
 /// ECS Observer: fires during apply_deferred when the server sends OpenScreen.
@@ -2747,6 +2774,10 @@ async fn execute_command(
             let chat_command = format!("/viewauction {}", uuid);
 
             info!("Sending chat command: {}", chat_command);
+
+            // Clear stale observer data from any previous window so the timing
+            // comparison in the OpenScreen handler is accurate for THIS purchase.
+            *state.window_open_info.write() = None;
 
             // Record buy-speed start time right before sending /viewauction
             // so the measurement covers command-send → coins-in-escrow (the
