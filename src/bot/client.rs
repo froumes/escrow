@@ -195,23 +195,23 @@ impl bevy_app::Plugin for PacketAcceleratorPlugin {
         app.add_observer(on_menu_opened);
         app.add_observer(on_container_set_content);
         // Add a system in Update that logs slow ECS frames.  On busy servers
-        // the schedule may take >25 ms, which directly increases window/
-        // packet detection latency.  The 25 ms threshold (vs the 16.7 ms
-        // 60-fps target) avoids noisy warnings from minor jitter while still
+        // the schedule may take >8 ms, which directly increases window/
+        // packet detection latency.  The 8 ms threshold (vs the 3.3 ms
+        // 300-fps target) avoids noisy warnings from minor jitter while still
         // flagging frames that materially impact purchase timing.
         app.add_systems(bevy_app::Update, ecs_frame_timing_system);
     }
 }
 
 /// Threshold in ms beyond which an ECS frame is considered slow.  Chosen to be
-/// above the 16.7 ms (60 fps) target with enough margin to filter out minor
+/// above the 3.3 ms (300 fps) target with enough margin to filter out minor
 /// jitter, while still flagging frames that materially impact purchase timing.
-const SLOW_FRAME_THRESHOLD_MS: f64 = 25.0;
+const SLOW_FRAME_THRESHOLD_MS: f64 = 8.0;
 
 /// Bevy system that tracks ECS frame durations and warns about slow frames.
-/// Runs once per Update cycle (nominally 60 fps / 16.7 ms).  Frames taking
+/// Runs once per Update cycle (nominally 300 fps / 3.3 ms).  Frames taking
 /// longer than SLOW_FRAME_THRESHOLD_MS are logged because the extra latency
-/// (frame_ms − 16.7) directly delays window and packet detection.
+/// (frame_ms − 3.3) directly delays window and packet detection.
 fn ecs_frame_timing_system(
     mut last_frame_time: bevy_ecs::system::Local<Option<std::time::Instant>>,
 ) {
@@ -222,11 +222,11 @@ fn ecs_frame_timing_system(
             // Floor at 0.1 fps to avoid division-by-zero display artifacts.
             let effective_fps = (1000.0 / frame_ms).max(0.1);
             warn!(
-                "[ECS] Slow frame: {:.1}ms ({:.0}fps, target 60fps / 16.7ms). \
+                "[ECS] Slow frame: {:.1}ms ({:.0}fps, target 300fps / 3.3ms). \
                  Window detection latency is increased by ~{:.0}ms.",
                 frame_ms,
                 effective_fps,
-                frame_ms - 16.7
+                frame_ms - 3.3
             );
         }
     }
@@ -3193,7 +3193,7 @@ async fn handle_window_interaction(
                 // for ContainerSetContent / ContainerSetSlot.  When the
                 // server sends both OpenScreen and ContainerSetContent in the
                 // same TCP segment this is ~0 ms; otherwise it is one extra
-                // ECS cycle (~16.7 ms).
+                // ECS cycle (~3.3 ms at 300 fps).
                 if let Some(t0) = *state.purchase_start_time.read() {
                     info!(
                         "[Timing] /viewauction → slot 31 ready ({}): {:.1}ms",
@@ -5898,10 +5898,10 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
 /// bypassing Azalea's message-based chat system.
 ///
 /// `write_chat_packet` queues a Bevy Message that is only processed in the
-/// **next** ECS Update cycle (~16.7 ms at 60 fps).  By sending
+/// **next** ECS Update cycle (~3.3 ms at 300 fps).  By sending
 /// `ServerboundChatCommand` through the trigger-based `write_packet` path
 /// the packet reaches the TCP socket **immediately**, eliminating a full
-/// ECS cycle of send-side latency.  On the purchase path this saves ~17 ms
+/// ECS cycle of send-side latency.  On the purchase path this saves ~3 ms
 /// per command.
 ///
 /// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
