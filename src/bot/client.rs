@@ -792,9 +792,15 @@ impl BotClient {
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
-    /// Used by `main.rs` to skip ManageOrders when collection would fail.
+    /// Used by `main.rs` to skip BUY orders and defer claiming.
     pub fn is_inventory_full(&self) -> bool {
         self.inventory_full.load(Ordering::Relaxed)
+    }
+
+    /// Clear the inventory-full flag.  Called by the periodic order-check
+    /// timer after a cooldown so that ManageOrders can retry BUY collection.
+    pub fn clear_inventory_full(&self) {
+        self.inventory_full.store(false, Ordering::Relaxed);
     }
 
     /// Returns true if the startup workflow is currently running.
@@ -2300,6 +2306,16 @@ async fn event_handler(
                 state.inventory_full.store(true, Ordering::Relaxed);
             }
 
+            // Detect "Inventory full? Don't forget to check out your Storage
+            // inside the SkyBlock Menu!" — Hypixel sends this frequently when
+            // the player's inventory is full.  Set inventory_full so the bot
+            // stops accepting new BUY orders and defers claiming until space
+            // is freed.
+            if clean_message.contains("Inventory full?") {
+                warn!("[ManageOrders] Inventory full hint detected");
+                state.inventory_full.store(true, Ordering::Relaxed);
+            }
+
             // Detect "You don't have anything to sell!" during SellingInventoryBz
             // — Hypixel sends this when inventory has no instasellable items.
             if clean_message.contains("don't have anything to sell")
@@ -3023,7 +3039,14 @@ async fn execute_command(
             let mode = if *cancel_open { "startup (cancel+collect)" } else { "collect-only" };
             info!("[ManageOrders] Triggered ({}) — opening /bz", mode);
             *state.manage_orders_cancelled.write() = 0;
-            state.inventory_full.store(false, Ordering::Relaxed);
+            // NOTE: inventory_full is intentionally NOT cleared here.  Clearing
+            // it caused a tight loop where ManageOrders would reset the flag,
+            // try to collect a BUY order, fail ("no space"), re-set the flag,
+            // and repeat every cycle.  The flag is now cleared only by:
+            //   1. The periodic order-check timer (after a 90 s cooldown).
+            //   2. InstaSell completion.
+            // This lets ManageOrders skip BUY orders when the flag is set while
+            // still collecting SELL orders (which yield coins, not items).
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
             state.manage_orders_processed.write().clear();
             // Do NOT clear order_cancel_failures here — let failures accumulate
@@ -4406,9 +4429,19 @@ async fn handle_window_interaction(
                 // However, stale orders that exceed the cancel-due-to-age threshold
                 // must still be selected so they can be cancelled.
                 let cancel_mins = state.bazaar_order_cancel_minutes_per_million;
+                let inv_full = state.inventory_full.load(Ordering::Relaxed);
                 let chosen_order: Option<OrderEntry> = if !cancel_open {
+                    // Always try claimable sell orders first (yield coins, no
+                    // inventory space needed).
                     sell_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
-                        .or_else(|| buy_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned())
+                        // Claimable buy orders — skip entirely when inventory is
+                        // full so we don't waste a ManageOrders cycle opening /bz,
+                        // navigating to the order, and then aborting.
+                        .or_else(|| {
+                            if inv_full { None } else {
+                                buy_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
+                            }
+                        })
                         .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable)| {
                             !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
                         }).cloned())

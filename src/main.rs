@@ -937,11 +937,16 @@ async fn main() -> Result<()> {
                     // periodic check.  Only enqueue if bazaar flips are enabled and no
                     // ManageOrders is already queued/running (prevents duplicate processing
                     // that causes double cancel/collect Hypixel chat messages).
-                    // Note: we do NOT skip when inventory is full because ManageOrders
-                    // can still collect SELL fills (which give coins, no inventory needed)
-                    // and free up bazaar slots.
+                    //
+                    // When inventory is full and the fill is a BUY order, skip
+                    // triggering ManageOrders — collecting BUY items requires free
+                    // inventory space that we don't have.  The periodic order-check
+                    // timer will retry after the 90 s cooldown clears the flag.
+                    // SELL fills are always collected (they yield coins, not items).
                     if enable_bazaar_flips_events.load(Ordering::Relaxed) {
-                        if command_queue_clone.has_manage_orders() {
+                        if is_buy_order && bot_client_clone.is_inventory_full() {
+                            info!("[BazaarOrders] BUY order filled but inventory full — deferring ManageOrders for \"{}\"", item_name);
+                        } else if command_queue_clone.has_manage_orders() {
                             info!("[BazaarOrders] Order filled — ManageOrders already queued/running, skipping duplicate");
                         } else {
                             info!("[BazaarOrders] Order filled — queuing ManageOrders");
@@ -1994,12 +1999,16 @@ async fn main() -> Result<()> {
                 }
                 // When inventory is full, ManageOrders can't collect buy orders
                 // and repeatedly opening/closing the bazaar GUI generates packet
-                // spam that risks a kick.  Extend the interval instead of
-                // skipping entirely so ManageOrders can still trigger InstaSelling
-                // to free space (and clear the inventory_full flag at start).
+                // spam that risks a kick.  Wait 90 s to give the player (or
+                // InstaSell) time to free space, then clear the flag so
+                // ManageOrders can retry BUY collection once.  If the inventory
+                // is still full, the flag will be re-set on the next failed
+                // claim attempt.
                 if bot_client_orders.is_inventory_full() {
                     debug!("[BazaarOrders] Inventory full — waiting extra 90s before next order check");
                     sleep(Duration::from_secs(90)).await;
+                    bot_client_orders.clear_inventory_full();
+                    debug!("[BazaarOrders] Inventory full cooldown elapsed — clearing flag for retry");
                 }
                 if bot_client_orders.state().allows_commands() && !command_queue_orders.has_manage_orders() {
                     debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
