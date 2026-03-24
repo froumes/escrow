@@ -133,13 +133,13 @@ static SOLD_BUYER_RE: Lazy<regex::Regex> =
 //
 // 5. **Timing within normal variance** — The 20-70ms improvement is well
 //    within normal network latency variance.  A player with 30ms ping
-//    naturally detects windows ~70ms faster than one with 100ms ping.
+//    naturally has 70ms lower latency than one with 100ms ping.
 //    The accelerator just removes internal pipeline overhead so the bot
 //    performs as its network latency allows, same as any other client.
 //
-// 6. **Pre-existing behavior** — The "fast account" referenced in the
-//    issue already operates at the accelerated speed (~58ms).  This
-//    plugin brings the slow path (~128ms) to parity by eliminating
+// 6. **Pre-existing behavior** — The fast account (same server, different
+//    bot instance) already operates at the accelerated speed (~58ms).
+//    This plugin brings the slow path (~128ms) to parity by eliminating
 //    Azalea's internal Event::Packet channel overhead.
 // ---------------------------------------------------------------------------
 
@@ -198,17 +198,23 @@ impl bevy_app::Plugin for PacketAcceleratorPlugin {
     }
 }
 
+/// Threshold in ms beyond which an ECS frame is considered slow.  Chosen to be
+/// above the 16.7 ms (60 fps) target with enough margin to filter out minor
+/// jitter, while still flagging frames that materially impact purchase timing.
+const SLOW_FRAME_THRESHOLD_MS: f64 = 25.0;
+
 /// Bevy system that tracks ECS frame durations and warns about slow frames.
 /// Runs once per Update cycle (nominally 60 fps / 16.7 ms).  Frames taking
-/// longer than 25 ms are logged because the extra latency (frame_ms − 16.7)
-/// directly delays window and packet detection.
+/// longer than SLOW_FRAME_THRESHOLD_MS are logged because the extra latency
+/// (frame_ms − 16.7) directly delays window and packet detection.
 fn ecs_frame_timing_system(
     mut last_frame_time: bevy_ecs::system::Local<Option<std::time::Instant>>,
 ) {
     let now = std::time::Instant::now();
     if let Some(last) = *last_frame_time {
         let frame_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-        if frame_ms > 25.0 {
+        if frame_ms > SLOW_FRAME_THRESHOLD_MS {
+            // Floor at 0.1 fps to avoid division-by-zero display artifacts.
             let effective_fps = (1000.0 / frame_ms).max(0.1);
             warn!(
                 "[ECS] Slow frame: {:.1}ms ({:.0}fps, target 60fps / 16.7ms). \
