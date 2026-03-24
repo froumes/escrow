@@ -71,6 +71,11 @@ const SELL_INVENTORY_NOW_FALLBACK_SLOT: usize = 47;
 /// Individual slot updates are coalesced within this window to avoid excessive CPU
 /// from repeated NBT extraction + JSON serialisation during rapid GUI interactions.
 const WINDOW_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
+/// Debounce interval for `rebuild_cached_inventory_json` on `ContainerSetSlot` events.
+/// Same rationale as `WINDOW_CACHE_REBUILD_DEBOUNCE_MS`: coalesces rapid per-slot
+/// updates into a single rebuild to keep the ECS World lock acquisition frequency low
+/// and reduce CPU spent on repeated JSON serialisation.
+const INVENTORY_CACHE_REBUILD_DEBOUNCE_MS: u64 = 100;
 /// Timeout (seconds) for `wait_for_collect_confirmation` and
 /// `wait_for_cancel_confirmation` to consider an action unprocessed.
 /// Raised from 5 → 8 to accommodate Hypixel server lag that caused
@@ -582,6 +587,7 @@ impl BotClient {
             chat_batch_buffer: self.chat_batch_buffer.clone(),
             cached_window_json: self.cached_window_json.clone(),
             window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
+            inventory_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
             command_queue: self.command_queue.clone(),
             startup_in_progress: self.startup_in_progress.clone(),
             enable_bazaar_flips: self.enable_bazaar_flips.clone(),
@@ -1132,6 +1138,10 @@ pub struct BotClientState {
     /// When true, a rebuild task is already scheduled; additional slot updates are
     /// coalesced into that single rebuild to avoid 100 % CPU during rapid updates.
     pub window_cache_rebuild_scheduled: Arc<AtomicBool>,
+    /// Debounce flag for `rebuild_cached_inventory_json` on `ContainerSetSlot` events.
+    /// Same pattern as `window_cache_rebuild_scheduled`: coalesces rapid per-slot
+    /// updates into a single rebuild.
+    pub inventory_cache_rebuild_scheduled: Arc<AtomicBool>,
     /// Shared reference to the command queue for the startup workflow.
     pub command_queue: Arc<RwLock<Option<CommandQueue>>>,
     /// Set while the startup workflow is running so flip handlers can block
@@ -1220,6 +1230,7 @@ impl Default for BotClientState {
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
             window_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
+            inventory_cache_rebuild_scheduled: Arc::new(AtomicBool::new(false)),
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
@@ -2522,7 +2533,18 @@ async fn event_handler(
                     *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
-                    rebuild_cached_window_json(&bot, &state);
+                    // Defer the window-JSON rebuild so the event handler returns
+                    // quickly.  bot.menu() briefly locks the ECS World mutex; doing
+                    // the full NBT-extraction + JSON-serialisation synchronously
+                    // keeps that contention window open and delays the next ECS
+                    // schedule cycle, contributing to slow frames.
+                    {
+                        let bot_close = bot.clone();
+                        let state_close = state.clone();
+                        tokio::spawn(async move {
+                            rebuild_cached_window_json(&bot_close, &state_close);
+                        });
+                    }
                     if state.event_tx.send(BotEvent::WindowClose).is_err() {
                         debug!("Failed to send WindowClose event - receiver dropped");
                     }
@@ -2533,10 +2555,21 @@ async fn event_handler(
                     // data on another thread without waiting for the inventory
                     // JSON rebuild.
                     state.slot_data_notify.notify_waiters();
-                    // Rebuild the cached player-inventory JSON whenever a slot changes.
-                    // This keeps the cache up-to-date for instant getInventory replies
-                    // (matching TypeScript: `bot.inventory` is always fresh mineflayer state).
-                    rebuild_cached_inventory_json(&bot, &state);
+                    // Debounce the inventory-JSON rebuild: individual slot updates
+                    // can fire dozens of times per GUI interaction.  Each call locks
+                    // the ECS World mutex (via bot.menu()) and serialises all
+                    // inventory slots to JSON.  Coalescing into a single rebuild
+                    // after the debounce window dramatically reduces both CPU usage
+                    // and World-lock contention that causes slow ECS frames.
+                    if !state.inventory_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
+                        let bot_inv = bot.clone();
+                        let state_inv = state.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(INVENTORY_CACHE_REBUILD_DEBOUNCE_MS)).await;
+                            rebuild_cached_inventory_json(&bot_inv, &state_inv);
+                            state_inv.inventory_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                        });
+                    }
                     // Debounce the window-JSON rebuild: individual slot updates can fire
                     // dozens of times per GUI interaction.  Coalesce them into a single
                     // rebuild after the debounce window to avoid excessive CPU from
@@ -2567,9 +2600,26 @@ async fn event_handler(
                     // data on another thread without waiting for the inventory
                     // JSON rebuild.
                     state.slot_data_notify.notify_waiters();
-                    // Rebuild the cached player-inventory JSON on full content updates.
-                    rebuild_cached_inventory_json(&bot, &state);
-                    rebuild_cached_window_json(&bot, &state);
+                    // Defer both JSON rebuilds so the event handler returns quickly.
+                    // Each rebuild calls bot.menu() which briefly locks the ECS World
+                    // mutex; running them synchronously keeps the handler blocked for
+                    // 20-50 ms of NBT extraction + JSON serialisation, starving
+                    // subsequent event processing and increasing World-lock contention
+                    // with the ECS schedule loop (causing slow frames).
+                    {
+                        let bot_inv = bot.clone();
+                        let state_inv = state.clone();
+                        tokio::spawn(async move {
+                            rebuild_cached_inventory_json(&bot_inv, &state_inv);
+                        });
+                    }
+                    {
+                        let bot_win = bot.clone();
+                        let state_win = state.clone();
+                        tokio::spawn(async move {
+                            rebuild_cached_window_json(&bot_win, &state_win);
+                        });
+                    }
                 }
 
                 ClientboundGamePacket::OpenSignEditor(pkt) => {
