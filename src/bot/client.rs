@@ -156,16 +156,18 @@ impl bevy_app::Plugin for PacketAcceleratorPlugin {
         app.add_observer(on_menu_opened);
         app.add_observer(on_container_set_content);
         // Add a system in Update that logs slow ECS frames.  On busy servers
-        // the schedule may take >16.7 ms (dropping below 60 fps), which is
-        // the dominant source of window-detection latency.
+        // the schedule may take >25 ms, which directly increases window/
+        // packet detection latency.  The 25 ms threshold (vs the 16.7 ms
+        // 60-fps target) avoids noisy warnings from minor jitter while still
+        // flagging frames that materially impact purchase timing.
         app.add_systems(bevy_app::Update, ecs_frame_timing_system);
     }
 }
 
 /// Bevy system that tracks ECS frame durations and warns about slow frames.
-/// Runs once per Update cycle (nominally 60 fps).  If a frame takes longer
-/// than 20 ms, the schedule is falling behind 60 fps and the resulting
-/// per-frame latency directly increases window/packet detection time.
+/// Runs once per Update cycle (nominally 60 fps / 16.7 ms).  Frames taking
+/// longer than 25 ms are logged because the extra latency (frame_ms − 16.7)
+/// directly delays window and packet detection.
 fn ecs_frame_timing_system(
     mut last_frame_time: bevy_ecs::system::Local<Option<std::time::Instant>>,
 ) {
@@ -173,11 +175,12 @@ fn ecs_frame_timing_system(
     if let Some(last) = *last_frame_time {
         let frame_ms = now.duration_since(last).as_secs_f64() * 1000.0;
         if frame_ms > 25.0 {
+            let effective_fps = (1000.0 / frame_ms).max(0.1);
             warn!(
-                "[ECS] Slow frame: {:.1}ms (>{:.0}fps target of 16.7ms). \
+                "[ECS] Slow frame: {:.1}ms ({:.0}fps, target 60fps / 16.7ms). \
                  Window detection latency is increased by ~{:.0}ms.",
                 frame_ms,
-                1000.0 / frame_ms,
+                effective_fps,
                 frame_ms - 16.7
             );
         }
@@ -191,8 +194,9 @@ fn on_menu_opened(
     event: bevy_ecs::observer::On<MenuOpenedEvent>,
     bridge: bevy_ecs::system::Res<PacketAcceleratorBridge>,
 ) {
-    let title = event.event().title.to_string();
-    let window_id = event.event().window_id;
+    let ev = event.event();
+    let title = ev.title.to_string();
+    let window_id = ev.window_id;
     *bridge.window_open_info.write() = Some(WindowOpenInfo {
         window_id,
         title,
@@ -2334,12 +2338,14 @@ async fn event_handler(
                     // Event::Packet handler timestamp to measure pipeline overhead.
                     if let Some(t0) = *state.purchase_start_time.read() {
                         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        // Check how much earlier the ECS observer detected this window
-                        let observer_info = state.window_open_info.read().clone();
-                        if let Some(ref info) = observer_info {
-                            let observer_ms = info.timestamp.duration_since(t0).as_secs_f64() * 1000.0;
+                        // Read the observer timestamp, dropping the lock immediately.
+                        let observer_ts = state.window_open_info.read()
+                            .as_ref()
+                            .map(|info| info.timestamp);
+                        if let Some(obs_ts) = observer_ts {
+                            let observer_ms = obs_ts.duration_since(t0).as_secs_f64() * 1000.0;
                             let pipeline_ms = event_handler_at
-                                .duration_since(info.timestamp)
+                                .duration_since(obs_ts)
                                 .as_secs_f64() * 1000.0;
                             info!(
                                 "[Timing] /viewauction → window: ECS observer {:.1}ms, \
