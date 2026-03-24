@@ -640,6 +640,13 @@ async function claimBzOrders() {
     await fetch('/api/claim_bz_orders', {method:'POST'});
 }
 
+async function cancelBzOrder(itemName, isBuyOrder) {
+    const orderType = isBuyOrder ? 'BUY' : 'SELL';
+    if (!confirm('Cancel ' + orderType + ' order for "' + itemName + '"?')) return;
+    await fetch('/api/cancel_bz_order', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({item_name: itemName, is_buy_order: isBuyOrder})});
+    fetchBazaarOrders();
+}
+
 async function fetchInventory() {
     try {
         const r = await fetch('/api/inventory');
@@ -749,7 +756,7 @@ function renderBazaarOrders(orders) {
     }
     const table = document.createElement('table');
     table.className = 'auction-table';
-    table.innerHTML = '<thead><tr><th>Type</th><th>Item</th><th>Qty</th><th>Price/u</th><th>Total</th><th>Status</th></tr></thead>';
+    table.innerHTML = '<thead><tr><th>Type</th><th>Item</th><th>Qty</th><th>Price/u</th><th>Total</th><th>Status</th><th></th></tr></thead>';
     const tbody = document.createElement('tbody');
     orders.forEach(o => {
         const tr = document.createElement('tr');
@@ -768,7 +775,15 @@ function renderBazaarOrders(orders) {
             '<td>' + o.amount + '</td>' +
             '<td class="auction-bid">' + formatShortCoins(o.price_per_unit) + '</td>' +
             '<td class="auction-bid">' + formatShortCoins(total) + '</td>' +
-            '<td' + statusClass + '>' + statusLabel + (age ? ' <span style="color:var(--text-dim);font-size:.72rem">(' + age + ')</span>' : '') + '</td>';
+            '<td' + statusClass + '>' + statusLabel + (age ? ' <span style="color:var(--text-dim);font-size:.72rem">(' + age + ')</span>' : '') + '</td>' +
+            '<td></td>';
+        // Create cancel button via DOM to avoid XSS
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.style.cssText = 'background:var(--danger);font-size:.7rem;padding:3px 8px';
+        cancelBtn.textContent = '✕ Cancel';
+        cancelBtn.addEventListener('click', () => cancelBzOrder(o.item_name, o.is_buy_order));
+        tr.lastElementChild.appendChild(cancelBtn);
         tbody.appendChild(tr);
     });
     table.appendChild(tbody);

@@ -432,6 +432,12 @@ pub enum BotEvent {
         item_name: String,
         starting_bid: u64,
     },
+    /// Reconciliation snapshot: the set of orders visible in the in-game
+    /// Bazaar Orders window.  Each entry is (item_name, is_buy_order).
+    /// The tracker should remove any orders not in this list.
+    BazaarOrdersSnapshot {
+        ingame_orders: Vec<(String, bool)>,
+    },
 }
 
 impl BotClient {
@@ -4421,6 +4427,20 @@ async fn handle_window_interaction(
                 }
 
                 let total_orders = sell_orders.len() + buy_orders.len();
+
+                // Emit a reconciliation snapshot so the tracker can remove
+                // stale entries that no longer exist in-game.
+                {
+                    let mut ingame_orders = Vec::with_capacity(total_orders);
+                    for (_, name, identity, _, _) in sell_orders.iter().chain(buy_orders.iter()) {
+                        let is_buy = identity.as_ref()
+                            .map(|(b, _)| *b)
+                            .unwrap_or_else(|| is_buy_bazaar_order_name(name));
+                        let clean = clean_order_item_name(name, identity);
+                        ingame_orders.push((clean, is_buy));
+                    }
+                    let _ = state.event_tx.send(BotEvent::BazaarOrdersSnapshot { ingame_orders });
+                }
 
                 // In collect-only mode, ONLY click claimable orders.  Open
                 // (unfilled) orders have nothing to collect and clicking them

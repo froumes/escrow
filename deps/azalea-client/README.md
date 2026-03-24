@@ -1,5 +1,1 @@
-# `azalea-client`
-
-A library that can mimic everything that a normal Minecraft client can do.
-
-To make a bot with higher-level functions, consider using the `azalea` crate instead.
+# azalea-client (patched)\n\nLocally patched copy of azalea-client 0.15.1.\nOnly change: UPDATE_DURATION_TARGET from 60fps to 300fps in client.rs.
