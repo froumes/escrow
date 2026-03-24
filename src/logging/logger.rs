@@ -1,4 +1,5 @@
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -99,10 +100,15 @@ fn rotate_previous_latest_log(logs_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pre-compiled regex for stripping Minecraft §-color codes.  Compiled once on
+/// first use instead of on every call, avoiding ~1 ms of regex compilation overhead
+/// per invocation (significant during rapid chat/lore processing).
+static COLOR_CODE_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"§[0-9a-fk-or]").unwrap());
+
 /// Remove Minecraft color codes from a string
 pub fn remove_color_codes(text: &str) -> String {
-    let re = regex::Regex::new(r"§[0-9a-fk-or]").unwrap();
-    re.replace_all(text, "").to_string()
+    COLOR_CODE_RE.replace_all(text, "").to_string()
 }
 
 /// Convert Minecraft color codes to ANSI color codes for terminal display
