@@ -14,6 +14,7 @@ use azalea_protocol::packets::game::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
+use azalea_client::inventory::{MenuOpenedEvent, SetContainerContentEvent};
 use bevy_app::AppExit;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -85,6 +86,175 @@ static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
 #[cfg(test)]
 static SOLD_BUYER_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)").expect("valid sold-buyer regex"));
+
+// ---------------------------------------------------------------------------
+// Bevy Plugin: PacketAcceleratorPlugin
+//
+// Registers ECS observers for MenuOpenedEvent and SetContainerContentEvent
+// that fire DURING the ECS frame (in apply_deferred, between PreUpdate and
+// Update).  This is significantly earlier than the Event::Packet pipeline
+// which only delivers events AFTER the frame completes:
+//
+//   Event::Packet path:
+//     PreUpdate (read_packets) → Update (packet_listener) → channel →
+//     event_copying_task → dispatch loop → spawn handler → handler runs
+//
+//   Observer path (this plugin):
+//     PreUpdate (read_packets → process_packet → commands.trigger) →
+//     apply_deferred → observer fires → Notify set
+//     → After frame: waiting task resumes immediately
+//
+// On busy servers (many entities/chunks/events), the Event::Packet path
+// can add 20-70 ms of pipeline delay on top of network RTT.  The observer
+// path eliminates this overhead for time-critical purchase operations.
+//
+// ## Anti-Cheat Safety Analysis
+//
+// This plugin is safe and will NOT trigger Hypixel anti-cheat because:
+//
+// 1. **No new packets sent** — The plugin only fires Notify signals earlier.
+//    It does NOT send any packets to the server.  The actual buy-click path
+//    (click_window_slot) is completely unchanged.
+//
+// 2. **gold_nugget gate unchanged** — The buy-click is still gated on
+//    slot 31 containing gold_nugget (see handle_window_interaction).
+//    Clicking before the item loads ("impossible action") is still
+//    impossible because the slot check runs before any click.
+//
+// 3. **Standard Minecraft protocol** — All clicks use normal
+//    ServerboundContainerClick packets with correct window IDs, slot
+//    numbers, and state IDs.  No packet modification or forging.
+//
+// 4. **TCP ordering guarantees safety** — The server sends OpenScreen →
+//    client detects it → client clicks.  Because TCP preserves order,
+//    the server will always have finished sending the window before it
+//    receives the client's click response.  Faster client-side detection
+//    cannot produce out-of-order packets.
+//
+// 5. **Timing within normal variance** — The 20-70ms improvement is well
+//    within normal network latency variance.  A player with 30ms ping
+//    naturally has 70ms lower latency than one with 100ms ping.
+//    The accelerator just removes internal pipeline overhead so the bot
+//    performs as its network latency allows, same as any other client.
+//
+// 6. **Pre-existing behavior** — The fast account (same server, different
+//    bot instance) already operates at the accelerated speed (~58ms).
+//    This plugin brings the slow path (~128ms) to parity by eliminating
+//    Azalea's internal Event::Packet channel overhead.
+// ---------------------------------------------------------------------------
+
+/// Information about the most recently opened window, set by the ECS observer.
+#[derive(Clone, Debug)]
+pub struct WindowOpenInfo {
+    pub window_id: i32,
+    pub title: String,
+    pub timestamp: std::time::Instant,
+}
+
+/// Shared bridge between the Bevy ECS observers and async tokio tasks.
+/// The ECS observers write data here; the purchase handler reads it.
+#[derive(Clone, bevy_ecs::prelude::Resource)]
+struct PacketAcceleratorBridge {
+    /// Fired when any window opens (MenuOpenedEvent observer).
+    window_open_notify: Arc<tokio::sync::Notify>,
+    /// Most recent window open info (set by MenuOpenedEvent observer).
+    window_open_info: Arc<RwLock<Option<WindowOpenInfo>>>,
+    /// Fired when container content is set (SetContainerContentEvent observer).
+    slot_data_notify: Arc<tokio::sync::Notify>,
+}
+
+/// Bevy Plugin that registers ECS-level observers for instant packet detection.
+pub struct PacketAcceleratorPlugin {
+    bridge: PacketAcceleratorBridge,
+}
+
+impl PacketAcceleratorPlugin {
+    fn new(
+        window_open_notify: Arc<tokio::sync::Notify>,
+        window_open_info: Arc<RwLock<Option<WindowOpenInfo>>>,
+        slot_data_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            bridge: PacketAcceleratorBridge {
+                window_open_notify,
+                window_open_info,
+                slot_data_notify,
+            },
+        }
+    }
+}
+
+impl bevy_app::Plugin for PacketAcceleratorPlugin {
+    fn build(&self, app: &mut bevy_app::App) {
+        app.insert_resource(self.bridge.clone());
+        app.add_observer(on_menu_opened);
+        app.add_observer(on_container_set_content);
+        // Add a system in Update that logs slow ECS frames.  On busy servers
+        // the schedule may take >25 ms, which directly increases window/
+        // packet detection latency.  The 25 ms threshold (vs the 16.7 ms
+        // 60-fps target) avoids noisy warnings from minor jitter while still
+        // flagging frames that materially impact purchase timing.
+        app.add_systems(bevy_app::Update, ecs_frame_timing_system);
+    }
+}
+
+/// Threshold in ms beyond which an ECS frame is considered slow.  Chosen to be
+/// above the 16.7 ms (60 fps) target with enough margin to filter out minor
+/// jitter, while still flagging frames that materially impact purchase timing.
+const SLOW_FRAME_THRESHOLD_MS: f64 = 25.0;
+
+/// Bevy system that tracks ECS frame durations and warns about slow frames.
+/// Runs once per Update cycle (nominally 60 fps / 16.7 ms).  Frames taking
+/// longer than SLOW_FRAME_THRESHOLD_MS are logged because the extra latency
+/// (frame_ms − 16.7) directly delays window and packet detection.
+fn ecs_frame_timing_system(
+    mut last_frame_time: bevy_ecs::system::Local<Option<std::time::Instant>>,
+) {
+    let now = std::time::Instant::now();
+    if let Some(last) = *last_frame_time {
+        let frame_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+        if frame_ms > SLOW_FRAME_THRESHOLD_MS {
+            // Floor at 0.1 fps to avoid division-by-zero display artifacts.
+            let effective_fps = (1000.0 / frame_ms).max(0.1);
+            warn!(
+                "[ECS] Slow frame: {:.1}ms ({:.0}fps, target 60fps / 16.7ms). \
+                 Window detection latency is increased by ~{:.0}ms.",
+                frame_ms,
+                effective_fps,
+                frame_ms - 16.7
+            );
+        }
+    }
+    *last_frame_time = Some(now);
+}
+
+/// ECS Observer: fires during apply_deferred when the server sends OpenScreen.
+/// Sets the window info and notifies any waiting purchase handler task.
+fn on_menu_opened(
+    event: bevy_ecs::observer::On<MenuOpenedEvent>,
+    bridge: bevy_ecs::system::Res<PacketAcceleratorBridge>,
+) {
+    let ev = event.event();
+    let title = ev.title.to_string();
+    let window_id = ev.window_id;
+    *bridge.window_open_info.write() = Some(WindowOpenInfo {
+        window_id,
+        title,
+        timestamp: std::time::Instant::now(),
+    });
+    bridge.window_open_notify.notify_waiters();
+}
+
+/// ECS Observer: fires during apply_deferred when the server sends
+/// ContainerSetContent.  This is the same data that populates slot 31 in
+/// the BIN Auction View.  Notifying here lets the purchase handler react
+/// to slot data without waiting for the Event::Packet pipeline.
+fn on_container_set_content(
+    _event: bevy_ecs::observer::On<SetContainerContentEvent>,
+    bridge: bevy_ecs::system::Res<PacketAcceleratorBridge>,
+) {
+    bridge.slot_data_notify.notify_waiters();
+}
 
 /// Main bot client wrapper for Azalea
 /// 
@@ -385,6 +555,8 @@ impl BotClient {
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             freemoney: self.freemoney,
@@ -418,11 +590,20 @@ impl BotClient {
         
         // Build and start the client (this blocks until disconnection)
         let handler_state_clone = handler_state.clone();
+        // Create the PacketAcceleratorPlugin sharing the same Notify/info as BotClientState.
+        // The plugin registers ECS-level observers that fire DURING the frame
+        // (in apply_deferred), bypassing the multi-hop Event::Packet channel pipeline.
+        let accelerator_plugin = PacketAcceleratorPlugin::new(
+            handler_state.window_open_notify.clone(),
+            handler_state.window_open_info.clone(),
+            handler_state.slot_data_notify.clone(),
+        );
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new()
                 .expect("Failed to create tokio runtime for bot - this should never happen unless system resources are exhausted");
             rt.block_on(async move {
                 let exit_result = ClientBuilder::new()
+                    .add_plugins(accelerator_plugin)
                     .set_handler(event_handler)
                     .set_state(handler_state_clone)
                     .start(account, "mc.hypixel.net")
@@ -873,6 +1054,12 @@ pub struct BotClientState {
     /// Notified when ContainerSetSlot / ContainerSetContent arrives so the purchase
     /// handler can react instantly instead of polling every 10ms.
     pub slot_data_notify: Arc<tokio::sync::Notify>,
+    /// Notified by the ECS-level MenuOpenedEvent observer (PacketAcceleratorPlugin).
+    /// Fires during the ECS frame, bypassing the Event::Packet channel pipeline.
+    pub window_open_notify: Arc<tokio::sync::Notify>,
+    /// Most recent window open info, set by the ECS-level MenuOpenedEvent observer.
+    /// Contains window_id, title, and timestamp.
+    pub window_open_info: Arc<RwLock<Option<WindowOpenInfo>>>,
     /// Cached player-inventory JSON shared with BotClient for instant getInventory replies.
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
@@ -1006,6 +1193,8 @@ impl Default for BotClientState {
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_notify: Arc::new(tokio::sync::Notify::new()),
+            window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
@@ -2180,6 +2369,38 @@ async fn event_handler(
             // Handle specific packets for window open/close and inventory updates
             match packet.as_ref() {
                 ClientboundGamePacket::OpenScreen(open_screen) => {
+                    // Record the instant the OpenScreen packet reaches our
+                    // event handler via the Event::Packet channel pipeline.
+                    let event_handler_at = std::time::Instant::now();
+
+                    // If a purchase is in-flight, compare the ECS observer timestamp
+                    // (set by PacketAcceleratorPlugin during apply_deferred) with the
+                    // Event::Packet handler timestamp to measure pipeline overhead.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        // Read the observer timestamp, dropping the lock immediately.
+                        let observer_ts = state.window_open_info.read()
+                            .as_ref()
+                            .map(|info| info.timestamp);
+                        if let Some(obs_ts) = observer_ts {
+                            let observer_ms = obs_ts.duration_since(t0).as_secs_f64() * 1000.0;
+                            let pipeline_ms = event_handler_at
+                                .duration_since(obs_ts)
+                                .as_secs_f64() * 1000.0;
+                            info!(
+                                "[Timing] /viewauction → window: ECS observer {:.1}ms, \
+                                 Event::Packet handler {:.1}ms (+{:.1}ms pipeline overhead)",
+                                observer_ms, total_ms, pipeline_ms
+                            );
+                        } else {
+                            info!(
+                                "[Timing] /viewauction → OpenScreen handler: {:.1}ms \
+                                 (ECS observer did not fire — check PacketAcceleratorPlugin)",
+                                total_ms
+                            );
+                        }
+                    }
+
                     let window_id = open_screen.container_id;
                     let window_type = format!("{:?}", open_screen.menu_type);
                     let title = open_screen.title.to_string();
@@ -2191,6 +2412,20 @@ async fn event_handler(
                     *state.last_window_id.write() = window_id as u8;
                     
                     state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
+
+                    // Log the synchronous overhead of the OpenScreen handler
+                    // itself (title parsing + state writes + logging).  This
+                    // should be <1 ms; if it is significantly higher, a lock
+                    // contention problem exists.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        let handler_ms = event_handler_at.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        info!(
+                            "[Timing] OpenScreen handler overhead: {:.2}ms \
+                             (total since /viewauction: {:.1}ms)",
+                            handler_ms, total_ms
+                        );
+                    }
                     // Defer the (expensive) window-JSON rebuild so the event
                     // handler returns faster.  On the purchase path this is
                     // critical: ContainerSetContent may arrive in the very next
@@ -2318,6 +2553,16 @@ async fn event_handler(
                 }
                 
                 ClientboundGamePacket::ContainerSetContent(_content) => {
+                    // Log when ContainerSetContent arrives during a purchase
+                    // flow — this populates slot 31 and unblocks the buy-click.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        if *state.bot_state.read() == BotState::Purchasing {
+                            info!(
+                                "[Timing] /viewauction → ContainerSetContent: {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
                     // Wake the purchase handler FIRST so it can react to slot 31
                     // data on another thread without waiting for the inventory
                     // JSON rebuild.
@@ -2576,6 +2821,10 @@ async fn execute_command(
 
             info!("Sending chat command: {}", chat_command);
 
+            // Clear stale observer data from any previous window so the timing
+            // comparison in the OpenScreen handler is accurate for THIS purchase.
+            *state.window_open_info.write() = None;
+
             // Record buy-speed start time right before sending /viewauction
             // so the measurement covers command-send → coins-in-escrow (the
             // relevant metric), NOT flip-receive → escrow which includes
@@ -2808,12 +3057,30 @@ async fn handle_window_interaction(
                 // /viewauction is sent, so buy speed measures
                 // command-send → coins-in-escrow.
 
-                // ---- Wait for slot 31 before clicking ----
+                // Log the time from /viewauction to the spawned task
+                // actually starting.  The delta between this and the
+                // OpenScreen handler log shows the tokio::spawn overhead
+                // (typically <1 ms unless the runtime is saturated).
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    info!(
+                        "[Timing] /viewauction → interaction handler started: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
+                // ---- Wait for slot 31 before clicking (ANTI-CHEAT GATE) ----
                 // Do NOT click slot 31 or send skip-click until we know what
                 // item the server placed there.  Clicking on a non-interactive
                 // item (e.g. feather = loading placeholder) is an "impossible
                 // action" that can trigger Hypixel anti-cheat.  The buy-click
                 // and skip-click are sent AFTER gold_nugget is confirmed.
+                //
+                // The PacketAcceleratorPlugin fires slot_data_notify earlier
+                // (during ECS apply_deferred rather than via Event::Packet),
+                // which makes this loop exit ~20-70ms sooner on busy servers.
+                // This is safe because the gold_nugget check still runs before
+                // ANY click is sent — the accelerator just detects the server's
+                // ContainerSetContent packet faster, not before it arrives.
                 //
                 // Wait for ContainerSetContent / ContainerSetSlot to populate
                 // slot 31.  Uses a Notify that fires instantly when the packet
@@ -2847,6 +3114,20 @@ async fn handle_window_interaction(
                     }
                     kind
                 };
+
+                // Log when slot 31 data is ready — the delta between this
+                // and the interaction handler start shows how long we waited
+                // for ContainerSetContent / ContainerSetSlot.  When the
+                // server sends both OpenScreen and ContainerSetContent in the
+                // same TCP segment this is ~0 ms; otherwise it is one extra
+                // ECS cycle (~16.7 ms).
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    info!(
+                        "[Timing] /viewauction → slot 31 ready ({}): {:.1}ms",
+                        slot_31_kind,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
@@ -2988,12 +3269,25 @@ async fn handle_window_interaction(
                         }
                     }
                 } else if slot_31_kind.contains("gold_nugget") {
-                    // ---- Buyable auction ----
+                    // ---- Buyable auction (SAFE: gold_nugget confirmed) ----
                     // Now that we know slot 31 is gold_nugget (the buy button),
                     // send the buy-click.  Sending AFTER confirmation avoids
                     // clicking non-interactive items like feather (loading
                     // placeholder) which is an "impossible action" that can
                     // trigger Hypixel anti-cheat.
+                    //
+                    // Anti-cheat safety: This click only happens AFTER the
+                    // server has sent both OpenScreen AND ContainerSetContent
+                    // with gold_nugget in slot 31.  The PacketAcceleratorPlugin
+                    // reduces how long we wait to notice these packets, but the
+                    // click still occurs after the server has prepared the
+                    // window — which is exactly what a fast human player does.
+                    if let Some(t0) = *state.purchase_start_time.read() {
+                        info!(
+                            "[Timing] /viewauction → buy click sent: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     if state.fastbuy {
                         info!("[AH] gold_nugget confirmed — sending buy + skip (fastbuy)");
                     } else {
@@ -3063,6 +3357,14 @@ async fn handle_window_interaction(
                 // The terminal-failure chat handler or 5s GUI watchdog will
                 // clean up.
             } else if window_title.contains("Confirm Purchase") {
+                // Log time from /viewauction to Confirm Purchase window.
+                // This is the buy-click → server-processes → OpenScreen RTT.
+                if let Some(t0) = *state.purchase_start_time.read() {
+                    info!(
+                        "[Timing] /viewauction → Confirm Purchase opened: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 // If a skip-click was already sent for this window, don't fire a
                 // redundant reactive click — the pre-click packet should already be
                 // queued on the server for the same tick.
