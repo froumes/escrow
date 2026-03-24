@@ -35,10 +35,10 @@ pub struct TrackedBazaarOrder {
 #[derive(Clone)]
 pub struct BazaarOrderTracker {
     orders: Arc<RwLock<Vec<TrackedBazaarOrder>>>,
-    /// Stores (price_per_unit, amount) for the most recently collected buy order
-    /// per item, so that profit can be computed when the corresponding sell offer
-    /// is collected. If multiple buy orders for the same item are collected before
-    /// a sell, only the last buy cost is retained.
+    /// Stores (price_per_unit, amount) for all collected buy orders per item,
+    /// so that profit can be computed when the corresponding sell offer is
+    /// collected.  Multiple buy orders for the same item are accumulated
+    /// (weighted-average PPU) instead of overwriting.
     last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
 }
 
@@ -147,12 +147,54 @@ impl BazaarOrderTracker {
         removed
     }
 
+    /// Reconcile the tracker with the orders currently visible in-game.
+    ///
+    /// `ingame_orders` is the set of `(item_name, is_buy_order)` tuples taken
+    /// from the Bazaar Orders window during a ManageOrders cycle.  Any tracked
+    /// order whose item+type does **not** appear in this list is removed so the
+    /// web panel stays in sync with the actual in-game state.
+    ///
+    /// Returns the number of stale tracker entries removed.
+    pub fn reconcile_with_ingame(&self, ingame_orders: &[(String, bool)]) -> usize {
+        let ingame_set: std::collections::HashSet<(String, bool)> = ingame_orders
+            .iter()
+            .map(|(name, is_buy)| (normalize_for_match(name), *is_buy))
+            .collect();
+        let mut orders = self.orders.write();
+        let original_len = orders.len();
+        orders.retain(|o| {
+            ingame_set.contains(&(normalize_for_match(&o.item_name), o.is_buy_order))
+        });
+        let removed = original_len - orders.len();
+        drop(orders);
+        if removed > 0 {
+            self.save_orders_to_disk();
+        }
+        removed
+    }
+
     /// Record a collected buy order's cost so that profit can be computed
     /// when the corresponding sell offer for the same item is collected.
+    ///
+    /// If a buy cost already exists for this item (e.g. two buy orders filled
+    /// before a single sell offer is collected), the amounts are accumulated
+    /// and the price-per-unit is recomputed as a weighted average so that the
+    /// profit calculation accounts for **all** purchased units, not just the
+    /// last batch.
     pub fn record_buy_cost(&self, item_name: &str, price_per_unit: f64, amount: u64) {
-        self.last_buy_costs
-            .write()
-            .insert(normalize_for_match(item_name), (price_per_unit, amount));
+        let key = normalize_for_match(item_name);
+        let mut costs = self.last_buy_costs.write();
+        let entry = costs.entry(key).or_insert((0.0, 0));
+        let old_total_cost = entry.0 * entry.1 as f64;
+        let new_total_cost = price_per_unit * amount as f64;
+        let combined_amount = entry.1 + amount;
+        entry.0 = if combined_amount > 0 {
+            (old_total_cost + new_total_cost) / combined_amount as f64
+        } else {
+            0.0
+        };
+        entry.1 = combined_amount;
+        drop(costs);
         self.save_buy_costs_to_disk();
     }
 
@@ -394,5 +436,65 @@ mod tests {
         let (buy_ppu, buy_amount) = tracker.take_buy_cost("Coal").unwrap();
         let profit = (sell_ppu * sell_amount as f64) - (buy_ppu * buy_amount as f64);
         assert_eq!(profit, 1000.0);
+    }
+
+    #[test]
+    fn multiple_buy_orders_accumulate_cost() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // Two buy orders for the same item collected before the sell
+        tracker.record_buy_cost("Coal", 500.0, 10);
+        tracker.record_buy_cost("Coal", 500.0, 10);
+        // Sell 20x Coal @ 600 coins/unit
+        let (buy_ppu, buy_amount) = tracker.take_buy_cost("Coal").unwrap();
+        assert_eq!(buy_amount, 20);
+        assert!((buy_ppu - 500.0).abs() < 0.01);
+        let sell_total = 600.0 * 20.0;
+        let buy_total = buy_ppu * buy_amount as f64;
+        let profit = sell_total - buy_total;
+        // Expected: (600*20) - (500*20) = 12000 - 10000 = 2000
+        assert_eq!(profit, 2000.0);
+    }
+
+    #[test]
+    fn multiple_buy_orders_weighted_average() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // Buy 10 @ 500/unit, then 10 @ 510/unit
+        tracker.record_buy_cost("Diamond", 500.0, 10);
+        tracker.record_buy_cost("Diamond", 510.0, 10);
+        let (buy_ppu, buy_amount) = tracker.take_buy_cost("Diamond").unwrap();
+        assert_eq!(buy_amount, 20);
+        // Weighted avg = (500*10 + 510*10) / 20 = 10100 / 20 = 505
+        assert!((buy_ppu - 505.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn reconcile_removes_stale_orders() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Coal".into(), 10, 500.0, true);
+        tracker.add_order("Diamond".into(), 5, 1000.0, false);
+        tracker.add_order("Iron Ingot".into(), 64, 50.0, true);
+        assert_eq!(tracker.get_orders().len(), 3);
+
+        // In-game only has Coal BUY and Diamond SELL — Iron Ingot is stale
+        let ingame = vec![
+            ("Coal".to_string(), true),
+            ("Diamond".to_string(), false),
+        ];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 1);
+        let remaining = tracker.get_orders();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|o| o.item_name == "Coal" && o.is_buy_order));
+        assert!(remaining.iter().any(|o| o.item_name == "Diamond" && !o.is_buy_order));
+    }
+
+    #[test]
+    fn reconcile_case_insensitive() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Enchanted Coal Block".into(), 4, 30100.0, false);
+        let ingame = vec![("enchanted coal block".to_string(), false)];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        assert_eq!(tracker.get_orders().len(), 1);
     }
 }

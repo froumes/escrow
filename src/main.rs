@@ -958,6 +958,14 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                frikadellen_baf::bot::BotEvent::BazaarOrdersSnapshot { ingame_orders } => {
+                    // Reconcile the tracker with the orders actually visible
+                    // in the Bazaar Orders window so the web GUI stays in sync.
+                    let removed = bazaar_tracker_events.reconcile_with_ingame(&ingame_orders);
+                    if removed > 0 {
+                        info!("[BazaarOrders] Reconciled tracker: removed {} stale entries not found in-game", removed);
+                    }
+                }
             }
         }
     });

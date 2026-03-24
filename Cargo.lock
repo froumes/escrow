@@ -357,8 +357,6 @@ dependencies = [
 [[package]]
 name = "azalea-client"
 version = "0.15.1+mc1.21.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eae3437facd56ea9cb0ae5253b540d1cdb78db681cdfd7afb0d40dcc18dd4cbe"
 dependencies = [
  "async-compat",
  "azalea-auth",

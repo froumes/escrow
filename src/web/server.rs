@@ -107,6 +107,12 @@ struct CancelAuctionPayload {
 }
 
 #[derive(Deserialize)]
+struct CancelBzOrderPayload {
+    item_name: String,
+    is_buy_order: bool,
+}
+
+#[derive(Deserialize)]
 struct LoginPayload {
     password: String,
 }
@@ -263,6 +269,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/claim_purchases", axum::routing::post(claim_purchases))
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
+        .route("/api/cancel_bz_order", axum::routing::post(cancel_bz_order))
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
         .route("/api/config", get(get_config).post(save_config))
@@ -710,6 +717,35 @@ async fn claim_bz_orders(
     );
 
     (StatusCode::OK, "Claim bazaar orders command queued")
+}
+
+async fn cancel_bz_order(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<CancelBzOrderPayload>,
+) -> impl IntoResponse {
+    let order_type = if payload.is_buy_order { "BUY" } else { "SELL" };
+    info!(
+        "[WebGUI] Cancel bazaar order requested: '{}' ({})",
+        payload.item_name, order_type
+    );
+
+    let _ = s.chat_tx.send(format!(
+        "[BAF Web] Cancelling bazaar {} order: {}...",
+        order_type, payload.item_name
+    ));
+
+    // Remove the order from the tracker immediately so the web GUI reflects
+    // the intent.  The in-game cancellation happens asynchronously via
+    // ManageOrders and will fire BazaarOrderCancelled on success.
+    s.bazaar_tracker.remove_order(&payload.item_name, payload.is_buy_order);
+
+    s.command_queue.enqueue(
+        CommandType::ManageOrders { cancel_open: true },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Cancel bazaar order command queued")
 }
 
 // ── Active auctions ───────────────────────────────────────────
