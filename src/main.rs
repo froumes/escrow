@@ -35,6 +35,11 @@ const REJOIN_MAX_ATTEMPTS: u32 = 5;
 /// to arrive before computing and displaying the total.
 const BZ_LIST_DEBOUNCE_SECS: u64 = 2;
 
+/// Delay (seconds) before sending `/cofl bz l` after a SELL order is filled.
+/// Coflnet needs a brief window to register the completed flip in its database
+/// before the list is requested; 3 seconds covers typical processing latency.
+const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -978,7 +983,7 @@ async fn main() -> Result<()> {
                         let ws = ws_client_for_events.clone();
                         tokio::spawn(async move {
                             // Small delay to let Coflnet register the completed flip.
-                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS)).await;
                             let data_json = serde_json::json!("l").to_string();
                             let message = serde_json::json!({
                                 "type": "bz",
