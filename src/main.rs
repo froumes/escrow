@@ -1366,7 +1366,9 @@ async fn main() -> Result<()> {
                             // Also parse per-item detail for fallback profit lookup.
                             if let Some((item_name, item_profit, flip_count)) = parse_bz_list_flip_detail(&clean) {
                                 if let Ok(mut items) = bz_list_items.lock() {
-                                    items.insert(item_name, (item_profit, flip_count));
+                                    let entry = items.entry(item_name).or_insert((0, 0));
+                                    entry.0 += item_profit;
+                                    entry.1 += flip_count;
                                 }
                             }
                             let should_spawn_summary = {

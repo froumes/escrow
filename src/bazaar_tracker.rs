@@ -229,8 +229,8 @@ impl BazaarOrderTracker {
     pub fn get_bz_list_avg_profit(&self, item_name: &str) -> Option<i64> {
         let key = normalize_for_match(item_name);
         let data = self.bz_list_profits.read();
-        data.get(&key).map(|(total, count)| {
-            if *count > 0 { total / *count as i64 } else { *total }
+        data.get(&key).and_then(|(total, count)| {
+            if *count > 0 { Some(total / *count as i64) } else { None }
         })
     }
 
@@ -556,6 +556,15 @@ mod tests {
     fn bz_list_avg_profit_missing_item() {
         let tracker = BazaarOrderTracker::new_in_memory();
         assert!(tracker.get_bz_list_avg_profit("Nonexistent").is_none());
+    }
+
+    #[test]
+    fn bz_list_avg_profit_zero_count_returns_none() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut items = HashMap::new();
+        items.insert("Coal".to_string(), (50_000i64, 0u32));
+        tracker.set_bz_list_profits(items);
+        assert!(tracker.get_bz_list_avg_profit("Coal").is_none());
     }
 
     #[test]
