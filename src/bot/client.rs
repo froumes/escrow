@@ -324,6 +324,9 @@ pub struct BotClient {
     /// Set when inventory is full (stashed items / no space to claim).
     /// Shared with `BotClientState` so `main.rs` can check before enqueuing ManageOrders.
     inventory_full: Arc<AtomicBool>,
+    /// Cached count of empty player inventory slots (shared with BotClientState).
+    /// Updated on every inventory rebuild.
+    cached_empty_player_slots: Arc<std::sync::atomic::AtomicU8>,
     /// Shared reference to the command queue so the startup workflow can enqueue
     /// commands (CheckCookie, ManageOrders, ClaimSoldItem, ClaimPurchasedItem)
     /// through the proper queue instead of directly driving bot state.
@@ -443,6 +446,7 @@ impl BotClient {
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
             inventory_full: Arc::new(AtomicBool::new(false)),
+            cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
@@ -541,6 +545,7 @@ impl BotClient {
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: self.inventory_full.clone(),
+            cached_empty_player_slots: self.cached_empty_player_slots.clone(),
             insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
             active_auction_listings: self.active_auction_listings.clone(),
@@ -762,9 +767,21 @@ impl BotClient {
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
-    /// Used by `main.rs` to skip BUY orders and defer claiming.
+    /// Also checks the cached empty-slot count: if the inventory has free
+    /// slots the flag is auto-cleared so stale "stashed away" reminders
+    /// don't block BUY orders indefinitely.
     pub fn is_inventory_full(&self) -> bool {
-        self.inventory_full.load(Ordering::Relaxed)
+        if !self.inventory_full.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Reality-check: the flag might be stale after a manual instasell.
+        let empty = self.cached_empty_player_slots.load(Ordering::Relaxed);
+        if empty >= 2 {
+            info!("[Inventory] Clearing stale inventory_full flag — cached {} empty slots", empty);
+            self.inventory_full.store(false, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     /// Clear the inventory-full flag.  Called by the periodic order-check
@@ -1064,6 +1081,10 @@ pub struct BotClientState {
     /// received.  The ManageOrders loop reads this flag to stop trying to collect
     /// and log the remaining orders to pending_claims.log.
     pub inventory_full: Arc<AtomicBool>,
+    /// Cached count of empty player inventory slots, updated on every inventory
+    /// rebuild (ContainerSetContent / ContainerSetSlot).  Used to verify the
+    /// inventory_full flag is not stale (e.g. after a manual instasell).
+    pub cached_empty_player_slots: Arc<std::sync::atomic::AtomicU8>,
     /// Item name to instasell via bazaar "Sell Instantly" when inventory is dominated
     /// by one stackable item type. Set by ManageOrders, consumed by InstaSelling handler.
     pub insta_sell_item: Arc<RwLock<Option<String>>>,
@@ -1190,6 +1211,7 @@ impl Default for BotClientState {
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             inventory_full: Arc::new(AtomicBool::new(false)),
+            cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
@@ -2263,23 +2285,35 @@ async fn event_handler(
                 state.inventory_full.store(true, Ordering::Relaxed);
             }
 
-            // Detect "You have X item(s) stashed away!" — Hypixel sends this when
-            // collected items went to stash because the inventory was full.
-            // Treat it the same as inventory_full so ManageOrders stops trying
-            // to collect BUY orders that have no room.
+            // Detect "You have X item(s) stashed away!" — Hypixel sends this both
+            // when items are newly stashed AND as a periodic reminder while any
+            // stashed items exist.  Only set inventory_full if the player
+            // inventory actually has very few free slots (≤ 2), because the
+            // reminder keeps firing long after the player frees space via
+            // instasell or other means.
             if clean_message.contains("stashed away") {
-                warn!("[ManageOrders] Items stashed — inventory effectively full");
-                state.inventory_full.store(true, Ordering::Relaxed);
+                let empty = count_empty_player_slots(&bot);
+                if empty <= 2 {
+                    warn!("[ManageOrders] Items stashed and inventory nearly full ({} empty slots)", empty);
+                    state.inventory_full.store(true, Ordering::Relaxed);
+                } else {
+                    debug!("[ManageOrders] Stashed-away reminder ignored — inventory has {} empty slots", empty);
+                }
             }
 
             // Detect "Inventory full? Don't forget to check out your Storage
             // inside the SkyBlock Menu!" — Hypixel sends this frequently when
-            // the player's inventory is full.  Set inventory_full so the bot
-            // stops accepting new BUY orders and defers claiming until space
-            // is freed.
+            // the player's inventory is full.  Only set the flag when inventory
+            // truly has very few free slots, in case the message arrives after
+            // the player freed space (e.g. via manual instasell).
             if clean_message.contains("Inventory full?") {
-                warn!("[ManageOrders] Inventory full hint detected");
-                state.inventory_full.store(true, Ordering::Relaxed);
+                let empty = count_empty_player_slots(&bot);
+                if empty <= 2 {
+                    warn!("[ManageOrders] Inventory full hint detected ({} empty slots)", empty);
+                    state.inventory_full.store(true, Ordering::Relaxed);
+                } else {
+                    debug!("[ManageOrders] Inventory-full hint ignored — inventory has {} empty slots", empty);
+                }
             }
 
             // Detect "You don't have anything to sell!" during SellingInventoryBz
@@ -4337,7 +4371,20 @@ async fn handle_window_interaction(
                 // However, stale orders that exceed the cancel-due-to-age threshold
                 // must still be selected so they can be cancelled.
                 let cancel_mins = state.bazaar_order_cancel_minutes_per_million;
-                let inv_full = state.inventory_full.load(Ordering::Relaxed);
+                let mut inv_full = state.inventory_full.load(Ordering::Relaxed);
+                // When the flag is set, double-check the actual inventory.
+                // The flag can become stale after a manual instasell or
+                // delayed Hypixel reminder ("stashed away").  If there are
+                // enough free slots to hold a stack, clear the flag and let
+                // BUY orders through.
+                if inv_full {
+                    let empty = count_empty_player_slots(&bot);
+                    if empty >= 2 {
+                        info!("[ManageOrders] inventory_full flag was set but {} empty slots found — clearing flag", empty);
+                        state.inventory_full.store(false, Ordering::Relaxed);
+                        inv_full = false;
+                    }
+                }
                 let chosen_order: Option<OrderEntry> = if !cancel_open {
                     // Always try claimable sell orders first (yield coins, no
                     // inventory space needed).
@@ -4378,14 +4425,25 @@ async fn handle_window_interaction(
 
                         // Skip BUY orders when inventory is full (no room for items).
                         // Exception: cancel_open mode still clicks to cancel.
-                        if order_is_buy && state.inventory_full.load(Ordering::Relaxed) && !cancel_open {
-                            warn!("[ManageOrders] Inventory full — skipping BUY order \"{}\"", order_name);
-                            log_pending_claim(&order_name);
-                            persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                            send_raw_close(bot, window_id);
-                            *state.manage_orders_deadline.write() = None;
-                            *state.bot_state.write() = BotState::Idle;
-                            return;
+                        // Re-check actual inventory to catch space freed by manual
+                        // instasell or other actions since the flag was set.
+                        if order_is_buy && !cancel_open {
+                            let still_full = state.inventory_full.load(Ordering::Relaxed);
+                            if still_full {
+                                let empty = count_empty_player_slots(&bot);
+                                if empty >= 2 {
+                                    info!("[ManageOrders] inventory_full flag stale — {} empty slots, proceeding with BUY order \"{}\"", empty, order_name);
+                                    state.inventory_full.store(false, Ordering::Relaxed);
+                                } else {
+                                    warn!("[ManageOrders] Inventory full ({} empty slots) — skipping BUY order \"{}\"", empty, order_name);
+                                    log_pending_claim(&order_name);
+                                    persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
+                                    send_raw_close(bot, window_id);
+                                    *state.manage_orders_deadline.write() = None;
+                                    *state.bot_state.write() = BotState::Idle;
+                                    return;
+                                }
+                            }
                         }
 
                         // Store context for the Order options handler (Branch C)
@@ -5304,6 +5362,23 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
 
     debug!("[Inventory] Rebuilt cache: {} non-empty slots — {}", slot_descriptions.len(), slot_descriptions.join(", "));
 
+    // Update cached empty-slot count.  The player inventory occupies mineflayer slots 9..44.
+    // Count nulls in slots_array which correspond to empty (air) slots.
+    let empty_count = (9..=44usize)
+        .filter(|&s| slots_array.get(s).map(|v| v.is_null()).unwrap_or(true))
+        .count() as u8;
+    let prev = state.cached_empty_player_slots.swap(empty_count, Ordering::Relaxed);
+    if prev != empty_count {
+        debug!("[Inventory] Empty player slots: {} → {}", prev, empty_count);
+    }
+    // Auto-clear a stale inventory_full flag when inventory clearly has space.
+    // This handles manual instasells, external trades, and any other action that
+    // frees inventory without going through the bot's InstaSell flow.
+    if empty_count >= 2 && state.inventory_full.load(Ordering::Relaxed) {
+        info!("[Inventory] Clearing stale inventory_full flag — {} empty slots detected", empty_count);
+        state.inventory_full.store(false, Ordering::Relaxed);
+    }
+
     let inventory_json = serde_json::json!({
         "id": 0,
         "slots": slots_array,
@@ -5713,6 +5788,16 @@ fn log_pending_claim(order_name: &str) {
         Err(e) => warn!("[ManageOrders] Failed to write pending_claims.log: {}", e),
     }
     warn!("[ManageOrders] Logged unclaimed order \"{}\" to {:?}", order_name, log_path);
+}
+
+/// Count the number of empty (air) slots in the player's inventory (36 slots).
+/// Used to verify whether inventory is actually full before skipping BUY orders.
+fn count_empty_player_slots(bot: &Client) -> usize {
+    let menu = bot.menu();
+    let all_slots = menu.slots();
+    let player_range = menu.player_slots_range();
+    let player_slots = &all_slots[player_range];
+    player_slots.iter().filter(|s| s.is_empty()).count()
 }
 
 /// Returns the display name of the item that occupies more than half of the player's
