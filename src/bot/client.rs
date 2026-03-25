@@ -85,6 +85,11 @@ const ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS: u64 = 8;
 /// After this many failed cancel clicks in Order options, the order is skipped
 /// so the bot doesn't get stuck retrying indefinitely.
 const MAX_CANCEL_RETRIES: u32 = 5;
+/// Minimum number of empty player-inventory slots required to consider the
+/// inventory "not full".  Used when verifying the `inventory_full` flag
+/// against actual slot counts so stale flags are auto-cleared after a manual
+/// instasell or any other action that frees space.
+const MIN_FREE_SLOTS_FOR_BUY: u8 = 2;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -776,7 +781,7 @@ impl BotClient {
         }
         // Reality-check: the flag might be stale after a manual instasell.
         let empty = self.cached_empty_player_slots.load(Ordering::Relaxed);
-        if empty >= 2 {
+        if empty >= MIN_FREE_SLOTS_FOR_BUY {
             info!("[Inventory] Clearing stale inventory_full flag — cached {} empty slots", empty);
             self.inventory_full.store(false, Ordering::Relaxed);
             return false;
@@ -2293,7 +2298,7 @@ async fn event_handler(
             // instasell or other means.
             if clean_message.contains("stashed away") {
                 let empty = count_empty_player_slots(&bot);
-                if empty <= 2 {
+                if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
                     warn!("[ManageOrders] Items stashed and inventory nearly full ({} empty slots)", empty);
                     state.inventory_full.store(true, Ordering::Relaxed);
                 } else {
@@ -2308,7 +2313,7 @@ async fn event_handler(
             // the player freed space (e.g. via manual instasell).
             if clean_message.contains("Inventory full?") {
                 let empty = count_empty_player_slots(&bot);
-                if empty <= 2 {
+                if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
                     warn!("[ManageOrders] Inventory full hint detected ({} empty slots)", empty);
                     state.inventory_full.store(true, Ordering::Relaxed);
                 } else {
@@ -4379,7 +4384,7 @@ async fn handle_window_interaction(
                 // BUY orders through.
                 if inv_full {
                     let empty = count_empty_player_slots(&bot);
-                    if empty >= 2 {
+                    if empty >= MIN_FREE_SLOTS_FOR_BUY as usize {
                         info!("[ManageOrders] inventory_full flag was set but {} empty slots found — clearing flag", empty);
                         state.inventory_full.store(false, Ordering::Relaxed);
                         inv_full = false;
@@ -4431,7 +4436,7 @@ async fn handle_window_interaction(
                             let still_full = state.inventory_full.load(Ordering::Relaxed);
                             if still_full {
                                 let empty = count_empty_player_slots(&bot);
-                                if empty >= 2 {
+                                if empty >= MIN_FREE_SLOTS_FOR_BUY as usize {
                                     info!("[ManageOrders] inventory_full flag stale — {} empty slots, proceeding with BUY order \"{}\"", empty, order_name);
                                     state.inventory_full.store(false, Ordering::Relaxed);
                                 } else {
@@ -5374,7 +5379,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     // Auto-clear a stale inventory_full flag when inventory clearly has space.
     // This handles manual instasells, external trades, and any other action that
     // frees inventory without going through the bot's InstaSell flow.
-    if empty_count >= 2 && state.inventory_full.load(Ordering::Relaxed) {
+    if empty_count >= MIN_FREE_SLOTS_FOR_BUY && state.inventory_full.load(Ordering::Relaxed) {
         info!("[Inventory] Clearing stale inventory_full flag — {} empty slots detected", empty_count);
         state.inventory_full.store(false, Ordering::Relaxed);
     }
