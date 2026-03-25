@@ -30,6 +30,11 @@ const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
 /// backoff does not grow unbounded.
 const REJOIN_MAX_ATTEMPTS: u32 = 5;
 
+/// Debounce delay before displaying the `/cofl bz l` profit summary (seconds).
+/// Coflnet sends each flip as a separate chat message; we wait for the full list
+/// to arrive before computing and displaying the total.
+const BZ_LIST_DEBOUNCE_SECS: u64 = 2;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -1293,7 +1298,7 @@ async fn main() -> Result<()> {
                                 let tx = chat_tx_ws.clone();
                                 tokio::spawn(async move {
                                     // Wait for the full list to arrive.
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_DEBOUNCE_SECS)).await;
                                     if let Ok(acc) = accum.lock() {
                                         let (total, count, _) = *acc;
                                         if count > 0 {
