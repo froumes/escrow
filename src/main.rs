@@ -30,6 +30,11 @@ const REJOIN_MAX_BACKOFF_SECS: u64 = 300;
 /// backoff does not grow unbounded.
 const REJOIN_MAX_ATTEMPTS: u32 = 5;
 
+/// Debounce delay before displaying the `/cofl bz l` profit summary (seconds).
+/// Coflnet sends each flip as a separate chat message; we wait for the full list
+/// to arrive before computing and displaying the total.
+const BZ_LIST_DEBOUNCE_SECS: u64 = 2;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -111,6 +116,21 @@ fn parse_short_number(s: &str) -> Option<i64> {
     };
     let val: f64 = num_part.parse().ok()?;
     Some((val * multiplier) as i64)
+}
+
+/// Parse a single flip line from `/cofl bz l` output and return the profit.
+///
+/// Expected format (color-stripped):
+///   `"2xJungle Key: 1.05M -> 287K => -768K(1)"`
+///   `"128xWorm Membrane: 7.16M -> 7.91M => 741K(7)"`
+///
+/// The profit is the value between `=> ` and `(`.
+fn parse_bz_list_flip_profit(line: &str) -> Option<i64> {
+    let arrow_idx = line.find("=> ")?;
+    let after_arrow = &line[arrow_idx + 3..];
+    let paren_idx = after_arrow.find('(')?;
+    let profit_str = after_arrow[..paren_idx].trim();
+    parse_short_number(profit_str)
 }
 
 fn should_enqueue_periodic_auction_claim(
@@ -861,9 +881,25 @@ async fn main() -> Result<()> {
                     };
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order collected: {} ({})", item_name, order_type);
+                    // Build the collection message with prices and optional profit.
+                    let price_info = if let Some(ref order) = order_data {
+                        let total = order.price_per_unit * order.amount as f64;
+                        format!(" §7({}x @ §6{}§7 = §6{}§7 coins)",
+                            order.amount,
+                            format_coins_f64(order.price_per_unit),
+                            format_coins_f64(total))
+                    } else {
+                        String::new()
+                    };
+                    let profit_info = if let Some(profit) = opt_profit {
+                        let (color, sign) = if profit >= 0 { ("§a", "+") } else { ("§c", "") };
+                        format!(" §7→ {}{}{}§7 profit", color, sign, format_coins(profit))
+                    } else {
+                        String::new()
+                    };
                     let baf_msg = format!(
-                        "§f[§4BAF§f]: §a✅ [BZ] {}§7 order collected: §r{}",
-                        if is_buy_order { "BUY" } else { "SELL" }, item_name
+                        "§f[§4BAF§f]: §a✅ [BZ] {}§7 order collected: §r{}{}{}",
+                        if is_buy_order { "BUY" } else { "SELL" }, item_name, price_info, profit_info
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -988,6 +1024,11 @@ async fn main() -> Result<()> {
     let license_default_sent_ws = license_default_sent.clone();
     let ingame_name_ws = ingame_name.clone();
     let bazaar_tracker_ws = bazaar_tracker.clone();
+    // Accumulator for `/cofl bz l` output: (total_profit, flip_count, last_update).
+    // Reset when "Last Completed Bazaar Flips" header is seen; each parsed flip
+    // line adds to the total.  A debounce task displays the summary after 2s idle.
+    let bz_list_accum: Arc<std::sync::Mutex<(i64, usize, std::time::Instant)>> =
+        Arc::new(std::sync::Mutex::new((0, 0, std::time::Instant::now())));
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1226,6 +1267,52 @@ async fn main() -> Result<()> {
                                     warn!("[LicenseDefault] Failed to set default license: {}", e);
                                 }
                             });
+                        }
+                    }
+                    // ---- `/cofl bz l` output parsing ----
+                    // Coflnet sends "Last Completed Bazaar Flips" followed by lines like:
+                    //   "2xJungle Key: 1.05M -> 287K => -768K(1)"
+                    // Parse each flip line's profit and accumulate a running total.
+                    {
+                        let clean = frikadellen_baf::utils::remove_minecraft_colors(&msg);
+                        if clean.contains("Last Completed Bazaar Flips") {
+                            // Header line — reset the accumulator.
+                            if let Ok(mut acc) = bz_list_accum.lock() {
+                                *acc = (0, 0, std::time::Instant::now());
+                            }
+                        } else if let Some(profit) = parse_bz_list_flip_profit(&clean) {
+                            let should_spawn_summary = {
+                                if let Ok(mut acc) = bz_list_accum.lock() {
+                                    acc.0 += profit;
+                                    acc.1 += 1;
+                                    acc.2 = std::time::Instant::now();
+                                    // Only spawn a summary task for the first flip
+                                    // to avoid many duplicate summary outputs.
+                                    acc.1 == 1
+                                } else {
+                                    false
+                                }
+                            };
+                            if should_spawn_summary {
+                                let accum = bz_list_accum.clone();
+                                let tx = chat_tx_ws.clone();
+                                tokio::spawn(async move {
+                                    // Wait for the full list to arrive.
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_DEBOUNCE_SECS)).await;
+                                    if let Ok(acc) = accum.lock() {
+                                        let (total, count, _) = *acc;
+                                        if count > 0 {
+                                            let (color, sign) = if total >= 0 { ("§a", "+") } else { ("§c", "") };
+                                            let summary = format!(
+                                                "§f[§4BAF§f]: §6[BZ List] §7{} flips, total profit: {}{}{}",
+                                                count, color, sign, format_coins(total)
+                                            );
+                                            print_mc_chat(&summary);
+                                            let _ = tx.send(summary);
+                                        }
+                                    }
+                                });
+                            }
                         }
                     }
                     // Try to parse the Coflnet chat message as a bazaar flip recommendation.

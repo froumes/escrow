@@ -194,43 +194,7 @@ impl bevy_app::Plugin for PacketAcceleratorPlugin {
         app.insert_resource(self.bridge.clone());
         app.add_observer(on_menu_opened);
         app.add_observer(on_container_set_content);
-        // Add a system in Update that logs slow ECS frames.  On busy servers
-        // the schedule may take >8 ms, which directly increases window/
-        // packet detection latency.  The 8 ms threshold (vs the 3.3 ms
-        // 300-fps target) avoids noisy warnings from minor jitter while still
-        // flagging frames that materially impact purchase timing.
-        app.add_systems(bevy_app::Update, ecs_frame_timing_system);
     }
-}
-
-/// Threshold in ms beyond which an ECS frame is considered slow.  Chosen to be
-/// above the 3.3 ms (300 fps) target with enough margin to filter out minor
-/// jitter, while still flagging frames that materially impact purchase timing.
-const SLOW_FRAME_THRESHOLD_MS: f64 = 8.0;
-
-/// Bevy system that tracks ECS frame durations and warns about slow frames.
-/// Runs once per Update cycle (nominally 300 fps / 3.3 ms).  Frames taking
-/// longer than SLOW_FRAME_THRESHOLD_MS are logged because the extra latency
-/// (frame_ms − 3.3) directly delays window and packet detection.
-fn ecs_frame_timing_system(
-    mut last_frame_time: bevy_ecs::system::Local<Option<std::time::Instant>>,
-) {
-    let now = std::time::Instant::now();
-    if let Some(last) = *last_frame_time {
-        let frame_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-        if frame_ms > SLOW_FRAME_THRESHOLD_MS {
-            // Floor at 0.1 fps to avoid division-by-zero display artifacts.
-            let effective_fps = (1000.0 / frame_ms).max(0.1);
-            warn!(
-                "[ECS] Slow frame: {:.1}ms ({:.0}fps, target 300fps / 3.3ms). \
-                 Window detection latency is increased by ~{:.0}ms.",
-                frame_ms,
-                effective_fps,
-                frame_ms - 3.3
-            );
-        }
-    }
-    *last_frame_time = Some(now);
 }
 
 /// ECS Observer: fires during apply_deferred when the server sends OpenScreen.
@@ -2904,7 +2868,7 @@ async fn execute_command(
             // Safe: commands execute sequentially from the queue processor.
             *state.purchase_start_time.write() = Some(std::time::Instant::now());
 
-            send_chat_command(bot, &chat_command);
+            send_raw_chat_command(bot, &chat_command);
 
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
             // local Instant later — and only when the auction turns out to be a
@@ -3313,7 +3277,7 @@ async fn handle_window_interaction(
                             info!("[AH] Bed timing: gold_nugget appeared, clicking slot 31");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             if *state.last_window_id.read() == window_id {
-                                click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                                send_raw_click(bot, window_id, 31);
                             }
                             break;
                         } else if current_kind.contains("potato") {
@@ -3328,7 +3292,7 @@ async fn handle_window_interaction(
                             if state.freemoney {
                                 debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
                                 if *state.last_window_id.read() == window_id {
-                                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                                    send_raw_click(bot, window_id, 31);
                                 }
                             } else {
                                 debug!("[AH] Bed timing: grace period active, waiting for gold_nugget");
@@ -3372,7 +3336,8 @@ async fn handle_window_interaction(
                     } else {
                         info!("[AH] gold_nugget confirmed — sending buy click");
                     }
-                    click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                    // Use raw connection to bypass ECS queue for the buy click.
+                    send_raw_click(bot, window_id, 31);
 
                     // Skip-click: only when fastbuy is explicitly enabled,
                     // pre-click slot 11 on the predicted Confirm Purchase
@@ -3384,24 +3349,13 @@ async fn handle_window_interaction(
                         // loss — only needed when we also send the skip-click,
                         // because a lost buy-click + queued confirm-click on a
                         // window that never opens is an impossible action.
-                        click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                        send_raw_click(bot, window_id, 31);
 
                         let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
                         info!("[AH] Fastbuy: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
                         state.skip_click_sent.store(true, Ordering::Relaxed);
-                        use azalea_protocol::packets::game::s_container_click::{
-                            ServerboundContainerClick as SkipClick,
-                            HashedStack as SkipHashed,
-                        };
-                        bot.write_packet(SkipClick {
-                            container_id: next_wid as i32,
-                            state_id: 0,
-                            slot_num: 11,
-                            button_num: 0,
-                            click_type: ClickType::Pickup,
-                            changed_slots: Default::default(),
-                            carried_item: SkipHashed(None),
-                        });
+                        // Use raw connection for the skip-click too.
+                        send_raw_click(bot, next_wid, 11);
                     }
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
@@ -3451,8 +3405,8 @@ async fn handle_window_interaction(
                 if skip_was_sent {
                     info!("[AH] Skip-click was sent — skipping reactive confirm click");
                 } else {
-                    // No skip-click — click confirm (slot 11) immediately.
-                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                    // No skip-click — click confirm (slot 11) immediately via raw connection.
+                    send_raw_click(bot, window_id, 11);
                 }
 
                 // When skip-click was sent, the server already has the confirm
@@ -3476,7 +3430,7 @@ async fn handle_window_interaction(
                     .map(|t| t.contains("Confirm Purchase"))
                     .unwrap_or(false)
                 {
-                    click_window_slot(bot, &state.last_window_id, window_id, 11).await;
+                    send_raw_click(bot, window_id, 11);
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
                 }
 
@@ -5914,15 +5868,8 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
     info!("Clicked slot {} in window {}", slot, window_id);
 }
 
-/// Send a chat command directly via `write_packet(ServerboundChatCommand)`,
-/// bypassing Azalea's message-based chat system.
-///
-/// `write_chat_packet` queues a Bevy Message that is only processed in the
-/// **next** ECS Update cycle (~3.3 ms at 300 fps).  By sending
-/// `ServerboundChatCommand` through the trigger-based `write_packet` path
-/// the packet reaches the TCP socket **immediately**, eliminating a full
-/// ECS cycle of send-side latency.  On the purchase path this saves ~3 ms
-/// per command.
+/// Send a chat command via `write_packet(ServerboundChatCommand)`, which uses
+/// the ECS trigger/observer path.  This is fine for non-critical commands.
 ///
 /// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
 /// The function strips it before putting the command string into the packet.
@@ -5934,6 +5881,59 @@ fn send_chat_command(bot: &Client, content: &str) {
     bot.write_packet(ServerboundChatCommand {
         command: command.to_string(),
     });
+}
+
+/// Send a chat command directly to the TCP socket via `with_raw_connection_mut`,
+/// completely bypassing the ECS command queue and trigger/observer pipeline.
+///
+/// `write_packet` queues a Bevy Trigger that is applied during `apply_deferred`,
+/// meaning the packet only reaches TCP when the ECS schedule processes commands.
+/// By writing to `RawConnection` directly, the packet is serialized and pushed
+/// into the TCP write buffer **immediately**, shaving off the entire ECS cycle
+/// overhead.  Use this for time-critical packets like `/viewauction`, buy clicks,
+/// and confirm clicks on the auction purchase path.
+///
+/// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
+fn send_raw_chat_command(bot: &Client, content: &str) {
+    let command = content.strip_prefix('/').unwrap_or_else(|| {
+        debug!("send_raw_chat_command called without leading '/' — sending as-is: {}", content);
+        content
+    });
+    let cmd_packet = ServerboundChatCommand {
+        command: command.to_string(),
+    };
+    bot.with_raw_connection_mut(|mut raw_conn| {
+        if let Err(e) = raw_conn.write(cmd_packet) {
+            error!("raw chat command write failed: {e}");
+        }
+    });
+}
+
+/// Send a container click packet directly to the TCP socket via
+/// `with_raw_connection_mut`, bypassing the ECS command queue.
+///
+/// Used for time-critical slot clicks (buy button, confirm button) on the
+/// auction purchase path where every millisecond matters.
+fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
+    use azalea_protocol::packets::game::s_container_click::{
+        ServerboundContainerClick,
+        HashedStack,
+    };
+    let packet = ServerboundContainerClick {
+        container_id: window_id as i32,
+        state_id: 0,
+        slot_num: slot,
+        button_num: 0,
+        click_type: ClickType::Pickup,
+        changed_slots: Default::default(),
+        carried_item: HashedStack(None),
+    };
+    bot.with_raw_connection_mut(|mut raw_conn| {
+        if let Err(e) = raw_conn.write(packet) {
+            error!("raw click write failed (window {} slot {}): {e}", window_id, slot);
+        }
+    });
+    info!("Raw-clicked slot {} in window {}", slot, window_id);
 }
 
 /// After clicking a Cancel button in a bazaar order management window, wait for
