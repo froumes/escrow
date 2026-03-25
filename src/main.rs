@@ -35,6 +35,11 @@ const REJOIN_MAX_ATTEMPTS: u32 = 5;
 /// to arrive before computing and displaying the total.
 const BZ_LIST_DEBOUNCE_SECS: u64 = 2;
 
+/// Delay (seconds) before sending `/cofl bz l` after a SELL order is filled.
+/// Coflnet needs a brief window to register the completed flip in its database
+/// before the list is requested; 3 seconds covers typical processing latency.
+const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
+
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
 /// - <100M → 2%
@@ -851,6 +856,8 @@ async fn main() -> Result<()> {
                             if is_buy_order { "BUY" } else { "SELL" }, item_name);
                     }
                     // Compute profit/loss for sell offers: sell_total - buy_total - tax.
+                    // This is used for the immediate chat display; the session profit
+                    // total is driven by `/cofl bz l` via set_bz_total().
                     // Bazaar tax is applied to sell proceeds (default 1.25%).
                     let bazaar_tax_rate = config_for_events.bazaar_tax_rate;
                     let opt_profit: Option<i64> = if !is_buy_order {
@@ -861,14 +868,14 @@ async fn main() -> Result<()> {
                             if let Some((buy_ppu, buy_amt)) = bazaar_tracker_events.take_buy_cost(&item_name) {
                                 let buy_total = buy_ppu * buy_amt as f64;
                                 let profit = (sell_after_tax - buy_total).round() as i64;
-                                profit_tracker_events.record_bz_profit(profit);
+                                // Session BZ profit is tracked via /cofl bz l (set_bz_total),
+                                // so we don't call record_bz_profit here.
                                 info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0}, profit: {}",
                                     item_name, sell_total, tax, bazaar_tax_rate, buy_total, profit);
                                 Some(profit)
                             } else {
-                                // No recorded buy cost — just record sell after tax as profit
+                                // No recorded buy cost — estimate sell after tax as profit
                                 let profit = sell_after_tax.round() as i64;
-                                profit_tracker_events.record_bz_profit(profit);
                                 info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no buy cost recorded, profit: {}",
                                     item_name, sell_total, tax, profit);
                                 Some(profit)
@@ -968,6 +975,27 @@ async fn main() -> Result<()> {
                     if !item_name.is_empty() {
                         bazaar_tracker_events.mark_filled(&item_name, is_buy_order);
                     }
+                    // When a SELL order is filled the flip is complete in Coflnet's
+                    // view.  Request `/cofl bz l` (with a short delay so Coflnet
+                    // finishes recording the flip) — the response handler will parse
+                    // profits and update the session BZ total via set_bz_total().
+                    if !is_buy_order {
+                        let ws = ws_client_for_events.clone();
+                        tokio::spawn(async move {
+                            // Small delay to let Coflnet register the completed flip.
+                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS)).await;
+                            let data_json = serde_json::json!("l").to_string();
+                            let message = serde_json::json!({
+                                "type": "bz",
+                                "data": data_json
+                            }).to_string();
+                            if let Err(e) = ws.send_message(&message).await {
+                                tracing::warn!("[BZList] Failed to send /cofl bz l: {}", e);
+                            } else {
+                                tracing::info!("[BZList] Auto-requested /cofl bz l after SELL fill");
+                            }
+                        });
+                    }
                     // A bazaar buy/sell order was filled — trigger a ManageOrders run
                     // immediately so the items are collected without waiting for the next
                     // periodic check.  Only enqueue if bazaar flips are enabled and no
@@ -1024,6 +1052,7 @@ async fn main() -> Result<()> {
     let license_default_sent_ws = license_default_sent.clone();
     let ingame_name_ws = ingame_name.clone();
     let bazaar_tracker_ws = bazaar_tracker.clone();
+    let profit_tracker_ws = profit_tracker.clone();
     // Accumulator for `/cofl bz l` output: (total_profit, flip_count, last_update).
     // Reset when "Last Completed Bazaar Flips" header is seen; each parsed flip
     // line adds to the total.  A debounce task displays the summary after 2s idle.
@@ -1296,12 +1325,17 @@ async fn main() -> Result<()> {
                             if should_spawn_summary {
                                 let accum = bz_list_accum.clone();
                                 let tx = chat_tx_ws.clone();
+                                let pt = profit_tracker_ws.clone();
                                 tokio::spawn(async move {
                                     // Wait for the full list to arrive.
                                     tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_DEBOUNCE_SECS)).await;
                                     if let Ok(acc) = accum.lock() {
                                         let (total, count, _) = *acc;
                                         if count > 0 {
+                                            // Use the `/cofl bz l` total as the authoritative
+                                            // BZ session profit (replaces local calculation).
+                                            pt.set_bz_total(total);
+                                            tracing::info!("[BZList] Updated BZ profit from /cofl bz l: {} coins ({} flips)", total, count);
                                             let (color, sign) = if total >= 0 { ("§a", "+") } else { ("§c", "") };
                                             let summary = format!(
                                                 "§f[§4BAF§f]: §6[BZ List] §7{} flips, total profit: {}{}{}",
