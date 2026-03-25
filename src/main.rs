@@ -910,11 +910,11 @@ async fn main() -> Result<()> {
                                 info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0}, profit: {}",
                                     item_name, sell_total, tax, bazaar_tax_rate, buy_total, profit);
                                 Some(profit)
-                            } else if let Some(avg_profit) = bazaar_tracker_events.get_bz_list_avg_profit(&item_name) {
-                                // Fallback: use average per-flip profit from /cofl bz l
-                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no local buy cost, using /cofl bz l avg profit: {}",
-                                    item_name, sell_total, tax, avg_profit);
-                                Some(avg_profit)
+                            } else if let Some(bz_list_profit) = bazaar_tracker_events.get_bz_list_profit(&item_name) {
+                                // Fallback: use profit from /cofl bz l for this item
+                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no local buy cost, using /cofl bz l profit: {}",
+                                    item_name, sell_total, tax, bz_list_profit);
+                                Some(bz_list_profit)
                             } else {
                                 // No buy cost recorded and no /cofl bz l data —
                                 // do NOT report sell proceeds as profit (the item

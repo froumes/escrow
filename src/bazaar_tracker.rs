@@ -224,14 +224,13 @@ impl BazaarOrderTracker {
         *self.bz_list_profits.write() = normalized;
     }
 
-    /// Return the average per-flip profit for an item from the latest `/cofl bz l`
-    /// data.  Used as a fallback when local buy-cost tracking has no data.
-    pub fn get_bz_list_avg_profit(&self, item_name: &str) -> Option<i64> {
+    /// Return the total profit for an item from the latest `/cofl bz l` data.
+    /// Used as a fallback when local buy-cost tracking has no data for a sell.
+    /// Returns the profit exactly as shown in the `/cofl bz l` list for that item.
+    pub fn get_bz_list_profit(&self, item_name: &str) -> Option<i64> {
         let key = normalize_for_match(item_name);
         let data = self.bz_list_profits.read();
-        data.get(&key).and_then(|(total, count)| {
-            if *count > 0 { Some(total / *count as i64) } else { None }
-        })
+        data.get(&key).map(|(total, _count)| *total)
     }
 
     // ── Persistence helpers ──
@@ -525,46 +524,46 @@ mod tests {
     }
 
     #[test]
-    fn bz_list_avg_profit_single_flip() {
+    fn bz_list_profit_single_flip() {
         let tracker = BazaarOrderTracker::new_in_memory();
         let mut items = HashMap::new();
         items.insert("Worm Membrane".to_string(), (100_000i64, 1u32));
         tracker.set_bz_list_profits(items);
-        assert_eq!(tracker.get_bz_list_avg_profit("Worm Membrane"), Some(100_000));
+        assert_eq!(tracker.get_bz_list_profit("Worm Membrane"), Some(100_000));
     }
 
     #[test]
-    fn bz_list_avg_profit_multiple_flips() {
+    fn bz_list_profit_multiple_flips_returns_total() {
         let tracker = BazaarOrderTracker::new_in_memory();
         let mut items = HashMap::new();
         items.insert("Worm Membrane".to_string(), (741_000i64, 7u32));
         tracker.set_bz_list_profits(items);
-        // 741_000 / 7 = 105_857
-        assert_eq!(tracker.get_bz_list_avg_profit("Worm Membrane"), Some(105_857));
+        // Returns total profit, not per-flip average
+        assert_eq!(tracker.get_bz_list_profit("Worm Membrane"), Some(741_000));
     }
 
     #[test]
-    fn bz_list_avg_profit_case_insensitive() {
+    fn bz_list_profit_case_insensitive() {
         let tracker = BazaarOrderTracker::new_in_memory();
         let mut items = HashMap::new();
         items.insert("Enchanted Coal Block".to_string(), (50_000i64, 2u32));
         tracker.set_bz_list_profits(items);
-        assert_eq!(tracker.get_bz_list_avg_profit("enchanted coal block"), Some(25_000));
+        assert_eq!(tracker.get_bz_list_profit("enchanted coal block"), Some(50_000));
     }
 
     #[test]
-    fn bz_list_avg_profit_missing_item() {
+    fn bz_list_profit_missing_item() {
         let tracker = BazaarOrderTracker::new_in_memory();
-        assert!(tracker.get_bz_list_avg_profit("Nonexistent").is_none());
+        assert!(tracker.get_bz_list_profit("Nonexistent").is_none());
     }
 
     #[test]
-    fn bz_list_avg_profit_zero_count_returns_none() {
+    fn bz_list_profit_zero_count_still_returns_total() {
         let tracker = BazaarOrderTracker::new_in_memory();
         let mut items = HashMap::new();
         items.insert("Coal".to_string(), (50_000i64, 0u32));
         tracker.set_bz_list_profits(items);
-        assert!(tracker.get_bz_list_avg_profit("Coal").is_none());
+        assert_eq!(tracker.get_bz_list_profit("Coal"), Some(50_000));
     }
 
     #[test]
@@ -573,13 +572,13 @@ mod tests {
         let mut items1 = HashMap::new();
         items1.insert("Coal".to_string(), (10_000i64, 1u32));
         tracker.set_bz_list_profits(items1);
-        assert!(tracker.get_bz_list_avg_profit("Coal").is_some());
+        assert!(tracker.get_bz_list_profit("Coal").is_some());
 
         // Second set replaces all data
         let mut items2 = HashMap::new();
         items2.insert("Diamond".to_string(), (20_000i64, 2u32));
         tracker.set_bz_list_profits(items2);
-        assert!(tracker.get_bz_list_avg_profit("Coal").is_none());
-        assert_eq!(tracker.get_bz_list_avg_profit("Diamond"), Some(10_000));
+        assert!(tracker.get_bz_list_profit("Coal").is_none());
+        assert_eq!(tracker.get_bz_list_profit("Diamond"), Some(20_000));
     }
 }
