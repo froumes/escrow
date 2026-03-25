@@ -138,6 +138,43 @@ fn parse_bz_list_flip_profit(line: &str) -> Option<i64> {
     parse_short_number(profit_str)
 }
 
+/// Parse a single flip line from `/cofl bz l` output and return item name,
+/// profit, and flip count.
+///
+/// Expected format (color-stripped):
+///   `"2xJungle Key: 1.05M -> 287K => -768K(1)"`
+///   `"128xWorm Membrane: 7.16M -> 7.91M => 741K(7)"`
+///
+/// Returns `(item_name, profit, flip_count)`.
+fn parse_bz_list_flip_detail(line: &str) -> Option<(String, i64, u32)> {
+    // Amount prefix: digits before 'x'
+    let x_idx = line.find('x')?;
+    let amount_str = line[..x_idx].trim();
+    if amount_str.is_empty() || !amount_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let rest = &line[x_idx + 1..];
+    let colon_idx = rest.find(':')?;
+    let item_name = rest[..colon_idx].trim().to_string();
+    if item_name.is_empty() {
+        return None;
+    }
+
+    // Profit: between "=> " and "("
+    let arrow_idx = rest.find("=> ")?;
+    let after_arrow = &rest[arrow_idx + 3..];
+    let paren_idx = after_arrow.find('(')?;
+    let profit_str = after_arrow[..paren_idx].trim();
+    let profit = parse_short_number(profit_str)?;
+
+    // Flip count: between "(" and ")"
+    let after_paren = &after_arrow[paren_idx + 1..];
+    let close_paren = after_paren.find(')')?;
+    let count: u32 = after_paren[..close_paren].trim().parse().ok()?;
+
+    Some((item_name, profit, count))
+}
+
 fn should_enqueue_periodic_auction_claim(
     bot_state: frikadellen_baf::types::BotState,
     queue_empty: bool,
@@ -873,12 +910,18 @@ async fn main() -> Result<()> {
                                 info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0}, profit: {}",
                                     item_name, sell_total, tax, bazaar_tax_rate, buy_total, profit);
                                 Some(profit)
+                            } else if let Some(avg_profit) = bazaar_tracker_events.get_bz_list_avg_profit(&item_name) {
+                                // Fallback: use average per-flip profit from /cofl bz l
+                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no local buy cost, using /cofl bz l avg profit: {}",
+                                    item_name, sell_total, tax, avg_profit);
+                                Some(avg_profit)
                             } else {
-                                // No recorded buy cost — estimate sell after tax as profit
-                                let profit = sell_after_tax.round() as i64;
-                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no buy cost recorded, profit: {}",
-                                    item_name, sell_total, tax, profit);
-                                Some(profit)
+                                // No buy cost recorded and no /cofl bz l data —
+                                // do NOT report sell proceeds as profit (the item
+                                // was not free).
+                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no buy cost or /cofl bz l data, skipping profit",
+                                    item_name, sell_total, tax);
+                                None
                             }
                         } else {
                             None
@@ -1058,6 +1101,10 @@ async fn main() -> Result<()> {
     // line adds to the total.  A debounce task displays the summary after 2s idle.
     let bz_list_accum: Arc<std::sync::Mutex<(i64, usize, std::time::Instant)>> =
         Arc::new(std::sync::Mutex::new((0, 0, std::time::Instant::now())));
+    // Per-item profit accumulator for `/cofl bz l` output, used as a fallback
+    // for per-order profit when local buy-cost tracking has no data.
+    let bz_list_items: Arc<std::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     
     tokio::spawn(async move {
         use frikadellen_baf::websocket::CoflEvent;
@@ -1302,14 +1349,26 @@ async fn main() -> Result<()> {
                     // Coflnet sends "Last Completed Bazaar Flips" followed by lines like:
                     //   "2xJungle Key: 1.05M -> 287K => -768K(1)"
                     // Parse each flip line's profit and accumulate a running total.
+                    // Per-item data is stored in the bazaar tracker so it can be used
+                    // as a fallback profit source when local buy-cost tracking has
+                    // no data for a sell.
                     {
                         let clean = frikadellen_baf::utils::remove_minecraft_colors(&msg);
                         if clean.contains("Last Completed Bazaar Flips") {
-                            // Header line — reset the accumulator.
+                            // Header line — reset the accumulators.
                             if let Ok(mut acc) = bz_list_accum.lock() {
                                 *acc = (0, 0, std::time::Instant::now());
                             }
+                            if let Ok(mut items) = bz_list_items.lock() {
+                                items.clear();
+                            }
                         } else if let Some(profit) = parse_bz_list_flip_profit(&clean) {
+                            // Also parse per-item detail for fallback profit lookup.
+                            if let Some((item_name, item_profit, flip_count)) = parse_bz_list_flip_detail(&clean) {
+                                if let Ok(mut items) = bz_list_items.lock() {
+                                    items.insert(item_name, (item_profit, flip_count));
+                                }
+                            }
                             let should_spawn_summary = {
                                 if let Ok(mut acc) = bz_list_accum.lock() {
                                     acc.0 += profit;
@@ -1324,6 +1383,8 @@ async fn main() -> Result<()> {
                             };
                             if should_spawn_summary {
                                 let accum = bz_list_accum.clone();
+                                let items_clone = bz_list_items.clone();
+                                let tracker = bazaar_tracker_ws.clone();
                                 let tx = chat_tx_ws.clone();
                                 let pt = profit_tracker_ws.clone();
                                 tokio::spawn(async move {
@@ -1343,6 +1404,14 @@ async fn main() -> Result<()> {
                                             );
                                             print_mc_chat(&summary);
                                             let _ = tx.send(summary);
+                                        }
+                                    }
+                                    // Push per-item profit data to the tracker for
+                                    // fallback use when computing sell order profit.
+                                    if let Ok(items) = items_clone.lock() {
+                                        if !items.is_empty() {
+                                            tracker.set_bz_list_profits(items.clone());
+                                            tracing::debug!("[BZList] Stored per-item profits for {} items", items.len());
                                         }
                                     }
                                 });
@@ -2415,7 +2484,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_short_number, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
     use frikadellen_baf::types::{BotState, CommandType};
 
     #[test]
@@ -2520,5 +2589,29 @@ mod tests {
         assert_eq!(parse_short_number("500"), Some(500));
         assert_eq!(parse_short_number("1,500,000"), Some(1_500_000));
         assert_eq!(parse_short_number("abc"), None);
+    }
+
+    #[test]
+    fn parse_bz_list_flip_detail_profit() {
+        let line = "2xJungle Key: 1.05M -> 287K => -768K(1)";
+        let (name, profit, count) = parse_bz_list_flip_detail(line).unwrap();
+        assert_eq!(name, "Jungle Key");
+        assert_eq!(profit, -768_000);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn parse_bz_list_flip_detail_multiple_flips() {
+        let line = "128xWorm Membrane: 7.16M -> 7.91M => 741K(7)";
+        let (name, profit, count) = parse_bz_list_flip_detail(line).unwrap();
+        assert_eq!(name, "Worm Membrane");
+        assert_eq!(profit, 741_000);
+        assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn parse_bz_list_flip_detail_no_match() {
+        assert!(parse_bz_list_flip_detail("Some random text").is_none());
+        assert!(parse_bz_list_flip_detail("Last Completed Bazaar Flips").is_none());
     }
 }
