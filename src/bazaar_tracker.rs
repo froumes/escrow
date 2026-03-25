@@ -40,6 +40,10 @@ pub struct BazaarOrderTracker {
     /// collected.  Multiple buy orders for the same item are accumulated
     /// (weighted-average PPU) instead of overwriting.
     last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
+    /// Per-item profit data from `/cofl bz l` output.
+    /// Maps normalized item name → (total_profit, flip_count).
+    /// Used as a fallback when local buy-cost tracking has no data for a sell.
+    bz_list_profits: Arc<RwLock<HashMap<String, (i64, u32)>>>,
 }
 
 impl BazaarOrderTracker {
@@ -47,6 +51,7 @@ impl BazaarOrderTracker {
         let tracker = Self {
             orders: Arc::new(RwLock::new(Vec::new())),
             last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+            bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
         };
         tracker.load_from_disk();
         tracker
@@ -59,6 +64,7 @@ impl BazaarOrderTracker {
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
             last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+            bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -206,6 +212,25 @@ impl BazaarOrderTracker {
             .remove(&normalize_for_match(item_name));
         self.save_buy_costs_to_disk();
         result
+    }
+
+    /// Replace the per-item profit map with data parsed from `/cofl bz l`.
+    /// Called after collecting all flip lines from a single `/cofl bz l` response.
+    pub fn set_bz_list_profits(&self, items: HashMap<String, (i64, u32)>) {
+        let normalized: HashMap<String, (i64, u32)> = items
+            .into_iter()
+            .map(|(k, v)| (normalize_for_match(&k), v))
+            .collect();
+        *self.bz_list_profits.write() = normalized;
+    }
+
+    /// Return the total profit for an item from the latest `/cofl bz l` data.
+    /// Used as a fallback when local buy-cost tracking has no data for a sell.
+    /// Returns the profit exactly as shown in the `/cofl bz l` list for that item.
+    pub fn get_bz_list_profit(&self, item_name: &str) -> Option<i64> {
+        let key = normalize_for_match(item_name);
+        let data = self.bz_list_profits.read();
+        data.get(&key).map(|(total, _count)| *total)
     }
 
     // ── Persistence helpers ──
@@ -496,5 +521,64 @@ mod tests {
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 0);
         assert_eq!(tracker.get_orders().len(), 1);
+    }
+
+    #[test]
+    fn bz_list_profit_single_flip() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut items = HashMap::new();
+        items.insert("Worm Membrane".to_string(), (100_000i64, 1u32));
+        tracker.set_bz_list_profits(items);
+        assert_eq!(tracker.get_bz_list_profit("Worm Membrane"), Some(100_000));
+    }
+
+    #[test]
+    fn bz_list_profit_multiple_flips_returns_total() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut items = HashMap::new();
+        items.insert("Worm Membrane".to_string(), (741_000i64, 7u32));
+        tracker.set_bz_list_profits(items);
+        // Returns total profit, not per-flip average
+        assert_eq!(tracker.get_bz_list_profit("Worm Membrane"), Some(741_000));
+    }
+
+    #[test]
+    fn bz_list_profit_case_insensitive() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut items = HashMap::new();
+        items.insert("Enchanted Coal Block".to_string(), (50_000i64, 2u32));
+        tracker.set_bz_list_profits(items);
+        assert_eq!(tracker.get_bz_list_profit("enchanted coal block"), Some(50_000));
+    }
+
+    #[test]
+    fn bz_list_profit_missing_item() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        assert!(tracker.get_bz_list_profit("Nonexistent").is_none());
+    }
+
+    #[test]
+    fn bz_list_profit_zero_count_still_returns_total() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut items = HashMap::new();
+        items.insert("Coal".to_string(), (50_000i64, 0u32));
+        tracker.set_bz_list_profits(items);
+        assert_eq!(tracker.get_bz_list_profit("Coal"), Some(50_000));
+    }
+
+    #[test]
+    fn bz_list_profits_replaced_on_new_set() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut items1 = HashMap::new();
+        items1.insert("Coal".to_string(), (10_000i64, 1u32));
+        tracker.set_bz_list_profits(items1);
+        assert!(tracker.get_bz_list_profit("Coal").is_some());
+
+        // Second set replaces all data
+        let mut items2 = HashMap::new();
+        items2.insert("Diamond".to_string(), (20_000i64, 2u32));
+        tracker.set_bz_list_profits(items2);
+        assert!(tracker.get_bz_list_profit("Coal").is_none());
+        assert_eq!(tracker.get_bz_list_profit("Diamond"), Some(20_000));
     }
 }
