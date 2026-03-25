@@ -63,6 +63,15 @@ impl ProfitTracker {
         }
     }
 
+    /// Replace the BZ total with an authoritative value (e.g. from `/cofl bz l`
+    /// accumulated profit) and record a new data-point so the chart updates.
+    pub fn set_bz_total(&self, total: i64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.bz_total = total;
+            inner.bz_points.push((now_unix(), total));
+        }
+    }
+
     /// Get all AH profit data points.
     pub fn ah_points(&self) -> Vec<ProfitPoint> {
         self.inner
