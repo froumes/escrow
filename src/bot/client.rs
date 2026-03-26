@@ -5832,7 +5832,12 @@ fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
         .map(|(name, _)| name)
 }
 
-/// Click a window slot
+/// Click a window slot via raw TCP, matching the transport used by
+/// `send_raw_close` so that click → close ordering is preserved on the wire.
+/// Previously this used `bot.write_packet()` (ECS trigger pipeline) which
+/// queued the click *behind* an `apply_deferred` boundary, while
+/// `send_raw_close` wrote directly to TCP — causing the close to reach the
+/// server before the click, silently discarding Claim All / Collect actions.
 async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, window_id: u8, slot: i16) {
     // Window 0 is the player's own inventory — always valid, no container guard.
     // For all GUI containers, refuse to click if a newer window has replaced this one;
@@ -5845,23 +5850,7 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
         );
         return;
     }
-    use azalea_protocol::packets::game::s_container_click::{
-        ServerboundContainerClick,
-        HashedStack,
-    };
-    
-    let packet = ServerboundContainerClick {
-        container_id: window_id as i32,
-        state_id: 0,
-        slot_num: slot,
-        button_num: 0,
-        click_type: ClickType::Pickup,
-        changed_slots: Default::default(),
-        carried_item: HashedStack(None),
-    };
-    
-    bot.write_packet(packet);
-    info!("Clicked slot {} in window {}", slot, window_id);
+    send_raw_click(bot, window_id, slot);
 }
 
 /// Send a chat command via `write_packet(ServerboundChatCommand)`, which uses
@@ -6086,6 +6075,9 @@ async fn clear_auction_preview_slot(
 /// Used when the cursor already holds an item from a previous pick-up click,
 /// so the server receives the correct `carried_item` and processes the interaction
 /// (e.g. placing the item in the auction item-slot to trigger the price sign).
+///
+/// Uses raw TCP (matching `click_window_slot` and `send_raw_close`) so that
+/// click → close ordering is preserved on the wire.
 async fn click_window_slot_carrying(
     bot: &Client,
     last_window_id: &Arc<RwLock<u8>>,
@@ -6118,8 +6110,12 @@ async fn click_window_slot_carrying(
         carried_item,
     };
 
-    bot.write_packet(packet);
-    info!("Clicked slot {} in window {} (carrying item)", slot, window_id);
+    bot.with_raw_connection_mut(|mut raw_conn| {
+        if let Err(e) = raw_conn.write(packet) {
+            error!("raw click (carrying) write failed (window {} slot {}): {e}", window_id, slot);
+        }
+    });
+    info!("Raw-clicked slot {} in window {} (carrying item)", slot, window_id);
 }
 
 /// Shared startup workflow: cancel old orders, claim sold items, then emit StartupComplete.
