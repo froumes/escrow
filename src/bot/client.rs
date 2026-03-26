@@ -52,9 +52,6 @@ const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 /// Brief delay after closing a stale window so Hypixel processes the
 /// container-close packet before the next command is sent.
 const WINDOW_CLOSE_DELAY_MS: u64 = 150;
-/// Delay after clicking Claim All / Collect to let the server process the claim
-/// before closing the window.  Without this the window close can race the claim.
-const CLAIM_PROCESSING_DELAY_MS: u64 = 1000;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
 /// stuck item from the auction slot.  Gives Hypixel time to process the
@@ -3810,8 +3807,6 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimPurchased] Found Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    // Wait for server to process the Claim All before closing
-                    tokio::time::sleep(tokio::time::Duration::from_millis(CLAIM_PROCESSING_DELAY_MS)).await;
                     send_raw_close(bot, window_id);
                     *state.bot_state.write() = BotState::Idle;
                     found = true;
@@ -3839,8 +3834,6 @@ async fn handle_window_interaction(
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                // Wait for server to process the collect before closing
-                tokio::time::sleep(tokio::time::Duration::from_millis(CLAIM_PROCESSING_DELAY_MS)).await;
                 send_raw_close(bot, window_id);
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -3873,8 +3866,6 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    // Wait for server to process the Claim All before closing
-                    tokio::time::sleep(tokio::time::Duration::from_millis(CLAIM_PROCESSING_DELAY_MS)).await;
                     // Claim All finishes everything — close window and go idle
                     send_raw_close(bot, window_id);
                     *state.bot_state.write() = BotState::Idle;
@@ -5841,7 +5832,12 @@ fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
         .map(|(name, _)| name)
 }
 
-/// Click a window slot
+/// Click a window slot via raw TCP, matching the transport used by
+/// `send_raw_close` so that click → close ordering is preserved on the wire.
+/// Previously this used `bot.write_packet()` (ECS trigger pipeline) which
+/// queued the click *behind* an `apply_deferred` boundary, while
+/// `send_raw_close` wrote directly to TCP — causing the close to reach the
+/// server before the click, silently discarding Claim All / Collect actions.
 async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, window_id: u8, slot: i16) {
     // Window 0 is the player's own inventory — always valid, no container guard.
     // For all GUI containers, refuse to click if a newer window has replaced this one;
@@ -5854,23 +5850,7 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
         );
         return;
     }
-    use azalea_protocol::packets::game::s_container_click::{
-        ServerboundContainerClick,
-        HashedStack,
-    };
-    
-    let packet = ServerboundContainerClick {
-        container_id: window_id as i32,
-        state_id: 0,
-        slot_num: slot,
-        button_num: 0,
-        click_type: ClickType::Pickup,
-        changed_slots: Default::default(),
-        carried_item: HashedStack(None),
-    };
-    
-    bot.write_packet(packet);
-    info!("Clicked slot {} in window {}", slot, window_id);
+    send_raw_click(bot, window_id, slot);
 }
 
 /// Send a chat command via `write_packet(ServerboundChatCommand)`, which uses
@@ -6095,6 +6075,9 @@ async fn clear_auction_preview_slot(
 /// Used when the cursor already holds an item from a previous pick-up click,
 /// so the server receives the correct `carried_item` and processes the interaction
 /// (e.g. placing the item in the auction item-slot to trigger the price sign).
+///
+/// Uses raw TCP (matching `click_window_slot` and `send_raw_close`) so that
+/// click → close ordering is preserved on the wire.
 async fn click_window_slot_carrying(
     bot: &Client,
     last_window_id: &Arc<RwLock<u8>>,
@@ -6127,8 +6110,12 @@ async fn click_window_slot_carrying(
         carried_item,
     };
 
-    bot.write_packet(packet);
-    info!("Clicked slot {} in window {} (carrying item)", slot, window_id);
+    bot.with_raw_connection_mut(|mut raw_conn| {
+        if let Err(e) = raw_conn.write(packet) {
+            error!("raw click (carrying) write failed (window {} slot {}): {e}", window_id, slot);
+        }
+    });
+    info!("Raw-clicked slot {} in window {} (carrying item)", slot, window_id);
 }
 
 /// Shared startup workflow: cancel old orders, claim sold items, then emit StartupComplete.
