@@ -52,9 +52,6 @@ const CONFIRM_PURCHASE_RETRY_MS: u64 = 50;
 /// Brief delay after closing a stale window so Hypixel processes the
 /// container-close packet before the next command is sent.
 const WINDOW_CLOSE_DELAY_MS: u64 = 150;
-/// Delay after clicking Claim All / Collect to let the server process the claim
-/// before closing the window.  Without this the window close can race the claim.
-const CLAIM_PROCESSING_DELAY_MS: u64 = 1000;
 const MAX_CLAIM_SOLD_UUID_QUEUE: usize = 64;
 /// Delay before retrying the auction flow after closing a window to remove a
 /// stuck item from the auction slot.  Gives Hypixel time to process the
@@ -3810,8 +3807,6 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimPurchased] Found Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    // Wait for server to process the Claim All before closing
-                    tokio::time::sleep(tokio::time::Duration::from_millis(CLAIM_PROCESSING_DELAY_MS)).await;
                     send_raw_close(bot, window_id);
                     *state.bot_state.write() = BotState::Idle;
                     found = true;
@@ -3839,8 +3834,6 @@ async fn handle_window_interaction(
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                // Wait for server to process the collect before closing
-                tokio::time::sleep(tokio::time::Duration::from_millis(CLAIM_PROCESSING_DELAY_MS)).await;
                 send_raw_close(bot, window_id);
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -3873,8 +3866,6 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    // Wait for server to process the Claim All before closing
-                    tokio::time::sleep(tokio::time::Duration::from_millis(CLAIM_PROCESSING_DELAY_MS)).await;
                     // Claim All finishes everything — close window and go idle
                     send_raw_close(bot, window_id);
                     *state.bot_state.write() = BotState::Idle;
