@@ -1891,7 +1891,7 @@ fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
         let lower = clean.to_lowercase();
         if let Some(idx) = lower.find("filled:") {
             // Extract the part after "filled:" — e.g. " 32/64 50%"
-            let after = &clean[idx + 7..].trim_start();
+            let after = &clean[idx + "filled:".len()..].trim_start();
             // Split at '/' to get filled and total
             if let Some(slash_pos) = after.find('/') {
                 let filled_str = after[..slash_pos].replace(',', "");
