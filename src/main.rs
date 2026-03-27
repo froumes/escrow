@@ -496,17 +496,57 @@ async fn main() -> Result<()> {
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
     // is printed to the terminal; the Coflnet auth link is sent via chat_tx and
     // appears in the web panel automatically).
+    //
+    // Retry with exponential backoff on auth failure.  Running without a
+    // Minecraft connection is useless (no flips, no bazaar, nothing to do),
+    // so after exhausting retries we restart the process to re-run the full
+    // startup sequence (config reload, fresh WebSocket, etc.).
     info!("Initializing Minecraft bot...");
     info!("Authenticating with Microsoft account...");
     info!("A browser window will open for you to log in");
-    match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
-        Ok(_) => {
-            info!("Bot connection initiated successfully");
+    {
+        const AUTH_MAX_RETRIES: u32 = 3;
+        const AUTH_INITIAL_BACKOFF_SECS: u64 = 10;
+
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=AUTH_MAX_RETRIES {
+            match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
+                Ok(_) => {
+                    info!("Bot connection initiated successfully");
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    let backoff = AUTH_INITIAL_BACKOFF_SECS.saturating_mul(1u64 << (attempt - 1).min(5)); // 10s, 20s, 40s for 3 retries; .min(5) caps shift for safety
+                    warn!(
+                        "Failed to connect bot (attempt {}/{}): {} — retrying in {}s",
+                        attempt, AUTH_MAX_RETRIES, e, backoff
+                    );
+                    let baf_msg = format!(
+                        "§f[§4BAF§f]: §cAuth failed (attempt {}/{}): {} — retrying in {}s",
+                        attempt, AUTH_MAX_RETRIES, e, backoff
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx.send(baf_msg);
+                    last_err = Some(format!("{}", e));
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                }
+            }
         }
-        Err(e) => {
-            warn!("Failed to connect bot: {}", e);
-            warn!("The bot will continue running in limited mode (WebSocket only)");
-            warn!("Please ensure your Microsoft account is valid and you have access to Hypixel");
+        if let Some(err) = last_err {
+            error!(
+                "All {} auth attempts failed (last error: {}) — restarting process",
+                AUTH_MAX_RETRIES, err
+            );
+            let baf_msg = format!(
+                "§f[§4BAF§f]: §cAll {} auth attempts failed — restarting...",
+                AUTH_MAX_RETRIES
+            );
+            print_mc_chat(&baf_msg);
+            let _ = chat_tx.send(baf_msg);
+            // Short delay so the message is visible before restart.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            restart_process();
         }
     }
 
@@ -877,16 +917,24 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                frikadellen_baf::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order } => {
+                frikadellen_baf::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order, claimed_amount } => {
                     // Remove from tracker.
                     let order_data = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                    // Determine the actual quantity collected.  `claimed_amount` is
+                    // parsed from the "Filled: X/Y" lore in the Manage Orders window.
+                    // Fall back to the tracker's original order amount when unavailable.
+                    let actual_amount = claimed_amount
+                        .or_else(|| order_data.as_ref().map(|o| o.amount))
+                        .unwrap_or(0);
                     if let Some(ref order) = order_data {
                         // Store buy cost so we can compute profit when the sell offer is collected.
                         // BUY collections do NOT record profit — profit is only realized on SELL.
+                        // Only record cost for the actually claimed quantity — a partial fill
+                        // should not inflate the buy cost with the unfilled remainder.
                         if is_buy_order {
-                            bazaar_tracker_events.record_buy_cost(&item_name, order.price_per_unit, order.amount);
+                            bazaar_tracker_events.record_buy_cost(&item_name, order.price_per_unit, actual_amount);
                             info!("[BazaarProfit] Recorded buy cost for {} — {} x {:.0} coins/unit",
-                                item_name, order.amount, order.price_per_unit);
+                                item_name, actual_amount, order.price_per_unit);
                         }
                     } else {
                         debug!("[BazaarProfit] No tracked order for collected {} {} (may be from a previous session)",
@@ -896,19 +944,27 @@ async fn main() -> Result<()> {
                     // This is used for the immediate chat display; the session profit
                     // total is driven by `/cofl bz l` via set_bz_total().
                     // Bazaar tax is applied to sell proceeds (default 1.25%).
+                    //
+                    // When a sell is partially filled, only use the actual sold quantity
+                    // for both sell revenue AND buy cost comparison.  Using per-unit buy
+                    // cost × actual_sold prevents the false loss that occurred when comparing
+                    // partial sell revenue against the TOTAL buy cost for all purchased units.
                     let bazaar_tax_rate = config_for_events.bazaar_tax_rate;
                     let opt_profit: Option<i64> = if !is_buy_order {
                         if let Some(ref sell_order) = order_data {
-                            let sell_total = sell_order.price_per_unit * sell_order.amount as f64;
+                            let sell_total = sell_order.price_per_unit * actual_amount as f64;
                             let tax = sell_total * (bazaar_tax_rate / 100.0);
                             let sell_after_tax = sell_total - tax;
-                            if let Some((buy_ppu, buy_amt)) = bazaar_tracker_events.take_buy_cost(&item_name) {
-                                let buy_total = buy_ppu * buy_amt as f64;
+                            if let Some((buy_ppu, _buy_amt)) = bazaar_tracker_events.take_buy_cost(&item_name) {
+                                // Use per-unit buy cost × actual sold quantity, NOT
+                                // buy_ppu × total_buy_amount.  This correctly handles
+                                // partial sells (e.g. sold 21 of 64 bought).
+                                let buy_total = buy_ppu * actual_amount as f64;
                                 let profit = (sell_after_tax - buy_total).round() as i64;
                                 // Session BZ profit is tracked via /cofl bz l (set_bz_total),
                                 // so we don't call record_bz_profit here.
-                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0}, profit: {}",
-                                    item_name, sell_total, tax, bazaar_tax_rate, buy_total, profit);
+                                info!("[BazaarProfit] SELL {} — {} units, sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0} ({:.0}/ea), profit: {}",
+                                    item_name, actual_amount, sell_total, tax, bazaar_tax_rate, buy_total, buy_ppu, profit);
                                 Some(profit)
                             } else if let Some(bz_list_profit) = bazaar_tracker_events.get_bz_list_profit(&item_name) {
                                 // Fallback: use profit from /cofl bz l for this item
@@ -930,12 +986,14 @@ async fn main() -> Result<()> {
                         None
                     };
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
-                    info!("[BazaarOrders] Order collected: {} ({})", item_name, order_type);
+                    info!("[BazaarOrders] Order collected: {} ({}) x{}", item_name, order_type, actual_amount);
                     // Build the collection message with prices and optional profit.
+                    // Use actual_amount (from lore) instead of the tracker's original
+                    // order amount so partial fills display correctly (e.g. "1x" not "4x").
                     let price_info = if let Some(ref order) = order_data {
-                        let total = order.price_per_unit * order.amount as f64;
+                        let total = order.price_per_unit * actual_amount as f64;
                         format!(" §7({}x @ §6{}§7 = §6{}§7 coins)",
-                            order.amount,
+                            actual_amount,
                             format_coins_f64(order.price_per_unit),
                             format_coins_f64(total))
                     } else {
