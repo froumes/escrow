@@ -393,6 +393,10 @@ pub enum BotEvent {
     BazaarOrderCollected {
         item_name: String,
         is_buy_order: bool,
+        /// Actual quantity claimed from this collection.  `None` when the
+        /// filled amount could not be determined (falls back to the tracker's
+        /// original order amount).
+        claimed_amount: Option<u64>,
     },
     /// A bazaar order was cancelled during ManageOrders.
     BazaarOrderCancelled {
@@ -1109,9 +1113,11 @@ pub struct BotClientState {
     /// Context of the order currently being processed in the ManageOrders iteration.
     /// Stored when clicking an order in Branch B so that Branch C (separate "Order options"
     /// window) can apply the same `cancel_due_to_age` logic.
-    /// Fields: `(is_buy, order_display_name, order_identity)` where `order_identity` is
-    /// the `(is_buy, item_tag)` tuple used by `should_cancel_open_order_due_to_age()`.
-    pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>)>>>,
+    /// Fields: `(is_buy, order_display_name, order_identity, filled_amount)` where
+    /// `order_identity` is the `(is_buy, item_tag)` tuple used by
+    /// `should_cancel_open_order_due_to_age()`, and `filled_amount` is the actual
+    /// filled quantity parsed from the "Filled: X/Y" lore line.
+    pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>, Option<u64>)>>>,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
     /// Persistent set of processed order names (normalized, slot-index-free) across
@@ -1869,6 +1875,36 @@ fn is_order_claimable_from_lore(lore: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Parse the filled amount from Hypixel's order lore.
+///
+/// Lore lines contain `"Filled: X/Y Z%"` (e.g. `"Filled: 32/64 50%"`).
+/// Returns `Some((filled, total))` when found.  Used to determine the actual
+/// quantity claimed (not the original order amount) so buy-cost recording and
+/// profit calculations are accurate for partial fills.
+fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
+    for line in lore {
+        let clean = remove_mc_colors(line);
+        // Expected format: "Filled: 32/64 50%"
+        // After lowercasing: "filled: 32/64 50%"
+        let lower = clean.to_lowercase();
+        if let Some(idx) = lower.find("filled:") {
+            // Extract the part after "filled:" — e.g. " 32/64 50%"
+            let after = &clean[idx + 7..].trim_start();
+            // Split at '/' to get filled and total
+            if let Some(slash_pos) = after.find('/') {
+                let filled_str = after[..slash_pos].replace(',', "");
+                let rest = &after[slash_pos + 1..];
+                // Total ends at the next space or end of string
+                let total_str = rest.split_whitespace().next().unwrap_or("").replace(',', "");
+                if let (Ok(filled), Ok(total)) = (filled_str.parse::<u64>(), total_str.parse::<u64>()) {
+                    return Some((filled, total));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
@@ -4324,8 +4360,8 @@ async fn handle_window_interaction(
                 //   SELL before BUY within each tier.
                 // Priority (cancel mode): SELL first, then BUY (all orders).
                 //
-                // Tuple: (slot, name, identity, order_key, claimable)
-                type OrderEntry = (usize, String, Option<(bool, String)>, String, bool);
+                // Tuple: (slot, name, identity, order_key, claimable, filled_amount)
+                type OrderEntry = (usize, String, Option<(bool, String)>, String, bool, Option<u64>);
                 let mut sell_orders: Vec<OrderEntry> = Vec::new();
                 let mut buy_orders: Vec<OrderEntry> = Vec::new();
 
@@ -4344,11 +4380,12 @@ async fn handle_window_interaction(
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&name));
                         let claimable = is_order_claimable_from_lore(&lore);
+                        let filled_amount = parse_filled_amount_from_lore(&lore).map(|(f, _)| f);
                         let order_key = format!("{}::{}", i, name_key);
                         if is_buy {
-                            buy_orders.push((i, name, identity, order_key, claimable));
+                            buy_orders.push((i, name, identity, order_key, claimable, filled_amount));
                         } else {
-                            sell_orders.push((i, name, identity, order_key, claimable));
+                            sell_orders.push((i, name, identity, order_key, claimable, filled_amount));
                         }
                     }
                 }
@@ -4359,7 +4396,7 @@ async fn handle_window_interaction(
                 // stale entries that no longer exist in-game.
                 {
                     let mut ingame_orders = Vec::with_capacity(total_orders);
-                    for (_, name, identity, _, _) in sell_orders.iter().chain(buy_orders.iter()) {
+                    for (_, name, identity, _, _, _) in sell_orders.iter().chain(buy_orders.iter()) {
                         let is_buy = identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(name));
@@ -4393,19 +4430,19 @@ async fn handle_window_interaction(
                 let chosen_order: Option<OrderEntry> = if !cancel_open {
                     // Always try claimable sell orders first (yield coins, no
                     // inventory space needed).
-                    sell_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
+                    sell_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
                         // Claimable buy orders — skip entirely when inventory is
                         // full so we don't waste a ManageOrders cycle opening /bz,
                         // navigating to the order, and then aborting.
                         .or_else(|| {
                             if inv_full { None } else {
-                                buy_orders.iter().find(|&(_, _, _, _, claimable)| *claimable).cloned()
+                                buy_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
                             }
                         })
-                        .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable)| {
+                        .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable, _)| {
                             !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
                         }).cloned())
-                        .or_else(|| buy_orders.iter().find(|&(_, _, identity, _, claimable)| {
+                        .or_else(|| buy_orders.iter().find(|&(_, _, identity, _, claimable, _)| {
                             !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
                         }).cloned())
                 } else {
@@ -4423,7 +4460,7 @@ async fn handle_window_interaction(
                         state.bazaar_at_limit.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
-                    Some((i, order_name, order_identity, _processed_key, _claimable)) => {
+                    Some((i, order_name, order_identity, _processed_key, _claimable, order_filled_amount)) => {
                         let order_is_buy = order_identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
@@ -4452,7 +4489,7 @@ async fn handle_window_interaction(
                         }
 
                         // Store context for the Order options handler (Branch C)
-                        *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone()));
+                        *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone(), order_filled_amount));
 
                         info!("[ManageOrders] Clicking order at slot {}: \"{}\"", i, order_name);
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
@@ -4499,6 +4536,9 @@ async fn handle_window_interaction(
                             let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
                                 item_name: clean_order_item_name(&order_name, &order_identity),
                                 is_buy_order: order_is_buy,
+                                // Direct collection = fully filled. Use parsed filled
+                                // amount from lore; falls back to tracker amount in handler.
+                                claimed_amount: order_filled_amount,
                             });
                             persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
                             state.bazaar_at_limit.store(false, Ordering::Relaxed);
@@ -4550,11 +4590,11 @@ async fn handle_window_interaction(
                 // After handling ONE order, close and go Idle (one order per cycle).
 
                 let order_ctx = state.managing_order_context.read().clone();
-                let (order_name, order_identity) = match &order_ctx {
-                    Some((_is_buy, name, identity)) => (name.clone(), identity.clone()),
-                    None => (String::new(), None),
+                let (order_name, order_identity, order_filled_amount) = match &order_ctx {
+                    Some((_is_buy, name, identity, filled)) => (name.clone(), identity.clone(), *filled),
+                    None => (String::new(), None, None),
                 };
-                let order_identity_for_clean = order_ctx.as_ref().and_then(|(_, _, id)| id.clone());
+                let order_identity_for_clean = order_ctx.as_ref().and_then(|(_, _, id, _)| id.clone());
 
                 let name_key = normalize_bazaar_order_text(&order_name);
                 if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
@@ -4620,10 +4660,13 @@ async fn handle_window_interaction(
                         if *state.last_window_id.read() == window_id {
                             click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                             if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
-                                if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
                                         item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                         is_buy_order: *ctx_is_buy,
+                                        // Partial fill — use filled amount parsed from
+                                        // the Manage Orders lore before we clicked.
+                                        claimed_amount: order_filled_amount,
                                     });
                                 }
                             } else {
@@ -4712,10 +4755,13 @@ async fn handle_window_interaction(
                         info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
                         click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                         if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
-                            if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                            if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
                                 let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
                                     item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                     is_buy_order: *ctx_is_buy,
+                                    // Partial or full fill from Order Options — use
+                                    // filled amount parsed from the Manage Orders lore.
+                                    claimed_amount: order_filled_amount,
                                 });
                             }
                         } else {
@@ -4729,7 +4775,7 @@ async fn handle_window_interaction(
                                     if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                         *state.manage_orders_cancelled.write() += 1;
                                         state.order_cancel_failures.write().remove(&cancel_fail_key);
-                                        if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                        if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
                                             let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                                 item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                                 is_buy_order: *ctx_is_buy,
@@ -4751,7 +4797,7 @@ async fn handle_window_interaction(
                             if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                 *state.manage_orders_cancelled.write() += 1;
                                 state.order_cancel_failures.write().remove(&cancel_fail_key);
-                                if let Some((ctx_is_buy, _, _)) = order_ctx.as_ref() {
+                                if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                         item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                         is_buy_order: *ctx_is_buy,
@@ -6554,6 +6600,60 @@ mod tests {
     fn test_is_order_claimable_from_lore_empty() {
         let lore: Vec<String> = vec![];
         assert!(!is_order_claimable_from_lore(&lore));
+    }
+
+    #[test]
+    fn test_parse_filled_amount_fully_filled() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Filled: 64/64 100%!".to_string(),
+        ];
+        assert_eq!(parse_filled_amount_from_lore(&lore), Some((64, 64)));
+    }
+
+    #[test]
+    fn test_parse_filled_amount_partially_filled() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Order amount: 64x".to_string(),
+            "Filled: 1/4 25%".to_string(),
+            "You have 1 items to claim!".to_string(),
+        ];
+        assert_eq!(parse_filled_amount_from_lore(&lore), Some((1, 4)));
+    }
+
+    #[test]
+    fn test_parse_filled_amount_with_color_codes() {
+        let lore = vec![
+            "§7Buy Order".to_string(),
+            "§7Filled: §a32/64 §650%".to_string(),
+        ];
+        assert_eq!(parse_filled_amount_from_lore(&lore), Some((32, 64)));
+    }
+
+    #[test]
+    fn test_parse_filled_amount_zero() {
+        let lore = vec![
+            "Filled: 0/64 0%".to_string(),
+        ];
+        assert_eq!(parse_filled_amount_from_lore(&lore), Some((0, 64)));
+    }
+
+    #[test]
+    fn test_parse_filled_amount_no_filled_line() {
+        let lore = vec![
+            "Buy Order".to_string(),
+            "Price per unit: 1,000.0 coins".to_string(),
+        ];
+        assert_eq!(parse_filled_amount_from_lore(&lore), None);
+    }
+
+    #[test]
+    fn test_parse_filled_amount_large_numbers() {
+        let lore = vec![
+            "Filled: 1,280/2,560 50%".to_string(),
+        ];
+        assert_eq!(parse_filled_amount_from_lore(&lore), Some((1280, 2560)));
     }
 
     #[test]
