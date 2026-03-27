@@ -2046,7 +2046,7 @@ async fn event_handler(
                         clean_message, window_id
                     );
                     if window_id > 0 {
-                        send_raw_close(&bot, window_id);
+                        send_raw_close(&bot, window_id, &state.handlers);
                     }
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
                     state.skip_click_sent.store(false, Ordering::Relaxed);
@@ -2116,7 +2116,7 @@ async fn event_handler(
                     state.auction_sell_aborted.store(true, Ordering::Relaxed);
                     let window_id = *state.last_window_id.read();
                     if window_id > 0 {
-                        send_raw_close(&bot, window_id);
+                        send_raw_close(&bot, window_id, &state.handlers);
                     }
 
                     if attempt >= MAX_AUCTION_STUCK_ITEM_RETRIES {
@@ -2330,7 +2330,7 @@ async fn event_handler(
                 *state.bazaar_step.write() = BazaarStep::Initial;
                 let wid = *state.last_window_id.read();
                 if wid > 0 {
-                    send_raw_close(&bot, wid);
+                    send_raw_close(&bot, wid, &state.handlers);
                 }
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -2492,6 +2492,7 @@ async fn event_handler(
                         let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
                         let wdog_deadline = state.manage_orders_deadline.clone();
                         let wdog_bz_limit = state.bazaar_at_limit.clone();
+                        let wdog_handlers = state.handlers.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             let still_open  = *wdog_last.read() == wdog_wid;
@@ -2508,7 +2509,7 @@ async fn event_handler(
                             let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
                             if still_open && is_interactive && !is_bed && gen_unchanged {
                                 warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
-                                send_raw_close(&wdog_bot, wdog_wid);
+                                send_raw_close(&wdog_bot, wdog_wid, &wdog_handlers);
                                 // Clean up ManagingOrders-specific state so the bot
                                 // doesn't remain stuck with a stale deadline or the
                                 // bazaar order-limit flag blocking new flips.
@@ -2858,8 +2859,7 @@ async fn execute_command(
     // from being stuck "in an inventory".
     if let Some(open_wid) = state.handlers.current_window_id() {
         warn!("[SafeClose] Closing window {} before executing {}", open_wid, command.command_type.display_name());
-        send_raw_close(bot, open_wid);
-        state.handlers.handle_window_close().await;
+        send_raw_close(bot, open_wid, &state.handlers);
         tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CLOSE_DELAY_MS)).await;
     }
 
@@ -3278,7 +3278,7 @@ async fn handle_window_interaction(
                         if tokio::time::Instant::now() >= bed_deadline {
                             warn!("[AH] Bed timing: grace period did not end — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         }
@@ -3295,7 +3295,7 @@ async fn handle_window_interaction(
                         if current_kind == "air" || current_kind.contains("air") {
                             info!("[AH] Bed timing: window closed");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("gold_nugget") {
@@ -3308,7 +3308,7 @@ async fn handle_window_interaction(
                         } else if current_kind.contains("potato") {
                             info!("[AH] Bed timing: potato detected — auction not purchasable, closing");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("bed") {
@@ -3326,7 +3326,7 @@ async fn handle_window_interaction(
                             if failed_clicks >= MAX_FAILED_CLICKS {
                                 warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
                                 state.bed_timing_active.store(false, Ordering::Relaxed);
-                                send_raw_close(bot, window_id);
+                                send_raw_close(bot, window_id, &state.handlers);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -3402,7 +3402,7 @@ async fn handle_window_interaction(
                         warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
                         *state.purchase_start_time.write() = None;
                         *state.pending_purchase_at_ms.write() = None;
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                     }
                 }
                 // air = slot 31 never populated within the poll deadline.
@@ -3453,7 +3453,7 @@ async fn handle_window_interaction(
                     tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
                 }
 
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3588,7 +3588,7 @@ async fn handle_window_interaction(
                     }
                     None => {
                         warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -3664,7 +3664,7 @@ async fn handle_window_interaction(
                     });
                     info!("[Bazaar] ===== ORDER COMPLETE =====");
                 }
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3684,7 +3684,7 @@ async fn handle_window_interaction(
                 Some(name) => name,
                 None => {
                     warn!("[InstaSell] No item name stored, closing window and going idle");
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     *state.bot_state.write() = BotState::Idle;
                     return;
                 }
@@ -3722,7 +3722,7 @@ async fn handle_window_interaction(
                     }
                     None => {
                         warn!("[InstaSell] Item \"{}\" not found in bazaar search, closing window and going idle", item_name);
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.insta_sell_item.write() = None;
                         *state.bot_state.write() = BotState::Idle;
                     }
@@ -3748,7 +3748,7 @@ async fn handle_window_interaction(
                     }
                     None => {
                         warn!("[InstaSell] \"Sell Instantly\" not found, closing window and going idle");
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.insta_sell_item.write() = None;
                         *state.bot_state.write() = BotState::Idle;
                     }
@@ -3807,7 +3807,7 @@ async fn handle_window_interaction(
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimPurchased] Found Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     *state.bot_state.write() = BotState::Idle;
                     found = true;
                 }
@@ -3826,7 +3826,7 @@ async fn handle_window_interaction(
                     }
                     if !found {
                         info!("[ClaimPurchased] Nothing to claim, closing window and going idle");
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -3834,7 +3834,7 @@ async fn handle_window_interaction(
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -3867,7 +3867,7 @@ async fn handle_window_interaction(
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     // Claim All finishes everything — close window and go idle
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     *state.bot_state.write() = BotState::Idle;
                 } else {
                     // Look for first claimable item
@@ -3883,7 +3883,7 @@ async fn handle_window_interaction(
                     }
                     if !found {
                         info!("[ClaimSold] Nothing to claim, closing window and going idle");
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -3972,7 +3972,7 @@ async fn handle_window_interaction(
                 }
                 if !found {
                     info!("[CancelAuction] Target auction not found in Manage Auctions, closing window and going idle");
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     *state.bot_state.write() = BotState::Idle;
                 }
             } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
@@ -3985,7 +3985,7 @@ async fn handle_window_interaction(
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 } else {
                     info!("[CancelAuction] Cancel Auction button not found, closing window and going idle");
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     *state.bot_state.write() = BotState::Idle;
                 }
                 // Watchdog: go idle if no follow-up window in 2s
@@ -4011,7 +4011,7 @@ async fn handle_window_interaction(
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 }
                 info!("[CancelAuction] Auction cancellation confirmed, closing window and going idle");
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 let cancelled_name = state.cancel_auction_item_name.read().clone();
                 let cancelled_bid = *state.cancel_auction_starting_bid.read();
                 let _ = state.event_tx.send(BotEvent::AuctionCancelled {
@@ -4042,7 +4042,7 @@ async fn handle_window_interaction(
             // chat handler will re-open /ah once the window is closed.
             if state.auction_sell_aborted.load(Ordering::Relaxed) {
                 warn!("[Auction] Window opened but auction sell aborted — closing window {}", window_id);
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 return;
             }
 
@@ -4066,7 +4066,7 @@ async fn handle_window_interaction(
                             if lore_text.contains("maximum") || lore_text.contains("limit") {
                                 warn!("[Auction] Maximum auction count reached, going idle");
                                 state.auction_at_limit.store(true, Ordering::Relaxed);
-                                send_raw_close(bot, window_id);
+                                send_raw_close(bot, window_id, &state.handlers);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
@@ -4076,7 +4076,7 @@ async fn handle_window_interaction(
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                         } else {
                             warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                         }
                     } else if window_title.contains("Create Auction") && !window_title.contains("BIN") {
@@ -4116,7 +4116,7 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -4162,7 +4162,7 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -4213,7 +4213,7 @@ async fn handle_window_interaction(
                             click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                         }
                     }
@@ -4244,7 +4244,7 @@ async fn handle_window_interaction(
                         // Check if the sell was aborted (e.g. wrong item in auction slot)
                         if state.auction_sell_aborted.load(Ordering::Relaxed) {
                             warn!("[Auction] ConfirmSell aborted — wrong item detected, closing window");
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             // Stay in Selling state so the retry task can re-open /ah
                             return;
                         }
@@ -4262,7 +4262,7 @@ async fn handle_window_interaction(
                         // Check if the sell was aborted (e.g. wrong item in auction slot)
                         if state.auction_sell_aborted.load(Ordering::Relaxed) {
                             warn!("[Auction] FinalConfirm aborted — wrong item detected, closing window");
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                             // Stay in Selling state so the retry task can re-open /ah
                             return;
                         }
@@ -4271,7 +4271,7 @@ async fn handle_window_interaction(
                         click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         info!("[Auction] ===== AUCTION CREATED =====");
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -4418,7 +4418,7 @@ async fn handle_window_interaction(
                     None => {
                         // No orders to process — done.
                         info!("[ManageOrders] No actionable orders, closing window");
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                         *state.manage_orders_deadline.write() = None;
                         state.bazaar_at_limit.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
@@ -4443,7 +4443,7 @@ async fn handle_window_interaction(
                                     warn!("[ManageOrders] Inventory full ({} empty slots) — skipping BUY order \"{}\"", empty, order_name);
                                     log_pending_claim(&order_name);
                                     persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
-                                    send_raw_close(bot, window_id);
+                                    send_raw_close(bot, window_id, &state.handlers);
                                     *state.manage_orders_deadline.write() = None;
                                     *state.bot_state.write() = BotState::Idle;
                                     return;
@@ -4508,7 +4508,7 @@ async fn handle_window_interaction(
 
                         // Close this window and go Idle (one order per cycle).
                         if *state.last_window_id.read() == window_id {
-                            send_raw_close(bot, window_id);
+                            send_raw_close(bot, window_id, &state.handlers);
                         }
                         if !order_options_opened {
                             // Only transition to Idle when the order was collected
@@ -4559,7 +4559,7 @@ async fn handle_window_interaction(
                 let name_key = normalize_bazaar_order_text(&order_name);
                 if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
                     debug!("[ManageOrders] Order \"{}\" already processed — closing", order_name);
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
                 } else {
@@ -4582,7 +4582,7 @@ async fn handle_window_interaction(
                         state.manage_orders_processed.write().insert(name_key);
                     }
                     if *state.last_window_id.read() == window_id {
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                     }
                     *state.manage_orders_deadline.write() = None;
                     state.bazaar_at_limit.store(false, Ordering::Relaxed);
@@ -4638,7 +4638,7 @@ async fn handle_window_interaction(
                         state.manage_orders_processed.write().insert(name_key);
                     }
                     if *state.last_window_id.read() == window_id {
-                        send_raw_close(bot, window_id);
+                        send_raw_close(bot, window_id, &state.handlers);
                     }
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
@@ -4774,7 +4774,7 @@ async fn handle_window_interaction(
                     state.manage_orders_processed.write().insert(name_key);
                 }
                 if *state.last_window_id.read() == window_id {
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                 }
                 *state.manage_orders_deadline.write() = None;
                 state.bazaar_at_limit.store(false, Ordering::Relaxed);
@@ -4837,7 +4837,7 @@ async fn handle_window_interaction(
                 click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 info!("[SellInventoryBz] Done — closing window and going idle");
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 *state.bazaar_step.write() = BazaarStep::Initial;
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -4863,7 +4863,7 @@ async fn handle_window_interaction(
             }
 
             // Close the SkyBlock menu before proceeding
-            send_raw_close(bot, window_id);
+            send_raw_close(bot, window_id, &state.handlers);
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
             match cookie_time_secs {
@@ -4943,7 +4943,7 @@ async fn handle_window_interaction(
                     // Another concurrent handler already processed this step — close
                     // any stale window and bail out.
                     info!("[Cookie] BuyConfirm already handled by another task — closing window");
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     return;
                 }
 
@@ -4954,7 +4954,7 @@ async fn handle_window_interaction(
                 // after purchase — that is handled by the WaitingForCookie branch below.
                 tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
                 // Close the purchase/item-detail window if still open
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
                 // Find cookie in inventory and consume it by right-clicking.
@@ -5024,7 +5024,7 @@ async fn handle_window_interaction(
                 // Any window that opens here (e.g. Bazaar re-opening item detail) is
                 // unexpected — close it immediately and do nothing else.
                 info!("[Cookie] Unexpected window while waiting for cookie in inventory — closing");
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
             } else if step == CookieStep::ConsumingCookie {
                 // Atomically claim the consume step so only one concurrent handler fires.
                 // Lock is acquired, checked, updated, then released before any I/O.
@@ -5041,7 +5041,7 @@ async fn handle_window_interaction(
                 if !claimed {
                     // Already handled — close stale window and bail.
                     info!("[Cookie] ConsumingCookie already handled by another task — closing window");
-                    send_raw_close(bot, window_id);
+                    send_raw_close(bot, window_id, &state.handlers);
                     return;
                 }
 
@@ -5052,7 +5052,7 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
                 // Close the cookie GUI
-                send_raw_close(bot, window_id);
+                send_raw_close(bot, window_id, &state.handlers);
 
                 let current_time = *state.cookie_time_secs.read();
                 let new_hours = (current_time + 4 * 86400) / 3600;
@@ -5929,7 +5929,16 @@ fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
 /// stuck open indefinitely.  Writing directly to TCP guarantees the close
 /// packet reaches the server immediately, matching the reliability of
 /// `send_raw_click` and `send_raw_chat_command`.
-fn send_raw_close(bot: &Client, window_id: u8) {
+///
+/// Also eagerly clears the local window tracking state (`current_window_id`,
+/// `current_window_title`, `current_window_type`) so that subsequent code
+/// never sees a stale window ID.  Hypixel does not always respond with a
+/// `ClientboundContainerClose` packet, so relying on the server response to
+/// clear client-side state left windows "stuck open" and forced SafeClose to
+/// fire on the next command.  Clearing eagerly is harmless: if the server
+/// does send `ClientboundContainerClose`, the `ContainerClose` handler
+/// re-clears the already-`None` fields.
+fn send_raw_close(bot: &Client, window_id: u8, handlers: &BotEventHandlers) {
     bot.with_raw_connection_mut(|mut raw_conn| {
         if let Err(e) = raw_conn.write(ServerboundContainerClose {
             container_id: window_id as i32,
@@ -5937,6 +5946,7 @@ fn send_raw_close(bot: &Client, window_id: u8) {
             error!("raw container close write failed (window {}): {e}", window_id);
         }
     });
+    handlers.clear_window_tracking();
     debug!("Raw-closed window {}", window_id);
 }
 
@@ -6007,7 +6017,7 @@ fn check_manage_orders_deadline(
     if let Some(deadline) = *state.manage_orders_deadline.read() {
         if tokio::time::Instant::now() >= deadline {
             warn!("[ManageOrders] Internal deadline exceeded — closing window and going Idle");
-            send_raw_close(bot, window_id);
+            send_raw_close(bot, window_id, &state.handlers);
             *state.manage_orders_deadline.write() = None;
             // Clear the order-limit flag so new flips aren't blocked after timeout.
             state.bazaar_at_limit.store(false, Ordering::Relaxed);
@@ -6019,7 +6029,7 @@ fn check_manage_orders_deadline(
     // AH purchase flow.  The order will be re-queued after the AH pause.
     if state.bazaar_flips_paused.load(Ordering::Relaxed) {
         info!("[ManageOrders] AH flips incoming — aborting ManageOrders to free queue");
-        send_raw_close(bot, window_id);
+        send_raw_close(bot, window_id, &state.handlers);
         *state.manage_orders_deadline.write() = None;
         state.bazaar_at_limit.store(false, Ordering::Relaxed);
         *state.bot_state.write() = BotState::Idle;
@@ -6039,7 +6049,7 @@ async fn close_window_and_reopen_bz(
     window_id: u8,
 ) {
     if *state.last_window_id.read() == window_id {
-        send_raw_close(bot, window_id);
+        send_raw_close(bot, window_id, &state.handlers);
         tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
         send_chat_command(bot, "/bz");
     }

@@ -496,17 +496,57 @@ async fn main() -> Result<()> {
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
     // is printed to the terminal; the Coflnet auth link is sent via chat_tx and
     // appears in the web panel automatically).
+    //
+    // Retry with exponential backoff on auth failure.  Running without a
+    // Minecraft connection is useless (no flips, no bazaar, nothing to do),
+    // so after exhausting retries we restart the process to re-run the full
+    // startup sequence (config reload, fresh WebSocket, etc.).
     info!("Initializing Minecraft bot...");
     info!("Authenticating with Microsoft account...");
     info!("A browser window will open for you to log in");
-    match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
-        Ok(_) => {
-            info!("Bot connection initiated successfully");
+    {
+        const AUTH_MAX_RETRIES: u32 = 3;
+        const AUTH_INITIAL_BACKOFF_SECS: u64 = 10;
+
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=AUTH_MAX_RETRIES {
+            match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
+                Ok(_) => {
+                    info!("Bot connection initiated successfully");
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    let backoff = AUTH_INITIAL_BACKOFF_SECS * (1u64 << (attempt - 1)); // 10, 20, 40
+                    warn!(
+                        "Failed to connect bot (attempt {}/{}): {} — retrying in {}s",
+                        attempt, AUTH_MAX_RETRIES, e, backoff
+                    );
+                    let baf_msg = format!(
+                        "§f[§4BAF§f]: §cAuth failed (attempt {}/{}): {} — retrying in {}s",
+                        attempt, AUTH_MAX_RETRIES, e, backoff
+                    );
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx.send(baf_msg);
+                    last_err = Some(format!("{}", e));
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                }
+            }
         }
-        Err(e) => {
-            warn!("Failed to connect bot: {}", e);
-            warn!("The bot will continue running in limited mode (WebSocket only)");
-            warn!("Please ensure your Microsoft account is valid and you have access to Hypixel");
+        if let Some(err) = last_err {
+            error!(
+                "All {} auth attempts failed (last error: {}) — restarting process",
+                AUTH_MAX_RETRIES, err
+            );
+            let baf_msg = format!(
+                "§f[§4BAF§f]: §cAll {} auth attempts failed — restarting...",
+                AUTH_MAX_RETRIES
+            );
+            print_mc_chat(&baf_msg);
+            let _ = chat_tx.send(baf_msg);
+            // Short delay so the message is visible before restart.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            restart_process();
         }
     }
 

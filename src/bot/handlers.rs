@@ -48,6 +48,18 @@ impl BotEventHandlers {
             info!("[Window] Closed: title=\"{}\"", title);
         }
 
+        self.clear_window_tracking();
+    }
+
+    /// Clear tracked window state (ID, title, type) synchronously.
+    ///
+    /// Called immediately after `send_raw_close()` so the bot never sees a
+    /// stale `current_window_id()` while waiting for the server's
+    /// `ClientboundContainerClose` response (which Hypixel does not always
+    /// send reliably).  The `ContainerClose` handler calls
+    /// `handle_window_close()` which delegates here, so a duplicate clear
+    /// is harmless.
+    pub fn clear_window_tracking(&self) {
         *self.current_window_id.write() = None;
         *self.current_window_title.write() = None;
         *self.current_window_type.write() = None;
