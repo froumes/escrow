@@ -57,8 +57,8 @@ impl BotEventHandlers {
     /// stale `current_window_id()` while waiting for the server's
     /// `ClientboundContainerClose` response (which Hypixel does not always
     /// send reliably).  The `ContainerClose` handler calls
-    /// `handle_window_close()` which delegates here, so a duplicate clear
-    /// is harmless.
+    /// `handle_window_close()` which also calls this method, so a duplicate
+    /// clear is harmless.
     pub fn clear_window_tracking(&self) {
         *self.current_window_id.write() = None;
         *self.current_window_title.write() = None;

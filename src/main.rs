@@ -517,7 +517,7 @@ async fn main() -> Result<()> {
                     break;
                 }
                 Err(e) => {
-                    let backoff = AUTH_INITIAL_BACKOFF_SECS * (1u64 << (attempt - 1)); // 10, 20, 40
+                    let backoff = AUTH_INITIAL_BACKOFF_SECS.saturating_mul(1u64 << (attempt - 1).min(5)); // 10, 20, 40
                     warn!(
                         "Failed to connect bot (attempt {}/{}): {} — retrying in {}s",
                         attempt, AUTH_MAX_RETRIES, e, backoff
