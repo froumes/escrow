@@ -1861,8 +1861,12 @@ fn is_buy_bazaar_order_name(name: &str) -> bool {
 }
 
 fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
-    parse_bazaar_order_identity_from_name(name)
-        .or_else(|| parse_bazaar_order_identity_from_lore(lore))
+    // Prefer lore-based identity when available — it contains the *specific*
+    // item name (e.g. "Blast Protection VII") while the display name may be
+    // generic (e.g. "Enchanted Book").  Fall back to name-based parsing when
+    // the lore has no identity data.
+    parse_bazaar_order_identity_from_lore(lore)
+        .or_else(|| parse_bazaar_order_identity_from_name(name))
 }
 
 fn should_treat_as_bazaar_order_slot(name: &str, identity: Option<&(bool, String)>) -> bool {
