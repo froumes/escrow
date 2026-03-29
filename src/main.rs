@@ -219,11 +219,62 @@ fn should_drop_bazaar_command_during_ah_pause(
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
 
+/// GitHub release response (subset of fields).
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    published_at: Option<String>,
+}
+
+/// Check the GitHub releases API to see if the current binary is outdated.
+/// Logs a prominent warning if the latest release tag differs from `VERSION`.
+async fn check_version_outdated() {
+    const GITHUB_REPO: &str = "TreXito/frikadellen-baf-121";
+
+    // If the loader is managing updates it writes a `.version` file next to the binary.
+    // When that file exists and matches the latest release we can trust the loader, so
+    // the check is still useful even for loader users who have stale binaries.
+    let client = match reqwest::Client::builder()
+        .user_agent("FrikadellenBAF/version-check")
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+    let release: GithubRelease = match resp.json().await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let latest_tag = release.tag_name.trim();
+    if latest_tag == VERSION {
+        return; // Up to date
+    }
+    let date_info = release.published_at
+        .as_deref()
+        .and_then(|d| d.split('T').next())
+        .unwrap_or("unknown date");
+    warn!("========================================");
+    warn!("YOU ARE USING AN OUTDATED CLIENT, BUG REPORTS ARE NOT VALID FOR OUTDATED CLIENTS");
+    warn!("Current version: {}  |  Latest release: {} ({})", VERSION, latest_tag, date_info);
+    warn!("Download the latest release or use the FrikadellenBAF-loader for automatic updates.");
+    warn!("========================================");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     init_logger()?;
     info!("Starting Frikadellen BAF v{}", VERSION);
+
+    // Check for outdated version (non-loader users).
+    // Runs synchronously before the main loop so the warning appears at the very top of the log.
+    check_version_outdated().await;
 
     // Load or create configuration
     let config_loader = Arc::new(ConfigLoader::new());
