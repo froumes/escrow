@@ -276,6 +276,9 @@ pub struct BotClient {
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
     /// Cleared when an order fills (Claimed message detected).
     bazaar_at_limit: Arc<AtomicBool>,
+    /// Set when "[Bazaar] You reached the daily limit" is detected.
+    /// Cleared on account switch or at 0:00 UTC daily reset.
+    bazaar_daily_limit: Arc<AtomicBool>,
     /// Set when "Maximum auction count reached" is detected in the Manage Auctions GUI.
     /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
     /// SellToAuction → /ah → limit-detected → idle loops.
@@ -436,6 +439,7 @@ impl BotClient {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
+            bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
             auction_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
@@ -534,6 +538,7 @@ impl BotClient {
             scoreboard_teams: self.scoreboard_teams.clone(),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
+            bazaar_daily_limit: self.bazaar_daily_limit.clone(),
             auction_at_limit: self.auction_at_limit.clone(),
             bazaar_order_rejected: self.bazaar_order_rejected.clone(),
             purchase_start_time: self.purchase_start_time.clone(),
@@ -767,6 +772,16 @@ impl BotClient {
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
     pub fn is_bazaar_at_limit(&self) -> bool {
         self.bazaar_at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the bazaar daily sell value limit has been hit.
+    pub fn is_bazaar_daily_limit(&self) -> bool {
+        self.bazaar_daily_limit.load(Ordering::Relaxed)
+    }
+
+    /// Clears the bazaar daily sell value limit flag (e.g. at 0:00 UTC reset).
+    pub fn clear_bazaar_daily_limit(&self) {
+        self.bazaar_daily_limit.store(false, Ordering::Relaxed);
     }
 
     /// Returns true if the auction house limit has been hit and not yet cleared.
@@ -1033,6 +1048,9 @@ pub struct BotClientState {
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
     /// Cleared when an order fills. Prevents placing new orders while at the cap.
     pub bazaar_at_limit: Arc<AtomicBool>,
+    /// Set when "[Bazaar] You reached the daily limit" is detected.
+    /// Cleared on account switch or at 0:00 UTC daily reset.
+    pub bazaar_daily_limit: Arc<AtomicBool>,
     /// Set when "Maximum auction count reached" is detected in the Manage Auctions GUI.
     /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
     /// SellToAuction → /ah → limit-detected → idle loops.
@@ -1202,6 +1220,7 @@ impl Default for BotClientState {
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
+            bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
             auction_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
@@ -2300,6 +2319,12 @@ async fn event_handler(
                     info!("[Bazaar] Order collected, clearing order-limit flag");
                     state.bazaar_at_limit.store(false, Ordering::Relaxed);
                 }
+            }
+
+            // Detect bazaar daily sell value limit
+            if clean_message.contains("You reached the daily limit") && clean_message.to_lowercase().contains("bazaar") {
+                warn!("[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC");
+                state.bazaar_daily_limit.store(true, Ordering::Relaxed);
             }
 
             // Detect bazaar order rejection ("Your price isn't competitive enough")

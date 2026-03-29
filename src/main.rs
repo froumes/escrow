@@ -586,6 +586,40 @@ async fn main() -> Result<()> {
                         profit_tracker_events.set_ah_total(profit);
                         tracing::info!("[CoflProfit] Updated AH total from Coflnet: {} coins", profit);
                     }
+
+                    // Detect bazaar daily sell value limit
+                    if clean.contains("You reached the daily limit") && clean.to_lowercase().contains("bazaar") {
+                        warn!("[Bazaar] Daily sell value limit reached — disabling bazaar flips until 0:00 UTC");
+                        // Send webhook notification
+                        if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
+                            let url = webhook_url.to_string();
+                            let name = ingame_name_for_events.clone();
+                            tokio::spawn(async move {
+                                frikadellen_baf::webhook::send_webhook_bazaar_daily_limit(&name, &url).await;
+                            });
+                        }
+                        // Schedule auto-clear of daily limit flag at next 0:00 UTC
+                        let bot_for_reset = bot_client_clone.clone();
+                        let chat_tx_dl = chat_tx_events.clone();
+                        tokio::spawn(async move {
+                            let midnight = frikadellen_baf::webhook::next_utc_midnight_unix();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let secs_until_midnight = midnight.saturating_sub(now);
+                            tracing::info!("[Bazaar] Scheduling daily-limit reset in {}s (0:00 UTC)", secs_until_midnight);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight + 5)).await;
+                            bot_for_reset.clear_bazaar_daily_limit();
+                            let reset_msg = "§f[§4BAF§f]: §aBazaar daily limit reset — flips re-enabled".to_string();
+                            frikadellen_baf::logging::print_mc_chat(&reset_msg);
+                            let _ = chat_tx_dl.send(reset_msg);
+                            tracing::info!("[Bazaar] Daily limit reset — bazaar flips re-enabled");
+                        });
+                        let baf_msg = "§f[§4BAF§f]: §c⚠ Bazaar daily sell limit reached — flips disabled until 0:00 UTC".to_string();
+                        frikadellen_baf::logging::print_mc_chat(&baf_msg);
+                        let _ = chat_tx_events.send(baf_msg);
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
                     debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
@@ -1256,6 +1290,12 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Skip if daily sell value limit reached
+                    if bot_client_for_ws.is_bazaar_daily_limit() {
+                        debug!("Skipping bazaar flip — daily sell value limit reached: {}", bazaar_flip.item_name);
+                        continue;
+                    }
+
                     // Skip if there are filled orders waiting to be collected —
                     // they still occupy a slot until ManageOrders collects them.
                     if bazaar_tracker_ws.has_filled_orders() {
@@ -1486,6 +1526,7 @@ async fn main() -> Result<()> {
                         && cofl_authenticated_ws.load(Ordering::Relaxed)
                         && !bazaar_flips_paused_ws.load(Ordering::Relaxed)
                         && !bot_client_for_ws.is_bazaar_at_limit()
+                        && !bot_client_for_ws.is_bazaar_daily_limit()
                     {
                         if let Ok(Some(rec)) = frikadellen_baf::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
                             let bot_state = bot_client_for_ws.state();
