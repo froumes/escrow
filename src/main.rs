@@ -266,6 +266,23 @@ async fn check_version_outdated() {
     warn!("========================================");
 }
 
+/// Persist the total accumulated session time (in seconds) for a given IGN.
+/// The file is a JSON object mapping IGN → total_seconds.  Existing entries
+/// for other accounts are preserved.
+fn save_session_time(path: &std::path::Path, ign: &str, total_secs: u64) {
+    use std::collections::HashMap;
+    let mut times: HashMap<String, u64> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    times.insert(ign.to_string(), total_secs);
+    if let Ok(json) = serde_json::to_string_pretty(&times) {
+        if let Err(e) = std::fs::write(path, json) {
+            tracing::warn!("[SessionTime] Failed to save session times: {}", e);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -371,6 +388,31 @@ async fn main() -> Result<()> {
     };
 
     let ingame_name = ingame_names[current_account_index].clone();
+
+    // ---- Session time persistence ----
+    // Load the accumulated running time for this account from a sidecar JSON file.
+    // When the user stops and restarts the macro, the elapsed time is preserved
+    // so profit-per-hour calculations and `/cofl profit`/`bz h` day-range queries
+    // cover the total running period, not just the current invocation.
+    let session_times_path = match std::env::current_exe() {
+        Ok(p) => p.parent().map(|d| d.join("session_times.json")).unwrap_or_else(|| std::path::PathBuf::from("session_times.json")),
+        Err(_) => std::path::PathBuf::from("session_times.json"),
+    };
+    let previous_session_secs: u64 = {
+        match std::fs::read_to_string(&session_times_path) {
+            Ok(contents) => {
+                match serde_json::from_str::<HashMap<String, u64>>(&contents) {
+                    Ok(times) => *times.get(&ingame_name).unwrap_or(&0),
+                    Err(_) => 0,
+                }
+            }
+            Err(_) => 0,
+        }
+    };
+    if previous_session_secs > 0 {
+        info!("Resumed session for {} — previous accumulated time: {}s ({:.2}h)",
+            ingame_name, previous_session_secs, previous_session_secs as f64 / 3600.0);
+    }
 
     info!("Configuration loaded for player: {} (account {}/{})", ingame_name, current_account_index + 1, ingame_names.len());
     info!("AH Flips: {}", if config.enable_ah_flips { "ENABLED" } else { "DISABLED" });
@@ -551,6 +593,7 @@ async fn main() -> Result<()> {
             )),
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),
+            previous_session_secs,
             hypixel_api_key: config.hypixel_api_key.clone(),
             detected_cofl_license: detected_cofl_license.clone(),
             profit_tracker: profit_tracker.clone(),
@@ -635,6 +678,7 @@ async fn main() -> Result<()> {
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let session_start = std::time::Instant::now();
+    let prev_secs_events = previous_session_secs;
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -950,7 +994,7 @@ async fn main() -> Result<()> {
                     // the session window so the tracker stays in sync with Coflnet.
                     // Skip if session is too short for meaningful data (< ~15 min).
                     {
-                        let days = session_start.elapsed().as_secs_f64() / 86400.0;
+                        let days = (prev_secs_events as f64 + session_start.elapsed().as_secs_f64()) / 86400.0;
                         if days >= 0.01 {
                             let ign = ingame_name_for_events.clone();
                             let args = format!("{} {:.4}", ign, days);
@@ -1197,6 +1241,7 @@ async fn main() -> Result<()> {
                         let ws2 = ws_client_for_events.clone();
                         let ign = ingame_name_for_events.clone();
                         let ss = session_start;
+                        let prev_secs = prev_secs_events;
                         tokio::spawn(async move {
                             // Small delay to let Coflnet register the completed flip.
                             tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS)).await;
@@ -1212,7 +1257,7 @@ async fn main() -> Result<()> {
                             }
                             // Also request `/cofl bz h <ign> <days>` for authoritative
                             // BZ session profit (same as AH `/cofl profit`).
-                            let days = ss.elapsed().as_secs_f64() / 86400.0;
+                            let days = (prev_secs as f64 + ss.elapsed().as_secs_f64()) / 86400.0;
                             if days >= 0.01 {
                                 let args = format!("h {} {:.4}", ign, days);
                                 let data_json = serde_json::json!(args).to_string();
@@ -2617,6 +2662,10 @@ async fn main() -> Result<()> {
             let chat_tx_switch = chat_tx.clone();
             let detected_license_switch = detected_cofl_license.clone();
             let ws_switch = ws_client.clone();
+            let session_times_path_switch = session_times_path.clone();
+            let ign_switch = ingame_name.clone();
+            let started_switch = std::time::Instant::now();
+            let prev_secs_switch = previous_session_secs;
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
                 ingame_name, next_name, switch_hours
@@ -2627,6 +2676,10 @@ async fn main() -> Result<()> {
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
                     next_index + 1, next_name
                 );
+                // Save accumulated session time before switching.
+                let total_secs = prev_secs_switch + started_switch.elapsed().as_secs();
+                save_session_time(&session_times_path_switch, &ign_switch, total_secs);
+                info!("[AccountSwitch] Saved session time for {}: {}s", ign_switch, total_secs);
                 // Transfer the COFL license to the next account before restarting.
                 let license_index = detected_license_switch.load(Ordering::Relaxed);
                 if license_index > 0 {
@@ -2658,15 +2711,32 @@ async fn main() -> Result<()> {
         let webhook_url = webhook_url.to_string();
         let name = ingame_name.clone();
         let started = std::time::Instant::now();
+        let prev_secs_summary = previous_session_secs;
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(30 * 60)).await;
                 let (ah, bz) = profit_tracker_webhook.totals();
-                let uptime = started.elapsed().as_secs();
+                let uptime = prev_secs_summary + started.elapsed().as_secs();
                 frikadellen_baf::webhook::send_webhook_profit_summary(
                     &name, ah, bz, uptime, &webhook_url,
                 )
                 .await;
+            }
+        });
+    }
+
+    // Periodic session-time persistence — save the accumulated running time for
+    // this account every 60 seconds so a crash or kill preserves most of the data.
+    {
+        let session_times_path_save = session_times_path.clone();
+        let ign_save = ingame_name.clone();
+        let started_save = std::time::Instant::now();
+        let prev_secs_save = previous_session_secs;
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(60)).await;
+                let total_secs = prev_secs_save + started_save.elapsed().as_secs();
+                save_session_time(&session_times_path_save, &ign_save, total_secs);
             }
         });
     }
@@ -2677,6 +2747,10 @@ async fn main() -> Result<()> {
     // Wait until Ctrl+C (SIGINT) is received
     tokio::signal::ctrl_c().await?;
     info!("Received Ctrl+C — shutting down BAF...");
+    // Save final session time before exit.
+    let total_secs = previous_session_secs + session_start.elapsed().as_secs();
+    save_session_time(&session_times_path, &ingame_name, total_secs);
+    info!("[SessionTime] Saved final session time for {}: {}s ({:.2}h)", ingame_name, total_secs, total_secs as f64 / 3600.0);
     std::process::exit(0);
 }
 
