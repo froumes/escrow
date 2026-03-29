@@ -175,6 +175,26 @@ fn parse_bz_list_flip_detail(line: &str) -> Option<(String, i64, u32)> {
     Some((item_name, profit, count))
 }
 
+/// Parse a Coflnet `/cofl bz h` response and return the total profit in coins.
+///
+/// Expected format (color-stripped):
+///   `"Bazaar Profit History for <ign> (last <days> days)"`
+///   `"Total Profit: -234M"`
+///   `"Average Daily Profit: -33.5M"`
+///   …
+///
+/// We look for `"Total Profit: "` and parse the short-number value after it.
+fn parse_cofl_bz_h_total_profit(clean_msg: &str) -> Option<i64> {
+    let prefix = "Total Profit: ";
+    let idx = clean_msg.find(prefix)?;
+    let after = &clean_msg[idx + prefix.len()..];
+    // Take until the next whitespace or end of string.
+    let value_str: String = after.chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    parse_short_number(&value_str)
+}
+
 fn should_enqueue_periodic_auction_claim(
     bot_state: frikadellen_baf::types::BotState,
     queue_empty: bool,
@@ -585,6 +605,13 @@ async fn main() -> Result<()> {
                     if let Some(profit) = parse_cofl_profit_response(&clean) {
                         profit_tracker_events.set_ah_total(profit);
                         tracing::info!("[CoflProfit] Updated AH total from Coflnet: {} coins", profit);
+                    }
+
+                    // Parse `/cofl bz h` response for authoritative BZ session profit.
+                    // "Total Profit: -234M" (inside "Bazaar Profit History for <ign> ...")
+                    if let Some(bz_profit) = parse_cofl_bz_h_total_profit(&clean) {
+                        profit_tracker_events.set_bz_total(bz_profit);
+                        tracing::info!("[CoflBzH] Updated BZ total from /cofl bz h: {} coins", bz_profit);
                     }
 
                     // Detect bazaar daily sell value limit
@@ -1116,6 +1143,9 @@ async fn main() -> Result<()> {
                     // profits and update the session BZ total via set_bz_total().
                     if !is_buy_order {
                         let ws = ws_client_for_events.clone();
+                        let ws2 = ws_client_for_events.clone();
+                        let ign = ingame_name_for_events.clone();
+                        let ss = session_start;
                         tokio::spawn(async move {
                             // Small delay to let Coflnet register the completed flip.
                             tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS)).await;
@@ -1128,6 +1158,22 @@ async fn main() -> Result<()> {
                                 tracing::warn!("[BZList] Failed to send /cofl bz l: {}", e);
                             } else {
                                 tracing::info!("[BZList] Auto-requested /cofl bz l after SELL fill");
+                            }
+                            // Also request `/cofl bz h <ign> <days>` for authoritative
+                            // BZ session profit (same as AH `/cofl profit`).
+                            let days = ss.elapsed().as_secs_f64() / 86400.0;
+                            if days >= 0.01 {
+                                let args = format!("h {} {:.4}", ign, days);
+                                let data_json = serde_json::json!(args).to_string();
+                                let message = serde_json::json!({
+                                    "type": "bz",
+                                    "data": data_json
+                                }).to_string();
+                                if let Err(e) = ws2.send_message(&message).await {
+                                    tracing::warn!("[CoflBzH] Failed to send /cofl bz h: {}", e);
+                                } else {
+                                    tracing::info!("[CoflBzH] Auto-requested /cofl bz h {} {:.4}", ign, days);
+                                }
                             }
                         });
                     }
@@ -2585,7 +2631,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_cofl_bz_h_total_profit, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
     use frikadellen_baf::types::{BotState, CommandType};
 
     #[test]
@@ -2714,5 +2760,28 @@ mod tests {
     fn parse_bz_list_flip_detail_no_match() {
         assert!(parse_bz_list_flip_detail("Some random text").is_none());
         assert!(parse_bz_list_flip_detail("Last Completed Bazaar Flips").is_none());
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_negative_profit() {
+        let msg = "Total Profit: -234M";
+        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(-234_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_positive_profit() {
+        let msg = "Total Profit: 1.5B";
+        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(1_500_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_in_context() {
+        let msg = "Bazaar Profit History for TestUser (last 1 days)\nTotal Profit: -234M\nAverage Daily Profit: -33.5M";
+        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(-234_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_no_match() {
+        assert_eq!(parse_cofl_bz_h_total_profit("Some random message"), None);
     }
 }
