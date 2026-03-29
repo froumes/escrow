@@ -2326,7 +2326,7 @@ async fn event_handler(
             }
 
             // Detect bazaar daily sell value limit
-            if clean_message.contains("You reached the daily limit") && clean_message.to_lowercase().contains("bazaar") {
+            if clean_message.contains("You reached the daily limit") && clean_message.contains("bazaar") {
                 warn!("[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC");
                 state.bazaar_daily_limit.store(true, Ordering::Relaxed);
             }

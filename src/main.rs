@@ -21,6 +21,7 @@ use frikadellen_baf::utils::restart_process;
 
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
+const GITHUB_REPO: &str = "TreXito/frikadellen-baf-121";
 
 /// Base delay per consecutive rejoin attempt (seconds).
 const REJOIN_BACKOFF_BASE_SECS: u64 = 60;
@@ -39,6 +40,15 @@ const BZ_LIST_DEBOUNCE_SECS: u64 = 2;
 /// Coflnet needs a brief window to register the completed flip in its database
 /// before the list is requested; 3 seconds covers typical processing latency.
 const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
+
+/// Seconds in one day — used to convert elapsed seconds to fractional days
+/// for Coflnet `/cofl profit` and `/cofl bz h` day-range queries.
+const SECS_PER_DAY: f64 = 86400.0;
+
+/// Buffer seconds added past midnight UTC before re-enabling bazaar flips
+/// after the daily sell value limit reset — ensures the server-side reset
+/// has fully propagated.
+const DAILY_LIMIT_RESET_BUFFER_SECS: u64 = 5;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -229,7 +239,6 @@ struct GithubRelease {
 /// Check the GitHub releases API to see if the current binary is outdated.
 /// Logs a prominent warning if the latest release tag differs from `VERSION`.
 async fn check_version_outdated() {
-    const GITHUB_REPO: &str = "TreXito/frikadellen-baf-121";
 
     // If the loader is managing updates it writes a `.version` file next to the binary.
     // When that file exists and matches the latest release we can trust the loader, so
@@ -394,21 +403,15 @@ async fn main() -> Result<()> {
     // When the user stops and restarts the macro, the elapsed time is preserved
     // so profit-per-hour calculations and `/cofl profit`/`bz h` day-range queries
     // cover the total running period, not just the current invocation.
-    let session_times_path = match std::env::current_exe() {
-        Ok(p) => p.parent().map(|d| d.join("session_times.json")).unwrap_or_else(|| std::path::PathBuf::from("session_times.json")),
-        Err(_) => std::path::PathBuf::from("session_times.json"),
-    };
-    let previous_session_secs: u64 = {
-        match std::fs::read_to_string(&session_times_path) {
-            Ok(contents) => {
-                match serde_json::from_str::<HashMap<String, u64>>(&contents) {
-                    Ok(times) => *times.get(&ingame_name).unwrap_or(&0),
-                    Err(_) => 0,
-                }
-            }
-            Err(_) => 0,
-        }
-    };
+    let session_times_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("session_times.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("session_times.json"));
+    let previous_session_secs: u64 = std::fs::read_to_string(&session_times_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, u64>>(&s).ok())
+        .and_then(|m| m.get(&ingame_name).copied())
+        .unwrap_or(0);
     if previous_session_secs > 0 {
         info!("Resumed session for {} — previous accumulated time: {}s ({:.2}h)",
             ingame_name, previous_session_secs, previous_session_secs as f64 / 3600.0);
@@ -710,7 +713,7 @@ async fn main() -> Result<()> {
                     }
 
                     // Detect bazaar daily sell value limit
-                    if clean.contains("You reached the daily limit") && clean.to_lowercase().contains("bazaar") {
+                    if clean.contains("You reached the daily limit") && clean.contains("bazaar") {
                         warn!("[Bazaar] Daily sell value limit reached — disabling bazaar flips until 0:00 UTC");
                         // Send webhook notification
                         if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
@@ -731,7 +734,7 @@ async fn main() -> Result<()> {
                                 .as_secs();
                             let secs_until_midnight = midnight.saturating_sub(now);
                             tracing::info!("[Bazaar] Scheduling daily-limit reset in {}s (0:00 UTC)", secs_until_midnight);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight + 5)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight + DAILY_LIMIT_RESET_BUFFER_SECS)).await;
                             bot_for_reset.clear_bazaar_daily_limit();
                             let reset_msg = "§f[§4BAF§f]: §aBazaar daily limit reset — flips re-enabled".to_string();
                             frikadellen_baf::logging::print_mc_chat(&reset_msg);
@@ -994,7 +997,7 @@ async fn main() -> Result<()> {
                     // the session window so the tracker stays in sync with Coflnet.
                     // Skip if session is too short for meaningful data (< ~15 min).
                     {
-                        let days = (prev_secs_events as f64 + session_start.elapsed().as_secs_f64()) / 86400.0;
+                        let days = (prev_secs_events as f64 + session_start.elapsed().as_secs_f64()) / SECS_PER_DAY;
                         if days >= 0.01 {
                             let ign = ingame_name_for_events.clone();
                             let args = format!("{} {:.4}", ign, days);
@@ -1257,7 +1260,7 @@ async fn main() -> Result<()> {
                             }
                             // Also request `/cofl bz h <ign> <days>` for authoritative
                             // BZ session profit (same as AH `/cofl profit`).
-                            let days = (prev_secs as f64 + ss.elapsed().as_secs_f64()) / 86400.0;
+                            let days = (prev_secs as f64 + ss.elapsed().as_secs_f64()) / SECS_PER_DAY;
                             if days >= 0.01 {
                                 let args = format!("h {} {:.4}", ign, days);
                                 let data_json = serde_json::json!(args).to_string();
