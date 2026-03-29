@@ -21,6 +21,7 @@ use frikadellen_baf::utils::restart_process;
 
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
+const GITHUB_REPO: &str = "TreXito/frikadellen-baf-121";
 
 /// Base delay per consecutive rejoin attempt (seconds).
 const REJOIN_BACKOFF_BASE_SECS: u64 = 60;
@@ -39,6 +40,15 @@ const BZ_LIST_DEBOUNCE_SECS: u64 = 2;
 /// Coflnet needs a brief window to register the completed flip in its database
 /// before the list is requested; 3 seconds covers typical processing latency.
 const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
+
+/// Seconds in one day — used to convert elapsed seconds to fractional days
+/// for Coflnet `/cofl profit` and `/cofl bz h` day-range queries.
+const SECS_PER_DAY: f64 = 86400.0;
+
+/// Buffer seconds added past midnight UTC before re-enabling bazaar flips
+/// after the daily sell value limit reset — ensures the server-side reset
+/// has fully propagated.
+const DAILY_LIMIT_RESET_BUFFER_SECS: u64 = 5;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -175,6 +185,26 @@ fn parse_bz_list_flip_detail(line: &str) -> Option<(String, i64, u32)> {
     Some((item_name, profit, count))
 }
 
+/// Parse a Coflnet `/cofl bz h` response and return the total profit in coins.
+///
+/// Expected format (color-stripped):
+///   `"Bazaar Profit History for <ign> (last <days> days)"`
+///   `"Total Profit: -234M"`
+///   `"Average Daily Profit: -33.5M"`
+///   …
+///
+/// We look for `"Total Profit: "` and parse the short-number value after it.
+fn parse_cofl_bz_h_total_profit(clean_msg: &str) -> Option<i64> {
+    let prefix = "Total Profit: ";
+    let idx = clean_msg.find(prefix)?;
+    let after = &clean_msg[idx + prefix.len()..];
+    // Take until the next whitespace or end of string.
+    let value_str: String = after.chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    parse_short_number(&value_str)
+}
+
 fn should_enqueue_periodic_auction_claim(
     bot_state: frikadellen_baf::types::BotState,
     queue_empty: bool,
@@ -199,11 +229,78 @@ fn should_drop_bazaar_command_during_ah_pause(
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
 
+/// GitHub release response (subset of fields).
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    published_at: Option<String>,
+}
+
+/// Check the GitHub releases API to see if the current binary is outdated.
+/// Logs a prominent warning if the latest release tag differs from `VERSION`.
+async fn check_version_outdated() {
+
+    // If the loader is managing updates it writes a `.version` file next to the binary.
+    // When that file exists and matches the latest release we can trust the loader, so
+    // the check is still useful even for loader users who have stale binaries.
+    let client = match reqwest::Client::builder()
+        .user_agent("FrikadellenBAF/version-check")
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+    let release: GithubRelease = match resp.json().await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let latest_tag = release.tag_name.trim();
+    if latest_tag == VERSION {
+        return; // Up to date
+    }
+    let date_info = release.published_at
+        .as_deref()
+        .and_then(|d| d.split('T').next())
+        .unwrap_or("unknown date");
+    warn!("========================================");
+    warn!("YOU ARE USING AN OUTDATED CLIENT, BUG REPORTS ARE NOT VALID FOR OUTDATED CLIENTS");
+    warn!("Current version: {}  |  Latest release: {} ({})", VERSION, latest_tag, date_info);
+    warn!("Download the latest release or use the FrikadellenBAF-loader for automatic updates.");
+    warn!("========================================");
+}
+
+/// Persist the total accumulated session time (in seconds) for a given IGN.
+/// The file is a JSON object mapping IGN → total_seconds.  Existing entries
+/// for other accounts are preserved.
+fn save_session_time(path: &std::path::Path, ign: &str, total_secs: u64) {
+    use std::collections::HashMap;
+    let mut times: HashMap<String, u64> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    times.insert(ign.to_string(), total_secs);
+    if let Ok(json) = serde_json::to_string_pretty(&times) {
+        if let Err(e) = std::fs::write(path, json) {
+            tracing::warn!("[SessionTime] Failed to save session times: {}", e);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     init_logger()?;
     info!("Starting Frikadellen BAF v{}", VERSION);
+
+    // Check for outdated version (non-loader users).
+    // Runs synchronously before the main loop so the warning appears at the very top of the log.
+    check_version_outdated().await;
 
     // Load or create configuration
     let config_loader = Arc::new(ConfigLoader::new());
@@ -300,6 +397,25 @@ async fn main() -> Result<()> {
     };
 
     let ingame_name = ingame_names[current_account_index].clone();
+
+    // ---- Session time persistence ----
+    // Load the accumulated running time for this account from a sidecar JSON file.
+    // When the user stops and restarts the macro, the elapsed time is preserved
+    // so profit-per-hour calculations and `/cofl profit`/`bz h` day-range queries
+    // cover the total running period, not just the current invocation.
+    let session_times_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("session_times.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("session_times.json"));
+    let previous_session_secs: u64 = std::fs::read_to_string(&session_times_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, u64>>(&s).ok())
+        .and_then(|m| m.get(&ingame_name).copied())
+        .unwrap_or(0);
+    if previous_session_secs > 0 {
+        info!("Resumed session for {} — previous accumulated time: {}s ({:.2}h)",
+            ingame_name, previous_session_secs, previous_session_secs as f64 / 3600.0);
+    }
 
     info!("Configuration loaded for player: {} (account {}/{})", ingame_name, current_account_index + 1, ingame_names.len());
     info!("AH Flips: {}", if config.enable_ah_flips { "ENABLED" } else { "DISABLED" });
@@ -480,6 +596,7 @@ async fn main() -> Result<()> {
             )),
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),
+            previous_session_secs,
             hypixel_api_key: config.hypixel_api_key.clone(),
             detected_cofl_license: detected_cofl_license.clone(),
             profit_tracker: profit_tracker.clone(),
@@ -564,6 +681,7 @@ async fn main() -> Result<()> {
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let session_start = std::time::Instant::now();
+    let prev_secs_events = previous_session_secs;
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -585,6 +703,47 @@ async fn main() -> Result<()> {
                     if let Some(profit) = parse_cofl_profit_response(&clean) {
                         profit_tracker_events.set_ah_total(profit);
                         tracing::info!("[CoflProfit] Updated AH total from Coflnet: {} coins", profit);
+                    }
+
+                    // Parse `/cofl bz h` response for authoritative BZ session profit.
+                    // "Total Profit: -234M" (inside "Bazaar Profit History for <ign> ...")
+                    if let Some(bz_profit) = parse_cofl_bz_h_total_profit(&clean) {
+                        profit_tracker_events.set_bz_total(bz_profit);
+                        tracing::info!("[CoflBzH] Updated BZ total from /cofl bz h: {} coins", bz_profit);
+                    }
+
+                    // Detect bazaar daily sell value limit
+                    if clean.contains("You reached the daily limit") && clean.contains("bazaar") {
+                        warn!("[Bazaar] Daily sell value limit reached — disabling bazaar flips until 0:00 UTC");
+                        // Send webhook notification
+                        if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
+                            let url = webhook_url.to_string();
+                            let name = ingame_name_for_events.clone();
+                            tokio::spawn(async move {
+                                frikadellen_baf::webhook::send_webhook_bazaar_daily_limit(&name, &url).await;
+                            });
+                        }
+                        // Schedule auto-clear of daily limit flag at next 0:00 UTC
+                        let bot_for_reset = bot_client_clone.clone();
+                        let chat_tx_dl = chat_tx_events.clone();
+                        tokio::spawn(async move {
+                            let midnight = frikadellen_baf::webhook::next_utc_midnight_unix();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let secs_until_midnight = midnight.saturating_sub(now);
+                            tracing::info!("[Bazaar] Scheduling daily-limit reset in {}s (0:00 UTC)", secs_until_midnight);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight + DAILY_LIMIT_RESET_BUFFER_SECS)).await;
+                            bot_for_reset.clear_bazaar_daily_limit();
+                            let reset_msg = "§f[§4BAF§f]: §aBazaar daily limit reset — flips re-enabled".to_string();
+                            frikadellen_baf::logging::print_mc_chat(&reset_msg);
+                            let _ = chat_tx_dl.send(reset_msg);
+                            tracing::info!("[Bazaar] Daily limit reset — bazaar flips re-enabled");
+                        });
+                        let baf_msg = "§f[§4BAF§f]: §c⚠ Bazaar daily sell limit reached — flips disabled until 0:00 UTC".to_string();
+                        frikadellen_baf::logging::print_mc_chat(&baf_msg);
+                        let _ = chat_tx_events.send(baf_msg);
                     }
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
@@ -838,7 +997,7 @@ async fn main() -> Result<()> {
                     // the session window so the tracker stays in sync with Coflnet.
                     // Skip if session is too short for meaningful data (< ~15 min).
                     {
-                        let days = session_start.elapsed().as_secs_f64() / 86400.0;
+                        let days = (prev_secs_events as f64 + session_start.elapsed().as_secs_f64()) / SECS_PER_DAY;
                         if days >= 0.01 {
                             let ign = ingame_name_for_events.clone();
                             let args = format!("{} {:.4}", ign, days);
@@ -1047,9 +1206,15 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order } => {
-                    // Remove from tracker without recording profit (cancelled orders don't count).
-                    let _ = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order, already_collected } => {
+                    // When already_collected is true, a BazaarOrderCollected event
+                    // already removed this order from the tracker (partial collect
+                    // followed by cancel of the unfilled remainder).  Calling
+                    // remove_order again would incorrectly remove a DIFFERENT
+                    // same-item order.
+                    if !already_collected {
+                        let _ = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                    }
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order cancelled: {} ({})", item_name, order_type);
                     let baf_msg = format!(
@@ -1082,6 +1247,10 @@ async fn main() -> Result<()> {
                     // profits and update the session BZ total via set_bz_total().
                     if !is_buy_order {
                         let ws = ws_client_for_events.clone();
+                        let ws2 = ws_client_for_events.clone();
+                        let ign = ingame_name_for_events.clone();
+                        let ss = session_start;
+                        let prev_secs = prev_secs_events;
                         tokio::spawn(async move {
                             // Small delay to let Coflnet register the completed flip.
                             tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS)).await;
@@ -1094,6 +1263,22 @@ async fn main() -> Result<()> {
                                 tracing::warn!("[BZList] Failed to send /cofl bz l: {}", e);
                             } else {
                                 tracing::info!("[BZList] Auto-requested /cofl bz l after SELL fill");
+                            }
+                            // Also request `/cofl bz h <ign> <days>` for authoritative
+                            // BZ session profit (same as AH `/cofl profit`).
+                            let days = (prev_secs as f64 + ss.elapsed().as_secs_f64()) / SECS_PER_DAY;
+                            if days >= 0.01 {
+                                let args = format!("h {} {:.4}", ign, days);
+                                let data_json = serde_json::json!(args).to_string();
+                                let message = serde_json::json!({
+                                    "type": "bz",
+                                    "data": data_json
+                                }).to_string();
+                                if let Err(e) = ws2.send_message(&message).await {
+                                    tracing::warn!("[CoflBzH] Failed to send /cofl bz h: {}", e);
+                                } else {
+                                    tracing::info!("[CoflBzH] Auto-requested /cofl bz h {} {:.4}", ign, days);
+                                }
                             }
                         });
                     }
@@ -1253,6 +1438,12 @@ async fn main() -> Result<()> {
                     // Skip if at the Bazaar order limit (21 orders)
                     if bot_client_for_ws.is_bazaar_at_limit() {
                         debug!("Skipping bazaar flip — at order limit: {}", bazaar_flip.item_name);
+                        continue;
+                    }
+
+                    // Skip if daily sell value limit reached
+                    if bot_client_for_ws.is_bazaar_daily_limit() {
+                        debug!("Skipping bazaar flip — daily sell value limit reached: {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -1486,6 +1677,7 @@ async fn main() -> Result<()> {
                         && cofl_authenticated_ws.load(Ordering::Relaxed)
                         && !bazaar_flips_paused_ws.load(Ordering::Relaxed)
                         && !bot_client_for_ws.is_bazaar_at_limit()
+                        && !bot_client_for_ws.is_bazaar_daily_limit()
                     {
                         if let Ok(Some(rec)) = frikadellen_baf::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
                             let bot_state = bot_client_for_ws.state();
@@ -2479,6 +2671,10 @@ async fn main() -> Result<()> {
             let chat_tx_switch = chat_tx.clone();
             let detected_license_switch = detected_cofl_license.clone();
             let ws_switch = ws_client.clone();
+            let session_times_path_switch = session_times_path.clone();
+            let ign_switch = ingame_name.clone();
+            let started_switch = std::time::Instant::now();
+            let prev_secs_switch = previous_session_secs;
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
                 ingame_name, next_name, switch_hours
@@ -2489,6 +2685,10 @@ async fn main() -> Result<()> {
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
                     next_index + 1, next_name
                 );
+                // Save accumulated session time before switching.
+                let total_secs = prev_secs_switch + started_switch.elapsed().as_secs();
+                save_session_time(&session_times_path_switch, &ign_switch, total_secs);
+                info!("[AccountSwitch] Saved session time for {}: {}s", ign_switch, total_secs);
                 // Transfer the COFL license to the next account before restarting.
                 let license_index = detected_license_switch.load(Ordering::Relaxed);
                 if license_index > 0 {
@@ -2520,15 +2720,32 @@ async fn main() -> Result<()> {
         let webhook_url = webhook_url.to_string();
         let name = ingame_name.clone();
         let started = std::time::Instant::now();
+        let prev_secs_summary = previous_session_secs;
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(30 * 60)).await;
                 let (ah, bz) = profit_tracker_webhook.totals();
-                let uptime = started.elapsed().as_secs();
+                let uptime = prev_secs_summary + started.elapsed().as_secs();
                 frikadellen_baf::webhook::send_webhook_profit_summary(
                     &name, ah, bz, uptime, &webhook_url,
                 )
                 .await;
+            }
+        });
+    }
+
+    // Periodic session-time persistence — save the accumulated running time for
+    // this account every 60 seconds so a crash or kill preserves most of the data.
+    {
+        let session_times_path_save = session_times_path.clone();
+        let ign_save = ingame_name.clone();
+        let started_save = std::time::Instant::now();
+        let prev_secs_save = previous_session_secs;
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(60)).await;
+                let total_secs = prev_secs_save + started_save.elapsed().as_secs();
+                save_session_time(&session_times_path_save, &ign_save, total_secs);
             }
         });
     }
@@ -2539,12 +2756,16 @@ async fn main() -> Result<()> {
     // Wait until Ctrl+C (SIGINT) is received
     tokio::signal::ctrl_c().await?;
     info!("Received Ctrl+C — shutting down BAF...");
+    // Save final session time before exit.
+    let total_secs = previous_session_secs + session_start.elapsed().as_secs();
+    save_session_time(&session_times_path, &ingame_name, total_secs);
+    info!("[SessionTime] Saved final session time for {}: {}s ({:.2}h)", ingame_name, total_secs, total_secs as f64 / 3600.0);
     std::process::exit(0);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_cofl_bz_h_total_profit, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
     use frikadellen_baf::types::{BotState, CommandType};
 
     #[test]
@@ -2673,5 +2894,28 @@ mod tests {
     fn parse_bz_list_flip_detail_no_match() {
         assert!(parse_bz_list_flip_detail("Some random text").is_none());
         assert!(parse_bz_list_flip_detail("Last Completed Bazaar Flips").is_none());
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_negative_profit() {
+        let msg = "Total Profit: -234M";
+        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(-234_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_positive_profit() {
+        let msg = "Total Profit: 1.5B";
+        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(1_500_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_in_context() {
+        let msg = "Bazaar Profit History for TestUser (last 1 days)\nTotal Profit: -234M\nAverage Daily Profit: -33.5M";
+        assert_eq!(parse_cofl_bz_h_total_profit(msg), Some(-234_000_000));
+    }
+
+    #[test]
+    fn parse_cofl_bz_h_no_match() {
+        assert_eq!(parse_cofl_bz_h_total_profit("Some random message"), None);
     }
 }

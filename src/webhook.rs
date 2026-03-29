@@ -452,6 +452,35 @@ pub async fn send_webhook_bazaar_order_cancelled(
     post_embed(webhook_url, payload).await;
 }
 
+/// Webhook sent when the bazaar daily sell value limit is reached.
+pub async fn send_webhook_bazaar_daily_limit(
+    ingame_name: &str,
+    webhook_url: &str,
+) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "⚠️ Bazaar Daily Limit Reached",
+            "description": format!("Bazaar flips disabled for **{}** until 0:00 UTC daily reset.", ingame_name),
+            "color": 0xFF0000u32,
+            "fields": [
+                {"name": "⏰ Resets At", "value": format!("<t:{}:R>", next_utc_midnight_unix()), "inline": true},
+            ],
+            "footer": {
+                "text": format!("BAF • {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
+/// Unix timestamp of the next 0:00 UTC.
+pub fn next_utc_midnight_unix() -> u64 {
+    let now = now_unix();
+    let secs_since_midnight = now % 86400;
+    now + (86400 - secs_since_midnight)
+}
+
 pub async fn send_webhook_auction_listed(
     ingame_name: &str,
     item_name: &str,

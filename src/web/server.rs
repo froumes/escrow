@@ -53,6 +53,9 @@ pub struct WebSharedState {
     pub player_uuid: Arc<tokio::sync::RwLock<Option<String>>>,
     /// Timestamp when the bot process started (for uptime tracking).
     pub started_at: std::time::Instant,
+    /// Accumulated running time from previous sessions (seconds).
+    /// Added to `started_at.elapsed()` to get total uptime across restarts.
+    pub previous_session_secs: u64,
     /// Hypixel API key for fetching active auctions (optional).
     pub hypixel_api_key: Option<String>,
     /// Auto-detected COFL license index for the current IGN (0 = none detected).
@@ -341,7 +344,7 @@ fn format_og_uptime(secs: u64) -> String {
 async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
     let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
-    let uptime = s.started_at.elapsed().as_secs();
+    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
 
@@ -456,7 +459,7 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
         current_account_index: s.current_account_index,
         accounts,
         purse: s.bot_client.get_purse(),
-        uptime_seconds: s.started_at.elapsed().as_secs(),
+        uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
     })
 }
 
@@ -1188,7 +1191,7 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
         bz_points: s.profit_tracker.bz_points(),
         ah_total,
         bz_total,
-        uptime_seconds: s.started_at.elapsed().as_secs(),
+        uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
     })
 }
 
@@ -1198,7 +1201,7 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
 async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfitResponse> {
     let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
-    let uptime = s.started_at.elapsed().as_secs();
+    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
     Json(PublicProfitResponse {
@@ -1217,7 +1220,7 @@ async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfit
 async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
     let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
-    let uptime = s.started_at.elapsed().as_secs();
+    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
 
