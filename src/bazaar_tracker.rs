@@ -155,21 +155,41 @@ impl BazaarOrderTracker {
 
     /// Reconcile the tracker with the orders currently visible in-game.
     ///
-    /// `ingame_orders` is the set of `(item_name, is_buy_order)` tuples taken
+    /// `ingame_orders` is the list of `(item_name, is_buy_order)` tuples taken
     /// from the Bazaar Orders window during a ManageOrders cycle.  Any tracked
     /// order whose item+type does **not** appear in this list is removed so the
     /// web panel stays in sync with the actual in-game state.
     ///
+    /// Duplicate same-item orders are handled by counting occurrences: if the
+    /// in-game window shows 2 "Coal" buy orders, at most 2 tracked "Coal" buy
+    /// orders are kept.
+    ///
     /// Returns the number of stale tracker entries removed.
     pub fn reconcile_with_ingame(&self, ingame_orders: &[(String, bool)]) -> usize {
-        let ingame_set: std::collections::HashSet<(String, bool)> = ingame_orders
-            .iter()
-            .map(|(name, is_buy)| (normalize_for_match(name), *is_buy))
-            .collect();
+        // Build a count map: (normalized_name, is_buy) → how many in-game.
+        let mut ingame_counts: std::collections::HashMap<(String, bool), usize> =
+            std::collections::HashMap::new();
+        for (name, is_buy) in ingame_orders {
+            *ingame_counts
+                .entry((normalize_for_match(name), *is_buy))
+                .or_insert(0) += 1;
+        }
         let mut orders = self.orders.write();
         let original_len = orders.len();
+        // Track how many of each (item, side) we have already kept so we
+        // don't exceed the in-game count.
+        let mut kept_counts: std::collections::HashMap<(String, bool), usize> =
+            std::collections::HashMap::new();
         orders.retain(|o| {
-            ingame_set.contains(&(normalize_for_match(&o.item_name), o.is_buy_order))
+            let key = (normalize_for_match(&o.item_name), o.is_buy_order);
+            let allowed = ingame_counts.get(&key).copied().unwrap_or(0);
+            let kept = kept_counts.entry(key).or_insert(0);
+            if *kept < allowed {
+                *kept += 1;
+                true
+            } else {
+                false
+            }
         });
         let removed = original_len - orders.len();
         drop(orders);
@@ -521,6 +541,42 @@ mod tests {
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 0);
         assert_eq!(tracker.get_orders().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_duplicate_same_item_orders() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // Tracker has 3 "Coal" buy orders
+        tracker.add_order("Coal".into(), 10, 500.0, true);
+        tracker.add_order("Coal".into(), 20, 510.0, true);
+        tracker.add_order("Coal".into(), 30, 520.0, true);
+        assert_eq!(tracker.get_orders().len(), 3);
+
+        // In-game only has 1 "Coal" buy order (2 were cancelled externally)
+        let ingame = vec![("Coal".to_string(), true)];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 2);
+        assert_eq!(tracker.get_orders().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_keeps_correct_count_of_duplicates() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // Tracker has 2 "Coal" buy orders and 1 "Diamond" sell order
+        tracker.add_order("Coal".into(), 10, 500.0, true);
+        tracker.add_order("Coal".into(), 20, 510.0, true);
+        tracker.add_order("Diamond".into(), 5, 1000.0, false);
+        assert_eq!(tracker.get_orders().len(), 3);
+
+        // In-game has 2 "Coal" buy orders and 1 "Diamond" sell order
+        let ingame = vec![
+            ("Coal".to_string(), true),
+            ("Coal".to_string(), true),
+            ("Diamond".to_string(), false),
+        ];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        assert_eq!(tracker.get_orders().len(), 3);
     }
 
     #[test]

@@ -405,6 +405,11 @@ pub enum BotEvent {
     BazaarOrderCancelled {
         item_name: String,
         is_buy_order: bool,
+        /// When `true`, a `BazaarOrderCollected` event was already emitted for
+        /// this same order (partial collect followed by cancel).  The handler
+        /// should NOT call `remove_order` again because the collected event
+        /// already removed the tracker entry.
+        already_collected: bool,
     },
     /// An auction was cancelled via the web GUI
     AuctionCancelled {
@@ -4808,6 +4813,7 @@ async fn handle_window_interaction(
                                             let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                                 item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                                 is_buy_order: *ctx_is_buy,
+                                                already_collected: true,
                                             });
                                         }
                                     } else {
@@ -4830,6 +4836,7 @@ async fn handle_window_interaction(
                                     let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
                                         item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
                                         is_buy_order: *ctx_is_buy,
+                                        already_collected: false,
                                     });
                                 }
                             } else {

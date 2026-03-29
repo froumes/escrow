@@ -1206,9 +1206,15 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order } => {
-                    // Remove from tracker without recording profit (cancelled orders don't count).
-                    let _ = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order, already_collected } => {
+                    // When already_collected is true, a BazaarOrderCollected event
+                    // already removed this order from the tracker (partial collect
+                    // followed by cancel of the unfilled remainder).  Calling
+                    // remove_order again would incorrectly remove a DIFFERENT
+                    // same-item order.
+                    if !already_collected {
+                        let _ = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                    }
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order cancelled: {} ({})", item_name, order_type);
                     let baf_msg = format!(
