@@ -1488,6 +1488,12 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Skip AH flips when inventory is full — selling mode
+                    if bot_client_for_ws.is_inventory_full() {
+                        debug!("Skipping AH flip — inventory full (selling mode): {}", flip.item_name);
+                        continue;
+                    }
+
                     // Print colorful flip announcement (item name keeps its rarity color code)
                     let profit = flip.target.saturating_sub(flip.starting_bid);
                     let baf_msg = format!(
@@ -2310,16 +2316,27 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Skip BazaarBuyOrder commands when inventory is full — there's no
-                // room to collect items, and placing a buy order we can't claim is
-                // pointless.  Sell offers and AH listings should proceed instead.
-                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. })
-                    && bot_client_clone.is_inventory_full()
-                {
-                    debug!("[Queue] Dropping BazaarBuyOrder — inventory full: {:?}", cmd.command_type);
-                    command_queue_processor.complete_current();
-                    sleep(Duration::from_millis(50)).await;
-                    continue;
+                // Full inventory "selling mode": when inventory is full, only
+                // allow commands that free up space (AH listings, bazaar sells,
+                // order management, claims).  Everything else is dropped so the
+                // bot focuses exclusively on selling until there's space again.
+                if bot_client_clone.is_inventory_full() {
+                    let is_selling_cmd = matches!(
+                        cmd.command_type,
+                        frikadellen_baf::types::CommandType::SellToAuction { .. }
+                        | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
+                        | frikadellen_baf::types::CommandType::ManageOrders { .. }
+                        | frikadellen_baf::types::CommandType::ClaimSoldItem
+                        | frikadellen_baf::types::CommandType::ClaimPurchasedItem
+                        | frikadellen_baf::types::CommandType::SellInventoryBz
+                        | frikadellen_baf::types::CommandType::CancelAuction { .. }
+                    );
+                    if !is_selling_cmd {
+                        debug!("[Queue] Dropping {:?} — inventory full (selling mode)", cmd.command_type);
+                        command_queue_processor.complete_current();
+                        sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                 }
 
                 // Skip bazaar-order-related commands when the bazaar order limit is reached.
