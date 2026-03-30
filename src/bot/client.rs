@@ -1743,6 +1743,12 @@ fn is_my_auctions_window_title(window_title: &str) -> bool {
     window_title.contains("Manage Auctions") || window_title.contains("My Auctions")
 }
 
+/// Calculate the number of "window-content" slots (excluding the 36 player
+/// inventory slots appended at the bottom).  Capped at 54 (max chest size).
+fn window_content_slot_count(total_slots: usize) -> usize {
+    total_slots.saturating_sub(36).min(54)
+}
+
 fn is_bazaar_orders_window_title(window_title: &str) -> bool {
     let lower = window_title.to_lowercase();
     lower.contains("manage orders")
@@ -3949,7 +3955,7 @@ async fn handle_window_interaction(
                 if !found {
                     // Look for purchased item with "Status: Sold!" in lore (TypeScript pattern)
                     // Only scan window slots, not player inventory.
-                    let window_slot_count = slots.len().saturating_sub(36).min(54);
+                    let window_slot_count = window_content_slot_count(slots.len());
                     for (i, item) in slots.iter().enumerate().take(window_slot_count) {
                         let lore = get_item_lore_from_slot(item);
                         let lore_lower = lore.join("\n").to_lowercase();
@@ -4006,7 +4012,7 @@ async fn handle_window_interaction(
                 let slots = menu.slots();
                 // Only scan the window slots (typically 0..27 for a 3-row GUI),
                 // not the player inventory at the bottom, to avoid false matches.
-                let window_slot_count = slots.len().saturating_sub(36).min(54);
+                let window_slot_count = window_content_slot_count(slots.len());
                 // Look for Claim All first
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
