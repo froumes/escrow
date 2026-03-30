@@ -1793,7 +1793,10 @@ fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String
     // Check if the display name is generic (e.g. "SELL Enchanted Book" or "BUY Enchanted Book").
     // When the lore-based identity has a *different* item name, prefer it.
     if let Some((_, ref lore_item)) = order_identity {
-        // Strip the order prefix from display name for comparison
+        // Strip the order prefix from display name for comparison.
+        // These prefixes are lowercase because we compare against a lowercased
+        // copy of the display name (different from the case-preserved prefixes
+        // used below for the display name extraction path).
         let display_item = {
             let lower = stripped.to_lowercase();
             let mut found = String::new();
@@ -5897,8 +5900,6 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
     // timeout (e.g. a 100K order with 5m/M → 5 min, not 0.5 min).
     let millions = (total_value / 1_000_000.0).max(1.0);
     let cancel_secs = (cancel_minutes_per_million as f64 * millions * 60.0) as u64;
-    // Ensure the calculated cancel threshold is at least the minimum age.
-    let cancel_secs = cancel_secs.max(MIN_ORDER_AGE_BEFORE_CANCEL_SECS);
     age_secs >= cancel_secs
 }
 

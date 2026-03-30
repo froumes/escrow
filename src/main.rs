@@ -45,6 +45,12 @@ const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
 /// for Coflnet `/cofl profit` and `/cofl bz h` day-range queries.
 const SECS_PER_DAY: f64 = 86400.0;
 
+/// Extra delay (seconds) added after `BZ_LIST_REQUEST_DELAY_SECS` when
+/// requesting `/cofl bz h` after a SELL order is **collected** (vs filled).
+/// The collection happens later than the fill, so Coflnet needs slightly
+/// more time to register the completed profit.
+const BZ_PROFIT_QUERY_EXTRA_DELAY_SECS: u64 = 2;
+
 /// Buffer seconds added past midnight UTC before re-enabling bazaar flips
 /// after the daily sell value limit reset — ensures the server-side reset
 /// has fully propagated.
@@ -1258,7 +1264,7 @@ async fn main() -> Result<()> {
                         let ss_bz_h = session_start;
                         let prev_bz_h = prev_secs_events;
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS + 2)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS + BZ_PROFIT_QUERY_EXTRA_DELAY_SECS)).await;
                             let days = (prev_bz_h as f64 + ss_bz_h.elapsed().as_secs_f64()) / SECS_PER_DAY;
                             if days >= 0.01 {
                                 let args = format!("h {} {:.4}", ign_bz_h, days);
@@ -2000,11 +2006,12 @@ async fn main() -> Result<()> {
                                                         let ah_fee = calculate_ah_fee(price);
                                                         let expected_profit = price as i64 - buy_price as i64 - ah_fee as i64;
                                                         if expected_profit < 0 {
+                                                            let loss_amount = expected_profit.abs();
                                                             warn!("[createAuction] Skipping negative profit listing: {} — sell {} - buy {} - fee {} = {} coins",
                                                                 item_name, price, buy_price, ah_fee, expected_profit);
                                                             let baf_msg = format!(
                                                                 "§f[§4BAF§f]: §c❌ Skipping AH listing: §r{}§r §7— would lose §c{}§7 coins",
-                                                                item_name, format_coins(-expected_profit)
+                                                                item_name, format_coins(loss_amount)
                                                             );
                                                             print_mc_chat(&baf_msg);
                                                             let _ = chat_tx_ws.send(baf_msg);
