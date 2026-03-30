@@ -792,6 +792,16 @@ async fn main() -> Result<()> {
                 }
                 frikadellen_baf::bot::BotEvent::StartupComplete { orders_cancelled } => {
                     info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
+                    // Clear the bazaar order tracker for a clean slate — the startup
+                    // ManageOrders cycle cancelled all in-game orders already.
+                    {
+                        let removed = bazaar_tracker_events.clear_all_orders();
+                        if removed > 0 {
+                            info!("[Startup] Cleared {} stale order(s) from bazaar tracker", removed);
+                        }
+                    }
+                    // Also clear the auction slot blocked flag on startup
+                    bot_client_clone.clear_auction_slot_blocked();
                     // Upload scoreboard to COFL (with real data matching TypeScript runStartupWorkflow)
                     {
                         let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
@@ -1998,25 +2008,29 @@ async fn main() -> Result<()> {
                                     // Strip Minecraft color codes (§X) from item name
                                     let item_name = frikadellen_baf::utils::remove_minecraft_colors(item_raw);
 
-                                    // Check if selling at this price would result in a loss.
-                                    // Look up the original buy price in the flip tracker and
-                                    // subtract the AH fee.  If profit is negative, keep the
-                                    // item in inventory instead of listing at a loss.
+                                    // Check if the ORIGINAL flip was unprofitable at the
+                                    // time of purchase.  We compare the COFL target price
+                                    // (entry.0.target) against the actual buy price (entry.1)
+                                    // to detect flips that should never have been bought.
+                                    // We do NOT compare against the current createAuction
+                                    // sell price — COFL may recommend a different sell price
+                                    // than the original target, and that is fine.
                                     let skip_negative = {
                                         let key = item_name.to_lowercase();
                                         match flip_tracker_ws.lock() {
                                             Ok(tracker) => {
                                                 if let Some(entry) = tracker.get(&key) {
                                                     let buy_price = entry.1;
-                                                    if buy_price > 0 {
-                                                        let ah_fee = calculate_ah_fee(price);
-                                                        let expected_profit = price as i64 - buy_price as i64 - ah_fee as i64;
+                                                    let target = entry.0.target;
+                                                    if buy_price > 0 && target > 0 {
+                                                        let ah_fee = calculate_ah_fee(target);
+                                                        let expected_profit = target as i64 - buy_price as i64 - ah_fee as i64;
                                                         if expected_profit < 0 {
                                                             let loss_amount = expected_profit.abs();
-                                                            warn!("[createAuction] Skipping negative profit listing: {} — sell {} - buy {} - fee {} = {} coins",
-                                                                item_name, price, buy_price, ah_fee, expected_profit);
+                                                            warn!("[createAuction] Skipping originally-unprofitable flip: {} — target {} - buy {} - fee {} = {} coins",
+                                                                item_name, target, buy_price, ah_fee, expected_profit);
                                                             let baf_msg = format!(
-                                                                "§f[§4BAF§f]: §c❌ Skipping AH listing: §r{}§r §7— would lose §c{}§7 coins",
+                                                                "§f[§4BAF§f]: §c❌ Skipping AH listing: §r{}§r §7— original flip would lose §c{}§7 coins",
                                                                 item_name, format_coins(loss_amount)
                                                             );
                                                             print_mc_chat(&baf_msg);
@@ -2246,6 +2260,25 @@ async fn main() -> Result<()> {
             if let Some(cmd) = command_queue_processor.start_current() {
                 debug!("Processing command: {:?}", cmd.command_type);
 
+                // During startup, only allow startup-essential commands through.
+                // All other commands are deferred until startup completes to avoid
+                // sending chat commands (e.g. /ah, /bz) while still in the lobby.
+                if bot_client_clone.is_startup_in_progress() {
+                    let is_startup_cmd = matches!(
+                        cmd.command_type,
+                        frikadellen_baf::types::CommandType::CheckCookie
+                        | frikadellen_baf::types::CommandType::ManageOrders { .. }
+                        | frikadellen_baf::types::CommandType::ClaimSoldItem
+                        | frikadellen_baf::types::CommandType::ClaimPurchasedItem
+                    );
+                    if !is_startup_cmd {
+                        debug!("[Queue] Deferring non-startup command during startup: {:?}", cmd.command_type);
+                        command_queue_processor.complete_current();
+                        sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                }
+
                 // During AH pause, drop incoming bazaar buy orders and defer
                 // ManageOrders — they will be re-queued when bazaar flips resume.
                 if should_drop_bazaar_command_during_ah_pause(
@@ -2295,6 +2328,17 @@ async fn main() -> Result<()> {
                     && bot_client_clone.is_bazaar_at_limit()
                 {
                     debug!("[Queue] Dropping bazaar order — bazaar limit reached: {:?}", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                // Skip SellToAuction when the auction slot is blocked (stuck item).
+                // A ClaimSold / ManageOrders cycle will clear the flag.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::SellToAuction { .. })
+                    && bot_client_clone.is_auction_slot_blocked()
+                {
+                    warn!("[Queue] Dropping SellToAuction — auction slot blocked (stuck item): {:?}", cmd.command_type);
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;

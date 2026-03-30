@@ -61,6 +61,10 @@ const AUCTION_RETRY_AFTER_STUCK_ITEM_MS: u64 = 2000;
 /// slot!" keeps recurring.  After this many retries the bot gives up and goes Idle
 /// instead of looping indefinitely and risking a "Sending packets too fast!" kick.
 const MAX_AUCTION_STUCK_ITEM_RETRIES: u8 = 3;
+/// When `auction_slot_blocked` is set after exhausting stuck-item retries,
+/// this flag prevents further SellToAuction attempts until it is cleared
+/// (e.g. by a successful ClaimSold cycle that frees the slot).
+/// Cleared by the ClaimingSold → Idle transition or ManageOrders completion.
 /// Fallback slot index for "Manage Orders" in the Bazaar GUI when dynamic name
 /// lookup fails.  Hypixel's default layout places it at slot 50.
 const MANAGE_ORDERS_FALLBACK_SLOT: usize = 50;
@@ -283,6 +287,11 @@ pub struct BotClient {
     /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
     /// SellToAuction → /ah → limit-detected → idle loops.
     auction_at_limit: Arc<AtomicBool>,
+    /// Set after exhausting `MAX_AUCTION_STUCK_ITEM_RETRIES` while trying to
+    /// list an item — "You already have an item in the auction slot!" kept
+    /// recurring.  Prevents further SellToAuction commands from being processed
+    /// until a successful ClaimSold/ManageOrders cycle clears it.
+    auction_slot_blocked: Arc<AtomicBool>,
     /// Set when the server rejects an order placement (e.g. "Your price isn't
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
@@ -446,6 +455,7 @@ impl BotClient {
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
             auction_at_limit: Arc::new(AtomicBool::new(false)),
+            auction_slot_blocked: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
@@ -545,6 +555,7 @@ impl BotClient {
             bazaar_at_limit: self.bazaar_at_limit.clone(),
             bazaar_daily_limit: self.bazaar_daily_limit.clone(),
             auction_at_limit: self.auction_at_limit.clone(),
+            auction_slot_blocked: self.auction_slot_blocked.clone(),
             bazaar_order_rejected: self.bazaar_order_rejected.clone(),
             purchase_start_time: self.purchase_start_time.clone(),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
@@ -793,6 +804,18 @@ impl BotClient {
     /// Used by `main.rs` to skip SellToAuction commands when at the cap.
     pub fn is_auction_at_limit(&self) -> bool {
         self.auction_at_limit.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the auction slot is blocked due to a stuck item.
+    /// Prevents SellToAuction commands until cleared by a ClaimSold or
+    /// ManageOrders cycle.
+    pub fn is_auction_slot_blocked(&self) -> bool {
+        self.auction_slot_blocked.load(Ordering::Relaxed)
+    }
+
+    /// Clear the auction-slot-blocked flag after a successful claim or manage cycle.
+    pub fn clear_auction_slot_blocked(&self) {
+        self.auction_slot_blocked.store(false, Ordering::Relaxed);
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
@@ -1068,6 +1091,10 @@ pub struct BotClientState {
     /// Cleared when an auction is sold/claimed (slot freed). Prevents repeated
     /// SellToAuction → /ah → limit-detected → idle loops.
     pub auction_at_limit: Arc<AtomicBool>,
+    /// Set after exhausting `MAX_AUCTION_STUCK_ITEM_RETRIES` — "You already have
+    /// an item in the auction slot!" kept recurring.  Blocks SellToAuction commands
+    /// until cleared by a ClaimSold / ManageOrders cycle.
+    pub auction_slot_blocked: Arc<AtomicBool>,
     /// Set when the server rejects an order placement (e.g. "Your price isn't
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
@@ -1235,6 +1262,7 @@ impl Default for BotClientState {
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
             auction_at_limit: Arc::new(AtomicBool::new(false)),
+            auction_slot_blocked: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
@@ -2221,9 +2249,10 @@ async fn event_handler(
 
                     if attempt >= MAX_AUCTION_STUCK_ITEM_RETRIES {
                         warn!(
-                            "[Auction] ABORTING: stuck item in auction slot after {} retries — giving up",
+                            "[Auction] ABORTING: stuck item in auction slot after {} retries — giving up and blocking further listings",
                             attempt
                         );
+                        state.auction_slot_blocked.store(true, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     } else {
                         warn!(
@@ -3919,7 +3948,9 @@ async fn handle_window_interaction(
                 }
                 if !found {
                     // Look for purchased item with "Status: Sold!" in lore (TypeScript pattern)
-                    for (i, item) in slots.iter().enumerate() {
+                    // Only scan window slots, not player inventory.
+                    let window_slot_count = slots.len().saturating_sub(36).min(54);
+                    for (i, item) in slots.iter().enumerate().take(window_slot_count) {
                         let lore = get_item_lore_from_slot(item);
                         let lore_lower = lore.join("\n").to_lowercase();
                         if lore_lower.contains("status:") && lore_lower.contains("sold") {
@@ -3940,6 +3971,11 @@ async fn handle_window_interaction(
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
+                send_raw_close(bot, window_id, &state.handlers);
+                *state.bot_state.write() = BotState::Idle;
+            } else {
+                // Unrecognized window while claiming purchased — close and go idle.
+                warn!("[ClaimPurchased] Unexpected window '{}' — closing and going idle", window_title);
                 send_raw_close(bot, window_id, &state.handlers);
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -3968,17 +4004,21 @@ async fn handle_window_interaction(
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
+                // Only scan the window slots (typically 0..27 for a 3-row GUI),
+                // not the player inventory at the bottom, to avoid false matches.
+                let window_slot_count = slots.len().saturating_sub(36).min(54);
                 // Look for Claim All first
                 if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     // Claim All finishes everything — close window and go idle
                     send_raw_close(bot, window_id, &state.handlers);
+                    state.auction_slot_blocked.store(false, Ordering::Relaxed);
                     *state.bot_state.write() = BotState::Idle;
                 } else {
-                    // Look for first claimable item
+                    // Look for first claimable item (only window slots)
                     let mut found = false;
-                    for (i, item) in slots.iter().enumerate() {
+                    for (i, item) in slots.iter().enumerate().take(window_slot_count) {
                         if is_claimable_auction_slot(item) {
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
@@ -3990,6 +4030,7 @@ async fn handle_window_interaction(
                     if !found {
                         info!("[ClaimSold] Nothing to claim, closing window and going idle");
                         send_raw_close(bot, window_id, &state.handlers);
+                        state.auction_slot_blocked.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
@@ -4021,6 +4062,13 @@ async fn handle_window_interaction(
                         *claim_state_ref.write() = BotState::Idle;
                     }
                 });
+            } else {
+                // Unrecognized window while claiming — close and go idle to avoid
+                // getting stuck in an unexpected GUI.
+                warn!("[ClaimSold] Unexpected window '{}' — closing and going idle", window_title);
+                send_raw_close(bot, window_id, &state.handlers);
+                state.auction_slot_blocked.store(false, Ordering::Relaxed);
+                *state.bot_state.write() = BotState::Idle;
             }
         }
         BotState::CancellingAuction => {

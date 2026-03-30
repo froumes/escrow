@@ -128,6 +128,17 @@ impl BazaarOrderTracker {
         self.orders.read().clone()
     }
 
+    /// Remove all tracked orders and persist.  Used on startup to get a clean
+    /// view since the in-game ManageOrders cycle will cancel everything.
+    pub fn clear_all_orders(&self) -> usize {
+        let mut orders = self.orders.write();
+        let removed = orders.len();
+        orders.clear();
+        drop(orders);
+        self.save_orders_to_disk();
+        removed
+    }
+
     /// Returns `true` if at least one tracked order has status `"filled"`.
     /// Used by the periodic ManageOrders timer to skip GUI cycles when there
     /// is nothing to collect.
