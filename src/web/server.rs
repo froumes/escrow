@@ -86,6 +86,9 @@ struct StatusResponse {
     accounts: Vec<String>,
     purse: Option<u64>,
     uptime_seconds: u64,
+    bazaar_at_limit: bool,
+    auction_at_limit: bool,
+    inventory_full: bool,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +278,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/cancel_bz_order", axum::routing::post(cancel_bz_order))
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
+        .route("/api/queue", get(get_queue_status))
         .route("/api/config", get(get_config).post(save_config))
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
@@ -460,6 +464,9 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
         accounts,
         purse: s.bot_client.get_purse(),
         uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
+        bazaar_at_limit: s.bot_client.is_bazaar_at_limit(),
+        auction_at_limit: s.bot_client.is_auction_at_limit(),
+        inventory_full: s.bot_client.is_inventory_full(),
     })
 }
 
@@ -1005,6 +1012,12 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
 
 async fn get_bazaar_orders(State(s): State<WebSharedState>) -> Json<Vec<crate::bazaar_tracker::TrackedBazaarOrder>> {
     Json(s.bazaar_tracker.get_orders())
+}
+
+// ── Queue status endpoint ───────────────────────────────────
+
+async fn get_queue_status(State(s): State<WebSharedState>) -> Json<Vec<crate::state::QueueEntry>> {
+    Json(s.command_queue.queue_snapshot())
 }
 
 // ── Config endpoint ─────────────────────────────────────────

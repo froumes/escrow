@@ -45,6 +45,12 @@ const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
 /// for Coflnet `/cofl profit` and `/cofl bz h` day-range queries.
 const SECS_PER_DAY: f64 = 86400.0;
 
+/// Extra delay (seconds) added after `BZ_LIST_REQUEST_DELAY_SECS` when
+/// requesting `/cofl bz h` after a SELL order is **collected** (vs filled).
+/// The collection happens later than the fill, so Coflnet needs slightly
+/// more time to register the completed profit.
+const BZ_PROFIT_QUERY_EXTRA_DELAY_SECS: u64 = 2;
+
 /// Buffer seconds added past midnight UTC before re-enabling bazaar flips
 /// after the daily sell value limit reset — ensures the server-side reset
 /// has fully propagated.
@@ -237,12 +243,14 @@ struct GithubRelease {
 }
 
 /// Check the GitHub releases API to see if the current binary is outdated.
-/// Logs a prominent warning if the latest release tag differs from `VERSION`.
+/// Logs a prominent warning if the latest release tag differs from the local
+/// version.  The local version is determined by:
+///   1. The `.version` file next to the binary (written by the loader), or
+///   2. The hardcoded `VERSION` constant (protocol version, as a last resort).
+///
+/// This avoids false "outdated" warnings when the loader has already updated
+/// the binary to the latest release.
 async fn check_version_outdated() {
-
-    // If the loader is managing updates it writes a `.version` file next to the binary.
-    // When that file exists and matches the latest release we can trust the loader, so
-    // the check is still useful even for loader users who have stale binaries.
     let client = match reqwest::Client::builder()
         .user_agent("FrikadellenBAF/version-check")
         .timeout(std::time::Duration::from_secs(8))
@@ -261,7 +269,19 @@ async fn check_version_outdated() {
         Err(_) => return,
     };
     let latest_tag = release.tag_name.trim();
-    if latest_tag == VERSION {
+
+    // Read the `.version` file that the loader writes next to the binary.
+    // When present and matching the latest release, the binary is up-to-date
+    // regardless of the hardcoded VERSION constant.
+    let loader_version: Option<String> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join(".version")))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|s| s.trim().to_string());
+
+    let local_version = loader_version.as_deref().unwrap_or(VERSION);
+
+    if latest_tag == local_version {
         return; // Up to date
     }
     let date_info = release.published_at
@@ -270,7 +290,7 @@ async fn check_version_outdated() {
         .unwrap_or("unknown date");
     warn!("========================================");
     warn!("YOU ARE USING AN OUTDATED CLIENT, BUG REPORTS ARE NOT VALID FOR OUTDATED CLIENTS");
-    warn!("Current version: {}  |  Latest release: {} ({})", VERSION, latest_tag, date_info);
+    warn!("Current version: {}  |  Latest release: {} ({})", local_version, latest_tag, date_info);
     warn!("Download the latest release or use the FrikadellenBAF-loader for automatic updates.");
     warn!("========================================");
 }
@@ -678,6 +698,7 @@ async fn main() -> Result<()> {
     let cofl_premium_events = cofl_premium.clone();
     let chat_tx_events = chat_tx.clone();
     let enable_bazaar_flips_events = enable_bazaar_flips.clone();
+    let enable_ah_flips_events = enable_ah_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let session_start = std::time::Instant::now();
@@ -1014,6 +1035,35 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
+                    // An AH auction sold — a listing slot just freed up.
+                    // Proactively request `/cofl sellinventory` so COFL can
+                    // immediately recommend items to list, instead of waiting
+                    // for the user or periodic check.
+                    if enable_ah_flips_events.load(Ordering::Relaxed) {
+                        let ws_si = ws_client_for_events.clone();
+                        let bot_si = bot_client_clone.clone();
+                        tokio::spawn(async move {
+                            // Small delay to let the claim complete first.
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            // Upload fresh inventory then request sellinventory.
+                            if let Some(inv_json) = bot_si.get_cached_inventory_json() {
+                                let upload_msg = serde_json::json!({
+                                    "type": "uploadInventory",
+                                    "data": inv_json
+                                }).to_string();
+                                let _ = ws_si.send_message(&upload_msg).await;
+                            }
+                            let msg = serde_json::json!({
+                                "type": "sellinventory",
+                                "data": serde_json::to_string("").unwrap_or_default()
+                            }).to_string();
+                            if let Err(e) = ws_si.send_message(&msg).await {
+                                tracing::warn!("[SellInventory] Failed to auto-request sellinventory after auction sale: {}", e);
+                            } else {
+                                tracing::info!("[SellInventory] Auto-requested sellinventory after auction sale");
+                            }
+                        });
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
                     // Track the order for the web panel and profit calculation on collect.
@@ -1205,6 +1255,32 @@ async fn main() -> Result<()> {
                             ).await;
                         });
                     }
+                    // After collecting a SELL order, request `/cofl bz h` for
+                    // authoritative BZ session profit.  A few seconds' delay gives
+                    // Coflnet time to register the completed flip in its database.
+                    if !is_buy_order {
+                        let ws_bz_h = ws_client_for_events.clone();
+                        let ign_bz_h = ingame_name_for_events.clone();
+                        let ss_bz_h = session_start;
+                        let prev_bz_h = prev_secs_events;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS + BZ_PROFIT_QUERY_EXTRA_DELAY_SECS)).await;
+                            let days = (prev_bz_h as f64 + ss_bz_h.elapsed().as_secs_f64()) / SECS_PER_DAY;
+                            if days >= 0.01 {
+                                let args = format!("h {} {:.4}", ign_bz_h, days);
+                                let data_json = serde_json::json!(args).to_string();
+                                let message = serde_json::json!({
+                                    "type": "bz",
+                                    "data": data_json
+                                }).to_string();
+                                if let Err(e) = ws_bz_h.send_message(&message).await {
+                                    tracing::warn!("[CoflBzH] Failed to send /cofl bz h after SELL collect: {}", e);
+                                } else {
+                                    tracing::info!("[CoflBzH] Auto-requested /cofl bz h after SELL order collected");
+                                }
+                            }
+                        });
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order, already_collected } => {
                     // When already_collected is true, a BazaarOrderCollected event
@@ -1212,14 +1288,27 @@ async fn main() -> Result<()> {
                     // followed by cancel of the unfilled remainder).  Calling
                     // remove_order again would incorrectly remove a DIFFERENT
                     // same-item order.
-                    if !already_collected {
-                        let _ = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
-                    }
+                    let order_data = if !already_collected {
+                        bazaar_tracker_events.remove_order(&item_name, is_buy_order)
+                    } else {
+                        None
+                    };
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
                     info!("[BazaarOrders] Order cancelled: {} ({})", item_name, order_type);
+                    // Include amount and price in the cancel message so the user knows
+                    // exactly which order was cancelled, not just the item name.
+                    let detail_str = if let Some(ref order) = order_data {
+                        let total = order.price_per_unit * order.amount as f64;
+                        format!(" §7({}x @ §6{}§7 = §6{}§7 coins)",
+                            order.amount,
+                            format_coins_f64(order.price_per_unit),
+                            format_coins_f64(total))
+                    } else {
+                        String::new()
+                    };
                     let baf_msg = format!(
-                        "§f[§4BAF§f]: §c🚫 [BZ] {}§7 order cancelled: §r{}",
-                        if is_buy_order { "BUY" } else { "SELL" }, item_name
+                        "§f[§4BAF§f]: §c🚫 [BZ] {}§7 order cancelled: §r{}{}",
+                        if is_buy_order { "BUY" } else { "SELL" }, item_name, detail_str
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -1228,9 +1317,11 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
+                        let opt_amount = order_data.as_ref().map(|o| o.amount);
+                        let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_bazaar_order_cancelled(
-                                &name, &item, is_buy_order, purse, &url,
+                                &name, &item, is_buy_order, opt_amount, opt_ppu, purse, &url,
                             ).await;
                         });
                     }
@@ -1900,6 +1991,50 @@ async fn main() -> Result<()> {
                                 (Some(item_raw), Some(price), Some(duration)) => {
                                     // Strip Minecraft color codes (§X) from item name
                                     let item_name = frikadellen_baf::utils::remove_minecraft_colors(item_raw);
+
+                                    // Check if selling at this price would result in a loss.
+                                    // Look up the original buy price in the flip tracker and
+                                    // subtract the AH fee.  If profit is negative, keep the
+                                    // item in inventory instead of listing at a loss.
+                                    let skip_negative = {
+                                        let key = item_name.to_lowercase();
+                                        match flip_tracker_ws.lock() {
+                                            Ok(tracker) => {
+                                                if let Some(entry) = tracker.get(&key) {
+                                                    let buy_price = entry.1;
+                                                    if buy_price > 0 {
+                                                        let ah_fee = calculate_ah_fee(price);
+                                                        let expected_profit = price as i64 - buy_price as i64 - ah_fee as i64;
+                                                        if expected_profit < 0 {
+                                                            let loss_amount = expected_profit.abs();
+                                                            warn!("[createAuction] Skipping negative profit listing: {} — sell {} - buy {} - fee {} = {} coins",
+                                                                item_name, price, buy_price, ah_fee, expected_profit);
+                                                            let baf_msg = format!(
+                                                                "§f[§4BAF§f]: §c❌ Skipping AH listing: §r{}§r §7— would lose §c{}§7 coins",
+                                                                item_name, format_coins(loss_amount)
+                                                            );
+                                                            print_mc_chat(&baf_msg);
+                                                            let _ = chat_tx_ws.send(baf_msg);
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    } else {
+                                                        false
+                                                    }
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Err(_) => false,
+                                        }
+                                    };
+
+                                    if skip_negative {
+                                        // Don't list — keep item in inventory
+                                        continue;
+                                    }
+
                                     let cmd = CommandType::SellToAuction {
                                         item_name,
                                         starting_bid: price,
@@ -1970,11 +2105,23 @@ async fn main() -> Result<()> {
                     // Relaxed ordering is fine here — these are simple toggle flags where
                     // eventual visibility across threads is sufficient.
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
-                        let baf_msg = "§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips".to_string();
+                        let baf_msg = "§f[§4BAF§f]: §c⚡ AH Flips incoming in ~10s — closing windows, pausing bazaar".to_string();
                         print_mc_chat(&baf_msg);
                         let _ = chat_tx_ws.send(baf_msg);
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
+
+                        // Close any open window so the bot is free for AH flips.
+                        // Also force state to Idle if it's in an interruptible state
+                        // so the AH flip can be processed immediately.
+                        bot_client_for_ws.close_current_window();
+                        let current_state = bot_client_for_ws.state();
+                        if current_state != frikadellen_baf::types::BotState::Purchasing
+                            && current_state != frikadellen_baf::types::BotState::Startup
+                        {
+                            bot_client_for_ws.set_state(frikadellen_baf::types::BotState::Idle);
+                        }
+
                         let ws = ws_client_clone.clone();
                         let enable_bz = enable_bazaar_flips_ws.clone();
                         let chat_tx_resume = chat_tx_ws.clone();
@@ -2119,6 +2266,29 @@ async fn main() -> Result<()> {
                     && bot_client_clone.is_auction_at_limit()
                 {
                     debug!("[Queue] Dropping SellToAuction — auction limit reached: {:?}", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                // Skip BazaarBuyOrder commands when inventory is full — there's no
+                // room to collect items, and placing a buy order we can't claim is
+                // pointless.  Sell offers and AH listings should proceed instead.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. })
+                    && bot_client_clone.is_inventory_full()
+                {
+                    debug!("[Queue] Dropping BazaarBuyOrder — inventory full: {:?}", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                // Skip bazaar-order-related commands when the bazaar order limit is reached.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
+                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. })
+                    && bot_client_clone.is_bazaar_at_limit()
+                {
+                    debug!("[Queue] Dropping bazaar order — bazaar limit reached: {:?}", cmd.command_type);
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
