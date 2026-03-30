@@ -1247,6 +1247,10 @@ async fn main() -> Result<()> {
                         let purse = bot_client_clone.get_purse();
                         // Use actual_amount (from lore) so the webhook reflects
                         // the real claimed quantity, not the original order size.
+                        // actual_amount is 0 only when both claimed_amount (lore
+                        // parsing) and the tracker had no data — fall back to the
+                        // tracker's original order amount so the webhook still
+                        // shows *something* rather than "0x".
                         let webhook_amount = if actual_amount > 0 { Some(actual_amount) } else { order_data.as_ref().map(|o| o.amount) };
                         let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
                         tokio::spawn(async move {

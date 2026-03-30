@@ -4743,13 +4743,13 @@ async fn handle_window_interaction(
                                     // sell recommendations for all collected items at
                                     // once instead of waiting for the full order to fill.
                                     if *ctx_is_buy {
-                                        let cancel_after = find_slot_by_name(&bot.menu().slots(), "Cancel")
+                                        let cancel_slot = find_slot_by_name(&bot.menu().slots(), "Cancel")
                                             .or_else(|| find_slot_by_lore_contains(&bot.menu().slots(), "click to cancel"))
                                             .or_else(|| find_slot_by_lore_contains(&bot.menu().slots(), "cancel order"));
-                                        if let Some(cancel_s) = cancel_after {
+                                        if let Some(cs) = cancel_slot {
                                             if *state.last_window_id.read() == window_id {
                                                 info!("[ManageOrders] Cancelling remaining BUY order \"{}\" after partial collect — prefer immediate sell via cofl", order_name);
-                                                click_window_slot(bot, &state.last_window_id, window_id, cancel_s as i16).await;
+                                                click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
                                                 if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
                                                     *state.manage_orders_cancelled.write() += 1;
                                                     state.order_cancel_failures.write().remove(&cancel_fail_key);
