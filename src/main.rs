@@ -1227,12 +1227,12 @@ async fn main() -> Result<()> {
                                 && config_for_events.share_legendary_flips
                             {
                                 let item_for_channel = item_name.clone();
-                                let opt_amount = order_data.as_ref().map(|o| o.amount);
+                                let channel_amount = actual_amount;
                                 let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
                                 tokio::spawn(async move {
                                     frikadellen_baf::webhook::send_webhook_bazaar_flip_channel(
                                         &item_for_channel,
-                                        opt_amount.unwrap_or(0),
+                                        channel_amount,
                                         opt_ppu.unwrap_or(0.0),
                                         profit,
                                     ).await;
@@ -1245,12 +1245,18 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
-                        let opt_amount = order_data.as_ref().map(|o| o.amount);
+                        // Use actual_amount (from lore) so the webhook reflects
+                        // the real claimed quantity, not the original order size.
+                        // actual_amount is 0 only when both claimed_amount (lore
+                        // parsing) and the tracker had no data — fall back to the
+                        // tracker's original order amount so the webhook still
+                        // shows *something* rather than "0x".
+                        let webhook_amount = if actual_amount > 0 { Some(actual_amount) } else { order_data.as_ref().map(|o| o.amount) };
                         let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
                         tokio::spawn(async move {
                             frikadellen_baf::webhook::send_webhook_bazaar_order_collected(
                                 &name, &item, is_buy_order,
-                                opt_amount, opt_ppu,
+                                webhook_amount, opt_ppu,
                                 opt_profit, purse, &url,
                             ).await;
                         });
