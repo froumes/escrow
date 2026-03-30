@@ -10,6 +10,10 @@ use uuid::Uuid;
 const BAZAAR_RECOMMENDATION_MAX_AGE_MS: u64 = 60_000; // 60 seconds
 #[allow(dead_code)]
 const COMMAND_TIMEOUT_MS: u64 = 30_000; // 30 seconds
+/// Maximum number of queued commands (excluding the currently executing one).
+/// When exceeded, low-priority commands are trimmed — but sell offers and AH
+/// listings are always kept because they represent revenue opportunities.
+const MAX_QUEUE_SIZE: usize = 5;
 
 #[derive(Clone)]
 pub struct CommandQueue {
@@ -29,7 +33,10 @@ impl CommandQueue {
         }
     }
 
-    /// Add a command to the queue
+    /// Add a command to the queue.  If the queue exceeds `MAX_QUEUE_SIZE`,
+    /// low-priority commands are trimmed — but sell offers, AH listings, and
+    /// ManageOrders are never dropped because they represent revenue or are
+    /// essential housekeeping.
     pub fn enqueue(&self, command_type: CommandType, priority: CommandPriority, interruptible: bool) -> Uuid {
         let id = Uuid::new_v4();
         let cmd = QueuedCommand {
@@ -49,6 +56,30 @@ impl CommandQueue {
             .unwrap_or(queue.len());
         
         queue.insert(pos, cmd);
+
+        // Enforce maximum queue size by removing low-priority droppable
+        // commands from the back.  Important commands (sell offers, AH
+        // listings, ManageOrders) are never dropped.
+        while queue.len() > MAX_QUEUE_SIZE {
+            // Find the last droppable (non-essential) command
+            if let Some(drop_idx) = queue.iter().rposition(|c| {
+                !matches!(
+                    c.command_type,
+                    CommandType::BazaarSellOrder { .. }
+                    | CommandType::SellToAuction { .. }
+                    | CommandType::ManageOrders { .. }
+                    | CommandType::PurchaseAuction { .. }
+                )
+            }) {
+                let dropped = queue.remove(drop_idx).unwrap();
+                info!("[Queue] Trimmed excess command {:?} ({:?}) — queue over {} limit",
+                    dropped.command_type.display_name(), dropped.priority, MAX_QUEUE_SIZE);
+            } else {
+                // All commands are essential — allow the queue to exceed the limit.
+                break;
+            }
+        }
+
         drop(queue);
 
         // Wake the command processor loop so it picks up the new command immediately.
@@ -211,6 +242,39 @@ impl CommandQueue {
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
+
+    /// Return a snapshot of the queue for the web panel.
+    /// Includes the currently executing command (if any) followed by all
+    /// queued commands, each described by its display name, priority, and age.
+    pub fn queue_snapshot(&self) -> Vec<QueueEntry> {
+        let mut entries = Vec::new();
+        if let Some(ref cur) = *self.current_command.read() {
+            entries.push(QueueEntry {
+                display_name: cur.command_type.display_name().to_string(),
+                priority: format!("{:?}", cur.priority),
+                age_ms: cur.queued_at.elapsed().as_millis() as u64,
+                executing: true,
+            });
+        }
+        for cmd in self.queue.read().iter() {
+            entries.push(QueueEntry {
+                display_name: cmd.command_type.display_name().to_string(),
+                priority: format!("{:?}", cmd.priority),
+                age_ms: cmd.queued_at.elapsed().as_millis() as u64,
+                executing: false,
+            });
+        }
+        entries
+    }
+}
+
+/// A single entry in the queue snapshot, serializable for the web API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueueEntry {
+    pub display_name: String,
+    pub priority: String,
+    pub age_ms: u64,
+    pub executing: bool,
 }
 
 impl Default for CommandQueue {

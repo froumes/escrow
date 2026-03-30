@@ -819,6 +819,14 @@ impl BotClient {
         self.inventory_full.store(false, Ordering::Relaxed);
     }
 
+    /// Clear window tracking state so the bot is no longer associated with
+    /// any open window.  Used during the AH flip countdown to ensure the
+    /// bot is free to process incoming flips.  The server-side window will
+    /// time out automatically.
+    pub fn close_current_window(&self) {
+        self.handlers.clear_window_tracking();
+    }
+
     /// Returns true if the startup workflow is currently running.
     /// Used by flip handlers to block bazaar flips during startup.
     pub fn is_startup_in_progress(&self) -> bool {

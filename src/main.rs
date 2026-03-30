@@ -692,6 +692,7 @@ async fn main() -> Result<()> {
     let cofl_premium_events = cofl_premium.clone();
     let chat_tx_events = chat_tx.clone();
     let enable_bazaar_flips_events = enable_bazaar_flips.clone();
+    let enable_ah_flips_events = enable_ah_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let session_start = std::time::Instant::now();
@@ -1027,6 +1028,35 @@ async fn main() -> Result<()> {
                                 }
                             });
                         }
+                    }
+                    // An AH auction sold — a listing slot just freed up.
+                    // Proactively request `/cofl sellinventory` so COFL can
+                    // immediately recommend items to list, instead of waiting
+                    // for the user or periodic check.
+                    if enable_ah_flips_events.load(Ordering::Relaxed) {
+                        let ws_si = ws_client_for_events.clone();
+                        let bot_si = bot_client_clone.clone();
+                        tokio::spawn(async move {
+                            // Small delay to let the claim complete first.
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            // Upload fresh inventory then request sellinventory.
+                            if let Some(inv_json) = bot_si.get_cached_inventory_json() {
+                                let upload_msg = serde_json::json!({
+                                    "type": "uploadInventory",
+                                    "data": inv_json
+                                }).to_string();
+                                let _ = ws_si.send_message(&upload_msg).await;
+                            }
+                            let msg = serde_json::json!({
+                                "type": "sellinventory",
+                                "data": serde_json::to_string("").unwrap_or_default()
+                            }).to_string();
+                            if let Err(e) = ws_si.send_message(&msg).await {
+                                tracing::warn!("[SellInventory] Failed to auto-request sellinventory after auction sale: {}", e);
+                            } else {
+                                tracing::info!("[SellInventory] Auto-requested sellinventory after auction sale");
+                            }
+                        });
                     }
                 }
                 frikadellen_baf::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
@@ -2068,11 +2098,23 @@ async fn main() -> Result<()> {
                     // Relaxed ordering is fine here — these are simple toggle flags where
                     // eventual visibility across threads is sufficient.
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
-                        let baf_msg = "§f[§4BAF§f]: §cAH Flips incoming, pausing bazaar flips".to_string();
+                        let baf_msg = "§f[§4BAF§f]: §c⚡ AH Flips incoming in ~10s — closing windows, pausing bazaar".to_string();
                         print_mc_chat(&baf_msg);
                         let _ = chat_tx_ws.send(baf_msg);
                         let flag = bazaar_flips_paused_ws.clone();
                         flag.store(true, Ordering::Relaxed);
+
+                        // Close any open window so the bot is free for AH flips.
+                        // Also force state to Idle if it's in an interruptible state
+                        // so the AH flip can be processed immediately.
+                        bot_client_for_ws.close_current_window();
+                        let current_state = bot_client_for_ws.state();
+                        if current_state != frikadellen_baf::types::BotState::Purchasing
+                            && current_state != frikadellen_baf::types::BotState::Startup
+                        {
+                            bot_client_for_ws.set_state(frikadellen_baf::types::BotState::Idle);
+                        }
+
                         let ws = ws_client_clone.clone();
                         let enable_bz = enable_bazaar_flips_ws.clone();
                         let chat_tx_resume = chat_tx_ws.clone();
@@ -2217,6 +2259,29 @@ async fn main() -> Result<()> {
                     && bot_client_clone.is_auction_at_limit()
                 {
                     debug!("[Queue] Dropping SellToAuction — auction limit reached: {:?}", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                // Skip BazaarBuyOrder commands when inventory is full — there's no
+                // room to collect items, and placing a buy order we can't claim is
+                // pointless.  Sell offers and AH listings should proceed instead.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. })
+                    && bot_client_clone.is_inventory_full()
+                {
+                    debug!("[Queue] Dropping BazaarBuyOrder — inventory full: {:?}", cmd.command_type);
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                // Skip bazaar-order-related commands when the bazaar order limit is reached.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
+                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. })
+                    && bot_client_clone.is_bazaar_at_limit()
+                {
+                    debug!("[Queue] Dropping bazaar order — bazaar limit reached: {:?}", cmd.command_type);
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
