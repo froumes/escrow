@@ -4738,6 +4738,32 @@ async fn handle_window_interaction(
                                         // the Manage Orders lore before we clicked.
                                         claimed_amount: order_filled_amount,
                                     });
+                                    // For BUY orders, cancel the remaining order after
+                                    // collecting the partial fill.  This lets cofl send
+                                    // sell recommendations for all collected items at
+                                    // once instead of waiting for the full order to fill.
+                                    if *ctx_is_buy {
+                                        let cancel_after = find_slot_by_name(&bot.menu().slots(), "Cancel")
+                                            .or_else(|| find_slot_by_lore_contains(&bot.menu().slots(), "click to cancel"))
+                                            .or_else(|| find_slot_by_lore_contains(&bot.menu().slots(), "cancel order"));
+                                        if let Some(cancel_s) = cancel_after {
+                                            if *state.last_window_id.read() == window_id {
+                                                info!("[ManageOrders] Cancelling remaining BUY order \"{}\" after partial collect — prefer immediate sell via cofl", order_name);
+                                                click_window_slot(bot, &state.last_window_id, window_id, cancel_s as i16).await;
+                                                if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
+                                                    *state.manage_orders_cancelled.write() += 1;
+                                                    state.order_cancel_failures.write().remove(&cancel_fail_key);
+                                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
+                                                        item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
+                                                        is_buy_order: true,
+                                                        already_collected: true,
+                                                    });
+                                                } else {
+                                                    warn!("[ManageOrders] Cancel after partial BUY collect for \"{}\" was not confirmed", order_name);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
                                 warn!("[ManageOrders] Collect click for partially filled \"{}\" was not confirmed", order_name);
