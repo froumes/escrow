@@ -276,6 +276,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
         .route("/api/cancel_bz_order", axum::routing::post(cancel_bz_order))
+        .route("/api/cancel_all_bz_orders", axum::routing::post(cancel_all_bz_orders))
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
         .route("/api/queue", get(get_queue_status))
@@ -756,6 +757,29 @@ async fn cancel_bz_order(
     );
 
     (StatusCode::OK, "Cancel bazaar order command queued")
+}
+
+async fn cancel_all_bz_orders(
+    State(s): State<WebSharedState>,
+) -> impl IntoResponse {
+    info!("[WebGUI] Cancel ALL bazaar orders requested");
+
+    let _ = s.chat_tx.send(
+        "[BAF Web] Cancelling all bazaar orders...".to_string(),
+    );
+
+    // Clear the tracker immediately so the web GUI reflects the intent.
+    let removed = s.bazaar_tracker.clear_all_orders();
+    info!("[WebGUI] Cleared {} order(s) from tracker", removed);
+
+    // Queue a ManageOrders cycle with cancel_open=true to cancel in-game orders.
+    s.command_queue.enqueue(
+        CommandType::ManageOrders { cancel_open: true },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Cancel all bazaar orders command queued")
 }
 
 // ── Active auctions ───────────────────────────────────────────

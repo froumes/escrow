@@ -311,6 +311,9 @@ a{color:var(--accent2);text-decoration:none}
     <div id="bazaar-orders-container">
         <p class="auction-empty">Loading...</p>
     </div>
+    <div style="margin-top:8px;text-align:center">
+        <button class="btn btn-sm" id="cancel-all-bz-btn" style="background:var(--danger);font-size:.75rem;padding:4px 12px" onclick="cancelAllBzOrders()">✕ Cancel All Orders</button>
+    </div>
 </div>
 </div>
 
@@ -647,6 +650,12 @@ async function cancelBzOrder(itemName, isBuyOrder) {
     fetchBazaarOrders();
 }
 
+async function cancelAllBzOrders() {
+    if (!confirm('Cancel ALL bazaar orders?')) return;
+    await fetch('/api/cancel_all_bz_orders', {method:'POST'});
+    fetchBazaarOrders();
+}
+
 async function fetchInventory() {
     try {
         const r = await fetch('/api/inventory');
@@ -746,9 +755,17 @@ function renderAuctions(auctions) {
     table.appendChild(tbody);
     container.innerHTML = '';
     container.appendChild(table);
+    // Total unsold bar
+    let totalUnsold = 0;
+    auctions.forEach(a => {
+        const bid = a.highest_bid > 0 ? a.highest_bid : a.starting_bid;
+        totalUnsold += bid;
+    });
+    const totalBar = document.createElement('div');
+    totalBar.style.cssText = 'text-align:right;padding:6px 10px;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)';
+    totalBar.innerHTML = '<strong>Total unsold:</strong> ' + totalUnsold.toLocaleString() + ' ✦';
+    container.appendChild(totalBar);
 }
-
-function renderBazaarOrders(orders) {
     const container = $('bazaar-orders-container');
     if (orders.length === 0) {
         container.innerHTML = '<p class="auction-empty">No active bazaar orders</p>';
@@ -789,6 +806,19 @@ function renderBazaarOrders(orders) {
     table.appendChild(tbody);
     container.innerHTML = '';
     container.appendChild(table);
+    // Total orders value bar (buy + sell totals)
+    let totalBuy = 0, totalSell = 0;
+    orders.forEach(o => {
+        const val = o.price_per_unit * o.amount;
+        if (o.is_buy_order) totalBuy += val; else totalSell += val;
+    });
+    const totalBar = document.createElement('div');
+    totalBar.style.cssText = 'text-align:right;padding:6px 10px;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)';
+    const parts = [];
+    if (totalBuy > 0) parts.push('<span style="color:var(--success)">Buy: ' + formatShortCoins(totalBuy) + '</span>');
+    if (totalSell > 0) parts.push('<span style="color:var(--danger)">Sell: ' + formatShortCoins(totalSell) + '</span>');
+    totalBar.innerHTML = '<strong>Total:</strong> ' + parts.join(' · ');
+    container.appendChild(totalBar);
 }
 
 function formatTimeAge(unixSecs) {
