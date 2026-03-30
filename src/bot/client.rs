@@ -1775,12 +1775,37 @@ fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
 }
 
 /// Extract the clean item name from a ManageOrders order slot display name.
-/// Uses the original display name (preserving Hypixel's casing) by stripping
-/// the BUY/SELL prefix.  Falls back to `order_identity` (lowercased) then
-/// `to_title_case` to ensure webhook/chat names look correct.
+/// For enchanted books (and other items where the display name is generic),
+/// prefers the lore-based identity which contains the specific enchantment
+/// name (e.g. "Blast Protection VII" instead of "Enchanted Book").
+/// Falls back to stripping the BUY/SELL prefix from the display name.
 fn clean_order_item_name(order_name: &str, order_identity: &Option<(bool, String)>) -> String {
-    // First try stripping prefix from the ORIGINAL display name (preserves case)
     let stripped = remove_mc_colors(order_name).trim().to_string();
+
+    // Check if the display name is generic (e.g. "SELL Enchanted Book" or "BUY Enchanted Book").
+    // When the lore-based identity has a *different* item name, prefer it.
+    if let Some((_, ref lore_item)) = order_identity {
+        // Strip the order prefix from display name for comparison
+        let display_item = {
+            let lower = stripped.to_lowercase();
+            let mut found = String::new();
+            for prefix in ["buy order: ", "sell offer: ", "buy ", "sell "] {
+                if let Some(rest) = lower.strip_prefix(prefix) {
+                    found = rest.trim().to_string();
+                    break;
+                }
+            }
+            found
+        };
+        let lore_lower = lore_item.to_lowercase();
+        // If lore identity differs from display name, use lore (it's more specific).
+        // e.g. display="enchanted book", lore="blast protection vii"
+        if !display_item.is_empty() && !lore_lower.is_empty() && display_item != lore_lower {
+            return crate::utils::to_title_case(lore_item);
+        }
+    }
+
+    // First try stripping prefix from the ORIGINAL display name (preserves case)
     for prefix in ["BUY ", "SELL ", "Buy Order: ", "Sell Offer: "] {
         if let Some(rest) = stripped.strip_prefix(prefix) {
             let rest = rest.trim();
@@ -5829,6 +5854,11 @@ fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
     last_logged_order_info(is_buy, item_name).map(|(ts, _)| ts)
 }
 
+/// Minimum age (seconds) an order must exist before it can be cancelled.
+/// Cancelling orders that have only existed for a minute or two is wasteful —
+/// give them at least 5 minutes to fill.
+const MIN_ORDER_AGE_BEFORE_CANCEL_SECS: u64 = 300; // 5 minutes
+
 fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes_per_million: u64) -> bool {
     if cancel_minutes_per_million == 0 {
         return false;
@@ -5850,11 +5880,17 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
     } else {
         0
     };
+    // Never cancel orders younger than 5 minutes — give them time to fill.
+    if age_secs < MIN_ORDER_AGE_BEFORE_CANCEL_SECS {
+        return false;
+    }
     // Scale cancel timeout by total order value: minutes_per_million * (total_value / 1_000_000)
     // Floor at 1.0M so orders under 1M coins still get the base cancel_minutes_per_million
     // timeout (e.g. a 100K order with 5m/M → 5 min, not 0.5 min).
     let millions = (total_value / 1_000_000.0).max(1.0);
     let cancel_secs = (cancel_minutes_per_million as f64 * millions * 60.0) as u64;
+    // Ensure the calculated cancel threshold is at least the minimum age.
+    let cancel_secs = cancel_secs.max(MIN_ORDER_AGE_BEFORE_CANCEL_SECS);
     age_secs >= cancel_secs
 }
 
