@@ -766,6 +766,8 @@ function renderAuctions(auctions) {
     totalBar.innerHTML = '<strong>Total unsold:</strong> ' + totalUnsold.toLocaleString() + ' ✦';
     container.appendChild(totalBar);
 }
+
+function renderBazaarOrders(orders) {
     const container = $('bazaar-orders-container');
     if (orders.length === 0) {
         container.innerHTML = '<p class="auction-empty">No active bazaar orders</p>';

@@ -666,6 +666,14 @@ async fn main() -> Result<()> {
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx.send(baf_msg);
                     last_err = Some(format!("{}", e));
+                    // Notify via Discord webhook so the user knows auth is failing
+                    if let Some(webhook_url) = config.active_webhook_url() {
+                        let err_str = format!("{}", e);
+                        frikadellen_baf::webhook::send_webhook_auth_failed(
+                            &ingame_name, attempt, AUTH_MAX_RETRIES, &err_str,
+                            config.active_discord_id(), webhook_url,
+                        ).await;
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
             }
@@ -675,6 +683,13 @@ async fn main() -> Result<()> {
                 "All {} auth attempts failed (last error: {}) — restarting process",
                 AUTH_MAX_RETRIES, err
             );
+            // Send final "all attempts failed" webhook before restarting
+            if let Some(webhook_url) = config.active_webhook_url() {
+                frikadellen_baf::webhook::send_webhook_auth_failed(
+                    &ingame_name, AUTH_MAX_RETRIES, AUTH_MAX_RETRIES, &err,
+                    config.active_discord_id(), webhook_url,
+                ).await;
+            }
             let baf_msg = format!(
                 "§f[§4BAF§f]: §cAll {} auth attempts failed — restarting...",
                 AUTH_MAX_RETRIES
@@ -857,11 +872,19 @@ async fn main() -> Result<()> {
                     });
                     // Queue claim at Normal priority so any pending High-priority flip
                     // purchases run before we open the AH windows to collect.
-                    command_queue_clone.enqueue(
-                        frikadellen_baf::types::CommandType::ClaimPurchasedItem,
-                        frikadellen_baf::types::CommandPriority::Normal,
-                        false,
-                    );
+                    // Skip claiming when inventory is near full to keep space for selling.
+                    if bot_client_clone.is_inventory_near_full() {
+                        warn!("[ItemPurchased] Skipping claim — inventory near full, prioritizing selling");
+                        let baf_msg = "§f[§4BAF§f]: §e⚠ Inventory near full — skipping claim to keep space for selling".to_string();
+                        print_mc_chat(&baf_msg);
+                        let _ = chat_tx_events.send(baf_msg);
+                    } else {
+                        command_queue_clone.enqueue(
+                            frikadellen_baf::types::CommandType::ClaimPurchasedItem,
+                            frikadellen_baf::types::CommandPriority::Normal,
+                            false,
+                        );
+                    }
                     // Look up stored flip data and update with real buy price + purchase time.
                     // Also grab the color-coded item name from the flip for colorful output.
                     // Buy speed comes from the event (flip received → escrow message).
@@ -2318,8 +2341,9 @@ async fn main() -> Result<()> {
 
                 // Full inventory "selling mode": when inventory is full, only
                 // allow commands that free up space (AH listings, bazaar sells,
-                // order management, claims).  Everything else is dropped so the
-                // bot focuses exclusively on selling until there's space again.
+                // order management, claims of SOLD items).  Everything else —
+                // including ClaimPurchasedItem (which adds items) — is dropped so
+                // the bot focuses exclusively on selling until there's space again.
                 if bot_client_clone.is_inventory_full() {
                     let is_selling_cmd = matches!(
                         cmd.command_type,
@@ -2327,7 +2351,6 @@ async fn main() -> Result<()> {
                         | frikadellen_baf::types::CommandType::BazaarSellOrder { .. }
                         | frikadellen_baf::types::CommandType::ManageOrders { .. }
                         | frikadellen_baf::types::CommandType::ClaimSoldItem
-                        | frikadellen_baf::types::CommandType::ClaimPurchasedItem
                         | frikadellen_baf::types::CommandType::SellInventoryBz
                         | frikadellen_baf::types::CommandType::CancelAuction { .. }
                     );
@@ -2337,6 +2360,19 @@ async fn main() -> Result<()> {
                         sleep(Duration::from_millis(50)).await;
                         continue;
                     }
+                }
+
+                // When inventory is near full (≤4 empty slots), skip claiming
+                // purchased items to keep space available for selling.  The
+                // purchases are safe in the AH collect bin and will be claimed
+                // once inventory drains.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::ClaimPurchasedItem)
+                    && bot_client_clone.is_inventory_near_full()
+                {
+                    debug!("[Queue] Deferring ClaimPurchasedItem — inventory near full, prioritizing selling");
+                    command_queue_processor.complete_current();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
 
                 // Skip bazaar-order-related commands when the bazaar order limit is reached.
@@ -2783,6 +2819,9 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // Periodic log cleanup — delete archived logs older than 7 days once a day.
+    frikadellen_baf::logging::spawn_periodic_log_cleanup();
 
     // Island guard: if "Your Island" is not in the scoreboard, send
     // /lobby → /play sb → /is to return to the island.
