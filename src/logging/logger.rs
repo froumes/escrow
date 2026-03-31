@@ -8,6 +8,8 @@ pub fn init_logger() -> Result<()> {
     let logs_dir = get_logs_dir();
     std::fs::create_dir_all(&logs_dir)?;
     rotate_previous_latest_log(&logs_dir)?;
+    // Clean up log files older than 7 days at startup
+    cleanup_old_logs(&logs_dir, 7);
 
     // Create file appender
     let file_appender = RollingFileAppender::new(
@@ -98,6 +100,66 @@ fn rotate_previous_latest_log(logs_dir: &Path) -> Result<()> {
     }
     std::fs::rename(latest_log, archived_log)?;
     Ok(())
+}
+
+const SECS_PER_DAY: u64 = 86_400;
+
+/// Delete archived log files older than `max_age_days` days.
+/// Only removes `*.log` files that are NOT `latest.log`.
+pub fn cleanup_old_logs(logs_dir: &Path, max_age_days: u64) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(max_age_days * SECS_PER_DAY));
+    let cutoff = match cutoff {
+        Some(c) => c,
+        None => return, // clock error, skip cleanup
+    };
+
+    let entries = match std::fs::read_dir(logs_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Only delete archived log files, never the active latest.log
+        if name == "latest.log" || !name.ends_with(".log") {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if modified < cutoff {
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("Warning: Failed to remove old log {}: {}", name, e);
+            } else {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        // Logger may not be initialized yet at startup, so use eprintln
+        eprintln!("Cleaned up {} old log file(s) from {:?}", removed, logs_dir);
+    }
+}
+
+/// Spawn a background task that cleans up old logs once per day.
+pub fn spawn_periodic_log_cleanup() {
+    let logs_dir = get_logs_dir();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(SECS_PER_DAY)).await;
+            cleanup_old_logs(&logs_dir, 7);
+        }
+    });
 }
 
 /// Pre-compiled regex for stripping Minecraft §-color codes.  Compiled once on

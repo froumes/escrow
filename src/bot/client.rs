@@ -94,6 +94,10 @@ const MAX_CANCEL_RETRIES: u32 = 5;
 /// against actual slot counts so stale flags are auto-cleared after a manual
 /// instasell or any other action that frees space.
 const MIN_FREE_SLOTS_FOR_BUY: u8 = 2;
+/// Threshold for "near full" inventory — when the number of empty slots is
+/// at or below this value, the bot stops claiming purchased items (bids) to
+/// keep space available for selling.
+const NEAR_FULL_SLOT_THRESHOLD: u8 = 4;
 #[cfg(test)]
 static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
@@ -840,6 +844,14 @@ impl BotClient {
     /// timer after a cooldown so that ManageOrders can retry BUY collection.
     pub fn clear_inventory_full(&self) {
         self.inventory_full.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns true if inventory is near full (≤ NEAR_FULL_SLOT_THRESHOLD
+    /// empty slots).  Used to stop claiming purchased items (bids) proactively
+    /// so the bot always has room to sell.
+    pub fn is_inventory_near_full(&self) -> bool {
+        let empty = self.cached_empty_player_slots.load(Ordering::Relaxed);
+        empty <= NEAR_FULL_SLOT_THRESHOLD
     }
 
     /// Clear window tracking state so the bot is no longer associated with

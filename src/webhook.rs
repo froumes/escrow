@@ -84,6 +84,42 @@ fn format_purse(n: u64) -> String {
     }
 }
 
+pub async fn send_webhook_auth_failed(
+    ingame_name: &str,
+    attempt: u32,
+    max_retries: u32,
+    error: &str,
+    discord_id: Option<&str>,
+    webhook_url: &str,
+) {
+    let description = if attempt >= max_retries {
+        format!(
+            "**{}** — all {} authentication attempts failed.\nThe process will restart automatically.",
+            ingame_name, max_retries
+        )
+    } else {
+        format!(
+            "**{}** — authentication failed (attempt {}/{}).\n```\n{}\n```",
+            ingame_name, attempt, max_retries, error
+        )
+    };
+
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🔒 Authentication Failed",
+            "description": description,
+            "color": 0xe74c3cu32,
+            "footer": {
+                "text": format!("BAF - {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }]
+    });
+    let ping = discord_id.map(|id| format!("<@{}>", id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
+
 
 pub async fn send_webhook_initialized(
     ingame_name: &str,
