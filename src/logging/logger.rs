@@ -102,11 +102,13 @@ fn rotate_previous_latest_log(logs_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+const SECS_PER_DAY: u64 = 86_400;
+
 /// Delete archived log files older than `max_age_days` days.
 /// Only removes `*.log` files that are NOT `latest.log`.
 pub fn cleanup_old_logs(logs_dir: &Path, max_age_days: u64) {
     let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(max_age_days * 86400));
+        .checked_sub(std::time::Duration::from_secs(max_age_days * SECS_PER_DAY));
     let cutoff = match cutoff {
         Some(c) => c,
         None => return, // clock error, skip cleanup
@@ -154,8 +156,7 @@ pub fn spawn_periodic_log_cleanup() {
     let logs_dir = get_logs_dir();
     tokio::spawn(async move {
         loop {
-            // Run cleanup every 24 hours
-            tokio::time::sleep(tokio::time::Duration::from_secs(86400)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(SECS_PER_DAY)).await;
             cleanup_old_logs(&logs_dir, 7);
         }
     });
