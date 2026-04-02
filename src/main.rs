@@ -2863,7 +2863,11 @@ async fn main() -> Result<()> {
             // Wait for startup to complete before starting idle checks.
             sleep(Duration::from_secs(INVENTORY_IDLE_SELLINVENTORY_SECS)).await;
             loop {
-                sleep(Duration::from_secs(60)).await; // check every minute
+                // Sleep for the remaining time until the threshold, capped to 60s minimum.
+                let elapsed = last_listed_idle.lock().unwrap().elapsed().as_secs();
+                let remaining = INVENTORY_IDLE_SELLINVENTORY_SECS.saturating_sub(elapsed);
+                sleep(Duration::from_secs(remaining.max(60))).await;
+
                 let elapsed = last_listed_idle.lock().unwrap().elapsed().as_secs();
                 if elapsed < INVENTORY_IDLE_SELLINVENTORY_SECS {
                     continue;
