@@ -614,7 +614,7 @@ pub async fn send_webhook_banned(
 
     let description = if parsed.is_security_ban {
         if parsed.clean_text.is_empty() {
-            format!("**{}** has been security blocked.\nSuspicious activity has been detected on the account.", ingame_name)
+            format!("**{}** has been security blocked.\nCheck <https://www.hypixel.net/security-block> for details.", ingame_name)
         } else {
             format!("**{}** has been security blocked.\n\n{}", ingame_name, parsed.clean_text)
         }
@@ -655,7 +655,7 @@ pub async fn send_webhook_no_cookie(
         "embeds": [{
             "title": "🍪 No Booster Cookie",
             "description": format!(
-                "**{}** received \"You cannot view this auction!\" — this usually means the account has no active booster cookie.\n\nPlease log in manually and buy a booster cookie, then restart the bot.",
+                "**{}** received \"You cannot view this auction!\" — this usually means the account has no active booster cookie.\n\nPlease log in manually and buy a booster cookie, then start the bot again.",
                 ingame_name
             ),
             "color": 0xe67e22u32,

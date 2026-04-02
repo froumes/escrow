@@ -819,7 +819,7 @@ async fn main() -> Result<()> {
                             webhook_url,
                         ).await;
                     }
-                    let baf_msg = "§f[§4BAF§f]: §c⚠ No booster cookie — please log in manually and buy one, then restart.".to_string();
+                    let baf_msg = "§f[§4BAF§f]: §c⚠ No booster cookie — please log in manually and buy one, then start the bot again.".to_string();
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
                     // Terminate — the bot can't flip without a cookie
