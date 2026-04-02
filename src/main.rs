@@ -48,6 +48,13 @@ const BZ_LIST_REQUEST_DELAY_SECS: u64 = 3;
 /// for Coflnet `/cofl profit` and `/cofl bz h` day-range queries.
 const SECS_PER_DAY: f64 = 86400.0;
 
+/// Maximum allowed gap (in seconds) between the last session save and the
+/// current startup.  If the gap is larger, the previous session time is
+/// discarded so that uptime reflects the *current* session only.
+/// A quick restart (crash, manual kill-and-relaunch) within this window
+/// carries over the accumulated time; an account switch or long pause resets it.
+const MAX_SESSION_GAP_SECS: u64 = 5 * 60; // 5 minutes
+
 /// Extra delay (seconds) added after `BZ_LIST_REQUEST_DELAY_SECS` when
 /// requesting `/cofl bz h` after a SELL order is **collected** (vs filled).
 /// The collection happens later than the fill, so Coflnet needs slightly
@@ -301,20 +308,69 @@ async fn check_version_outdated() {
     warn!("========================================");
 }
 
-/// Persist the total accumulated session time (in seconds) for a given IGN.
-/// The file is a JSON object mapping IGN → total_seconds.  Existing entries
-/// for other accounts are preserved.
+/// A single session-time entry stored in `session_times.json`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct SessionTimeEntry {
+    /// Accumulated running seconds for this session.
+    secs: u64,
+    /// Unix timestamp (seconds) when this entry was last saved.
+    saved_at: u64,
+}
+
+/// Return the current Unix timestamp in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Load the session-times map from disk.  Gracefully handles the **old**
+/// format (`{ign: u64}`) by treating those entries as expired (secs=0).
+fn load_session_times(path: &std::path::Path) -> HashMap<String, SessionTimeEntry> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    // Try new format first.
+    if let Ok(map) = serde_json::from_str::<HashMap<String, SessionTimeEntry>>(&raw) {
+        return map;
+    }
+    // Fallback: old `{ign: u64}` format — treat all entries as expired.
+    if let Ok(old) = serde_json::from_str::<HashMap<String, u64>>(&raw) {
+        return old
+            .into_iter()
+            .map(|(k, _)| (k, SessionTimeEntry { secs: 0, saved_at: 0 }))
+            .collect();
+    }
+    HashMap::new()
+}
+
+/// Persist the accumulated session time for a given IGN.
+/// Existing entries for other accounts are preserved.
 fn save_session_time(path: &std::path::Path, ign: &str, total_secs: u64) {
-    use std::collections::HashMap;
-    let mut times: HashMap<String, u64> = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    times.insert(ign.to_string(), total_secs);
+    let mut times = load_session_times(path);
+    times.insert(
+        ign.to_string(),
+        SessionTimeEntry {
+            secs: total_secs,
+            saved_at: unix_now(),
+        },
+    );
     if let Ok(json) = serde_json::to_string_pretty(&times) {
         if let Err(e) = std::fs::write(path, json) {
             tracing::warn!("[SessionTime] Failed to save session times: {}", e);
         }
+    }
+}
+
+/// Clear the session time for a given IGN (reset to 0).
+/// Used on account switch so the outgoing account starts fresh next time.
+fn clear_session_time(path: &std::path::Path, ign: &str) {
+    let mut times = load_session_times(path);
+    times.remove(ign);
+    if let Ok(json) = serde_json::to_string_pretty(&times) {
+        let _ = std::fs::write(path, json);
     }
 }
 
@@ -426,18 +482,29 @@ async fn main() -> Result<()> {
 
     // ---- Session time persistence ----
     // Load the accumulated running time for this account from a sidecar JSON file.
-    // When the user stops and restarts the macro, the elapsed time is preserved
-    // so profit-per-hour calculations and `/cofl profit`/`bz h` day-range queries
-    // cover the total running period, not just the current invocation.
+    // Only carry over previous time if the last save was recent (within
+    // MAX_SESSION_GAP_SECS), i.e. the user quickly restarted the macro.
+    // Account switches and long pauses reset uptime to 0.
     let session_times_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("session_times.json")))
         .unwrap_or_else(|| std::path::PathBuf::from("session_times.json"));
-    let previous_session_secs: u64 = std::fs::read_to_string(&session_times_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<HashMap<String, u64>>(&s).ok())
-        .and_then(|m| m.get(&ingame_name).copied())
-        .unwrap_or(0);
+    let previous_session_secs: u64 = {
+        let times = load_session_times(&session_times_path);
+        if let Some(entry) = times.get(&ingame_name) {
+            let now = unix_now();
+            let gap = now.saturating_sub(entry.saved_at);
+            if gap <= MAX_SESSION_GAP_SECS {
+                entry.secs
+            } else {
+                info!("Session gap for {} is {}s (>{} max) — starting fresh session",
+                    ingame_name, gap, MAX_SESSION_GAP_SECS);
+                0
+            }
+        } else {
+            0
+        }
+    };
     if previous_session_secs > 0 {
         info!("Resumed session for {} — previous accumulated time: {}s ({:.2}h)",
             ingame_name, previous_session_secs, previous_session_secs as f64 / 3600.0);
@@ -3053,8 +3120,6 @@ async fn main() -> Result<()> {
             let ws_switch = ws_client.clone();
             let session_times_path_switch = session_times_path.clone();
             let ign_switch = ingame_name.clone();
-            let started_switch = std::time::Instant::now();
-            let prev_secs_switch = previous_session_secs;
             info!(
                 "[AccountSwitch] Will switch from {} to {} in {:.1}h",
                 ingame_name, next_name, switch_hours
@@ -3065,10 +3130,10 @@ async fn main() -> Result<()> {
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
                     next_index + 1, next_name
                 );
-                // Save accumulated session time before switching.
-                let total_secs = prev_secs_switch + started_switch.elapsed().as_secs();
-                save_session_time(&session_times_path_switch, &ign_switch, total_secs);
-                info!("[AccountSwitch] Saved session time for {}: {}s", ign_switch, total_secs);
+                // Clear session time for the outgoing account so it starts
+                // fresh when this account is used again.
+                clear_session_time(&session_times_path_switch, &ign_switch);
+                info!("[AccountSwitch] Cleared session time for {}", ign_switch);
                 // Transfer the COFL license to the next account before restarting.
                 let license_index = detected_license_switch.load(Ordering::Relaxed);
                 if license_index > 0 {
