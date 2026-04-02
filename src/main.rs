@@ -106,6 +106,9 @@ fn is_ban_disconnect(reason: &str) -> bool {
     lower.contains("temporarily banned")
         || lower.contains("permanently banned")
         || lower.contains("ban id:")
+        || lower.contains("account has been blocked")
+        || lower.contains("security-block")
+        || lower.contains("block id:")
 }
 
 /// Parse a Coflnet `/cofl profit` response and return the total profit in coins.
@@ -791,19 +794,36 @@ async fn main() -> Result<()> {
                 frikadellen_baf::bot::BotEvent::Disconnected(reason) => {
                     warn!("Bot disconnected: {}", reason);
                     if is_ban_disconnect(&reason) {
+                        error!("Ban detected — sending webhook and terminating process");
                         if let Some(webhook_url) = config_for_events.active_webhook_url() {
-                            let url = webhook_url.to_string();
-                            let name = ingame_name_for_events.clone();
-                            let ban_reason = reason.clone();
-                            let did = config_for_events.active_discord_id().map(|s| s.to_string());
-                            tokio::spawn(async move {
-                                frikadellen_baf::webhook::send_webhook_banned(&name, &ban_reason, did.as_deref(), &url).await;
-                            });
+                            frikadellen_baf::webhook::send_webhook_banned(
+                                &ingame_name_for_events,
+                                &reason,
+                                config_for_events.active_discord_id(),
+                                webhook_url,
+                            ).await;
                         }
+                        // Terminate immediately so we don't reconnect and re-send the webhook
+                        std::process::exit(1);
                     }
                 }
                 frikadellen_baf::bot::BotEvent::Kicked(reason) => {
                     warn!("Bot kicked: {}", reason);
+                }
+                frikadellen_baf::bot::BotEvent::NoCookieDetected => {
+                    error!("No booster cookie detected — sending webhook and terminating process");
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        frikadellen_baf::webhook::send_webhook_no_cookie(
+                            &ingame_name_for_events,
+                            config_for_events.active_discord_id(),
+                            webhook_url,
+                        ).await;
+                    }
+                    let baf_msg = "§f[§4BAF§f]: §c⚠ No booster cookie — please log in manually and buy one, then restart.".to_string();
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
+                    // Terminate — the bot can't flip without a cookie
+                    std::process::exit(1);
                 }
                 frikadellen_baf::bot::BotEvent::StartupComplete { orders_cancelled } => {
                     info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
@@ -3062,6 +3082,13 @@ mod tests {
     #[test]
     fn ignores_non_ban_disconnect() {
         assert!(!is_ban_disconnect("Disconnected: Timed out"));
+    }
+
+    #[test]
+    fn detects_security_ban_disconnect() {
+        assert!(is_ban_disconnect("Your account has been blocked."));
+        assert!(is_ban_disconnect("Find out more: https://www.hypixel.net/security-block"));
+        assert!(is_ban_disconnect("Block ID: #ABC123"));
     }
 
     #[test]
