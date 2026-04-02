@@ -435,6 +435,9 @@ pub enum BotEvent {
     BazaarOrdersSnapshot {
         ingame_orders: Vec<(String, bool)>,
     },
+    /// "You cannot view this auction!" was received — no active booster cookie.
+    /// The bot cannot function; the user must manually buy a cookie.
+    NoCookieDetected,
 }
 
 impl BotClient {
@@ -2199,6 +2202,10 @@ async fn event_handler(
                     *state.purchase_start_time.write() = None;
                     *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
+                    // "You cannot view this auction!" means no booster cookie — alert user
+                    if clean_message.contains("You cannot view this auction!") {
+                        let _ = state.event_tx.send(BotEvent::NoCookieDetected);
+                    }
                 }
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"

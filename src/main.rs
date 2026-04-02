@@ -21,6 +21,9 @@ use frikadellen_baf::utils::restart_process;
 
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
+/// If no auction has been listed for this many seconds, force a `/cofl sellinventory`
+/// plus claim sold/purchased auctions to unblock stuck inventory.
+const INVENTORY_IDLE_SELLINVENTORY_SECS: u64 = 30 * 60; // 30 minutes
 const GITHUB_REPO: &str = "TreXito/frikadellen-baf-121";
 
 /// Base delay per consecutive rejoin attempt (seconds).
@@ -106,6 +109,9 @@ fn is_ban_disconnect(reason: &str) -> bool {
     lower.contains("temporarily banned")
         || lower.contains("permanently banned")
         || lower.contains("ban id:")
+        || lower.contains("account has been blocked")
+        || lower.contains("security-block")
+        || lower.contains("block id:")
 }
 
 /// Parse a Coflnet `/cofl profit` response and return the total profit in coins.
@@ -716,6 +722,10 @@ async fn main() -> Result<()> {
     let enable_ah_flips_events = enable_ah_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
+    // Tracks when the last AH auction was listed; the idle-inventory timer uses
+    // this to detect 30-minute stalls and force `/cofl sellinventory`.
+    let last_auction_listed_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    let last_auction_listed_at_events = last_auction_listed_at.clone();
     let session_start = std::time::Instant::now();
     let prev_secs_events = previous_session_secs;
     tokio::spawn(async move {
@@ -791,19 +801,36 @@ async fn main() -> Result<()> {
                 frikadellen_baf::bot::BotEvent::Disconnected(reason) => {
                     warn!("Bot disconnected: {}", reason);
                     if is_ban_disconnect(&reason) {
+                        error!("Ban detected — sending webhook and terminating process");
                         if let Some(webhook_url) = config_for_events.active_webhook_url() {
-                            let url = webhook_url.to_string();
-                            let name = ingame_name_for_events.clone();
-                            let ban_reason = reason.clone();
-                            let did = config_for_events.active_discord_id().map(|s| s.to_string());
-                            tokio::spawn(async move {
-                                frikadellen_baf::webhook::send_webhook_banned(&name, &ban_reason, did.as_deref(), &url).await;
-                            });
+                            frikadellen_baf::webhook::send_webhook_banned(
+                                &ingame_name_for_events,
+                                &reason,
+                                config_for_events.active_discord_id(),
+                                webhook_url,
+                            ).await;
                         }
+                        // Terminate immediately so we don't reconnect and re-send the webhook
+                        std::process::exit(1);
                     }
                 }
                 frikadellen_baf::bot::BotEvent::Kicked(reason) => {
                     warn!("Bot kicked: {}", reason);
+                }
+                frikadellen_baf::bot::BotEvent::NoCookieDetected => {
+                    error!("No booster cookie detected — sending webhook and terminating process");
+                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                        frikadellen_baf::webhook::send_webhook_no_cookie(
+                            &ingame_name_for_events,
+                            config_for_events.active_discord_id(),
+                            webhook_url,
+                        ).await;
+                    }
+                    let baf_msg = "§f[§4BAF§f]: §c⚠ No booster cookie — please log in manually and buy one, then start the bot again.".to_string();
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_events.send(baf_msg);
+                    // Terminate — the bot can't flip without a cookie
+                    std::process::exit(1);
                 }
                 frikadellen_baf::bot::BotEvent::StartupComplete { orders_cancelled } => {
                     info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
@@ -1122,6 +1149,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 frikadellen_baf::bot::BotEvent::AuctionListed { item_name, starting_bid, duration_hours } => {
+                    // Reset the idle-inventory timer so the 30-minute failsafe doesn't fire
+                    // while items are being actively listed.
+                    *last_auction_listed_at_events.lock().unwrap() = Instant::now();
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §a🏷️ BIN listed: §r{} §7@ §6{}§7 coins for §e{}h",
                         item_name, format_coins(starting_bid as i64), duration_hours
@@ -2820,6 +2850,80 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Idle-inventory failsafe: if no AH auction has been listed for 30 minutes,
+    // force-claim sold/purchased auctions and request `/cofl sellinventory` to
+    // unblock any stuck inventory.
+    if config.enable_ah_flips {
+        let bot_client_idle = bot_client.clone();
+        let command_queue_idle = command_queue.clone();
+        let ws_client_idle = ws_client.clone();
+        let last_listed_idle = last_auction_listed_at.clone();
+        tokio::spawn(async move {
+            use frikadellen_baf::types::{CommandPriority, CommandType};
+            // Wait for startup to complete before starting idle checks.
+            sleep(Duration::from_secs(INVENTORY_IDLE_SELLINVENTORY_SECS)).await;
+            loop {
+                // Sleep for the remaining time until the threshold, capped to 60s minimum.
+                let elapsed = last_listed_idle.lock().unwrap().elapsed().as_secs();
+                let remaining = INVENTORY_IDLE_SELLINVENTORY_SECS.saturating_sub(elapsed);
+                sleep(Duration::from_secs(remaining.max(60))).await;
+
+                let elapsed = last_listed_idle.lock().unwrap().elapsed().as_secs();
+                if elapsed < INVENTORY_IDLE_SELLINVENTORY_SECS {
+                    continue;
+                }
+                let bot_state = bot_client_idle.state();
+                if !bot_state.allows_commands() {
+                    continue;
+                }
+                info!(
+                    "[IdleInventory] No auction listed for {}m — forcing claim + sellinventory",
+                    elapsed / 60
+                );
+
+                // Force-claim sold auctions
+                command_queue_idle.enqueue(
+                    CommandType::ClaimSoldItem,
+                    CommandPriority::Normal,
+                    false,
+                );
+                // Force-claim purchased items (won bids)
+                if !bot_client_idle.is_inventory_near_full() {
+                    command_queue_idle.enqueue(
+                        CommandType::ClaimPurchasedItem,
+                        CommandPriority::Normal,
+                        false,
+                    );
+                }
+                // Upload inventory and request `/cofl sellinventory`
+                let ws = ws_client_idle.clone();
+                let bot_inv = bot_client_idle.clone();
+                tokio::spawn(async move {
+                    // Small delay to let the claim commands start first.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    if let Some(inv_json) = bot_inv.get_cached_inventory_json() {
+                        let upload_msg = serde_json::json!({
+                            "type": "uploadInventory",
+                            "data": inv_json
+                        }).to_string();
+                        let _ = ws.send_message(&upload_msg).await;
+                    }
+                    let msg = serde_json::json!({
+                        "type": "sellinventory",
+                        "data": serde_json::to_string("").unwrap_or_default()
+                    }).to_string();
+                    if let Err(e) = ws.send_message(&msg).await {
+                        tracing::warn!("[IdleInventory] Failed to send sellinventory: {}", e);
+                    } else {
+                        tracing::info!("[IdleInventory] Forced sellinventory after {}m idle", elapsed / 60);
+                    }
+                });
+                // Reset the timer so we don't spam every minute.
+                *last_listed_idle.lock().unwrap() = Instant::now();
+            }
+        });
+    }
+
     // Periodic log cleanup — delete archived logs older than 7 days once a day.
     frikadellen_baf::logging::spawn_periodic_log_cleanup();
 
@@ -3062,6 +3166,13 @@ mod tests {
     #[test]
     fn ignores_non_ban_disconnect() {
         assert!(!is_ban_disconnect("Disconnected: Timed out"));
+    }
+
+    #[test]
+    fn detects_security_ban_disconnect() {
+        assert!(is_ban_disconnect("Your account has been blocked."));
+        assert!(is_ban_disconnect("Find out more: https://www.hypixel.net/security-block"));
+        assert!(is_ban_disconnect("Block ID: #ABC123"));
     }
 
     #[test]

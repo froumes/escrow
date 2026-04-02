@@ -587,8 +587,9 @@ pub async fn send_webhook_banned(
         }));
     }
     if let Some(ban_id) = &parsed.ban_id {
+        let id_label = if parsed.is_security_ban { "🔖 Block ID" } else { "🔖 Ban ID" };
         fields.push(serde_json::json!({
-            "name": "🔖 Ban ID",
+            "name": id_label,
             "value": format!("`{}`", ban_id),
             "inline": true
         }));
@@ -601,7 +602,9 @@ pub async fn send_webhook_banned(
         }));
     }
 
-    let title = if parsed.is_permanent {
+    let title = if parsed.is_security_ban {
+        "🛡️ Security Ban"
+    } else if parsed.is_permanent {
         "⛔ Permanently Banned"
     } else if parsed.duration.is_some() {
         "⛔ Temporarily Banned"
@@ -609,7 +612,13 @@ pub async fn send_webhook_banned(
         "⛔ Bot Banned / Disconnected"
     };
 
-    let description = if parsed.clean_text.is_empty() {
+    let description = if parsed.is_security_ban {
+        if parsed.clean_text.is_empty() {
+            format!("**{}** has been security blocked.\nCheck <https://www.hypixel.net/security-block> for details.", ingame_name)
+        } else {
+            format!("**{}** has been security blocked.\n\n{}", ingame_name, parsed.clean_text)
+        }
+    } else if parsed.clean_text.is_empty() {
         format!("**{}** has been banned.", ingame_name)
     } else {
         format!("**{}** has been banned.\n\n{}", ingame_name, parsed.clean_text)
@@ -630,7 +639,35 @@ pub async fn send_webhook_banned(
     }
 
     let payload = serde_json::json!({ "embeds": [embed] });
-    let ping = discord_id.map(|id| format!("<@{}>", id));
+    // Triple ping so ban notifications are easily differentiated from other alerts
+    let ping = discord_id.map(|id| format!("<@{}> <@{}> <@{}>", id, id, id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
+
+/// Send a webhook when "You cannot view this auction!" is detected (no booster cookie).
+/// Pings the user so they can manually log in and buy a booster cookie.
+pub async fn send_webhook_no_cookie(
+    ingame_name: &str,
+    discord_id: Option<&str>,
+    webhook_url: &str,
+) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🍪 No Booster Cookie",
+            "description": format!(
+                "**{}** received \"You cannot view this auction!\" — this usually means the account has no active booster cookie.\n\nPlease log in manually and buy a booster cookie, then start the bot again.",
+                ingame_name
+            ),
+            "color": 0xe67e22u32,
+            "footer": {
+                "text": format!("BAF - {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }]
+    });
+    // Triple ping so the user notices immediately
+    let ping = discord_id.map(|id| format!("<@{}> <@{}> <@{}>", id, id, id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
 
@@ -904,6 +941,7 @@ fn build_purchase_fields(
 /// Parsed ban information extracted from the debug-formatted disconnect reason.
 pub struct ParsedBan {
     pub is_permanent: bool,
+    pub is_security_ban: bool,
     pub duration: Option<String>,
     pub reason: Option<String>,
     pub ban_id: Option<String>,
@@ -949,6 +987,9 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
     let full_text = texts.join("");
     let lower = full_text.to_ascii_lowercase();
     let is_permanent = lower.contains("permanently banned");
+    let is_security_ban = lower.contains("account has been blocked")
+        || lower.contains("security-block")
+        || lower.contains("block id:");
 
     // Extract duration (e.g. "29d 23h 59m 58s")
     let duration = texts.iter().find(|t| {
@@ -976,7 +1017,7 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         result
     };
 
-    // Extract ban ID (e.g. "#AF4CD6A8")
+    // Extract ban ID (e.g. "#AF4CD6A8") or Block ID (security bans use "Block ID:")
     let ban_id = {
         let mut found = false;
         let mut result = None;
@@ -988,15 +1029,18 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
                 }
                 break;
             }
-            if t.trim().starts_with("Ban ID:") || t.trim() == "Ban ID: " {
+            let tt = t.trim();
+            if tt.starts_with("Ban ID:") || tt == "Ban ID: "
+                || tt.starts_with("Block ID:") || tt == "Block ID: "
+            {
                 found = true;
             }
         }
         result
     };
 
-    // Extract appeal URL
-    let appeal_url = texts.iter().find(|t| t.contains("hypixel.net/appeal"))
+    // Extract appeal URL (regular bans use /appeal, security bans use /security-block)
+    let appeal_url = texts.iter().find(|t| t.contains("hypixel.net/appeal") || t.contains("hypixel.net/security-block"))
         .map(|s| s.trim().trim_end_matches('\n').to_string());
 
     // Build clean text summary (no raw debug output)
@@ -1009,6 +1053,7 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
 
     ParsedBan {
         is_permanent,
+        is_security_ban,
         duration,
         reason: reason_text,
         ban_id,
@@ -1083,5 +1128,26 @@ mod tests {
         let parsed = parse_ban_reason(reason);
         // Falls back to raw text since there are no `text: "..."` fields
         assert_eq!(parsed.clean_text, reason);
+    }
+
+    #[test]
+    fn parse_security_ban_message() {
+        // Simulated security ban disconnect reason with "account has been blocked" and Block ID
+        let reason = r##"Some(Text(TextComponent { base: BaseComponent { siblings: [Text(TextComponent { text: "Your account has been blocked." }), Text(TextComponent { text: "\n\nReason: " }), Text(TextComponent { text: "Suspicious activity has been detected on your account.\n" }), Text(TextComponent { text: "Find out more: " }), Text(TextComponent { text: "https://www.hypixel.net/security-block\n\n" }), Text(TextComponent { text: "Block ID: " }), Text(TextComponent { text: "#ABC12345\n" }), Text(TextComponent { text: "Sharing your Block ID may affect the processing of your appeal!" })], style: Style {} }, text: "" }))"##;
+
+        let parsed = parse_ban_reason(reason);
+        assert!(parsed.is_security_ban);
+        assert!(!parsed.is_permanent);
+        assert_eq!(parsed.reason.as_deref(), Some("Suspicious activity has been detected on your account."));
+        assert_eq!(parsed.ban_id.as_deref(), Some("#ABC12345"));
+        assert_eq!(parsed.appeal_url.as_deref(), Some("https://www.hypixel.net/security-block"));
+    }
+
+    #[test]
+    fn regular_ban_is_not_security_ban() {
+        let reason = r##"Some(Text(TextComponent { base: BaseComponent { siblings: [Text(TextComponent { text: "You are temporarily banned for " }), Text(TextComponent { text: "29d 23h 59m 58s" }), Text(TextComponent { text: " from this server!\n\n" }), Text(TextComponent { text: "Reason: " }), Text(TextComponent { text: "Cheating through the use of unfair game advantages.\n" }), Text(TextComponent { text: "Ban ID: " }), Text(TextComponent { text: "#AF4CD6A8\n" })], style: Style {} }, text: "" }))"##;
+
+        let parsed = parse_ban_reason(reason);
+        assert!(!parsed.is_security_ban);
     }
 }
