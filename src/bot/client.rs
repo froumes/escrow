@@ -825,6 +825,13 @@ impl BotClient {
         self.auction_slot_blocked.store(false, Ordering::Relaxed);
     }
 
+    /// Clear the auction-at-limit flag so the bot retries listing.
+    /// Called by the idle-inventory failsafe — AH slots may have freed up
+    /// from expired auctions without triggering an ItemSold event.
+    pub fn clear_auction_at_limit(&self) {
+        self.auction_at_limit.store(false, Ordering::Relaxed);
+    }
+
     /// Returns true if inventory is full (items stashed / no space to claim).
     /// Also checks the cached empty-slot count: if the inventory has free
     /// slots the flag is auto-cleared so stale "stashed away" reminders
