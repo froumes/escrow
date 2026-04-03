@@ -2948,6 +2948,18 @@ async fn main() -> Result<()> {
                     elapsed / 60
                 );
 
+                // Clear stale blocking flags that may have been set earlier in
+                // the session.  AH slots can free up from expired auctions
+                // (which don't trigger ItemSold), so the bot must retry.
+                if bot_client_idle.is_auction_at_limit() {
+                    info!("[IdleInventory] Clearing stale auction_at_limit flag");
+                    bot_client_idle.clear_auction_at_limit();
+                }
+                if bot_client_idle.is_auction_slot_blocked() {
+                    info!("[IdleInventory] Clearing stale auction_slot_blocked flag");
+                    bot_client_idle.clear_auction_slot_blocked();
+                }
+
                 // Force-claim sold auctions
                 command_queue_idle.enqueue(
                     CommandType::ClaimSoldItem,
