@@ -514,6 +514,11 @@ async fn main() -> Result<()> {
     info!("AH Flips: {}", if config.enable_ah_flips { "ENABLED" } else { "DISABLED" });
     info!("Bazaar Flips: {}", if config.enable_bazaar_flips { "ENABLED" } else { "DISABLED" });
     info!("Web GUI Port: {}", config.web_gui_port);
+    info!(
+        "Home island command: {} | scoreboard marker: {}",
+        config.home_island_command,
+        config.home_island_scoreboard_text
+    );
 
     if config.proxy_enabled {
         info!("Proxy: ENABLED — address: {:?}", config.proxy_address);
@@ -661,6 +666,7 @@ async fn main() -> Result<()> {
     bot_client.enable_bazaar_flips = enable_bazaar_flips.clone();
     bot_client.set_command_queue(command_queue.clone());
     *bot_client.ingame_name.write() = ingame_name.clone();
+    *bot_client.home_island_command.write() = config.home_island_command.clone();
 
     // Shared profit tracker for AH and Bazaar realized profits.
     let profit_tracker = Arc::new(frikadellen_baf::profit::ProfitTracker::new());
@@ -3006,13 +3012,15 @@ async fn main() -> Result<()> {
     // Periodic log cleanup — delete archived logs older than 7 days once a day.
     frikadellen_baf::logging::spawn_periodic_log_cleanup();
 
-    // Island guard: if "Your Island" is not in the scoreboard, send
-    // /lobby → /play sb → /is to return to the island.
+    // Island guard: if the configured home-island scoreboard marker is not
+    // visible, send /lobby → /play sb → <home command> to return there.
     // Matching TypeScript AFKHandler.ts tryToTeleportToIsland() logic.
     {
         let bot_client_island = bot_client.clone();
         let command_queue_island = command_queue.clone();
         let chat_tx_island = chat_tx.clone();
+        let home_island_command = config.home_island_command.clone();
+        let home_island_scoreboard_text = config.home_island_scoreboard_text.clone();
         tokio::spawn(async move {
             use frikadellen_baf::types::{CommandType, CommandPriority, BotState};
 
@@ -3034,20 +3042,61 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let lines = bot_client_island.get_scoreboard_lines();
+                let tab_lines = bot_client_island.get_tab_list_lines();
+                let scoreboard_lines = bot_client_island.get_scoreboard_lines();
 
-                // Scoreboard not yet populated — skip until it has data.
-                if lines.is_empty() {
+                // Neither tablist nor scoreboard is populated yet — skip until
+                // one of them has data.
+                if tab_lines.is_empty() && scoreboard_lines.is_empty() {
                     continue;
                 }
 
-                // If "Your Island" is in the sidebar we are home — nothing to do.
-                if lines.iter().any(|l| l.contains("Your Island")) {
+                // Prefer the tab list on visited private islands: Hypixel shows
+                // "Private Island" there even when the sidebar doesn't include
+                // a useful island marker. Fall back to the configured scoreboard
+                // text for the normal self-island flow.
+                let on_private_island = tab_lines.iter().any(|l| l.contains("Private Island"));
+                let on_configured_scoreboard = scoreboard_lines
+                    .iter()
+                    .any(|l| l.contains(&home_island_scoreboard_text));
+                if on_private_island || on_configured_scoreboard {
                     consecutive_rejoin_attempts = 0;
                     continue;
                 }
 
                 consecutive_rejoin_attempts += 1;
+
+                if consecutive_rejoin_attempts == 1 {
+                    let tab_preview = if tab_lines.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        tab_lines
+                            .iter()
+                            .take(20)
+                            .map(|s| frikadellen_baf::logging::remove_color_codes(s).trim().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    };
+                    let scoreboard_preview = if scoreboard_lines.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        scoreboard_lines
+                            .iter()
+                            .take(12)
+                            .map(|s| frikadellen_baf::logging::remove_color_codes(s).trim().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    };
+                    let tab_msg = format!("§f[§4BAF§f]: §7[Debug] Tablist snapshot: {}", tab_preview);
+                    let scoreboard_msg = format!(
+                        "§f[§4BAF§f]: §7[Debug] Scoreboard snapshot: {}",
+                        scoreboard_preview
+                    );
+                    print_mc_chat(&tab_msg);
+                    let _ = chat_tx_island.send(tab_msg);
+                    print_mc_chat(&scoreboard_msg);
+                    let _ = chat_tx_island.send(scoreboard_msg);
+                }
 
                 // Safety cap: after REJOIN_MAX_ATTEMPTS consecutive failures,
                 // reset the counter so the backoff does not grow unbounded.
@@ -3074,10 +3123,16 @@ async fn main() -> Result<()> {
                 }
 
                 // Not on island — send the return sequence.
-                let baf_msg = "§f[§4BAF§f]: §eNot detected on island — returning to island...".to_string();
+                let baf_msg = format!(
+                    "§f[§4BAF§f]: §eNeither tablist \"Private Island\" nor scoreboard marker \"{}\" detected — returning...",
+                    home_island_scoreboard_text
+                );
                 print_mc_chat(&baf_msg);
                 let _ = chat_tx_island.send(baf_msg);
-                info!("[AFKHandler] Not on island — sending /lobby → /play sb → /is");
+                info!(
+                    "[AFKHandler] Not on private island and scoreboard marker missing — sending /lobby → /play sb → {}",
+                    home_island_command
+                );
 
                 // Send commands with delays between them so each server
                 // transfer has time to complete before the next fires.
@@ -3106,7 +3161,7 @@ async fn main() -> Result<()> {
                 }
 
                 command_queue_island.enqueue(
-                    CommandType::SendChat { message: "/is".to_string() },
+                    CommandType::SendChat { message: home_island_command.clone() },
                     CommandPriority::High,
                     false,
                 );

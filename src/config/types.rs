@@ -66,6 +66,17 @@ pub struct Config {
     #[serde(default = "default_web_gui_port")]
     pub web_gui_port: u16,
 
+    /// Command used to return the bot to its "home" island/location after
+    /// joining SkyBlock or when the island guard detects it is away.
+    /// Default: `/is`
+    #[serde(default = "default_home_island_command")]
+    pub home_island_command: String,
+
+    /// Scoreboard text that indicates the bot is at its configured home
+    /// island/location. Default: `Your Island`
+    #[serde(default = "default_home_island_scoreboard_text")]
+    pub home_island_scoreboard_text: String,
+
     /// Minimum delay between consecutive queued commands in milliseconds.
     /// Prevents back-to-back Hypixel interactions from overlapping.
     /// Default: 500ms.
@@ -206,6 +217,14 @@ fn default_web_gui_port() -> u16 {
     8080
 }
 
+fn default_home_island_command() -> String {
+    "/is".to_string()
+}
+
+fn default_home_island_scoreboard_text() -> String {
+    "Your Island".to_string()
+}
+
 fn default_command_delay_ms() -> u64 {
     500
 }
@@ -249,6 +268,8 @@ impl Default for Config {
             multi_switch_time: None,
             websocket_url: default_websocket_url(),
             web_gui_port: default_web_gui_port(),
+            home_island_command: default_home_island_command(),
+            home_island_scoreboard_text: default_home_island_scoreboard_text(),
             command_delay_ms: default_command_delay_ms(),
             bed_spam_click_delay: default_bed_spam_click_delay(),
             bed_multiple_clicks_delay: 0,
@@ -474,6 +495,26 @@ proxy_credentials = "myuser:mypassword"
         let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(!toml.contains("[skip]"));
         assert!(!toml.contains("min_profit"));
+    }
+
+    #[test]
+    fn default_home_island_settings_present() {
+        let config = Config::default();
+        assert_eq!(config.home_island_command, "/is");
+        assert_eq!(config.home_island_scoreboard_text, "Your Island");
+    }
+
+    #[test]
+    fn parses_custom_home_island_settings() {
+        let config: Config = toml::from_str(
+            r#"
+home_island_command = "/visit FriendName"
+home_island_scoreboard_text = "FriendName's Island"
+"#,
+        )
+        .expect("config should parse");
+        assert_eq!(config.home_island_command, "/visit FriendName");
+        assert_eq!(config.home_island_scoreboard_text, "FriendName's Island");
     }
 
     #[test]

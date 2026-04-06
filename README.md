@@ -41,6 +41,15 @@ The application creates a `config.toml` file in the same directory as the execut
 - `enable_ah_flips`: Enable/disable auction house flips
 - `enable_bazaar_flips`: Enable/disable bazaar flips
 - `web_gui_port`: Port for the web interface (default: 8080)
+- `home_island_command`: Command used to return "home" after joining SkyBlock or recovery checks
+- `home_island_scoreboard_text`: Scoreboard text that confirms the bot is at that home location
+
+For a friend's island, you can set:
+
+```toml
+home_island_command = "/visit FriendName"
+home_island_scoreboard_text = "FriendName's Island"
+```
 
 ## Requirements
 

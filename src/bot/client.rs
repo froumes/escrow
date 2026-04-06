@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
+use uuid::Uuid;
 
 use crate::types::{BotState, QueuedCommand};
 use crate::state::CommandQueue;
@@ -279,6 +280,8 @@ pub struct BotClient {
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    /// Cached tab-list text entries keyed by player UUID.
+    tab_list_entries: Arc<RwLock<HashMap<Uuid, String>>>,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
@@ -324,6 +327,8 @@ pub struct BotClient {
     active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
+    /// Command used to return to the configured home island/location.
+    pub home_island_command: Arc<RwLock<String>>,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     manage_orders_cancel_open: Arc<AtomicBool>,
     /// Cancel open bazaar orders when they are older than this many minutes per million coins.
@@ -458,6 +463,7 @@ impl BotClient {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
+            tab_list_entries: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
@@ -473,6 +479,7 @@ impl BotClient {
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
+            home_island_command: Arc::new(RwLock::new("/is".to_string())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
@@ -558,6 +565,7 @@ impl BotClient {
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
+            tab_list_entries: self.tab_list_entries.clone(),
             manage_orders_cancelled: self.manage_orders_cancelled.clone(),
             bazaar_at_limit: self.bazaar_at_limit.clone(),
             bazaar_daily_limit: self.bazaar_daily_limit.clone(),
@@ -587,6 +595,7 @@ impl BotClient {
             bed_pre_click_ms: self.bed_pre_click_ms,
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
+            home_island_command: self.home_island_command.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
             bazaar_order_cancel_minutes_per_million: self.bazaar_order_cancel_minutes_per_million,
             managing_order_context: Arc::new(RwLock::new(None)),
@@ -743,6 +752,17 @@ impl BotClient {
                 .cloned()
                 .unwrap_or_else(|| display.clone())
         }).collect()
+    }
+
+    /// Get the current tab-list entries as plain strings.
+    ///
+    /// Prefers the server-provided display name when available, otherwise falls
+    /// back to the profile name. This is useful for Hypixel status detection
+    /// such as checking for "Private Island" in the tab layout.
+    pub fn get_tab_list_lines(&self) -> Vec<String> {
+        let mut entries: Vec<String> = self.tab_list_entries.read().values().cloned().collect();
+        entries.sort();
+        entries
     }
 
     /// Parse the player's current purse from the SkyBlock scoreboard sidebar.
@@ -1101,6 +1121,8 @@ pub struct BotClientState {
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
     pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    /// Cached tab-list text entries keyed by player UUID.
+    pub tab_list_entries: Arc<RwLock<HashMap<Uuid, String>>>,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
@@ -1184,6 +1206,8 @@ pub struct BotClientState {
     pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
+    /// Command used to return to the configured home island/location.
+    pub home_island_command: Arc<RwLock<String>>,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     /// When false, it only collects filled orders and leaves open orders untouched.
     pub manage_orders_cancel_open: Arc<AtomicBool>,
@@ -1280,6 +1304,7 @@ impl Default for BotClientState {
             scoreboard_scores: Arc::new(RwLock::new(HashMap::new())),
             sidebar_objective: Arc::new(RwLock::new(None)),
             scoreboard_teams: Arc::new(RwLock::new(HashMap::new())),
+            tab_list_entries: Arc::new(RwLock::new(HashMap::new())),
             manage_orders_cancelled: Arc::new(RwLock::new(0)),
             bazaar_at_limit: Arc::new(AtomicBool::new(false)),
             bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
@@ -1309,6 +1334,7 @@ impl Default for BotClientState {
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
+            home_island_command: Arc::new(RwLock::new("/is".to_string())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes_per_million: 5,
             managing_order_context: Arc::new(RwLock::new(None)),
@@ -2099,7 +2125,7 @@ async fn event_handler(
                         send_chat_command(&bot_wd, "/play sb");
                         // Wait for SkyBlock to load (5s) + island teleport delay combined
                         tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
-                        send_chat_command(&bot_wd, "/is");
+                        send_home_island_command(&bot_wd, &state).await;
                         tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
                         run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_queue_wd, startup_in_progress_wd, enable_bazaar_flips_wd).await;
                     }
@@ -2550,7 +2576,7 @@ async fn event_handler(
                         let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
-                            send_chat_command(&bot_clone, "/is");
+                            send_home_island_command(&bot_clone, &state).await;
                             
                             // Wait for teleport to complete
                             tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
@@ -2948,6 +2974,26 @@ async fn event_handler(
                     }
                 }
 
+                ClientboundGamePacket::PlayerInfoUpdate(pkt) => {
+                    let mut tab_entries = state.tab_list_entries.write();
+                    for updated_info in &pkt.entries {
+                        let text = updated_info
+                            .display_name
+                            .as_ref()
+                            .map(|name| name.to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| updated_info.profile.name.clone());
+                        tab_entries.insert(updated_info.profile.uuid, text);
+                    }
+                }
+
+                ClientboundGamePacket::PlayerInfoRemove(pkt) => {
+                    let mut tab_entries = state.tab_list_entries.write();
+                    for uuid in &pkt.profile_ids {
+                        tab_entries.remove(uuid);
+                    }
+                }
+
                 ClientboundGamePacket::SetPlayerTeam(pkt) => {
                     // Track team prefix/suffix for scoreboard display.
                     // Hypixel SkyBlock uses team-based encoding: the team prefix
@@ -3034,7 +3080,10 @@ async fn execute_command(
         CommandType::SendChat { message } => {
             // Send chat message to Minecraft
             info!("Sending chat message: {}", message);
-            if message.starts_with('/') {
+            let home_command = state.home_island_command.read().clone();
+            if message.trim() == home_command.trim() {
+                send_home_island_command(bot, state).await;
+            } else if message.starts_with('/') {
                 send_chat_command(bot, message);
             } else {
                 bot.write_chat_packet(message);
@@ -6099,6 +6148,45 @@ fn send_chat_command(bot: &Client, content: &str) {
     bot.write_packet(ServerboundChatCommand {
         command: command.to_string(),
     });
+}
+
+async fn send_home_island_command(bot: &Client, state: &BotClientState) {
+    let home_command = state.home_island_command.read().clone();
+    send_chat_command(bot, &home_command);
+
+    const HOME_GUI_TIMEOUT_MS: u64 = 5_000;
+    const HOME_GUI_POLL_MS: u64 = 100;
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(HOME_GUI_TIMEOUT_MS);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(HOME_GUI_POLL_MS)).await;
+
+        let window_id = *state.last_window_id.read();
+        if window_id != 0 {
+            let slots = bot.menu().slots();
+            if let Some((slot, _)) = slots
+                .iter()
+                .enumerate()
+                .find(|(_, item)| !item.is_empty() && item.kind().to_string().eq_ignore_ascii_case("minecraft:player_head"))
+            {
+                info!(
+                    "[Home] Clicking first player head at slot {} after {}",
+                    slot, home_command
+                );
+                click_window_slot(bot, &state.last_window_id, window_id, slot as i16).await;
+                return;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let title = state.handlers.current_window_title().unwrap_or_default();
+            debug!(
+                "[Home] No player-head GUI appeared after {} within {}ms (window title: \"{}\")",
+                home_command, HOME_GUI_TIMEOUT_MS, title
+            );
+            break;
+        }
+    }
 }
 
 /// Send a chat command directly to the TCP socket via `with_raw_connection_mut`,
