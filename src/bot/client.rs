@@ -2279,10 +2279,17 @@ async fn event_handler(
                     // 3 retry attempts (when MAX is 3); attempt 3 triggers the give-up.
                     let attempt = state.auction_stuck_item_retries.fetch_add(1, Ordering::Relaxed);
 
-                    // Common to both paths: abort current flow and close the window.
+                    // Common to both paths: abort current flow.
                     state.auction_sell_aborted.store(true, Ordering::Relaxed);
                     let window_id = *state.last_window_id.read();
                     if window_id > 0 {
+                        // Click slot 13 (auction preview slot) to explicitly remove
+                        // the stuck item before closing.  Simply closing the window
+                        // does NOT always clear Hypixel's internal auction-slot state,
+                        // causing the same error on retry.  Clicking the slot tells the
+                        // server to return the item to the player's inventory.
+                        info!("[Auction] Clicking slot 13 to clear stuck item before closing window");
+                        send_raw_click(&bot, window_id, 13);
                         send_raw_close(&bot, window_id, &state.handlers);
                     }
 
@@ -4291,6 +4298,7 @@ async fn handle_window_interaction(
                         // Co-op AH opened "Create BIN Auction" directly (skipping Manage Auctions).
                         // Run the SelectBIN logic inline.
                         info!("[Auction] Co-op AH: jumped straight to Create BIN Auction, handling as SelectBIN");
+                        clear_auction_preview_slot(bot, state, window_id, &slots).await;
                         let player_start = *menu.player_slots_range().start();
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
                             if mj_slot >= 9 && mj_slot <= 44 {
