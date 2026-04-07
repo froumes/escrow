@@ -1098,6 +1098,47 @@ pub async fn send_webhook_profit_summary(
     post_embed(webhook_url, payload).await;
 }
 
+/// Send a webhook when the bot takes a human-like rest break.
+pub async fn send_webhook_rest_break_start(
+    ingame_name: &str,
+    break_duration_secs: u64,
+    webhook_url: &str,
+) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "😴 Rest Break",
+            "description": format!(
+                "Taking a human-like break for **{}**.\nWill reconnect <t:{}:R>.",
+                format_duration(break_duration_secs),
+                now_unix() + break_duration_secs,
+            ),
+            "color": 0xf39c12u32,
+            "footer": {
+                "text": format!("BAF • {}", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
+/// Send a webhook when the bot reconnects after a rest break.
+pub async fn send_webhook_rest_break_end(
+    ingame_name: &str,
+    webhook_url: &str,
+) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "☀️ Break Over",
+            "description": "Reconnecting and resuming operations.",
+            "color": 0x2ecc71u32,
+            "footer": {
+                "text": format!("BAF • {}", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_ban_reason;

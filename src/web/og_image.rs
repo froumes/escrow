@@ -193,8 +193,66 @@ fn draw_rect_outline(
 
 // ── Public API ───────────────────────────────────────────────
 
+/// Draw a line between two points using Bresenham's algorithm.
+/// `dashed`: if true, alternates 4px on / 4px off.
+fn draw_line(
+    img: &mut RgbaImage,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    color: Rgba<u8>,
+    thickness: u32,
+    dashed: bool,
+) {
+    let dx = (x1 as i64 - x0 as i64).abs();
+    let dy = -(y1 as i64 - y0 as i64).abs();
+    let sx: i64 = if (x0 as i64) < (x1 as i64) { 1 } else { -1 };
+    let sy: i64 = if (y0 as i64) < (y1 as i64) { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut cx = x0 as i64;
+    let mut cy = y0 as i64;
+    let mut step = 0u32;
+    let half_t = thickness / 2;
+
+    loop {
+        let visible = !dashed || (step / 4) % 2 == 0;
+        if visible {
+            for dt in 0..thickness {
+                let py = (cy + dt as i64 - half_t as i64).max(0) as u32;
+                let px = cx.max(0) as u32;
+                if px < img.width() && py < img.height() {
+                    img.put_pixel(px, py, color);
+                }
+            }
+        }
+        if cx == x1 as i64 && cy == y1 as i64 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            cx += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            cy += sy;
+        }
+        step += 1;
+    }
+}
+
 /// Generate a 1200×630 stats card PNG and return the raw bytes.
-pub fn generate_og_image(total_profit: i64, per_hour: f64, uptime_secs: u64) -> Vec<u8> {
+///
+/// `ah_points` and `bz_points` are `(unix_timestamp, cumulative_profit)` series
+/// from `ProfitTracker`.  The chart plots these as AH, BZ, and Total lines.
+pub fn generate_og_image(
+    total_profit: i64,
+    per_hour: f64,
+    uptime_secs: u64,
+    ah_points: &[(u64, i64)],
+    bz_points: &[(u64, i64)],
+) -> Vec<u8> {
     let (w, h): (u32, u32) = (1200, 630);
     let mut img: RgbaImage = ImageBuffer::from_pixel(w, h, BG);
 
@@ -336,10 +394,94 @@ pub fn generate_og_image(total_profit: i64, per_hour: f64, uptime_secs: u64) -> 
         HEADING,
     );
 
-    // Draw a simple zero-line in the chart area
-    let zero_y = ax_top + (ax_bottom - ax_top) / 2;
-    for px in (ax_left + 4..ax_right).step_by(6) {
-        fill_rect(&mut img, px, zero_y, 3, 1, Rgba([50, 55, 90, 255]));
+    // ── Plot actual profit lines ──────────────────────────────
+    // Merge timestamps from both series so we can compute a Total line.
+    let mut all_times: Vec<u64> = Vec::new();
+    for &(t, _) in ah_points {
+        all_times.push(t);
+    }
+    for &(t, _) in bz_points {
+        all_times.push(t);
+    }
+    all_times.sort_unstable();
+    all_times.dedup();
+
+    if all_times.len() >= 2 {
+        // Step-interpolate helper: for a given `t`, find the last known value.
+        fn interp(points: &[(u64, i64)], t: u64) -> i64 {
+            let mut val: i64 = 0;
+            for &(pt, pv) in points {
+                if pt <= t {
+                    val = pv;
+                } else {
+                    break;
+                }
+            }
+            val
+        }
+
+        // Build interpolated series
+        let ah_vals: Vec<i64> = all_times.iter().map(|&t| interp(ah_points, t)).collect();
+        let bz_vals: Vec<i64> = all_times.iter().map(|&t| interp(bz_points, t)).collect();
+        let total_vals: Vec<i64> = ah_vals
+            .iter()
+            .zip(bz_vals.iter())
+            .map(|(&a, &b)| a + b)
+            .collect();
+
+        // Determine value range across all three series
+        let all_vals = ah_vals.iter().chain(bz_vals.iter()).chain(total_vals.iter());
+        let min_val = *all_vals.clone().min().unwrap_or(&0);
+        let max_val = *all_vals.max().unwrap_or(&0);
+        let range = (max_val - min_val).max(1) as f64;
+
+        let t_min = *all_times.first().unwrap();
+        let t_max = *all_times.last().unwrap();
+        let t_range = (t_max - t_min).max(1) as f64;
+
+        let plot_left = ax_left + 4;
+        let plot_right = ax_right - 4;
+        let plot_top = ax_top + 6;
+        let plot_bottom = ax_bottom - 4;
+        let plot_w = plot_right.saturating_sub(plot_left).max(1) as f64;
+        let plot_h = plot_bottom.saturating_sub(plot_top).max(1) as f64;
+
+        // Map (time, value) → (px_x, px_y)
+        let map_xy = |t: u64, v: i64| -> (u32, u32) {
+            let x = plot_left as f64 + ((t - t_min) as f64 / t_range) * plot_w;
+            let y = plot_bottom as f64 - ((v - min_val) as f64 / range) * plot_h;
+            (x as u32, y as u32)
+        };
+
+        // Draw a zero-line if the range crosses zero
+        if min_val < 0 && max_val > 0 {
+            let zero_y_px =
+                (plot_bottom as f64 - ((0 - min_val) as f64 / range) * plot_h) as u32;
+            for px in (plot_left..plot_right).step_by(6) {
+                fill_rect(&mut img, px, zero_y_px, 3, 1, Rgba([50, 55, 90, 255]));
+            }
+        }
+
+        // Helper: draw a polyline between consecutive data points.
+        let draw_line_series =
+            |img: &mut RgbaImage, vals: &[i64], color: Rgba<u8>, thickness: u32, dashed: bool| {
+                for i in 1..all_times.len() {
+                    let (x0, y0) = map_xy(all_times[i - 1], vals[i - 1]);
+                    let (x1, y1) = map_xy(all_times[i], vals[i]);
+                    draw_line(img, x0, y0, x1, y1, color, thickness, dashed);
+                }
+            };
+
+        // Draw AH (green), BZ (orange), Total (blue dashed) — back to front
+        draw_line_series(&mut img, &total_vals, total_color, 2, true);
+        draw_line_series(&mut img, &bz_vals, bz_color, 2, false);
+        draw_line_series(&mut img, &ah_vals, ah_color, 2, false);
+    } else {
+        // Not enough data — draw a simple zero-line placeholder
+        let zero_y = ax_top + (ax_bottom - ax_top) / 2;
+        for px in (ax_left + 4..ax_right).step_by(6) {
+            fill_rect(&mut img, px, zero_y, 3, 1, Rgba([50, 55, 90, 255]));
+        }
     }
 
     // ── Footer ───────────────────────────────────────────────
@@ -388,7 +530,9 @@ mod tests {
 
     #[test]
     fn og_image_is_valid_png() {
-        let bytes = generate_og_image(1_500_000, 250_000.0, 7265);
+        let ah = vec![(1000u64, 0i64), (2000, 500_000), (3000, 1_500_000)];
+        let bz = vec![(1000u64, 0i64), (2500, 300_000), (3000, 600_000)];
+        let bytes = generate_og_image(1_500_000, 250_000.0, 7265, &ah, &bz);
         // PNG magic bytes
         assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G']);
         assert!(bytes.len() > 100, "PNG should be non-trivial");
@@ -423,7 +567,9 @@ mod tests {
     #[test]
     #[ignore] // Only run manually to inspect the image
     fn save_og_image_to_disk() {
-        let bytes = generate_og_image(1_500_000, 250_000.0, 7265);
+        let ah = vec![(1000u64, 0i64), (2000, 500_000), (3000, 1_500_000)];
+        let bz = vec![(1000u64, 0i64), (2500, 300_000), (3000, 600_000)];
+        let bytes = generate_og_image(1_500_000, 250_000.0, 7265, &ah, &bz);
         let path = std::env::temp_dir().join("og_image_test.png");
         std::fs::write(&path, &bytes).unwrap();
     }
