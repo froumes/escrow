@@ -2267,15 +2267,13 @@ async fn main() -> Result<()> {
                             bot_client_for_ws.set_state(frikadellen_baf::types::BotState::Idle);
                         }
 
-                        let ws = ws_client_clone.clone();
-                        let enable_bz = enable_bazaar_flips_ws.clone();
                         let chat_tx_resume = chat_tx_ws.clone();
                         let command_queue_resume = command_queue_clone.clone();
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(20)).await;
                             flag.store(false, Ordering::Relaxed);
                             // Notify user that bazaar flips are resuming (matching TypeScript bazaarFlipPauser.ts)
-                            let baf_msg = "§f[§4BAF§f]: §aBazaar flips resumed, requesting new recommendations...".to_string();
+                            let baf_msg = "§f[§4BAF§f]: §aBazaar flips resumed".to_string();
                             print_mc_chat(&baf_msg);
                             let _ = chat_tx_resume.send(baf_msg);
                             info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
@@ -2289,18 +2287,8 @@ async fn main() -> Result<()> {
                                     false,
                                 );
                             }
-                            // Re-request bazaar flips to get fresh recommendations after the pause
-                            if enable_bz.load(Ordering::Relaxed) {
-                                let msg = serde_json::json!({
-                                    "type": "getbazaarflips",
-                                    "data": serde_json::to_string("").unwrap_or_default()
-                                }).to_string();
-                                if let Err(e) = ws.send_message(&msg).await {
-                                    error!("Failed to request bazaar flips after AH flip pause: {}", e);
-                                } else {
-                                    debug!("[BazaarFlips] Requested fresh bazaar flips after AH flip window");
-                                }
-                            }
+                            // COFL now automatically sends bazaar flip recommendations —
+                            // no need to request getbazaarflips here.
                         });
                     }
                 }
