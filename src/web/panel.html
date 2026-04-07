@@ -412,6 +412,7 @@ a{color:var(--accent2);text-decoration:none}
         <h2>🏛️ Auction House</h2>
         <div class="cfg-row"><label class="cfg-label" for="cfg-auction_duration_hours">Auction Duration (hours)</label><input class="cfg-input" id="cfg-auction_duration_hours" type="number" min="1" max="48"></div>
         <div class="cfg-row"><label class="cfg-label" for="cfg-auction_listing_delay_ms">Auction Listing Delay (ms)</label><input class="cfg-input" id="cfg-auction_listing_delay_ms" type="number" min="500"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-max_items_in_inventory">Max Flip Items in Inventory</label><input class="cfg-input" id="cfg-max_items_in_inventory" type="number" min="0" max="28"></div>
     </div>
 
     <!-- Category: Bazaar -->
@@ -1384,6 +1385,7 @@ const CONFIG_FIELDS = {
     bazaar_tax_rate: {type:'float', default:1.25},
     auction_listing_delay_ms: {type:'int', default:1500},
     auction_duration_hours: {type:'int', default:24},
+    max_items_in_inventory: {type:'int', default:12},
     auto_cookie: {type:'int', default:0},
     humanization_min_interval_minutes: {type:'int', default:45},
     humanization_max_interval_minutes: {type:'int', default:120},

@@ -296,6 +296,9 @@ pub struct BotClient {
     /// recurring.  Prevents further SellToAuction commands from being processed
     /// until a successful ClaimSold/ManageOrders cycle clears it.
     auction_slot_blocked: Arc<AtomicBool>,
+    /// Retry counter for "You already have an item in the auction slot!" errors.
+    /// Shared with BotClientState so clearing the blocked flag also resets retries.
+    auction_stuck_item_retries: Arc<std::sync::atomic::AtomicU8>,
     /// Set when the server rejects an order placement (e.g. "Your price isn't
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
@@ -463,6 +466,7 @@ impl BotClient {
             bazaar_daily_limit: Arc::new(AtomicBool::new(false)),
             auction_at_limit: Arc::new(AtomicBool::new(false)),
             auction_slot_blocked: Arc::new(AtomicBool::new(false)),
+            auction_stuck_item_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
@@ -554,7 +558,7 @@ impl BotClient {
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
             auction_sell_aborted: Arc::new(AtomicBool::new(false)),
-            auction_stuck_item_retries: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            auction_stuck_item_retries: self.auction_stuck_item_retries.clone(),
             scoreboard_scores: self.scoreboard_scores.clone(),
             sidebar_objective: self.sidebar_objective.clone(),
             scoreboard_teams: self.scoreboard_teams.clone(),
@@ -821,8 +825,11 @@ impl BotClient {
     }
 
     /// Clear the auction-slot-blocked flag after a successful claim or manage cycle.
+    /// Also resets the stuck-item retry counter so subsequent SellToAuction commands
+    /// get a fresh set of retries.
     pub fn clear_auction_slot_blocked(&self) {
         self.auction_slot_blocked.store(false, Ordering::Relaxed);
+        self.auction_stuck_item_retries.store(0, Ordering::Relaxed);
     }
 
     /// Clear the auction-at-limit flag so the bot retries listing.
@@ -2343,8 +2350,11 @@ async fn event_handler(
                     let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
                     state.active_auction_listings.write().insert(item_key);
                 }
-                // Listing succeeded — clear any stale auction-limit flag.
+                // Listing succeeded — clear any stale auction-limit flag and
+                // reset the stuck-item retry counter so the next SellToAuction
+                // starts with a fresh count.
                 state.auction_at_limit.store(false, Ordering::Relaxed);
+                state.auction_stuck_item_retries.store(0, Ordering::Relaxed);
                 if !item.is_empty() {
                     info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
                     let _ = state.event_tx.send(BotEvent::AuctionListed {
@@ -3163,7 +3173,13 @@ async fn execute_command(
             *state.auction_item_id.write() = item_id.clone();
             *state.auction_step.write() = AuctionStep::Initial;
             state.auction_sell_aborted.store(false, Ordering::Relaxed);
-            state.auction_stuck_item_retries.store(0, Ordering::Relaxed);
+            // NOTE: Do NOT reset auction_stuck_item_retries here.  If a previous
+            // SellToAuction hit "You already have an item in the auction slot!" and
+            // the 5-second GUI watchdog auto-closed the window (setting state to Idle),
+            // the command queue dispatches a new SellToAuction which would reset the
+            // counter, creating an infinite "attempt 1/3" loop.  The counter is
+            // instead reset when a listing actually succeeds ("BIN Auction started")
+            // or when the auction_slot_blocked flag is cleared.
             // Open auction house — window handler takes over from here
             send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::Selling;
