@@ -103,10 +103,14 @@ pub struct Config {
     #[serde(default = "default_auction_listing_delay_ms")]
     pub auction_listing_delay_ms: u64,
     
-    #[serde(default = "default_true")]
+    /// **Deprecated**: COFL now handles flip type selection automatically.
+    /// This field is kept for backward compatibility but is always treated as true.
+    #[serde(default = "default_true", skip_serializing)]
     pub enable_bazaar_flips: bool,
     
-    #[serde(default = "default_true")]
+    /// **Deprecated**: COFL now handles flip type selection automatically.
+    /// This field is kept for backward compatibility but is always treated as true.
+    #[serde(default = "default_true", skip_serializing)]
     pub enable_ah_flips: bool,
     
     #[serde(default)]

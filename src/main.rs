@@ -515,9 +515,11 @@ async fn main() -> Result<()> {
     // Master macro pause — web panel can set this to pause all command processing.
     let macro_paused = Arc::new(AtomicBool::new(false));
 
-    // Shared enable flags — web panel can toggle these at runtime.
-    let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
-    let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
+    // COFL now handles AH/Bazaar flip selection automatically based on user
+    // settings — these flags are always true for backward compatibility with
+    // internal code paths that check them.
+    let enable_ah_flips = Arc::new(AtomicBool::new(true));
+    let enable_bazaar_flips = Arc::new(AtomicBool::new(true));
     let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
 
     // Broadcast channel for chat messages → web panel clients.

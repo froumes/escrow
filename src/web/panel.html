@@ -176,6 +176,12 @@ a{color:var(--accent2);text-decoration:none}
 .profit-stat-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(18px,2vw,28px);text-align:center}
 .profit-stat-box .label{font-size:clamp(.78rem,.9vw,.92rem);color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
 .profit-stat-box .value{font-size:clamp(1.6rem,2.5vw,2.4rem);font-weight:700;color:var(--success)}
+/* Config GUI */
+.cfg-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.cfg-row:last-child{border-bottom:none}
+.cfg-label{font-size:.88rem;color:var(--text);flex:1;margin-right:12px}
+.cfg-input{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:.85rem;width:280px;max-width:50%;outline:none;transition:border-color .2s}
+.cfg-input:focus{border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -264,14 +270,6 @@ a{color:var(--accent2);text-decoration:none}
             <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimPurchases()">📦 Claim Purchases</button>
             <button class="btn btn-sm" style="background:var(--warn);color:#1a1a1a" onclick="collectBzOrders()">💰 Sell Instantly (BZ)</button>
             <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimBzOrders()">📋 Claim BZ Orders</button>
-        </div>
-        <div class="toggle-row">
-            <span class="toggle-label">Auction House Flips</span>
-            <label class="toggle"><input type="checkbox" id="tog-ah" onchange="toggleAH(this.checked)"><span class="slider"></span></label>
-        </div>
-        <div class="toggle-row">
-            <span class="toggle-label">Bazaar Flips</span>
-            <label class="toggle"><input type="checkbox" id="tog-bz" onchange="toggleBZ(this.checked)"><span class="slider"></span></label>
         </div>
         <div class="toggle-row">
             <span class="toggle-label">Anonymize</span>
@@ -386,15 +384,89 @@ a{color:var(--accent2);text-decoration:none}
 </div>
 
 <div class="tab-content" id="tab-config">
-    <div class="card">
-        <h2>Configuration (config.toml)</h2>
-        <p style="color:var(--text-dim);font-size:.82rem;margin-bottom:12px">Edit the configuration below and click Save. Changes take effect immediately for supported fields (toggles, delays). Other fields may require a restart.</p>
-        <div id="config-status" style="display:none;margin-bottom:10px;padding:8px 14px;border-radius:6px;font-size:.85rem"></div>
-        <textarea id="config-editor" spellcheck="false" style="width:100%;min-height:400px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;line-height:1.6;resize:vertical;outline:none;tab-size:4" placeholder="Loading config..."></textarea>
-        <div style="margin-top:12px;display:flex;gap:10px">
-            <button class="btn" style="background:var(--accent);color:#fff" onclick="saveConfig()">💾 Save Config</button>
-            <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="loadConfig()">🔄 Reload</button>
-        </div>
+    <div id="config-status" style="display:none;margin-bottom:10px;padding:8px 14px;border-radius:6px;font-size:.85rem"></div>
+
+    <!-- Category: General -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🎮 General</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-ingame_name">Ingame Name(s)</label><input class="cfg-input" id="cfg-ingame_name" placeholder="Account1,Account2"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-multi_switch_time">Account Switch Time (hours)</label><input class="cfg-input" id="cfg-multi_switch_time" type="number" step="0.5" min="0" placeholder="0 = disabled"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-web_gui_port">Web GUI Port</label><input class="cfg-input" id="cfg-web_gui_port" type="number" min="1" max="65535"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-web_gui_password">Web GUI Password</label><input class="cfg-input" id="cfg-web_gui_password" type="text" placeholder="Leave empty to disable"></div>
+        <div class="cfg-row"><label class="cfg-label">Enable Console Input</label><label class="toggle"><input type="checkbox" id="cfg-enable_console_input"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label">Share Legendary Flips</label><label class="toggle"><input type="checkbox" id="cfg-share_legendary_flips"><span class="slider"></span></label></div>
+    </div>
+
+    <!-- Category: Timing & Delays -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>⏱️ Timing &amp; Delays</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-command_delay_ms">Command Delay (ms)</label><input class="cfg-input" id="cfg-command_delay_ms" type="number" min="100"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bed_spam_click_delay">Bed Spam Click Delay (ms)</label><input class="cfg-input" id="cfg-bed_spam_click_delay" type="number" min="10"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bed_multiple_clicks_delay">Bed Multiple Clicks Delay (ms)</label><input class="cfg-input" id="cfg-bed_multiple_clicks_delay" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bed_pre_click_ms">Bed Pre-Click (ms)</label><input class="cfg-input" id="cfg-bed_pre_click_ms" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label">Bed Spam</label><label class="toggle"><input type="checkbox" id="cfg-bed_spam"><span class="slider"></span></label></div>
+    </div>
+
+    <!-- Category: Auction House -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🏛️ Auction House</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-auction_duration_hours">Auction Duration (hours)</label><input class="cfg-input" id="cfg-auction_duration_hours" type="number" min="1" max="48"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-auction_listing_delay_ms">Auction Listing Delay (ms)</label><input class="cfg-input" id="cfg-auction_listing_delay_ms" type="number" min="500"></div>
+    </div>
+
+    <!-- Category: Bazaar -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>📦 Bazaar</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_order_check_interval_seconds">Order Check Interval (seconds)</label><input class="cfg-input" id="cfg-bazaar_order_check_interval_seconds" type="number" min="10"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_order_cancel_minutes_per_million">Cancel Minutes Per Million</label><input class="cfg-input" id="cfg-bazaar_order_cancel_minutes_per_million" type="number" min="1"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_tax_rate">Tax Rate (%)</label><input class="cfg-input" id="cfg-bazaar_tax_rate" type="number" step="0.05" min="0" max="5"></div>
+    </div>
+
+    <!-- Category: Humanization -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>😴 Humanization / Rest Breaks</h2>
+        <p style="color:var(--text-dim);font-size:.82rem;margin-bottom:12px">When enabled, the bot will periodically take random breaks to appear more human-like. Session time is preserved.</p>
+        <div class="cfg-row"><label class="cfg-label">Enable Rest Breaks</label><label class="toggle"><input type="checkbox" id="cfg-humanization_enabled"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_min_interval_minutes">Min Interval (minutes)</label><input class="cfg-input" id="cfg-humanization_min_interval_minutes" type="number" min="5"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_max_interval_minutes">Max Interval (minutes)</label><input class="cfg-input" id="cfg-humanization_max_interval_minutes" type="number" min="10"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_min_break_minutes">Min Break Duration (minutes)</label><input class="cfg-input" id="cfg-humanization_min_break_minutes" type="number" min="1"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_max_break_minutes">Max Break Duration (minutes)</label><input class="cfg-input" id="cfg-humanization_max_break_minutes" type="number" min="1"></div>
+    </div>
+
+    <!-- Category: Webhooks -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🔔 Webhooks &amp; Notifications</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-webhook_url">Discord Webhook URL</label><input class="cfg-input" id="cfg-webhook_url" type="url" placeholder="https://discord.com/api/webhooks/..."></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_webhook_url">Bazaar Webhook URL</label><input class="cfg-input" id="cfg-bazaar_webhook_url" type="url" placeholder="Optional — falls back to main webhook"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-discord_id">Discord User ID (for pings)</label><input class="cfg-input" id="cfg-discord_id" placeholder="e.g. 123456789012345678"></div>
+    </div>
+
+    <!-- Category: Proxy -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🌐 Proxy</h2>
+        <div class="cfg-row"><label class="cfg-label">Proxy Enabled</label><label class="toggle"><input type="checkbox" id="cfg-proxy_enabled"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-proxy_address">Proxy Address</label><input class="cfg-input" id="cfg-proxy_address" placeholder="host:port"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-proxy_credentials">Proxy Credentials</label><input class="cfg-input" id="cfg-proxy_credentials" placeholder="username:password"></div>
+    </div>
+
+    <!-- Category: Advanced -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>⚙️ Advanced</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-websocket_url">WebSocket URL</label><input class="cfg-input" id="cfg-websocket_url" placeholder="wss://sky.coflnet.com/modsocket"></div>
+        <div class="cfg-row"><label class="cfg-label">Use COFL Chat</label><label class="toggle"><input type="checkbox" id="cfg-use_cofl_chat"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-auto_cookie">Auto Cookie (0 = disabled)</label><input class="cfg-input" id="cfg-auto_cookie" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-hypixel_api_key">Hypixel API Key</label><input class="cfg-input" id="cfg-hypixel_api_key" placeholder="Optional"></div>
+    </div>
+
+    <!-- Raw TOML (collapsed) -->
+    <details class="card" style="margin-bottom:16px">
+        <summary style="cursor:pointer;color:var(--text-dim);font-size:.85rem">📝 Raw Config (TOML)</summary>
+        <textarea id="config-editor" spellcheck="false" style="width:100%;min-height:300px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;line-height:1.6;resize:vertical;outline:none;tab-size:4;margin-top:10px" placeholder="Loading config..."></textarea>
+    </details>
+
+    <div style="display:flex;gap:10px;margin-bottom:20px">
+        <button class="btn" style="background:var(--accent);color:#fff" onclick="saveConfigGUI()">💾 Save Config</button>
+        <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="loadConfig()">🔄 Reload</button>
     </div>
 </div>
 
@@ -550,8 +622,6 @@ async function fetchStatus() {
         $('s-account').textContent = d.current_account || '—';
         $('s-purse').textContent = formatCoins(d.purse);
         $('s-uptime').textContent = formatUptime(d.uptime_seconds);
-        $('tog-ah').checked = d.enable_ah_flips;
-        $('tog-bz').checked = d.enable_bazaar_flips;
         $('tog-anon').checked = d.anonymize_webhook_name;
         isAnonymized = d.anonymize_webhook_name;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
@@ -601,12 +671,6 @@ function renderAccounts() {
 async function pauseMacro() { await fetch('/api/pause', {method:'POST'}); fetchStatus(); }
 async function resumeMacro() { await fetch('/api/resume', {method:'POST'}); fetchStatus(); }
 
-async function toggleAH(enabled) {
-    await fetch('/api/toggle_ah', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
-}
-async function toggleBZ(enabled) {
-    await fetch('/api/toggle_bazaar', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
-}
 async function toggleAnonymize(enabled) {
     await fetch('/api/toggle_anonymize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
 }
@@ -1296,6 +1360,142 @@ async function fetchProfit() {
 setInterval(fetchProfit, 15000);
 
 // ── Config Editor ────────────────────────────────────────────
+// Config field definitions for the GUI ↔ TOML bridge
+const CONFIG_FIELDS = {
+    // strings
+    ingame_name: {type:'string', default:''},
+    websocket_url: {type:'string', default:'wss://sky.coflnet.com/modsocket'},
+    webhook_url: {type:'string', default:''},
+    bazaar_webhook_url: {type:'string', default:''},
+    discord_id: {type:'string', default:''},
+    web_gui_password: {type:'string', default:''},
+    hypixel_api_key: {type:'string', default:''},
+    proxy_address: {type:'string', default:''},
+    proxy_credentials: {type:'string', default:''},
+    // numbers
+    multi_switch_time: {type:'float', default:0.0},
+    web_gui_port: {type:'int', default:8080},
+    command_delay_ms: {type:'int', default:500},
+    bed_spam_click_delay: {type:'int', default:100},
+    bed_multiple_clicks_delay: {type:'int', default:0},
+    bed_pre_click_ms: {type:'int', default:30},
+    bazaar_order_check_interval_seconds: {type:'int', default:60},
+    bazaar_order_cancel_minutes_per_million: {type:'int', default:1},
+    bazaar_tax_rate: {type:'float', default:1.25},
+    auction_listing_delay_ms: {type:'int', default:1500},
+    auction_duration_hours: {type:'int', default:24},
+    auto_cookie: {type:'int', default:0},
+    humanization_min_interval_minutes: {type:'int', default:45},
+    humanization_max_interval_minutes: {type:'int', default:120},
+    humanization_min_break_minutes: {type:'int', default:2},
+    humanization_max_break_minutes: {type:'int', default:10},
+    // booleans
+    bed_spam: {type:'bool', default:false},
+    use_cofl_chat: {type:'bool', default:true},
+    enable_console_input: {type:'bool', default:true},
+    proxy_enabled: {type:'bool', default:false},
+    share_legendary_flips: {type:'bool', default:true},
+    humanization_enabled: {type:'bool', default:false},
+};
+
+// Simple TOML parser for flat config (no nested tables except [sessions])
+function parseSimpleToml(text) {
+    const result = {};
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('[')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx < 0) continue;
+        const key = trimmed.substring(0, eqIdx).trim();
+        let val = trimmed.substring(eqIdx + 1).trim();
+        // Remove inline comments
+        if (val.startsWith('"')) {
+            // String value — find closing quote
+            const endQ = val.indexOf('"', 1);
+            if (endQ >= 0) val = val.substring(0, endQ + 1);
+            result[key] = val.slice(1, -1);
+        } else if (val === 'true') {
+            result[key] = true;
+        } else if (val === 'false') {
+            result[key] = false;
+        } else {
+            // number
+            const num = parseFloat(val);
+            result[key] = isNaN(num) ? val : num;
+        }
+    }
+    return result;
+}
+
+function populateConfigGUI(parsed) {
+    for (const [key, def] of Object.entries(CONFIG_FIELDS)) {
+        const el = $('cfg-' + key);
+        if (!el) continue;
+        const val = parsed[key] !== undefined ? parsed[key] : def.default;
+        if (def.type === 'bool') {
+            el.checked = !!val;
+        } else {
+            el.value = val;
+        }
+    }
+}
+
+function buildTomlFromGUI(originalToml) {
+    // Start from the parsed values, overlay GUI changes
+    const parsed = parseSimpleToml(originalToml);
+
+    for (const [key, def] of Object.entries(CONFIG_FIELDS)) {
+        const el = $('cfg-' + key);
+        if (!el) continue;
+        if (def.type === 'bool') {
+            parsed[key] = el.checked;
+        } else if (def.type === 'int') {
+            parsed[key] = parseInt(el.value, 10) || def.default;
+        } else if (def.type === 'float') {
+            parsed[key] = parseFloat(el.value) || def.default;
+        } else {
+            parsed[key] = el.value;
+        }
+    }
+
+    // Rebuild TOML preserving order and known fields
+    const lines = [];
+    const written = new Set();
+    // Write known fields in order
+    for (const key of Object.keys(CONFIG_FIELDS)) {
+        const val = parsed[key];
+        written.add(key);
+        if (typeof val === 'boolean') {
+            lines.push(key + ' = ' + val);
+        } else if (typeof val === 'number') {
+            // Ensure floats have decimal point
+            const def = CONFIG_FIELDS[key];
+            if (def && def.type === 'float') {
+                lines.push(key + ' = ' + (Number.isInteger(val) ? val.toFixed(1) : val));
+            } else {
+                lines.push(key + ' = ' + val);
+            }
+        } else {
+            lines.push(key + ' = "' + (val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"');
+        }
+    }
+
+    // Also preserve fields that aren't in our GUI (e.g. freemoney, fastbuy, enable_ah_flips, etc.)
+    for (const [key, val] of Object.entries(parsed)) {
+        if (written.has(key)) continue;
+        written.add(key);
+        if (typeof val === 'boolean') {
+            lines.push(key + ' = ' + val);
+        } else if (typeof val === 'number') {
+            lines.push(key + ' = ' + val);
+        } else {
+            lines.push(key + ' = "' + (val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"');
+        }
+    }
+
+    return lines.join('\n') + '\n';
+}
+
 async function loadConfig() {
     try {
         const r = await fetch('/api/config');
@@ -1303,6 +1503,9 @@ async function loadConfig() {
         if (!r.ok) { showConfigStatus('Failed to load config', true); return; }
         const text = await r.text();
         $('config-editor').value = text;
+        // Populate GUI fields
+        const parsed = parseSimpleToml(text);
+        populateConfigGUI(parsed);
         hideConfigStatus();
     } catch(e) {
         console.error('Config load failed', e);
@@ -1310,6 +1513,32 @@ async function loadConfig() {
     }
 }
 
+async function saveConfigGUI() {
+    const originalToml = $('config-editor').value;
+    const toml = buildTomlFromGUI(originalToml);
+    if (!toml.trim()) { showConfigStatus('Config cannot be empty', true); return; }
+    // Also update the raw textarea
+    $('config-editor').value = toml;
+    try {
+        const r = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({config_toml: toml})
+        });
+        if (r.ok) {
+            showConfigStatus('Config saved successfully!', false);
+            fetchStatus();
+        } else {
+            const msg = await r.text();
+            showConfigStatus('Save failed: ' + msg, true);
+        }
+    } catch(e) {
+        console.error('Config save failed', e);
+        showConfigStatus('Save failed: ' + e.message, true);
+    }
+}
+
+// Keep legacy saveConfig for raw TOML editing
 async function saveConfig() {
     const toml = $('config-editor').value;
     if (!toml.trim()) { showConfigStatus('Config cannot be empty', true); return; }
@@ -1321,7 +1550,7 @@ async function saveConfig() {
         });
         if (r.ok) {
             showConfigStatus('Config saved successfully!', false);
-            fetchStatus(); // refresh toggles to reflect any changes
+            fetchStatus();
         } else {
             const msg = await r.text();
             showConfigStatus('Save failed: ' + msg, true);
