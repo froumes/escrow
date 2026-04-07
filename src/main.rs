@@ -920,18 +920,20 @@ async fn main() -> Result<()> {
                     // inventory does not fill up with items the user cannot remove.
                     {
                         let ws = ws_client_for_events.clone();
+                        let max_items = config_for_events.max_items_in_inventory;
                         tokio::spawn(async move {
                             // Small delay to let the socket settle after startup commands
                             sleep(Duration::from_secs(2)).await;
-                            let data_json = serde_json::to_string("maxitemsininventory").unwrap_or_default();
+                            let set_value = format!("maxitemsininventory {}", max_items);
+                            let data_json = serde_json::to_string(&set_value).unwrap_or_default();
                             let msg = serde_json::json!({
                                 "type": "set",
                                 "data": data_json
                             }).to_string();
                             if let Err(e) = ws.send_message(&msg).await {
-                                error!("[Startup] Failed to send /cofl set maxitemsininventory: {}", e);
+                                error!("[Startup] Failed to send /cofl set maxitemsininventory {}: {}", max_items, e);
                             } else {
-                                info!("[Startup] Sent /cofl set maxitemsininventory");
+                                info!("[Startup] Sent /cofl set maxitemsininventory {}", max_items);
                             }
                         });
                     }

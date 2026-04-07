@@ -136,6 +136,12 @@ pub struct Config {
     
     #[serde(default = "default_auction_duration_hours")]
     pub auction_duration_hours: u64,
+
+    /// Maximum number of flip items allowed in inventory at once.
+    /// Sent to COFL on startup via `/cofl set maxitemsininventory`.
+    /// Default: 12.
+    #[serde(default = "default_max_items_in_inventory")]
+    pub max_items_in_inventory: u64,
     
     /// Enable proxy for both the Minecraft and WebSocket connections.
     #[serde(default)]
@@ -265,6 +271,10 @@ fn default_auction_duration_hours() -> u64 {
     24
 }
 
+fn default_max_items_in_inventory() -> u64 {
+    12
+}
+
 fn default_true() -> bool {
     true
 }
@@ -309,6 +319,7 @@ impl Default for Config {
             auto_cookie: 0,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
+            max_items_in_inventory: default_max_items_in_inventory(),
             proxy_enabled: false,
             proxy_address: None,
             proxy_credentials: None,
