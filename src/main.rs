@@ -3217,15 +3217,18 @@ async fn main() -> Result<()> {
     }
 
     // ── Human-like rest breaks ───────────────────────────────────
-    // When enabled, periodically pause the macro for a randomized duration,
-    // send the player to the lobby, then rejoin SkyBlock.
-    // The session timer is NOT reset — only macro processing is paused.
+    // When enabled, periodically disconnect from the server for a randomized
+    // duration, then restart the process to reconnect.
+    // Session time is saved right before restart so it is preserved across
+    // the break — the account-switching timer is NOT reset.
     if config.humanization_enabled {
-        let macro_paused_human = macro_paused.clone();
         let command_queue_human = command_queue.clone();
         let chat_tx_human = chat_tx.clone();
         let ign_human = ingame_name.clone();
         let webhook_url_human = config.active_webhook_url().map(|s| s.to_string());
+        let session_times_path_human = session_times_path.clone();
+        let prev_secs_human = previous_session_secs;
+        let started_human = std::time::Instant::now();
         let min_interval = config.humanization_min_interval_minutes.max(5); // floor at 5 min
         let max_interval = config.humanization_max_interval_minutes.max(min_interval + 1);
         let min_break = config.humanization_min_break_minutes.max(1); // floor at 1 min
@@ -3237,79 +3240,77 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             use rand::Rng;
             use frikadellen_baf::types::{CommandType, CommandPriority};
-            loop {
-                // Sleep for a random interval between min and max
-                let interval_secs = {
-                    let mut rng = rand::rng();
-                    rng.random_range(min_interval * 60..=max_interval * 60)
-                };
-                info!(
-                    "[Humanization] Next rest break in {:.1}m",
-                    interval_secs as f64 / 60.0
-                );
-                sleep(Duration::from_secs(interval_secs)).await;
 
-                // Pick random break duration
-                let break_secs = {
-                    let mut rng = rand::rng();
-                    rng.random_range(min_break * 60..=max_break * 60)
-                };
-                info!(
-                    "[Humanization] Starting rest break ({:.1}m)",
-                    break_secs as f64 / 60.0
-                );
+            // Sleep for a random interval between min and max
+            let interval_secs = {
+                let mut rng = rand::rng();
+                rng.random_range(min_interval * 60..=max_interval * 60)
+            };
+            info!(
+                "[Humanization] Next rest break in {:.1}m",
+                interval_secs as f64 / 60.0
+            );
+            sleep(Duration::from_secs(interval_secs)).await;
 
-                // Notify via webhook
-                if let Some(ref url) = webhook_url_human {
-                    frikadellen_baf::webhook::send_webhook_rest_break_start(
-                        &ign_human,
-                        break_secs,
-                        url,
-                    )
-                    .await;
-                }
+            // Pick random break duration
+            let break_secs = {
+                let mut rng = rand::rng();
+                rng.random_range(min_break * 60..=max_break * 60)
+            };
+            info!(
+                "[Humanization] Starting rest break ({:.1}m) — disconnecting from server",
+                break_secs as f64 / 60.0
+            );
 
-                // Notify chat
-                let baf_msg = format!(
-                    "§f[§4BAF§f]: §e😴 Taking a rest break ({:.0}m). Reconnecting soon...",
-                    break_secs as f64 / 60.0
-                );
-                let _ = chat_tx_human.send(baf_msg);
-
-                // Send /lobby via the command queue, then pause the macro
-                command_queue_human.enqueue(
-                    CommandType::SendChat { message: "/lobby".to_string() },
-                    CommandPriority::Critical,
-                    false,
-                );
-                // Give the command processor time to process the /lobby
-                sleep(Duration::from_secs(3)).await;
-                macro_paused_human.store(true, Ordering::Relaxed);
-
-                // Sleep for the break duration
-                sleep(Duration::from_secs(break_secs)).await;
-
-                // Unpause macro first so the command processor can work
-                macro_paused_human.store(false, Ordering::Relaxed);
-
-                // Rejoin SkyBlock via command queue
-                command_queue_human.enqueue(
-                    CommandType::SendChat { message: "/play skyblock".to_string() },
-                    CommandPriority::Critical,
-                    false,
-                );
-
-                // Short delay for SkyBlock to load
-                sleep(Duration::from_secs(8)).await;
-
-                // Notify
-                if let Some(ref url) = webhook_url_human {
-                    frikadellen_baf::webhook::send_webhook_rest_break_end(&ign_human, url).await;
-                }
-                let baf_msg = "§f[§4BAF§f]: §a☀️ Break over — resuming operations.".to_string();
-                let _ = chat_tx_human.send(baf_msg);
-                info!("[Humanization] Resumed after rest break");
+            // Notify via webhook
+            if let Some(ref url) = webhook_url_human {
+                frikadellen_baf::webhook::send_webhook_rest_break_start(
+                    &ign_human,
+                    break_secs,
+                    url,
+                )
+                .await;
             }
+
+            // Notify chat
+            let baf_msg = format!(
+                "§f[§4BAF§f]: §e😴 Taking a rest break ({:.0}m). Disconnecting...",
+                break_secs as f64 / 60.0
+            );
+            let _ = chat_tx_human.send(baf_msg);
+
+            // Disconnect from the server via /quit
+            command_queue_human.enqueue(
+                CommandType::SendChat { message: "/quit".to_string() },
+                CommandPriority::Critical,
+                false,
+            );
+            // Give the command processor time to process /quit
+            sleep(Duration::from_secs(3)).await;
+
+            info!("[Humanization] Disconnected — sleeping for {:.1}m", break_secs as f64 / 60.0);
+
+            // Sleep for the break duration (fully disconnected)
+            sleep(Duration::from_secs(break_secs)).await;
+
+            info!("[Humanization] Rest break over — saving session time and restarting");
+
+            // Send "break over" webhook before restart
+            if let Some(ref url) = webhook_url_human {
+                frikadellen_baf::webhook::send_webhook_rest_break_end(&ign_human, url).await;
+            }
+
+            // Save session time right before restart so the gap is near-zero
+            // and session time is preserved across the break.
+            let total_secs = prev_secs_human + started_human.elapsed().as_secs();
+            save_session_time(&session_times_path_human, &ign_human, total_secs);
+            info!(
+                "[Humanization] Saved session time: {}s ({:.2}h) — restarting process",
+                total_secs, total_secs as f64 / 3600.0
+            );
+
+            // Restart the process to reconnect
+            restart_process();
         });
     }
 
