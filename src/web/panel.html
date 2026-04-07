@@ -1458,6 +1458,21 @@ function buildTomlFromGUI(originalToml) {
         }
     }
 
+    function escapeTomlString(val) {
+        return '"' + (val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+    }
+
+    function tomlLine(key, val, fieldDef) {
+        if (typeof val === 'boolean') return key + ' = ' + val;
+        if (typeof val === 'number') {
+            if (fieldDef && fieldDef.type === 'float') {
+                return key + ' = ' + (Number.isInteger(val) ? val.toFixed(1) : val);
+            }
+            return key + ' = ' + val;
+        }
+        return key + ' = ' + escapeTomlString(val);
+    }
+
     // Rebuild TOML preserving order and known fields
     const lines = [];
     const written = new Set();
@@ -1465,32 +1480,14 @@ function buildTomlFromGUI(originalToml) {
     for (const key of Object.keys(CONFIG_FIELDS)) {
         const val = parsed[key];
         written.add(key);
-        if (typeof val === 'boolean') {
-            lines.push(key + ' = ' + val);
-        } else if (typeof val === 'number') {
-            // Ensure floats have decimal point
-            const def = CONFIG_FIELDS[key];
-            if (def && def.type === 'float') {
-                lines.push(key + ' = ' + (Number.isInteger(val) ? val.toFixed(1) : val));
-            } else {
-                lines.push(key + ' = ' + val);
-            }
-        } else {
-            lines.push(key + ' = "' + (val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"');
-        }
+        lines.push(tomlLine(key, val, CONFIG_FIELDS[key]));
     }
 
     // Also preserve fields that aren't in our GUI (e.g. freemoney, fastbuy, enable_ah_flips, etc.)
     for (const [key, val] of Object.entries(parsed)) {
         if (written.has(key)) continue;
         written.add(key);
-        if (typeof val === 'boolean') {
-            lines.push(key + ' = ' + val);
-        } else if (typeof val === 'number') {
-            lines.push(key + ' = ' + val);
-        } else {
-            lines.push(key + ' = "' + (val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"');
-        }
+        lines.push(tomlLine(key, val, null));
     }
 
     return lines.join('\n') + '\n';
