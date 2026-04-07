@@ -397,24 +397,10 @@ async fn main() -> Result<()> {
         config_loader.save(&config)?;
     }
 
-    if config.enable_ah_flips && config.enable_bazaar_flips {
-        // Both are enabled, ask user
-    } else if !config.enable_ah_flips && !config.enable_bazaar_flips {
-        // Neither is configured, ask user
-        let enable_ah = Confirm::new()
-            .with_prompt("Enable auction house flips?")
-            .default(true)
-            .interact()?;
-        config.enable_ah_flips = enable_ah;
-
-        let enable_bazaar = Confirm::new()
-            .with_prompt("Enable bazaar flips?")
-            .default(true)
-            .interact()?;
-        config.enable_bazaar_flips = enable_bazaar;
-
-        config_loader.save(&config)?;
-    }
+    // AH/Bazaar flip enable/disable is now handled automatically by COFL
+    // based on user settings — no need for local toggles or prompts.
+    // We still accept the config values for backward compatibility, but they
+    // are effectively always enabled.
 
     // Prompt for webhook URL if not yet configured (matches TypeScript configHelper.ts pattern
     // of adding new default values to existing config on first run of newer version)
@@ -529,9 +515,11 @@ async fn main() -> Result<()> {
     // Master macro pause — web panel can set this to pause all command processing.
     let macro_paused = Arc::new(AtomicBool::new(false));
 
-    // Shared enable flags — web panel can toggle these at runtime.
-    let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
-    let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
+    // COFL now handles AH/Bazaar flip selection automatically based on user
+    // settings — these flags are always true for backward compatibility with
+    // internal code paths that check them.
+    let enable_ah_flips = Arc::new(AtomicBool::new(true));
+    let enable_bazaar_flips = Arc::new(AtomicBool::new(true));
     let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
 
     // Broadcast channel for chat messages → web panel clients.
@@ -926,17 +914,26 @@ async fn main() -> Result<()> {
                             debug!("[Startup] Uploaded scoreboard ({} lines)", scoreboard_lines.len());
                         });
                     }
-                    // Request bazaar flips immediately after startup (matching TypeScript runStartupWorkflow)
-                    if config_for_events.enable_bazaar_flips {
-                        let msg = serde_json::json!({
-                            "type": "getbazaarflips",
-                            "data": serde_json::to_string("").unwrap_or_default()
-                        }).to_string();
-                        if let Err(e) = ws_client_for_events.send_message(&msg).await {
-                            error!("Failed to send getbazaarflips after startup: {}", e);
-                        } else {
-                            info!("[Startup] Requested bazaar flips");
-                        }
+                    // COFL now automatically sends bazaar flip recommendations based
+                    // on user settings — no need to request them manually.
+                    // Send /cofl set maxitemsininventory once on startup so the
+                    // inventory does not fill up with items the user cannot remove.
+                    {
+                        let ws = ws_client_for_events.clone();
+                        tokio::spawn(async move {
+                            // Small delay to let the socket settle after startup commands
+                            sleep(Duration::from_secs(2)).await;
+                            let data_json = serde_json::to_string("maxitemsininventory").unwrap_or_default();
+                            let msg = serde_json::json!({
+                                "type": "set",
+                                "data": data_json
+                            }).to_string();
+                            if let Err(e) = ws.send_message(&msg).await {
+                                error!("[Startup] Failed to send /cofl set maxitemsininventory: {}", e);
+                            } else {
+                                info!("[Startup] Sent /cofl set maxitemsininventory");
+                            }
+                        });
                     }
                     // Send startup complete webhook
                     if let Some(webhook_url) = config_for_events.active_webhook_url() {
@@ -2365,8 +2362,12 @@ async fn main() -> Result<()> {
     let command_delay_ms = config.command_delay_ms;
     let auction_listing_delay_ms = config.auction_listing_delay_ms;
     let chat_tx_proc = chat_tx.clone();
+    let ws_client_proc = ws_client.clone();
+    let bot_client_proc_inv = bot_client.clone();
     tokio::spawn(async move {
         use frikadellen_baf::types::BotState;
+        // Debounce: avoid requesting sellinventory too frequently when inventory is full
+        let mut last_sellinventory_request = Instant::now() - Duration::from_secs(300);
         loop {
             // When macro is paused via web panel, skip command processing entirely.
             if macro_paused_proc.load(Ordering::Relaxed) {
@@ -2453,6 +2454,33 @@ async fn main() -> Result<()> {
                     );
                     if !is_selling_cmd {
                         debug!("[Queue] Dropping {:?} — inventory full (selling mode)", cmd.command_type);
+                        // Proactively request /cofl sellinventory to get sell
+                        // recommendations (especially bazaar) when inventory is full.
+                        // Debounce to avoid spamming COFL.
+                        if last_sellinventory_request.elapsed() > Duration::from_secs(120) {
+                            last_sellinventory_request = Instant::now();
+                            let ws = ws_client_proc.clone();
+                            let inv_client = bot_client_proc_inv.clone();
+                            tokio::spawn(async move {
+                                // Upload inventory first
+                                if let Some(inv_json) = inv_client.get_cached_inventory_json() {
+                                    let upload_msg = serde_json::json!({
+                                        "type": "uploadInventory",
+                                        "data": inv_json
+                                    }).to_string();
+                                    let _ = ws.send_message(&upload_msg).await;
+                                }
+                                let msg = serde_json::json!({
+                                    "type": "sellinventory",
+                                    "data": serde_json::to_string("").unwrap_or_default()
+                                }).to_string();
+                                if let Err(e) = ws.send_message(&msg).await {
+                                    tracing::warn!("[SellingMode] Failed to request sellinventory: {}", e);
+                                } else {
+                                    tracing::info!("[SellingMode] Auto-requested sellinventory (inventory full)");
+                                }
+                            });
+                        }
                         command_queue_processor.complete_current();
                         sleep(Duration::from_millis(50)).await;
                         continue;
@@ -2742,27 +2770,8 @@ async fn main() -> Result<()> {
         }
     });
     
-    // Periodic bazaar flip requests every 5 minutes (matching TypeScript startBazaarFlipRequests)
-    if config.enable_bazaar_flips {
-        let ws_client_periodic = ws_client.clone();
-        let bot_client_periodic = bot_client.clone();
-        tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(300)).await; // 5 minutes
-                if bot_client_periodic.state().allows_commands() {
-                    let msg = serde_json::json!({
-                        "type": "getbazaarflips",
-                        "data": serde_json::to_string("").unwrap_or_default()
-                    }).to_string();
-                    if let Err(e) = ws_client_periodic.send_message(&msg).await {
-                        error!("Failed to send periodic getbazaarflips: {}", e);
-                    } else {
-                        debug!("[BazaarFlips] Auto-requested bazaar flips (periodic)");
-                    }
-                }
-            }
-        });
-    }
+    // COFL now automatically sends bazaar flip recommendations — no periodic
+    // request needed (previously sent getbazaarflips every 5 minutes).
 
     // Periodic scoreboard upload every 5 seconds (matching TypeScript setInterval purse update)
     {
@@ -3204,6 +3213,104 @@ async fn main() -> Result<()> {
                 let total_secs = prev_secs_save + started_save.elapsed().as_secs();
                 save_session_time(&session_times_path_save, &ign_save, total_secs);
             }
+        });
+    }
+
+    // ── Human-like rest breaks ───────────────────────────────────
+    // When enabled, periodically disconnect from the server for a randomized
+    // duration, then restart the process to reconnect.
+    // Session time is saved right before restart so it is preserved across
+    // the break — the account-switching timer is NOT reset.
+    if config.humanization_enabled {
+        let command_queue_human = command_queue.clone();
+        let chat_tx_human = chat_tx.clone();
+        let ign_human = ingame_name.clone();
+        let webhook_url_human = config.active_webhook_url().map(|s| s.to_string());
+        let session_times_path_human = session_times_path.clone();
+        let prev_secs_human = previous_session_secs;
+        let started_human = std::time::Instant::now();
+        let min_interval = config.humanization_min_interval_minutes.max(5); // floor at 5 min
+        let max_interval = config.humanization_max_interval_minutes.max(min_interval + 1);
+        let min_break = config.humanization_min_break_minutes.max(1); // floor at 1 min
+        let max_break = config.humanization_max_break_minutes.max(min_break + 1);
+        info!(
+            "[Humanization] Enabled — interval {}-{}m, break {}-{}m",
+            min_interval, max_interval, min_break, max_break
+        );
+        tokio::spawn(async move {
+            use rand::Rng;
+            use frikadellen_baf::types::{CommandType, CommandPriority};
+
+            // Sleep for a random interval between min and max
+            let interval_secs = {
+                let mut rng = rand::rng();
+                rng.random_range(min_interval * 60..=max_interval * 60)
+            };
+            info!(
+                "[Humanization] Next rest break in {:.1}m",
+                interval_secs as f64 / 60.0
+            );
+            sleep(Duration::from_secs(interval_secs)).await;
+
+            // Pick random break duration
+            let break_secs = {
+                let mut rng = rand::rng();
+                rng.random_range(min_break * 60..=max_break * 60)
+            };
+            info!(
+                "[Humanization] Starting rest break ({:.1}m) — disconnecting from server",
+                break_secs as f64 / 60.0
+            );
+
+            // Notify via webhook
+            if let Some(ref url) = webhook_url_human {
+                frikadellen_baf::webhook::send_webhook_rest_break_start(
+                    &ign_human,
+                    break_secs,
+                    url,
+                )
+                .await;
+            }
+
+            // Notify chat
+            let baf_msg = format!(
+                "§f[§4BAF§f]: §e😴 Taking a rest break ({:.0}m). Disconnecting...",
+                break_secs as f64 / 60.0
+            );
+            let _ = chat_tx_human.send(baf_msg);
+
+            // Disconnect from the server via /quit
+            command_queue_human.enqueue(
+                CommandType::SendChat { message: "/quit".to_string() },
+                CommandPriority::Critical,
+                false,
+            );
+            // Give the command processor time to process /quit
+            sleep(Duration::from_secs(3)).await;
+
+            info!("[Humanization] Disconnected — sleeping for {:.1}m", break_secs as f64 / 60.0);
+
+            // Sleep for the break duration (fully disconnected)
+            sleep(Duration::from_secs(break_secs)).await;
+
+            info!("[Humanization] Rest break over — saving session time and restarting");
+
+            // Send "break over" webhook before restart
+            if let Some(ref url) = webhook_url_human {
+                frikadellen_baf::webhook::send_webhook_rest_break_end(&ign_human, url).await;
+            }
+
+            // Save session time right before restart so the gap is near-zero
+            // and session time is preserved across the break.
+            let total_secs = prev_secs_human + started_human.elapsed().as_secs();
+            save_session_time(&session_times_path_human, &ign_human, total_secs);
+            info!(
+                "[Humanization] Saved session time: {}s ({:.2}h) — restarting process",
+                total_secs, total_secs as f64 / 3600.0
+            );
+
+            // Restart the process to reconnect
+            restart_process();
         });
     }
 

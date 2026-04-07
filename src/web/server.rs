@@ -1261,7 +1261,9 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
 
-    let png = super::og_image::generate_og_image(total, per_hour, uptime);
+    let ah_pts = s.profit_tracker.ah_points();
+    let bz_pts = s.profit_tracker.bz_points();
+    let png = super::og_image::generate_og_image(total, per_hour, uptime, &ah_pts, &bz_pts);
 
     (
         StatusCode::OK,
