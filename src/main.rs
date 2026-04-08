@@ -1667,16 +1667,16 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Determine order side early so gate checks can distinguish
+                    // Determine order side so gate checks can distinguish
                     // BUY from SELL.  SELL orders should almost never be dropped
                     // because they empty inventory and free bazaar slots.
-                    let effective_is_buy_early = bazaar_flip.effective_is_buy_order();
+                    let effective_is_buy = bazaar_flip.effective_is_buy_order();
 
                     // Skip if at the Bazaar order limit (21 orders).
                     // SELL orders are still accepted: they are queued and a
                     // ManageOrders run is triggered to free a slot before the
                     // sell order reaches the command processor.
-                    if bot_client_for_ws.is_bazaar_at_limit() && effective_is_buy_early {
+                    if bot_client_for_ws.is_bazaar_at_limit() && effective_is_buy {
                         debug!("Skipping BUY bazaar flip — at order limit: {}", bazaar_flip.item_name);
                         continue;
                     }
@@ -1691,7 +1691,7 @@ async fn main() -> Result<()> {
                     // collected — they still occupy a slot until ManageOrders
                     // collects them.  SELL flips are always accepted because
                     // placing a sell order does not require a free slot.
-                    if effective_is_buy_early && bazaar_tracker_ws.has_filled_orders() {
+                    if effective_is_buy && bazaar_tracker_ws.has_filled_orders() {
                         debug!("Skipping BUY bazaar flip — filled orders pending collection: {}", bazaar_flip.item_name);
                         continue;
                     }
@@ -1701,9 +1701,6 @@ async fn main() -> Result<()> {
                         debug!("Bazaar flips paused (AH flip incoming), skipping: {}", bazaar_flip.item_name);
                         continue;
                     }
-
-                    // Print colorful bazaar flip announcement
-                    let effective_is_buy = effective_is_buy_early;
 
                     // Skip BUY orders when inventory is full — items can't be
                     // collected from the bazaar without free inventory space.
