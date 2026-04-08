@@ -1667,9 +1667,17 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip if at the Bazaar order limit (21 orders)
-                    if bot_client_for_ws.is_bazaar_at_limit() {
-                        debug!("Skipping bazaar flip — at order limit: {}", bazaar_flip.item_name);
+                    // Determine order side early so gate checks can distinguish
+                    // BUY from SELL.  SELL orders should almost never be dropped
+                    // because they empty inventory and free bazaar slots.
+                    let effective_is_buy_early = bazaar_flip.effective_is_buy_order();
+
+                    // Skip if at the Bazaar order limit (21 orders).
+                    // SELL orders are still accepted: they are queued and a
+                    // ManageOrders run is triggered to free a slot before the
+                    // sell order reaches the command processor.
+                    if bot_client_for_ws.is_bazaar_at_limit() && effective_is_buy_early {
+                        debug!("Skipping BUY bazaar flip — at order limit: {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -1679,10 +1687,12 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip if there are filled orders waiting to be collected —
-                    // they still occupy a slot until ManageOrders collects them.
-                    if bazaar_tracker_ws.has_filled_orders() {
-                        debug!("Skipping bazaar flip — filled orders pending collection: {}", bazaar_flip.item_name);
+                    // Skip BUY flips if there are filled orders waiting to be
+                    // collected — they still occupy a slot until ManageOrders
+                    // collects them.  SELL flips are always accepted because
+                    // placing a sell order does not require a free slot.
+                    if effective_is_buy_early && bazaar_tracker_ws.has_filled_orders() {
+                        debug!("Skipping BUY bazaar flip — filled orders pending collection: {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -1693,7 +1703,7 @@ async fn main() -> Result<()> {
                     }
 
                     // Print colorful bazaar flip announcement
-                    let effective_is_buy = bazaar_flip.effective_is_buy_order();
+                    let effective_is_buy = effective_is_buy_early;
 
                     // Skip BUY orders when inventory is full — items can't be
                     // collected from the bazaar without free inventory space.
@@ -1745,6 +1755,19 @@ async fn main() -> Result<()> {
                         priority,
                         true, // Interruptible by AH flips
                     );
+
+                    // When at the bazaar order limit and we just queued a SELL
+                    // order, pre-queue a ManageOrders run so a filled/stale
+                    // order gets collected or cancelled, freeing a slot before
+                    // the sell order reaches the command processor.
+                    if bot_client_for_ws.is_bazaar_at_limit() && !effective_is_buy && !command_queue_clone.has_manage_orders() {
+                        info!("[BazaarFlips] At order limit with SELL queued — pre-queuing ManageOrders to free a slot");
+                        command_queue_clone.enqueue(
+                            CommandType::ManageOrders { cancel_open: false },
+                            CommandPriority::High,
+                            false,
+                        );
+                    }
                 }
                 CoflEvent::ChatMessage(msg) => {
                     // Parse "Your connection id is XXXX" (from chatMessage, matches TypeScript BAF.ts)
@@ -1908,16 +1931,20 @@ async fn main() -> Result<()> {
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed)
                         && cofl_authenticated_ws.load(Ordering::Relaxed)
                         && !bazaar_flips_paused_ws.load(Ordering::Relaxed)
-                        && !bot_client_for_ws.is_bazaar_at_limit()
-                        && !bot_client_for_ws.is_bazaar_daily_limit()
                     {
                         if let Ok(Some(rec)) = frikadellen_baf::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
                             let bot_state = bot_client_for_ws.state();
                             if !matches!(bot_state, frikadellen_baf::types::BotState::Startup) {
                                 let effective_is_buy = rec.effective_is_buy_order();
 
-                                // Skip BUY orders when inventory is full
-                                if effective_is_buy && bot_client_for_ws.is_inventory_full() {
+                                // Gate checks that only apply to BUY orders.
+                                // SELL orders bypass these because they empty
+                                // inventory and must not be silently dropped.
+                                if effective_is_buy && bot_client_for_ws.is_bazaar_at_limit() {
+                                    debug!("Skipping BUY bazaar flip from chat — at order limit: {}", rec.item_name);
+                                } else if bot_client_for_ws.is_bazaar_daily_limit() {
+                                    debug!("Skipping bazaar flip from chat — daily sell value limit reached: {}", rec.item_name);
+                                } else if effective_is_buy && bot_client_for_ws.is_inventory_full() {
                                     debug!("Skipping BUY bazaar flip from chat — inventory full: {}", rec.item_name);
                                 } else if effective_is_buy && bazaar_tracker_ws.has_filled_orders() {
                                     debug!("Skipping BUY bazaar flip from chat — filled orders pending: {}", rec.item_name);
@@ -1957,7 +1984,18 @@ async fn main() -> Result<()> {
                                 command_queue_clone.enqueue(command_type, priority, true);
                                 info!("[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
                                     order_label, rec.item_name, rec.amount, rec.price_per_unit);
-                                } // end inventory/filled check
+
+                                // When at the bazaar order limit and we just queued a SELL
+                                // order, pre-queue a ManageOrders run to free a slot.
+                                if bot_client_for_ws.is_bazaar_at_limit() && !effective_is_buy && !command_queue_clone.has_manage_orders() {
+                                    info!("[BazaarFlips] At order limit with SELL queued (chat) — pre-queuing ManageOrders to free a slot");
+                                    command_queue_clone.enqueue(
+                                        CommandType::ManageOrders { cancel_open: false },
+                                        CommandPriority::High,
+                                        false,
+                                    );
+                                }
+                                } // end gate checks
                             }
                         }
                     }
@@ -2490,12 +2528,15 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Skip bazaar-order-related commands when the bazaar order limit is reached.
-                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. }
-                    | frikadellen_baf::types::CommandType::BazaarSellOrder { .. })
+                // Skip BUY bazaar orders when the bazaar order limit is reached.
+                // SELL orders are NOT skipped — they are critical for emptying
+                // inventory.  The send_command handler will attempt them anyway;
+                // if the server rejects them the at_limit flag stays set and
+                // a ManageOrders run (already queued at intake) will free a slot.
+                if matches!(cmd.command_type, frikadellen_baf::types::CommandType::BazaarBuyOrder { .. })
                     && bot_client_clone.is_bazaar_at_limit()
                 {
-                    debug!("[Queue] Dropping bazaar order — bazaar limit reached: {:?}", cmd.command_type);
+                    debug!("[Queue] Dropping BUY bazaar order — bazaar limit reached: {:?}", cmd.command_type);
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
@@ -2950,6 +2991,8 @@ async fn main() -> Result<()> {
                 // Clear stale blocking flags that may have been set earlier in
                 // the session.  AH slots can free up from expired auctions
                 // (which don't trigger ItemSold), so the bot must retry.
+                // Bazaar order-limit flags can also become stale if the
+                // "coins from selling/buying" chat message was missed.
                 if bot_client_idle.is_auction_at_limit() {
                     info!("[IdleInventory] Clearing stale auction_at_limit flag");
                     bot_client_idle.clear_auction_at_limit();
@@ -2957,6 +3000,10 @@ async fn main() -> Result<()> {
                 if bot_client_idle.is_auction_slot_blocked() {
                     info!("[IdleInventory] Clearing stale auction_slot_blocked flag");
                     bot_client_idle.clear_auction_slot_blocked();
+                }
+                if bot_client_idle.is_bazaar_at_limit() {
+                    info!("[IdleInventory] Clearing stale bazaar_at_limit flag");
+                    bot_client_idle.clear_bazaar_at_limit();
                 }
 
                 // Force-claim sold auctions
@@ -3267,6 +3314,7 @@ async fn main() -> Result<()> {
                 "§f[§4BAF§f]: §e😴 Taking a rest break ({:.0}m). Disconnecting...",
                 break_secs as f64 / 60.0
             );
+            print_mc_chat(&baf_msg);
             let _ = chat_tx_human.send(baf_msg);
 
             // Disconnect from the server via /quit
