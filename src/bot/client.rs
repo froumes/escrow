@@ -811,6 +811,13 @@ impl BotClient {
         self.bazaar_daily_limit.store(false, Ordering::Relaxed);
     }
 
+    /// Clears the bazaar order-limit flag.  Used by the idle-inventory
+    /// failsafe to unstick accounts whose limit flag became stale (e.g.
+    /// the collection chat message was missed).
+    pub fn clear_bazaar_at_limit(&self) {
+        self.bazaar_at_limit.store(false, Ordering::Relaxed);
+    }
+
     /// Returns true if the auction house limit has been hit and not yet cleared.
     /// Used by `main.rs` to skip SellToAuction commands when at the cap.
     pub fn is_auction_at_limit(&self) -> bool {
@@ -3118,10 +3125,12 @@ async fn execute_command(
             *state.bot_state.write() = BotState::Bazaar;
         }
         CommandType::BazaarSellOrder { item_name, item_tag, amount, price_per_unit } => {
-            // Abort immediately if at the bazaar order limit
+            // Do NOT abort SELL orders when at the bazaar order limit.
+            // The server may reject the order, but it's better to try
+            // (the limit flag may be stale) than to silently drop a sell
+            // recommendation that would have freed inventory space.
             if state.bazaar_at_limit.load(Ordering::Relaxed) {
-                warn!("[Bazaar] Skipping SELL order for \"{}\" — already at bazaar order limit", item_name);
-                return;
+                info!("[Bazaar] Attempting SELL order for \"{}\" despite at_limit flag (sell orders are critical)", item_name);
             }
             // Store order context so window/sign handlers can use it
             *state.bazaar_item_name.write() = item_name.clone();
