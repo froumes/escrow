@@ -585,6 +585,7 @@ impl BotClient {
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            command_processor_started: Arc::new(AtomicBool::new(false)),
             inventory_full: self.inventory_full.clone(),
             cached_empty_player_slots: self.cached_empty_player_slots.clone(),
             insta_sell_item: self.insta_sell_item.clone(),
@@ -1180,6 +1181,9 @@ pub struct BotClientState {
     /// watchdog can detect whether a new command has started since the watched
     /// window was opened and skip the auto-close if so.
     pub command_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Ensures the dedicated command processor is only spawned once, using the
+    /// first live Azalea `Client` handle delivered to `event_handler`.
+    pub command_processor_started: Arc<AtomicBool>,
     /// Set when "[Bazaar] You don't have the space required to claim that!" is
     /// received.  The ManageOrders loop reads this flag to stop trying to collect
     /// and log the remaining orders to pending_claims.log.
@@ -1317,6 +1321,7 @@ impl Default for BotClientState {
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            command_processor_started: Arc::new(AtomicBool::new(false)),
             inventory_full: Arc::new(AtomicBool::new(false)),
             cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
             insta_sell_item: Arc::new(RwLock::new(None)),
@@ -2057,13 +2062,12 @@ async fn event_handler(
     event: Event,
     state: BotClientState,
 ) -> Result<()> {
-    // Process any pending commands first
-    // We use try_recv() to avoid blocking on command reception
-    if let Ok(mut command_rx) = state.command_rx.try_lock() {
-        if let Ok(command) = command_rx.try_recv() {
-            // Execute the command
-            execute_command(&bot, &command, &state).await;
-        }
+    if !state.command_processor_started.swap(true, Ordering::AcqRel) {
+        let command_bot = bot.clone();
+        let command_state = state.clone();
+        tokio::spawn(async move {
+            command_processor(command_bot, command_state).await;
+        });
     }
 
     match event {
@@ -3027,6 +3031,27 @@ async fn event_handler(
     }
     
     Ok(())
+}
+
+/// Process queued bot commands independently from the Azalea event stream.
+///
+/// Previously commands were only drained opportunistically from `event_handler`,
+/// which meant a `PurchaseAuction` could sit idle until the next packet/event.
+/// This dedicated loop removes that extra scheduling jitter.
+async fn command_processor(bot: Client, state: BotClientState) {
+    loop {
+        let command = {
+            let mut command_rx = state.command_rx.lock().await;
+            command_rx.recv().await
+        };
+
+        let Some(command) = command else {
+            debug!("Bot command channel closed; stopping command processor");
+            break;
+        };
+
+        execute_command(&bot, &command, &state).await;
+    }
 }
 
 /// Execute a command from the command queue

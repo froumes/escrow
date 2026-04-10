@@ -8,6 +8,7 @@ use frikadellen_baf::{
     websocket::CoflWebSocket,
     bot::BotClient,
     types::Flip,
+    CommandPriority,
     web::{start_web_server, WebSharedState},
 };
 use tracing::{debug, error, info, warn};
@@ -2624,7 +2625,23 @@ async fn main() -> Result<()> {
                     } else {
                         command_delay_ms
                     };
-                    sleep(Duration::from_millis(delay)).await;
+
+                    let next_is_critical_purchase = command_queue_processor
+                        .peek_queued()
+                        .map(|next| {
+                            matches!(next.command_type, frikadellen_baf::types::CommandType::PurchaseAuction { .. })
+                                && next.priority == CommandPriority::Critical
+                        })
+                        .unwrap_or(false);
+
+                    if next_is_critical_purchase {
+                        debug!(
+                            "[Queue] Skipping post-command cooldown after {:?} because a critical AH flip is queued",
+                            cmd.command_type
+                        );
+                    } else {
+                        sleep(Duration::from_millis(delay)).await;
+                    }
                 }
             } else {
                 // Queue is empty — wait for a notification instead of busy-polling.
