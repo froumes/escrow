@@ -257,7 +257,7 @@ pub fn generate_og_image(
     let mut img: RgbaImage = ImageBuffer::from_pixel(w, h, BG);
 
     // ── Title bar ────────────────────────────────────────────
-    let title = "Frikadellen BAF";
+    let title = "TWM";
     draw_text_centered(&mut img, title, 30, 5, ACCENT2);
 
     let subtitle = "Control Panel";

@@ -1586,43 +1586,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "frikadellen_baf"
-version = "3.0.0"
-dependencies = [
- "anyhow",
- "axum",
- "azalea",
- "azalea-chat",
- "azalea-client",
- "azalea-inventory",
- "azalea-protocol",
- "bevy_app",
- "bevy_ecs",
- "chrono",
- "dialoguer",
- "dirs",
- "futures",
- "image",
- "once_cell",
- "parking_lot",
- "rand 0.9.2",
- "regex",
- "reqwest",
- "rustyline",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "toml",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4137,6 +4100,43 @@ dependencies = [
  "sha1 0.10.6",
  "thiserror 2.0.18",
  "utf-8",
+]
+
+[[package]]
+name = "twm"
+version = "3.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "azalea",
+ "azalea-chat",
+ "azalea-client",
+ "azalea-inventory",
+ "azalea-protocol",
+ "bevy_app",
+ "bevy_ecs",
+ "chrono",
+ "dialoguer",
+ "dirs",
+ "futures",
+ "image",
+ "once_cell",
+ "parking_lot",
+ "rand 0.9.2",
+ "regex",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "toml",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

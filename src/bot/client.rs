@@ -253,7 +253,7 @@ fn on_container_set_content(
 /// 
 /// ## References
 /// 
-/// - Original TypeScript: `/tmp/frikadellen-baf/src/BAF.ts`
+/// - Original TypeScript: `/tmp/twm/src/BAF.ts`
 /// - Azalea examples: https://github.com/azalea-rs/azalea/tree/main/azalea/examples
 #[derive(Clone)]
 pub struct BotClient {
@@ -387,7 +387,7 @@ pub enum BotEvent {
     /// Item purchased from AH
     ItemPurchased { item_name: String, price: u64, buy_speed_ms: Option<u64> },
     /// Item sold on AH
-    ItemSold { item_name: String, price: u64, buyer: String },
+    ItemSold { item_name: String, price: u64, buyer: String, auction_uuid: Option<String> },
     /// Bazaar order placed successfully
     BazaarOrderPlaced {
         item_name: String,
@@ -507,7 +507,7 @@ impl BotClient {
     /// # Example
     /// 
     /// ```no_run
-    /// use frikadellen_baf::bot::BotClient;
+    /// use twm::bot::BotClient;
     /// 
     /// #[tokio::main]
     /// async fn main() {
@@ -2278,7 +2278,7 @@ async fn event_handler(
                             info!("[Auction] Auction sold, clearing auction-limit flag");
                             state.auction_at_limit.store(false, Ordering::Relaxed);
                         }
-                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer });
+                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer, auction_uuid: state.claim_sold_uuid.read().clone() });
                     }
                 }
             } else if clean_message.contains("You already have an item in the auction slot") {
@@ -6477,7 +6477,7 @@ async fn run_startup_workflow(
     };
 
     info!("╔══════════════════════════════════════╗");
-    info!("║        BAF Startup Workflow          ║");
+        info!("║        TWM Startup Workflow          ║");
     info!("╚══════════════════════════════════════╝");
 
     // Helper: enqueue a command and wait until the queue processor completes it.

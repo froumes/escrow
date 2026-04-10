@@ -203,7 +203,7 @@ pub enum BotState {
 impl BotState {
     /// Returns true if the bot can accept flip/trade commands.
     ///
-    /// Matches TypeScript frikadellen-baf command-queue safety: only "idle"
+/// Matches the TypeScript command-queue safety rule: only "idle"
     /// style states may accept new commands while GUI workflows are active.
     pub fn allows_commands(&self) -> bool {
         matches!(self, BotState::Idle | BotState::GracePeriod)

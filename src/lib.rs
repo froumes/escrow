@@ -1,4 +1,4 @@
-//! Frikadellen BAF (Bazaar Auction Flipper) for Hypixel Skyblock
+//! TWM (Bazaar Auction Flipper) for Hypixel Skyblock
 //! 
 //! A high-performance Minecraft bot for automated bazaar and auction house flipping.
 //! Rust port of the original TypeScript implementation using the Azalea framework.

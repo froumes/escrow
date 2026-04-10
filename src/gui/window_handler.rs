@@ -144,7 +144,7 @@ impl WindowHandler {
 
     /// Wait for a specific item to appear in a slot
     /// 
-    /// This implements the TPM+ pattern from the TypeScript version:
+    /// This implements the TWM+ pattern from the TypeScript version:
     /// - Polls slot at 1ms intervals
     /// - Times out after `delay * 3` milliseconds
     /// - Optionally waits for item to CHANGE from current value

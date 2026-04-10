@@ -110,7 +110,7 @@ pub async fn send_webhook_auth_failed(
             "description": description,
             "color": 0xe74c3cu32,
             "footer": {
-                "text": format!("BAF - {}", ingame_name),
+                "text": format!("TWM - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             },
             "timestamp": chrono::Utc::now().to_rfc3339()
@@ -150,22 +150,22 @@ pub async fn send_webhook_initialized(
 
     let embed = if fields.is_empty() {
         serde_json::json!({
-            "title": "✓ Started BAF",
+            "title": "✓ Started TWM",
             "description": description,
             "color": 0x00ff88u32,
             "footer": {
-                "text": format!("BAF - {}", ingame_name),
+                "text": format!("TWM - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         })
     } else {
         serde_json::json!({
-            "title": "✓ Started BAF",
+            "title": "✓ Started TWM",
             "description": description,
             "color": 0x00ff88u32,
             "fields": fields,
             "footer": {
-                "text": format!("BAF - {}", ingame_name),
+                "text": format!("TWM - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         })
@@ -220,7 +220,7 @@ pub async fn send_webhook_startup_complete(
             "color": 0x2ecc71u32,
             "fields": fields,
             "footer": {
-                "text": format!("BAF - {}", ingame_name),
+                "text": format!("TWM - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             },
             "timestamp": chrono::Utc::now().to_rfc3339()
@@ -251,7 +251,7 @@ pub async fn send_webhook_item_purchased(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -339,7 +339,7 @@ pub async fn send_webhook_item_sold(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -375,7 +375,7 @@ pub async fn send_webhook_bazaar_order_placed(
             ],
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -449,7 +449,7 @@ pub async fn send_webhook_bazaar_order_collected(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -494,7 +494,7 @@ pub async fn send_webhook_bazaar_order_cancelled(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -517,7 +517,7 @@ pub async fn send_webhook_bazaar_daily_limit(
                 {"name": "⏰ Resets At", "value": format!("<t:{}:R>", next_utc_midnight_unix()), "inline": true},
             ],
             "footer": {
-                "text": format!("BAF • {}", ingame_name),
+                "text": format!("TWM • {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
         }]
@@ -554,7 +554,7 @@ pub async fn send_webhook_auction_listed(
             ],
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -629,7 +629,7 @@ pub async fn send_webhook_banned(
         "description": description,
         "color": 0xe74c3cu32,
         "footer": {
-            "text": format!("BAF - {}", ingame_name),
+            "text": format!("TWM - {}", ingame_name),
             "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
         },
         "timestamp": chrono::Utc::now().to_rfc3339()
@@ -660,7 +660,7 @@ pub async fn send_webhook_no_cookie(
             ),
             "color": 0xe67e22u32,
             "footer": {
-                "text": format!("BAF - {}", ingame_name),
+                "text": format!("TWM - {}", ingame_name),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             },
             "timestamp": chrono::Utc::now().to_rfc3339()
@@ -689,7 +689,7 @@ pub async fn send_webhook_auction_cancelled(
             ],
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -732,7 +732,7 @@ pub async fn send_webhook_legendary_flip(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -767,7 +767,7 @@ pub async fn send_webhook_divine_flip(
             "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
-                "text": format!("BAF • {}{}", ingame_name,
+                "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
                 "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
             }
@@ -797,7 +797,7 @@ pub async fn send_webhook_flip_channel(
     // Append clickable footer-style links below the purchase info fields
     fields.push(serde_json::json!({
         "name": "\u{200b}",
-        "value": "[Frikadellen-BAF](https://auctionflipper.bz) • [Discord](https://discord.gg/42DvX6T9jh)",
+        "value": "[TWM](https://austinxyz.lol) • [Discord](https://discord.gg/42DvX6T9jh)",
         "inline": false
     }));
     let safe_item = sanitize_item_name(item_name);
@@ -842,7 +842,7 @@ pub async fn send_webhook_bazaar_flip_channel(
     ];
     fields.push(serde_json::json!({
         "name": "\u{200b}",
-        "value": "[Frikadellen-BAF](https://auctionflipper.bz) • [Discord](https://discord.gg/42DvX6T9jh)",
+        "value": "[TWM](https://austinxyz.lol) • [Discord](https://discord.gg/42DvX6T9jh)",
         "inline": false
     }));
     let payload = serde_json::json!({
@@ -1091,7 +1091,7 @@ pub async fn send_webhook_profit_summary(
                 {"name": "⏱️ Profit per Hour", "value": format!("```{}```", format_number(per_hour)), "inline": true}
             ],
             "footer": {
-                "text": format!("BAF • {} • Uptime: {}", ingame_name, format_duration(uptime_secs))
+                "text": format!("TWM • {} • Uptime: {}", ingame_name, format_duration(uptime_secs))
             }
         }]
     });
@@ -1114,7 +1114,7 @@ pub async fn send_webhook_rest_break_start(
             ),
             "color": 0xf39c12u32,
             "footer": {
-                "text": format!("BAF • {}", ingame_name)
+                "text": format!("TWM • {}", ingame_name)
             }
         }]
     });
@@ -1132,7 +1132,7 @@ pub async fn send_webhook_rest_break_end(
             "description": "Reconnecting and resuming operations.",
             "color": 0x2ecc71u32,
             "footer": {
-                "text": format!("BAF • {}", ingame_name)
+                "text": format!("TWM • {}", ingame_name)
             }
         }]
     });

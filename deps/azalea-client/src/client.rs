@@ -650,7 +650,7 @@ async fn run_schedule_loop(
     let mut last_update: Option<Instant> = None;
     let mut last_tick: Option<Instant> = None;
 
-    // Patched by frikadellen-baf: run the Update schedule at 300 fps instead
+// Patched by twm: run the Update schedule at 300 fps instead
     // of the vanilla 60 fps.  This reduces the average packet-detection latency
     // from ~8.3 ms to ~1.65 ms, which can shave a full Minecraft server tick
     // off purchase speed on borderline connections (2 ticks vs 3 ticks).

@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# TWM Launcher Script
+# This script helps users run the TWM application
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Check if the binary exists
+if [ -f "target/release/twm" ]; then
+    echo "Running twm..."
+    exec ./target/release/twm "$@"
+elif [ -f "twm" ]; then
+    echo "Running twm..."
+    exec ./twm "$@"
+else
+    echo "Binary not found. Building from source..."
+    if ! command -v cargo &> /dev/null; then
+        echo "Error: cargo is not installed. Please install Rust from https://rustup.rs/"
+        exit 1
+    fi
+    
+    echo "Building release binary..."
+    cargo build --release
+    
+echo "Build complete. Running twm..."
+exec ./target/release/twm "$@"
+fi

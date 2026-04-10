@@ -1,6 +1,6 @@
 # Bot Module
 
-This module implements the core Azalea bot client for Frikadellen BAF (Bazaar Auction Flipper).
+This module implements the core Azalea bot client for TWM (Bazaar Auction Flipper).
 
 ## ✅ Implementation Complete
 
@@ -47,7 +47,7 @@ The implementation follows azalea 0.15's plugin architecture:
 
 ### From TypeScript Version
 
-The implementation preserves all critical logic from `/tmp/frikadellen-baf/src/BAF.ts`:
+The implementation preserves all critical logic from `/tmp/twm/src/BAF.ts`:
 
 1. **Connection & Authentication**:
    - Uses `Account::microsoft()` for authentication
@@ -103,7 +103,7 @@ Each window click must increment this counter to avoid detection.
 ### Usage Example
 
 ```rust
-use frikadellen_baf::bot::client::BotClient;
+use twm::bot::client::BotClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -194,9 +194,9 @@ Current test coverage:
 
 ## References
 
-- **Original TypeScript**: `/tmp/frikadellen-baf/src/BAF.ts`
-- **FastWindowClick**: `/tmp/frikadellen-baf/src/fastWindowClick.ts`
-- **Bazaar Handler**: `/tmp/frikadellen-baf/src/bazaarFlipHandler.ts`
+- **Original TypeScript**: `/tmp/twm/src/BAF.ts`
+- **FastWindowClick**: `/tmp/twm/src/fastWindowClick.ts`
+- **Bazaar Handler**: `/tmp/twm/src/bazaarFlipHandler.ts`
 - **Azalea Examples**: https://github.com/azalea-rs/azalea/tree/main/azalea/examples
 - **Azalea 0.15 Docs**: Generated with `cargo doc --open`
 

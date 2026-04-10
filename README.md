@@ -1,5 +1,5 @@
-# Frikadellen BAF
-Frikadellen BAF in the newest minecraft version based on Rust
+# TWM
+TWM in the newest minecraft version based on Rust
 
 #if you get banned well you know you risked it its a macro in very early access
 also send me logs of bans on [Discord](https://discord.gg/42DvX6T9jh) thanks
@@ -15,12 +15,12 @@ also send me logs of bans on [Discord](https://discord.gg/42DvX6T9jh) thanks
 - **Configurable**: Easy-to-use configuration system
 
 # Installation on a Linux VPS:
-wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/frikadellen_baf-linux-x86_64 && chmod +x frikadellen_baf-linux-x86_64
-then you can run it everytime with ./frikadellen_baf-linux-x86_64
+wget https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64 && chmod +x twm-linux-x86_64
+then you can run it everytime with ./twm-linux-x86_64
 
 OR the loader:
 
-wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/FrikadellenBAF-loader-linux-x86_64  && chmod +x FrikadellenBAF-loader-linux-x86_64
+wget https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64  && chmod +x TWM-loader-linux-x86_64
 
 
 ## Quick Start
@@ -64,11 +64,11 @@ cargo build --release
 
 ### Using the Launcher Script
 
-For convenience, you can use the `frikadellen-baf-121` launcher script:
+For convenience, you can use the `twm` launcher script:
 
 ```bash
-chmod +x frikadellen-baf-121
-./frikadellen-baf-121
+chmod +x twm
+./twm
 ```
 
 The launcher script will:

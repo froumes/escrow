@@ -171,7 +171,7 @@ struct AuctionEntry {
 
 // ── Authentication middleware ─────────────────────────────────
 
-/// Extract the `baf_session` cookie value from a request.
+/// Extract the `twm_session` cookie value from a request.
 fn extract_session_cookie(req: &Request) -> Option<String> {
     req.headers()
         .get("cookie")?
@@ -180,7 +180,7 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
         .split(';')
         .find_map(|c| {
             let c = c.trim();
-            c.strip_prefix("baf_session=").map(|v| v.to_string())
+            c.strip_prefix("twm_session=").map(|v| v.to_string())
         })
 }
 
@@ -354,7 +354,7 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
 
-    let og_title = "Frikadellen BAF — Control Panel";
+    let og_title = "TWM — Control Panel";
     let og_description = format!(
         "💰 Total Profit: {} coins | ⏱️ P/H: {} coins/h | 🕐 Uptime: {}",
         format_og_number(total as f64),
@@ -426,7 +426,7 @@ async fn login(
     info!("[WebGUI] Successful login via web panel");
 
     let cookie = format!(
-        "baf_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800",
+        "twm_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800",
         token
     );
     (
@@ -475,7 +475,7 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
 async fn pause_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
     s.macro_paused.store(true, Ordering::Relaxed);
     info!("[WebGUI] Macro paused via web panel");
-    let msg = "[BAF Web] Macro paused".to_string();
+    let msg = "[TWM Web] Macro paused".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
@@ -484,7 +484,7 @@ async fn pause_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
 async fn resume_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
     s.macro_paused.store(false, Ordering::Relaxed);
     info!("[WebGUI] Macro resumed via web panel");
-    let msg = "[BAF Web] Macro resumed".to_string();
+    let msg = "[TWM Web] Macro resumed".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
@@ -510,7 +510,7 @@ async fn toggle_ah(
 ) -> impl IntoResponse {
     s.enable_ah_flips.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] AH flips set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] AH flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    let msg = format!("[TWM Web] AH flips {}", if payload.enabled { "enabled" } else { "disabled" });
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     // Persist to config file
@@ -530,7 +530,7 @@ async fn toggle_bazaar(
 ) -> impl IntoResponse {
     s.enable_bazaar_flips.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] Bazaar flips set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    let msg = format!("[TWM Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     // Persist to config file
@@ -550,7 +550,7 @@ async fn toggle_anonymize(
 ) -> impl IntoResponse {
     s.anonymize_webhook_name.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] Anonymize set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] Anonymize {}", if payload.enabled { "enabled" } else { "disabled" });
+    let msg = format!("[TWM Web] Anonymize {}", if payload.enabled { "enabled" } else { "disabled" });
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
@@ -642,7 +642,7 @@ async fn switch_account(
 
     let _ = s
         .chat_tx
-        .send(format!("[BAF Web] Switching to account {}...", next_name));
+        .send(format!("[TWM Web] Switching to account {}...", next_name));
 
     // Transfer the COFL license to the next account before restarting.
     let license_index = s.detected_cofl_license.load(std::sync::atomic::Ordering::Relaxed);
@@ -676,7 +676,7 @@ async fn cancel_auction(
     );
 
     let msg = format!(
-        "[BAF Web] Cancelling auction: {}...",
+        "[TWM Web] Cancelling auction: {}...",
         payload.item_name
     );
     print_mc_chat(&msg);
@@ -699,7 +699,7 @@ async fn claim_purchases(
 ) -> impl IntoResponse {
     info!("[WebGUI] Claim purchases requested");
 
-    let msg = "[BAF Web] Checking unclaimed purchases...".to_string();
+    let msg = "[TWM Web] Checking unclaimed purchases...".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
@@ -717,7 +717,7 @@ async fn collect_bz_orders(
 ) -> impl IntoResponse {
     info!("[WebGUI] Sell inventory instantly on bazaar requested");
 
-    let msg = "[BAF Web] Selling inventory on bazaar...".to_string();
+    let msg = "[TWM Web] Selling inventory on bazaar...".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
@@ -735,7 +735,7 @@ async fn claim_bz_orders(
 ) -> impl IntoResponse {
     info!("[WebGUI] Force claim bazaar orders requested");
 
-    let msg = "[BAF Web] Checking and claiming bazaar orders...".to_string();
+    let msg = "[TWM Web] Checking and claiming bazaar orders...".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
@@ -759,7 +759,7 @@ async fn cancel_bz_order(
     );
 
     let msg = format!(
-        "[BAF Web] Cancelling bazaar {} order: {}...",
+        "[TWM Web] Cancelling bazaar {} order: {}...",
         order_type, payload.item_name
     );
     print_mc_chat(&msg);
@@ -784,7 +784,7 @@ async fn cancel_all_bz_orders(
 ) -> impl IntoResponse {
     info!("[WebGUI] Cancel ALL bazaar orders requested");
 
-    let msg = "[BAF Web] Cancelling all bazaar orders...".to_string();
+    let msg = "[TWM Web] Cancelling all bazaar orders...".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
@@ -1116,7 +1116,7 @@ async fn save_config(
     }).await {
         Ok(Ok(())) => {
             info!("[WebGUI] Config saved via web panel");
-            let msg = "[BAF Web] Config saved".to_string();
+            let msg = "[TWM Web] Config saved".to_string();
             print_mc_chat(&msg);
             let _ = s.chat_tx.send(msg);
             StatusCode::OK.into_response()

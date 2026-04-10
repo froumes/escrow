@@ -213,7 +213,7 @@ mod tests {
     fn test_remove_color_codes() {
         let text = "§f[§4BAF§f]: §aHello §eWorld";
         let clean = remove_color_codes(text);
-        assert_eq!(clean, "[BAF]: Hello World");
+        assert_eq!(clean, "[TWM]: Hello World");
     }
 
     #[test]
@@ -226,7 +226,7 @@ mod tests {
         // Should end with reset
         assert!(ansi.ends_with("\x1b[0m"));
         // Original text parts should still be present (ANSI codes are inserted, not replacing text)
-        assert!(ansi.contains("BAF"));
+        assert!(ansi.contains("TWM"));
         assert!(ansi.contains("Test"));
     }
 
