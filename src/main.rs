@@ -16,7 +16,7 @@ use tokio::time::{sleep, Duration};
 use tokio::sync::broadcast;
 use serde_json;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use twm::utils::restart_process;
 
@@ -66,6 +66,13 @@ const BZ_PROFIT_QUERY_EXTRA_DELAY_SECS: u64 = 2;
 /// after the daily sell value limit reset — ensures the server-side reset
 /// has fully propagated.
 const DAILY_LIMIT_RESET_BUFFER_SECS: u64 = 5;
+/// Hold AH flips for a very short window when the bot is briefly busy
+/// (claiming/selling/open GUI) instead of dropping them immediately.
+const DEFERRED_AH_FLIP_TTL_MS: u64 = 1_500;
+/// Poll interval for retrying deferred AH flips.
+const DEFERRED_AH_FLIP_RETRY_MS: u64 = 75;
+/// Cap the number of deferred AH flips kept in memory at once.
+const MAX_DEFERRED_AH_FLIPS: usize = 3;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -699,7 +706,11 @@ async fn main() -> Result<()> {
     *bot_client.ingame_name.write() = ingame_name.clone();
 
     // Shared profit tracker for AH and Bazaar realized profits.
-    let profit_tracker = Arc::new(twm::profit::ProfitTracker::new());
+    let profit_tracker_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("profit_history.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("profit_history.json"));
+    let profit_tracker = Arc::new(twm::profit::ProfitTracker::load_or_new(profit_tracker_path));
 
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(twm::bazaar_tracker::BazaarOrderTracker::new());
@@ -1669,6 +1680,8 @@ async fn main() -> Result<()> {
     let ingame_name_ws = ingame_name.clone();
     let bazaar_tracker_ws = bazaar_tracker.clone();
     let profit_tracker_ws = profit_tracker.clone();
+    let deferred_ah_flips_ws: Arc<Mutex<VecDeque<(Instant, Flip)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     // Accumulator for `/cofl bz l` output: (total_profit, flip_count, last_update).
     // Reset when "Last Completed Bazaar Flips" header is seen; each parsed flip
     // line adds to the total.  A debounce task displays the summary after 2s idle.
@@ -1678,6 +1691,55 @@ async fn main() -> Result<()> {
     // for per-order profit when local buy-cost tracking has no data.
     let bz_list_items: Arc<std::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let deferred_ah_flips_retry = deferred_ah_flips_ws.clone();
+    let command_queue_deferred = command_queue.clone();
+    let bot_client_deferred = bot_client.clone();
+    let enable_ah_flips_deferred = enable_ah_flips.clone();
+    let cofl_authenticated_deferred = cofl_authenticated.clone();
+    let chat_tx_deferred = chat_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_millis(DEFERRED_AH_FLIP_RETRY_MS)).await;
+
+            if !enable_ah_flips_deferred.load(Ordering::Relaxed)
+                || !cofl_authenticated_deferred.load(Ordering::Relaxed)
+                || bot_client_deferred.is_startup_in_progress()
+                || !bot_client_deferred.state().allows_commands()
+                || bot_client_deferred.is_inventory_full()
+                || command_queue_deferred.has_purchase_auction()
+            {
+                continue;
+            }
+
+            let maybe_flip = {
+                let mut held = deferred_ah_flips_retry.lock().unwrap();
+                let now = Instant::now();
+                while let Some((queued_at, _)) = held.front() {
+                    if now.duration_since(*queued_at).as_millis() as u64 > DEFERRED_AH_FLIP_TTL_MS {
+                        held.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                held.pop_front().map(|(_, flip)| flip)
+            };
+
+            if let Some(flip) = maybe_flip {
+                let item_name = flip.item_name.clone();
+                command_queue_deferred.enqueue(
+                    twm::types::CommandType::PurchaseAuction { flip },
+                    twm::types::CommandPriority::Critical,
+                    false,
+                );
+                let baf_msg = format!(
+                    "Â§f[Â§4BAFÂ§f]: Â§bRe-queued held flip after busy window: Â§r{}",
+                    item_name
+                );
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_deferred.send(baf_msg);
+            }
+        }
+    });
     
     tokio::spawn(async move {
         use twm::websocket::CoflEvent;
@@ -1705,9 +1767,30 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip if in startup/claiming state - use bot_client state (authoritative source)
+                    // Briefly hold AH flips while the bot is busy instead of dropping
+                    // them immediately. This helps flips survive short claim/sell GUIs.
                     if !bot_client_for_ws.state().allows_commands() {
-                        debug!("Skipping flip — bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);
+                        debug!("Deferring flip - bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);
+                        let mut held = deferred_ah_flips_ws.lock().unwrap();
+                        let key = flip
+                            .uuid
+                            .clone()
+                            .unwrap_or_else(|| twm::utils::remove_minecraft_colors(&flip.item_name).to_lowercase());
+                        if let Some(existing_idx) = held.iter().position(|(_, queued_flip)| {
+                            queued_flip
+                                .uuid
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    twm::utils::remove_minecraft_colors(&queued_flip.item_name).to_lowercase()
+                                })
+                                == key
+                        }) {
+                            held.remove(existing_idx);
+                        }
+                        held.push_back((Instant::now(), flip.clone()));
+                        while held.len() > MAX_DEFERRED_AH_FLIPS {
+                            held.pop_front();
+                        }
                         continue;
                     }
 

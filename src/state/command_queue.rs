@@ -211,6 +211,19 @@ impl CommandQueue {
         self.queue.read().iter().any(|c| matches!(c.command_type, CommandType::ManageOrders { .. }))
     }
 
+    /// Returns true if a purchase command is queued or currently executing.
+    pub fn has_purchase_auction(&self) -> bool {
+        if let Some(ref cur) = *self.current_command.read() {
+            if matches!(cur.command_type, CommandType::PurchaseAuction { .. }) {
+                return true;
+            }
+        }
+        self.queue
+            .read()
+            .iter()
+            .any(|c| matches!(c.command_type, CommandType::PurchaseAuction { .. }))
+    }
+
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
         self.queue.read().is_empty() && self.current_command.read().is_none()
