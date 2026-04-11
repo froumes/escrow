@@ -1067,15 +1067,15 @@ async fn main() -> Result<()> {
                     };
                     {
                         let key = ah_purchase_ledger_key(&item_name, opt_auction_uuid.as_deref());
+                        let fallback_name_key = ah_purchase_ledger_key(&item_name, None);
                         if let Ok(mut ledger) = ah_purchase_ledger_events.lock() {
-                            ledger.insert(
-                                key,
-                                AhPurchaseEntry {
-                                    buy_price: price,
-                                    purchased_at_unix: unix_now(),
-                                    auction_uuid: opt_auction_uuid.clone(),
-                                },
-                            );
+                            let entry = AhPurchaseEntry {
+                                buy_price: price,
+                                purchased_at_unix: unix_now(),
+                                auction_uuid: opt_auction_uuid.clone(),
+                            };
+                            ledger.insert(key, entry.clone());
+                            ledger.insert(fallback_name_key, entry);
                             save_ah_purchase_ledger(&ah_purchase_ledger_path_events, &ledger);
                         }
                     }
@@ -1187,6 +1187,14 @@ async fn main() -> Result<()> {
                                                     None
                                                 }
                                             }) {
+                                                if let Some(original_uuid) = entry.auction_uuid.as_deref() {
+                                                    let original_uuid_key =
+                                                        ah_purchase_ledger_key(&item_name, Some(original_uuid));
+                                                    if original_uuid_key != ledger_key {
+                                                        ledger.remove(&original_uuid_key);
+                                                    }
+                                                }
+                                                ledger.remove(&fallback_name_key);
                                                 save_ah_purchase_ledger(&ah_purchase_ledger_path_events, &ledger);
                                                 let ah_fee = calculate_ah_fee(price);
                                                 let profit = price as i64 - entry.buy_price as i64 - ah_fee as i64;
