@@ -3,352 +3,478 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TWM — Bazaar &amp; Auction Flipper</title>
+    <title>TWM | Fast AH and Bazaar automation with a real control panel</title>
+    <meta name="description" content="TWM is a Rust-built Hypixel SkyBlock flipper with Auction House automation, Bazaar order management, browser controls, profit tracking, and configurable speed tuning.">
+    <meta name="theme-color" content="#0e1517">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;700&amp;display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦀</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='18' fill='%230e1517'/><text x='50' y='60' text-anchor='middle' font-size='44' fill='%23f3b45b' font-family='Arial'>TWM</text></svg>">
 </head>
 <body>
+    <div class="site-shell">
+        <nav id="navbar" class="nav">
+            <div class="container nav-container">
+                <a href="#top" class="logo" aria-label="TWM home">
+                    <span class="logo-mark">TWM</span>
+                    <span class="logo-copy">Trade With Muscle</span>
+                </a>
 
-<!-- ── Navigation ─────────────────────────────────────────────── -->
-<nav id="navbar">
-    <div class="nav-container">
-        <a href="#" class="logo"><span>TWM</span></a>
-        <ul class="nav-links">
-            <li><a href="#features">Features</a></li>
-            <li><a href="#screenshots">Screenshots</a></li>
-            <li><a href="#how-it-works">How It Works</a></li>
-            <li><a href="#config">Configuration</a></li>
-            <li><a href="#install">Install</a></li>
-            <li><a href="https://discord.gg/42DvX6T9jh" class="btn-nav" target="_blank" rel="noopener">Discord</a></li>
-        </ul>
+                <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-menu" data-nav-toggle>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+
+                <div class="nav-menu" id="nav-menu" data-nav-menu>
+                    <a href="#overview">Overview</a>
+                    <a href="#features">Features</a>
+                    <a href="#screenshots">Screenshots</a>
+                    <a href="#workflow">Workflow</a>
+                    <a href="#install">Install</a>
+                    <a href="https://github.com/froumes/escrow" target="_blank" rel="noopener">GitHub</a>
+                    <a href="https://discord.gg/42DvX6T9jh" class="button button-compact button-solid" target="_blank" rel="noopener">Discord</a>
+                </div>
+            </div>
+        </nav>
+
+        <main id="top">
+            <section class="hero section">
+                <div class="container hero-grid">
+                    <div class="hero-copy" data-reveal>
+                        <div class="eyebrow">Rust-native Hypixel flipping workflow</div>
+                        <h1>Fast buys, cleaner relists, and a browser panel that actually helps.</h1>
+                        <p class="hero-text">
+                            TWM handles Auction House flips, Bazaar order flow, profit tracking, and multi-account operations from one stack. The public site now explains the product clearly instead of looking like a placeholder.
+                        </p>
+
+                        <div class="hero-actions">
+                            <a href="#install" class="button button-solid">Install on Linux</a>
+                            <a href="#screenshots" class="button button-ghost">See the panel</a>
+                        </div>
+
+                        <div class="hero-pills">
+                            <span>AH fastbuy tuning</span>
+                            <span>Bazaar order automation</span>
+                            <span>Browser control panel</span>
+                            <span>Discord webhook alerts</span>
+                        </div>
+
+                        <div class="notice-card">
+                            <strong>Early access note</strong>
+                            <p>Use it with intention. This is macro software, the feature set is broad, and the config matters.</p>
+                        </div>
+                    </div>
+
+                    <div class="hero-panel" data-reveal>
+                        <div class="hero-panel-head">
+                            <div>
+                                <div class="panel-label">Live panel snapshot</div>
+                                <h2>Controls, status, inventory, and market views in one place</h2>
+                            </div>
+                            <span class="status-pill">Web UI included</span>
+                        </div>
+
+                        <div class="hero-panel-image">
+                            <img src="https://github.com/user-attachments/assets/8600abbd-34ea-4fd2-ad7d-9754ef390d39" alt="TWM web panel showing controls, profit, auctions, bazaar orders, and inventory" loading="eager">
+                        </div>
+
+                        <div class="hero-panel-grid">
+                            <article>
+                                <span>Control</span>
+                                <strong>Pause, toggle, switch accounts, and send chat from the browser.</strong>
+                            </article>
+                            <article>
+                                <span>Visibility</span>
+                                <strong>Track profit, active auctions, Bazaar orders, and game state without tab hunting.</strong>
+                            </article>
+                            <article>
+                                <span>Operations</span>
+                                <strong>Keep relists, stale order cleanup, and webhook reporting moving without manual babysitting.</strong>
+                            </article>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="proof-bar">
+                <div class="container proof-grid" data-reveal>
+                    <article>
+                        <span>Market coverage</span>
+                        <strong>Auction House and Bazaar</strong>
+                    </article>
+                    <article>
+                        <span>Runtime</span>
+                        <strong>Rust application with built-in web UI</strong>
+                    </article>
+                    <article>
+                        <span>Workflow</span>
+                        <strong>Detect, buy, relist, collect, report</strong>
+                    </article>
+                    <article>
+                        <span>Ops layer</span>
+                        <strong>Config file, queueing, reconnect, watchdogs</strong>
+                    </article>
+                </div>
+            </section>
+
+            <section class="section" id="overview">
+                <div class="container split-section">
+                    <div class="section-heading" data-reveal>
+                        <div class="eyebrow">Why this page changed</div>
+                        <h2>Visitors need fast orientation, not a wall of vaguely styled feature blurbs.</h2>
+                        <p>
+                            The old page had placeholder media, weak hierarchy, and almost no guidance for someone deciding whether to install. This version leads with the value proposition, shows the actual interface, and makes the first-run path obvious.
+                        </p>
+                    </div>
+
+                    <div class="capability-card" data-reveal>
+                        <div class="capability-row">
+                            <div>
+                                <span class="mini-label">AH flow</span>
+                                <h3>Fast buying with relist support</h3>
+                            </div>
+                            <p>Sub-second BIN flow, relisting, sold auction claiming, and limit awareness.</p>
+                        </div>
+                        <div class="capability-row">
+                            <div>
+                                <span class="mini-label">Bazaar flow</span>
+                                <h3>Order placement, fill handling, and cleanup</h3>
+                            </div>
+                            <p>Automated buy and sell orders, stale order cancellation, and tracked profit reporting.</p>
+                        </div>
+                        <div class="capability-row">
+                            <div>
+                                <span class="mini-label">Management</span>
+                                <h3>Operate from the browser</h3>
+                            </div>
+                            <p>Use the panel for controls, inventory, active auctions, Bazaar orders, and in-game chat.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section section-alt" id="features">
+                <div class="container">
+                    <div class="section-heading center" data-reveal>
+                        <div class="eyebrow">Feature map</div>
+                        <h2>Built for speed, but also for not losing context mid-session.</h2>
+                        <p>The product is stronger when the site explains the operating model clearly. These are the parts users actually care about first.</p>
+                    </div>
+
+                    <div class="feature-grid">
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">01</span>
+                            <h3>Fast Auction House execution</h3>
+                            <p>Buy speed tuning, confirmation-skipping fastbuy paths, and relisting logic focused on throughput.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">02</span>
+                            <h3>Bazaar order automation</h3>
+                            <p>Manage buy and sell orders, fill collection, cancellation thresholds, and inventory-aware order flow.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">03</span>
+                            <h3>Real browser control panel</h3>
+                            <p>Pause, resume, inspect inventory, monitor orders, review queue state, and send chat without staying in-game.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">04</span>
+                            <h3>Multi-account rotation</h3>
+                            <p>Cycle usernames on a timer to keep longer-running sessions manageable from one config surface.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">05</span>
+                            <h3>Webhook and profit tracking</h3>
+                            <p>Push notable events to Discord and keep Auction House plus Bazaar profit visible over time.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">06</span>
+                            <h3>Operational guardrails</h3>
+                            <p>Reconnect handling, queueing, watchdog behavior, and persistent order state reduce cleanup work.</p>
+                        </article>
+                    </div>
+
+                    <div class="detail-grid" data-reveal>
+                        <div class="detail-card">
+                            <h3>Auction House</h3>
+                            <ul>
+                                <li>Coflnet integration</li>
+                                <li>Fast buy timing controls</li>
+                                <li>Automatic relisting</li>
+                                <li>Sold auction claiming</li>
+                            </ul>
+                        </div>
+                        <div class="detail-card">
+                            <h3>Bazaar</h3>
+                            <ul>
+                                <li>Buy and sell order management</li>
+                                <li>Partial-fill handling</li>
+                                <li>Stale order cleanup</li>
+                                <li>Order profit tracking</li>
+                            </ul>
+                        </div>
+                        <div class="detail-card">
+                            <h3>Operations</h3>
+                            <ul>
+                                <li>Web panel with live data</li>
+                                <li>Discord webhook support</li>
+                                <li>Command queue visibility</li>
+                                <li>Anonymize mode and reconnect logic</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="screenshots">
+                <div class="container">
+                    <div class="section-heading center" data-reveal>
+                        <div class="eyebrow">Product tour</div>
+                        <h2>The interface should sell the tool better than the copy.</h2>
+                        <p>Instead of a broken embed, the page now puts the actual UI front and center and gives the screenshots room to breathe.</p>
+                    </div>
+
+                    <div class="gallery-grid">
+                        <article class="gallery-card gallery-featured" data-reveal>
+                            <div class="gallery-copy">
+                                <span class="mini-label">Dashboard</span>
+                                <h3>Main control panel</h3>
+                                <p>Status, controls, inventory, active auctions, Bazaar orders, and chat in a single view.</p>
+                            </div>
+                            <img src="https://github.com/user-attachments/assets/8600abbd-34ea-4fd2-ad7d-9754ef390d39" alt="TWM dashboard with controls and live state" loading="lazy">
+                        </article>
+                        <article class="gallery-card" data-reveal>
+                            <div class="gallery-copy">
+                                <span class="mini-label">Auth</span>
+                                <h3>Login screen</h3>
+                                <p>Clean entry point for local access to the panel.</p>
+                            </div>
+                            <img src="https://github.com/user-attachments/assets/55a28e4b-ec5e-4896-af9b-b62e28190909" alt="TWM login screen" loading="lazy">
+                        </article>
+                        <article class="gallery-card" data-reveal>
+                            <div class="gallery-copy">
+                                <span class="mini-label">Live view</span>
+                                <h3>In-game rendering</h3>
+                                <p>Watch the current window and activity without relying only on text logs.</p>
+                            </div>
+                            <img src="https://github.com/user-attachments/assets/cbca2c75-ff56-45f8-bad1-3fb0a7e8cfd2" alt="Live game view in the TWM panel" loading="lazy">
+                        </article>
+                        <article class="gallery-card" data-reveal>
+                            <div class="gallery-copy">
+                                <span class="mini-label">Alerts</span>
+                                <h3>High-value flip notifications</h3>
+                                <p>Surface standout flips quickly instead of burying them in console noise.</p>
+                            </div>
+                            <img src="https://github.com/user-attachments/assets/95897563-ebc4-47c6-bfd1-0c30c8df715b" alt="High-value flip notification" loading="lazy">
+                        </article>
+                        <article class="gallery-card" data-reveal>
+                            <div class="gallery-copy">
+                                <span class="mini-label">Reporting</span>
+                                <h3>Webhook output</h3>
+                                <p>Push event visibility into Discord so sessions are easier to supervise remotely.</p>
+                            </div>
+                            <img src="https://github.com/user-attachments/assets/0fcb24fe-6a14-4a27-9926-5928bb08725b" alt="Discord webhook showing big flip notifications" loading="lazy">
+                        </article>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section section-alt" id="workflow">
+                <div class="container">
+                    <div class="section-heading center" data-reveal>
+                        <div class="eyebrow">Workflow</div>
+                        <h2>The path from detection to profit is finally readable.</h2>
+                        <p>Users should understand the operating loop immediately: connect, evaluate, execute, manage, and report.</p>
+                    </div>
+
+                    <div class="timeline">
+                        <article class="timeline-step" data-reveal>
+                            <span class="timeline-index">01</span>
+                            <div>
+                                <h3>Authenticate and launch</h3>
+                                <p>Log in with Microsoft, connect to Hypixel SkyBlock, and bring up the local panel.</p>
+                            </div>
+                        </article>
+                        <article class="timeline-step" data-reveal>
+                            <span class="timeline-index">02</span>
+                            <div>
+                                <h3>Watch incoming opportunities</h3>
+                                <p>Coflnet data and internal market logic feed Auction House and Bazaar decisions in real time.</p>
+                            </div>
+                        </article>
+                        <article class="timeline-step" data-reveal>
+                            <span class="timeline-index">03</span>
+                            <div>
+                                <h3>Buy, order, relist, and collect</h3>
+                                <p>Execute the market actions, manage the queue, and keep state visible from the browser.</p>
+                            </div>
+                        </article>
+                        <article class="timeline-step" data-reveal>
+                            <span class="timeline-index">04</span>
+                            <div>
+                                <h3>Track outcomes</h3>
+                                <p>Review profit, webhook events, inventory state, and active listings without reconstructing the session manually.</p>
+                            </div>
+                        </article>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="config">
+                <div class="container config-layout">
+                    <div class="section-heading" data-reveal>
+                        <div class="eyebrow">Config-first setup</div>
+                        <h2>Most serious users want the knobs up front.</h2>
+                        <p>The config section now explains what matters instead of just dumping a tiny code block in the middle of the page.</p>
+
+                        <div class="config-points">
+                            <article>
+                                <h3>Account and module control</h3>
+                                <p>Switch Auction House and Bazaar modules independently and define one or more usernames.</p>
+                            </article>
+                            <article>
+                                <h3>Speed tuning</h3>
+                                <p>Adjust command pacing, bed interaction timing, and other latency-sensitive values directly in TOML.</p>
+                            </article>
+                            <article>
+                                <h3>Web and Discord integration</h3>
+                                <p>Set the web panel port and webhook destination without touching application code.</p>
+                            </article>
+                        </div>
+                    </div>
+
+                    <div class="config-card" data-reveal>
+                        <div class="config-card-head">
+                            <span class="mini-label">config.toml</span>
+                            <strong>Starting point</strong>
+                        </div>
+<pre><code><span class="comment"># Minecraft account(s)</span>
+<span class="key">ingame_name</span> = <span class="string">"YourUsername"</span>
+
+<span class="comment"># Flip modules</span>
+<span class="key">enable_ah_flips</span> = <span class="bool">true</span>
+<span class="key">enable_bazaar_flips</span> = <span class="bool">true</span>
+
+<span class="comment"># Timing and speed</span>
+<span class="key">command_delay_ms</span> = <span class="number">500</span>
+<span class="key">bed_spam_click_delay</span> = <span class="number">100</span>
+<span class="key">bed_pre_click_ms</span> = <span class="number">30</span>
+
+<span class="comment"># Web panel</span>
+<span class="key">web_gui_port</span> = <span class="number">8080</span>
+
+<span class="comment"># Notifications</span>
+<span class="key">webhook_url</span> = <span class="string">"https://discord.com/api/webhooks/..."</span></code></pre>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section section-alt" id="install">
+                <div class="container">
+                    <div class="section-heading center" data-reveal>
+                        <div class="eyebrow">Install</div>
+                        <h2>A first run path that does not make people dig through the repo.</h2>
+                        <p>The install section now keeps the Linux VPS flow obvious, tabbed, and copyable.</p>
+                    </div>
+
+                    <div class="install-summary" data-reveal>
+                        <article>
+                            <span class="mini-label">Step 1</span>
+                            <h3>Download a release or loader</h3>
+                            <p>Pick the binary path if you want the direct executable, or the loader if you want the latest release fetched automatically.</p>
+                        </article>
+                        <article>
+                            <span class="mini-label">Step 2</span>
+                            <h3>Run the binary</h3>
+                            <p>Launch it, complete the Microsoft login flow, and let the app create the local config file.</p>
+                        </article>
+                        <article>
+                            <span class="mini-label">Step 3</span>
+                            <h3>Tune config and open the panel</h3>
+                            <p>Adjust timing, modules, usernames, and web settings before you settle into longer sessions.</p>
+                        </article>
+                    </div>
+
+                    <div class="install-tabs" data-reveal>
+                        <button type="button" class="tab active" data-tab="release">Direct binary</button>
+                        <button type="button" class="tab" data-tab="loader">Loader</button>
+                    </div>
+
+                    <div class="install-panel active" id="tab-release" data-reveal>
+                        <div class="terminal">
+                            <div class="terminal-header">
+                                <div class="terminal-dots">
+                                    <span class="dot red"></span>
+                                    <span class="dot yellow"></span>
+                                    <span class="dot green"></span>
+                                </div>
+                                <span class="terminal-title">bash - Linux VPS</span>
+                                <button type="button" class="copy-button" data-copy="wget https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64&#10;chmod +x twm-linux-x86_64&#10;./twm-linux-x86_64">Copy commands</button>
+                            </div>
+                            <div class="terminal-body">
+                                <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64</p>
+                                <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x twm-linux-x86_64</p>
+                                <p><span class="prompt">$</span> <span class="cmd">./twm-linux-x86_64</span></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="install-panel" id="tab-loader" data-reveal>
+                        <div class="terminal">
+                            <div class="terminal-header">
+                                <div class="terminal-dots">
+                                    <span class="dot red"></span>
+                                    <span class="dot yellow"></span>
+                                    <span class="dot green"></span>
+                                </div>
+                                <span class="terminal-title">bash - Linux VPS loader</span>
+                                <button type="button" class="copy-button" data-copy="wget https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64&#10;chmod +x TWM-loader-linux-x86_64&#10;./TWM-loader-linux-x86_64">Copy commands</button>
+                            </div>
+                            <div class="terminal-body">
+                                <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64</p>
+                                <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x TWM-loader-linux-x86_64</p>
+                                <p><span class="prompt">$</span> <span class="cmd">./TWM-loader-linux-x86_64</span></p>
+                            </div>
+                        </div>
+                        <p class="install-note">The loader path is useful if you want it to pull the latest published build automatically.</p>
+                    </div>
+
+                    <div class="cta-banner" data-reveal>
+                        <div>
+                            <span class="mini-label">Need help or want updates?</span>
+                            <h3>Use the repo for source and the Discord for feedback loops.</h3>
+                        </div>
+                        <div class="cta-actions">
+                            <a href="https://github.com/froumes/escrow/releases" class="button button-solid" target="_blank" rel="noopener">View releases</a>
+                            <a href="https://discord.gg/42DvX6T9jh" class="button button-ghost" target="_blank" rel="noopener">Join Discord</a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <div class="container footer-grid">
+                <div>
+                    <a href="#top" class="logo footer-logo">
+                        <span class="logo-mark">TWM</span>
+                        <span class="logo-copy">Trade With Muscle</span>
+                    </a>
+                    <p class="footer-copy">Rust-built Auction House and Bazaar automation with a browser-first operations panel.</p>
+                </div>
+                <div class="footer-links">
+                    <a href="#features">Features</a>
+                    <a href="#screenshots">Screenshots</a>
+                    <a href="#install">Install</a>
+                    <a href="https://github.com/froumes/escrow" target="_blank" rel="noopener">GitHub</a>
+                    <a href="https://discord.gg/42DvX6T9jh" target="_blank" rel="noopener">Discord</a>
+                </div>
+            </div>
+        </footer>
     </div>
-</nav>
 
-<!-- ── Hero ────────────────────────────────────────────────────── -->
-<header id="hero">
-    <div class="hero-bg"></div>
-    <div class="hero-content">
-        <h1>TWM</h1>
-        <p class="tagline">A Coflnet-powered flipper that macros Auction House &amp; Bazaar with fast buy speeds, automatic selling, and order management — built in Rust&nbsp;🦀</p>
-        <div class="hero-buttons">
-            <a href="#install" class="btn btn-primary">Get Started</a>
-            <a href="https://github.com/froumes/escrow" class="btn btn-outline" target="_blank" rel="noopener">GitHub</a>
-        </div>
-        <div class="hero-stats">
-            <div class="stat"><span class="stat-value">v3.0</span><span class="stat-label">Latest</span></div>
-            <div class="stat"><span class="stat-value">Rust</span><span class="stat-label">Powered</span></div>
-            <div class="stat"><span class="stat-value">AGPLv3</span><span class="stat-label">License</span></div>
-        </div>
-    </div>
-    <div class="scroll-hint" aria-hidden="true">
-        <span>↓</span>
-    </div>
-</header>
-
-<!-- ── Video Showcase ──────────────────────────────────────────── -->
-<section id="showcase">
-    <div class="container">
-        <h2 class="section-title">See It In Action</h2>
-        <p class="section-subtitle">Watch the macro flip in real-time.</p>
-        <div class="video-wrapper">
-            <!-- TODO: Replace VIDEO_ID_HERE with your YouTube video ID (e.g. dQw4w9WgXcQ) -->
-            <iframe
-                src="https://www.youtube.com/embed/VIDEO_ID_HERE?autoplay=1&mute=1&loop=1&playlist=VIDEO_ID_HERE&rel=0"
-                title="TWM Showcase"
-                style="border:none"
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                allowfullscreen
-            ></iframe>
-        </div>
-    </div>
-</section>
-
-<!-- ── Features ────────────────────────────────────────────────── -->
-<section id="features">
-    <div class="container">
-        <h2 class="section-title">Features</h2>
-        <p class="section-subtitle">Everything you need to flip smarter, faster, and automatically.</p>
-
-        <div class="features-grid">
-
-            <div class="feature-card">
-                <div class="feature-icon">⚡</div>
-                <h3>Fast Auction House Buying</h3>
-                <p>Sub-second BIN purchases powered by Coflnet sniper data. Fastbuy mode skips confirmation windows for maximum speed.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">💰</div>
-                <h3>Automatic Selling &amp; Relisting</h3>
-                <p>Purchased items are automatically relisted at the target price. Sold auctions are claimed and profits tracked in real-time.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">📊</div>
-                <h3>Bazaar Flip Macro</h3>
-                <p>Automated bazaar buy &amp; sell order placement, fill tracking, stale order cancellation, and profit-taking — fully hands-free.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">🔄</div>
-                <h3>Multi-Account Rotation</h3>
-                <p>Comma-separate your usernames and set a switch timer. The macro automatically rotates between accounts on a schedule.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">🌐</div>
-                <h3>Web Control Panel</h3>
-                <p>Built-in web dashboard to pause/resume, toggle AH &amp; Bazaar flips, view inventory, manage auctions, switch accounts, and chat — all from your browser.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">🔔</div>
-                <h3>Discord Webhooks</h3>
-                <p>Rich embed notifications for every purchase, sale, and profit update — complete with item names, prices, and buy-speed metrics.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">🎯</div>
-                <h3>Smart Order Management</h3>
-                <p>Automatic collection of filled orders, cancellation of stale orders, and partial-fill detection — no coins left on the table.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">🛡️</div>
-                <h3>Built-in Safety</h3>
-                <p>GUI watchdog auto-closes stuck windows, packet-rate limiting prevents kicks, and graceful error recovery keeps the bot running 24/7.</p>
-            </div>
-
-            <div class="feature-card">
-                <div class="feature-icon">📈</div>
-                <h3>Profit Tracking</h3>
-                <p>Real-time profit logging for both AH flips and bazaar orders with buy cost tracking, tax calculations, and session summaries.</p>
-            </div>
-
-        </div>
-
-        <!-- ── Full Feature List ──────────────────────────────── -->
-        <div class="feature-list-section">
-            <h3 class="feature-list-title">Complete Feature List</h3>
-            <div class="feature-list-grid">
-                <div class="feature-list-col">
-                    <h4>Auction House</h4>
-                    <ul class="feature-list">
-                        <li>Coflnet sniper integration</li>
-                        <li>Sub-second BIN purchasing</li>
-                        <li>Automatic relisting at target price</li>
-                        <li>Sold auction auto-claiming</li>
-                        <li>Auction cancellation support</li>
-                        <li>Grace-period bed timing</li>
-                        <li>Configurable buy speed tuning</li>
-                        <li>AH listing limit detection</li>
-                    </ul>
-                </div>
-                <div class="feature-list-col">
-                    <h4>Bazaar</h4>
-                    <ul class="feature-list">
-                        <li>Automated buy &amp; sell orders</li>
-                        <li>Fill detection &amp; collection</li>
-                        <li>Partial-fill handling</li>
-                        <li>Stale order auto-cancellation</li>
-                        <li>Order age-based cancel threshold</li>
-                        <li>Configurable tax rate</li>
-                        <li>Instant-sell inventory mode</li>
-                        <li>Order profit tracking</li>
-                    </ul>
-                </div>
-                <div class="feature-list-col">
-                    <h4>Management</h4>
-                    <ul class="feature-list">
-                        <li>Web control panel (real-time)</li>
-                        <li>Multi-account rotation</li>
-                        <li>Discord webhook notifications</li>
-                        <li>In-game chat from browser</li>
-                        <li>Inventory viewer with item icons</li>
-                        <li>Active auctions dashboard</li>
-                        <li>Bazaar orders dashboard</li>
-                        <li>Anonymize mode for streaming</li>
-                    </ul>
-                </div>
-                <div class="feature-list-col">
-                    <h4>Reliability</h4>
-                    <ul class="feature-list">
-                        <li>Auto-reconnect on disconnect</li>
-                        <li>GUI watchdog (5s auto-close)</li>
-                        <li>Packet-rate limiting</li>
-                        <li>Command queue with priorities</li>
-                        <li>AH flip preemption for bazaar</li>
-                        <li>Startup order cleanup</li>
-                        <li>Cookie/booster detection</li>
-                        <li>Persistent order state (JSON)</li>
-                    </ul>
-                </div>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- ── Screenshots ─────────────────────────────────────────────── -->
-<section id="screenshots">
-    <div class="container">
-        <h2 class="section-title">Screenshots</h2>
-        <p class="section-subtitle">See what the macro looks like in action.</p>
-
-        <div class="screenshot-grid">
-            <div class="screenshot-card">
-                <div class="screenshot-label">Web Panel — Controls &amp; Dashboard</div>
-                <img src="https://github.com/user-attachments/assets/8600abbd-34ea-4fd2-ad7d-9754ef390d39" alt="Web control panel showing status, controls, inventory, active auctions, bazaar orders, and chat" loading="lazy">
-            </div>
-            <div class="screenshot-card">
-                <div class="screenshot-label">Login Screen</div>
-                <img src="https://github.com/user-attachments/assets/55a28e4b-ec5e-4896-af9b-b62e28190909" alt="Login screen for the web control panel" loading="lazy">
-            </div>
-            <div class="screenshot-card">
-                <div class="screenshot-label">Live Game View</div>
-                <img src="https://github.com/user-attachments/assets/cbca2c75-ff56-45f8-bad1-3fb0a7e8cfd2" alt="Live game view showing in-game render" loading="lazy">
-            </div>
-            <div class="screenshot-card">
-                <div class="screenshot-label">Divine Flip 💎</div>
-                <img src="https://github.com/user-attachments/assets/95897563-ebc4-47c6-bfd1-0c30c8df715b" alt="A divine-tier flip notification" loading="lazy">
-            </div>
-            <div class="screenshot-card">
-                <div class="screenshot-label">Public Big Flips Webhook</div>
-                <img src="https://github.com/user-attachments/assets/0fcb24fe-6a14-4a27-9926-5928bb08725b" alt="Discord webhook showing big flip notifications" loading="lazy">
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- ── How It Works ────────────────────────────────────────────── -->
-<section id="how-it-works">
-    <div class="container">
-        <h2 class="section-title">How It Works</h2>
-        <p class="section-subtitle">From flip detection to profit — fully automated.</p>
-
-        <div class="steps">
-            <div class="step">
-                <div class="step-number">1</div>
-                <div class="step-content">
-                    <h3>Connect</h3>
-                    <p>Log in with your Microsoft account. The macro connects to Hypixel SkyBlock and opens a WebSocket to Coflnet's flip feed.</p>
-                </div>
-            </div>
-            <div class="step">
-                <div class="step-number">2</div>
-                <div class="step-content">
-                    <h3>Detect</h3>
-                    <p>Coflnet streams underpriced auctions and bazaar margins in real-time. The macro evaluates each opportunity instantly.</p>
-                </div>
-            </div>
-            <div class="step">
-                <div class="step-number">3</div>
-                <div class="step-content">
-                    <h3>Purchase</h3>
-                    <p>BIN auctions are bought with fastbuy speed. Bazaar orders are placed, tracked, and managed automatically.</p>
-                </div>
-            </div>
-            <div class="step">
-                <div class="step-number">4</div>
-                <div class="step-content">
-                    <h3>Sell &amp; Profit</h3>
-                    <p>Items are automatically relisted at target prices. Sold auctions are claimed and profits reported via Discord webhooks.</p>
-                </div>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- ── Configuration ───────────────────────────────────────────── -->
-<section id="config">
-    <div class="container">
-        <h2 class="section-title">Configuration</h2>
-        <p class="section-subtitle">Customize everything in <code>config.toml</code>.</p>
-
-        <div class="config-block">
-            <pre><code><span class="c"># Minecraft account(s) — comma-separated for multi-account</span>
-<span class="k">ingame_name</span> = <span class="s">"YourUsername"</span>
-
-<span class="c"># Flip modules</span>
-<span class="k">enable_ah_flips</span>     = <span class="b">true</span>
-<span class="k">enable_bazaar_flips</span> = <span class="b">true</span>
-
-<span class="c"># Speed tuning</span>
-<span class="k">command_delay_ms</span>       = <span class="n">500</span>
-<span class="k">bed_spam_click_delay</span>   = <span class="n">100</span>
-<span class="k">bed_pre_click_ms</span>       = <span class="n">30</span>
-
-<span class="c"># Web control panel</span>
-<span class="k">web_gui_port</span> = <span class="n">8080</span>
-
-<span class="c"># Discord notifications</span>
-<span class="k">webhook_url</span> = <span class="s">"https://discord.com/api/webhooks/..."</span></code></pre>
-        </div>
-    </div>
-</section>
-
-<!-- ── Install ─────────────────────────────────────────────────── -->
-<section id="install">
-    <div class="container">
-        <h2 class="section-title">Installation</h2>
-        <p class="section-subtitle">Up and running in under a minute on a Linux VPS.</p>
-
-        <div class="install-tabs">
-            <button type="button" class="tab active" data-tab="release">From Releases</button>
-            <button type="button" class="tab" data-tab="loader">Using Loader</button>
-        </div>
-
-        <div class="install-content active" id="tab-release">
-            <div class="terminal">
-                <div class="terminal-header">
-                    <span class="dot red"></span>
-                    <span class="dot yellow"></span>
-                    <span class="dot green"></span>
-                    <span class="terminal-title">bash — Linux VPS</span>
-                </div>
-                <div class="terminal-body">
-                    <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64</p>
-                    <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x twm-linux-x86_64</p>
-                    <p><span class="prompt">$</span> <span class="cmd">./twm-linux-x86_64</span></p>
-                </div>
-            </div>
-        </div>
-
-        <div class="install-content" id="tab-loader">
-            <div class="terminal">
-                <div class="terminal-header">
-                    <span class="dot red"></span>
-                    <span class="dot yellow"></span>
-                    <span class="dot green"></span>
-                    <span class="terminal-title">bash — Linux VPS (Loader)</span>
-                </div>
-                <div class="terminal-body">
-                    <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64</p>
-                    <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x TWM-loader-linux-x86_64</p>
-                    <p><span class="prompt">$</span> <span class="cmd">./TWM-loader-linux-x86_64</span></p>
-                </div>
-            </div>
-            <p class="loader-note">The loader automatically downloads and runs the latest version.</p>
-        </div>
-    </div>
-</section>
-
-<!-- ── Footer ──────────────────────────────────────────────────── -->
-<footer>
-    <div class="container footer-content">
-        <div class="footer-brand">
-            <span class="logo">TWM</span>
-            <p>Coflnet-powered Auction House &amp; Bazaar flipper for Hypixel SkyBlock</p>
-        </div>
-        <div class="footer-links">
-            <a href="https://austinxyz.lol" target="_blank" rel="noopener">austinxyz.lol</a>
-            <a href="https://github.com/froumes/escrow" target="_blank" rel="noopener">GitHub</a>
-            <a href="https://discord.gg/42DvX6T9jh" target="_blank" rel="noopener">Discord</a>
-            <a href="https://github.com/froumes/escrow/releases" target="_blank" rel="noopener">Releases</a>
-        </div>
-        <p class="footer-copy">&copy; 2026 <a href="https://trexito.com" target="_blank" rel="noopener">TreXito</a> &middot; AGPLv3 License</p>
-    </div>
-</footer>
-
-<script src="script.js"></script>
+    <script src="script.js"></script>
 </body>
 </html>
