@@ -964,7 +964,19 @@ async function req(url, options = {}) {
         throw error;
     }
     const contentType = response.headers.get("content-type") || "";
-    return contentType.includes("json") ? response.json() : response.text();
+    if (contentType.includes("json")) {
+        return response.json();
+    }
+    const text = await response.text();
+    const trimmed = text.trim();
+    if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+        try {
+            return JSON.parse(trimmed);
+        } catch {
+            return text;
+        }
+    }
+    return text;
 }
 
 const Panel = ({ className, children }) => html`
@@ -979,7 +991,7 @@ const Button = ({ className, kind = "secondary", size = "", children, ...props }
 
 const StatusBadge = ({ label, value, tone = "" }) => html`
     <span className=${cls("statusBadge", tone)}>
-        ${label ? html`<span>${label}&nbsp;</span>` : null}
+        ${label ? html`<span>${label} </span>` : null}
         <strong>${value}</strong>
     </span>
 `;
