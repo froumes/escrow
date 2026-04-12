@@ -5,56 +5,2202 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <!-- OG_META_TAGS -->
 <title>TWM Control Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;700&amp;display=swap" rel="stylesheet">
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
-:root{--bg:#05070c;--bg2:#0a1220;--surface:rgba(255,255,255,.06);--surface2:rgba(255,255,255,.10);--border:rgba(255,255,255,.12);--dim:#97a6bf;--text:#edf3ff;--pink:#ff4d8d;--blue:#5aa7ff;--green:#39d98a;--gold:#f5c55a;--red:#ff6b7d;--shadow:0 24px 80px rgba(0,0,0,.42);--glow:0 0 42px rgba(90,167,255,.15),0 0 34px rgba(255,77,141,.11)}*{box-sizing:border-box}html,body{margin:0;min-height:100%}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% 20%,rgba(255,77,141,.16),transparent 24%),radial-gradient(circle at 82% 18%,rgba(90,167,255,.18),transparent 26%),linear-gradient(180deg,var(--bg2),var(--bg));overflow-x:hidden}body:before,body:after{content:"";position:fixed;border-radius:999px;filter:blur(120px);pointer-events:none}body:before{top:-120px;left:50%;width:460px;height:460px;transform:translateX(-50%);background:rgba(255,77,141,.16)}body:after{right:-80px;top:24%;width:380px;height:380px;background:rgba(90,167,255,.14)}a{color:inherit;text-decoration:none}button,input,textarea{font:inherit}button{border:0;cursor:pointer;background:none;color:inherit}textarea,input{width:100%;color:var(--text);background:rgba(0,0,0,.22);border:1px solid var(--border);border-radius:18px;outline:none}textarea:focus,input:focus{border-color:rgba(90,167,255,.7)}#root{min-height:100vh;position:relative;z-index:1}.app{max-width:1520px;margin:0 auto;padding:20px}.glass{position:relative;overflow:hidden;border-radius:28px;border:1px solid var(--border);background:linear-gradient(180deg,var(--surface2),var(--surface));backdrop-filter:blur(22px);box-shadow:var(--shadow)}.glass:before{content:"";position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,.18),rgba(255,255,255,.03) 36%,transparent 60%);pointer-events:none}.inner{position:relative;z-index:1}.header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:18px 22px;margin-bottom:18px;flex-wrap:wrap}.tabs,.actions,.stats{display:flex;flex-wrap:wrap;gap:10px}.tab,.btn,.chip{padding:10px 15px;border-radius:999px;border:1px solid rgba(255,255,255,.08);transition:transform .18s ease,background .18s ease}.tab{background:rgba(255,255,255,.04);color:var(--dim)}.tab.active{background:linear-gradient(135deg,var(--pink),var(--blue));color:#fff;box-shadow:var(--glow);border-color:transparent}.tab:hover,.btn:hover{transform:translateY(-1px)}.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:22px;padding:26px}.kicker{font-size:11px;text-transform:uppercase;letter-spacing:.22em;color:var(--blue)}.headline{margin:14px 0 0;font-size:clamp(2.2rem,4vw,4.5rem);line-height:.96;letter-spacing:-.06em;font-weight:900;max-width:10ch}.headline span{background:linear-gradient(90deg,#fff,var(--pink) 44%,var(--blue));-webkit-background-clip:text;background-clip:text;color:transparent}.sub{margin-top:18px;color:var(--dim);line-height:1.8;max-width:64ch}.btn{font-weight:700}.primary{background:linear-gradient(135deg,var(--pink),var(--blue));box-shadow:var(--glow)}.secondary{background:rgba(255,255,255,.05)}.success{background:linear-gradient(135deg,var(--green),#79e3a9);color:#08140d}.warn{background:linear-gradient(135deg,var(--gold),#ffd78f);color:#241700}.danger{background:linear-gradient(135deg,var(--red),var(--pink))}.grid2,.grid3{display:grid;gap:18px;margin-top:18px}.grid2{grid-template-columns:.9fr 1.1fr}.grid3{grid-template-columns:repeat(3,minmax(0,1fr))}.card{padding:22px}.title{margin:0;font-size:1.55rem;font-weight:900;letter-spacing:-.04em}.metricGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.metric{padding:15px;border-radius:20px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.035)}.metric small{display:block;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.2em}.metric strong{display:block;margin-top:10px;font-size:1.6rem;letter-spacing:-.05em}.blue{color:var(--blue)}.pink{color:var(--pink)}.green{color:var(--green)}.gold{color:var(--gold)}.red{color:var(--red)}.panel{margin-top:18px}.chart{height:280px}.inv{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:10px}.slot{position:relative;padding:10px;border-radius:18px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.035)}.slothead{color:var(--dim);font-size:10px;letter-spacing:.15em;text-transform:uppercase;margin-bottom:8px}.slotbody{display:flex;align-items:center;justify-content:center;aspect-ratio:1;border-radius:14px;background:rgba(0,0,0,.22);overflow:hidden}.slotbody img{width:42px;height:42px;object-fit:contain}.slotname{margin-top:8px;font-size:11px;line-height:1.4;color:var(--dim)}.slotcount{position:absolute;right:10px;bottom:10px;padding:2px 8px;border-radius:999px;background:rgba(0,0,0,.5);font-size:10px;font-weight:800}.tableWrap{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{padding:14px 12px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left;vertical-align:top}th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.18em;font-weight:600}code{white-space:pre-wrap;word-break:break-word;color:#abd4ff}.empty{padding:40px 16px;text-align:center;color:var(--dim)}.chat{min-height:430px;max-height:540px;overflow:auto;border:1px solid rgba(255,255,255,.07);border-radius:22px;background:rgba(0,0,0,.22);padding:16px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.line{padding:9px 0;border-bottom:1px solid rgba(255,255,255,.05)}.toast{position:fixed;right:22px;bottom:22px;padding:14px 18px;border-radius:999px;background:rgba(0,0,0,.58);border:1px solid var(--border);box-shadow:var(--glow);backdrop-filter:blur(18px)}.overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.68);backdrop-filter:blur(18px);z-index:20}.overlayGrid{width:min(1080px,100%);display:grid;grid-template-columns:.9fr 1.1fr;gap:18px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:var(--dim)}@media(max-width:1180px){.hero,.grid2,.grid3,.overlayGrid{grid-template-columns:1fr}}@media(max-width:900px){.inv{grid-template-columns:repeat(5,minmax(0,1fr))}.metricGrid{grid-template-columns:1fr 1fr}}@media(max-width:640px){.app{padding:12px}.header,.hero,.card{padding:16px}.headline{font-size:2.3rem;max-width:none}.metricGrid{grid-template-columns:1fr}.inv{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.actions{flex-direction:column}.btn{width:100%}}
+:root{
+    --bg:#0d1214;
+    --bg-soft:#141d20;
+    --panel:rgba(19,27,30,.88);
+    --panel-2:#1a2529;
+    --panel-3:#223136;
+    --line:rgba(217,231,226,.12);
+    --line-strong:rgba(217,231,226,.22);
+    --text:#edf5f2;
+    --muted:#9db2ac;
+    --warm:#f2b15c;
+    --warm-2:#ffd08a;
+    --mint:#73d2af;
+    --mint-2:#9ce8c7;
+    --blue:#81b7ff;
+    --blue-2:#b8d4ff;
+    --red:#ff8c74;
+    --red-2:#ffb0a0;
+    --shadow:0 24px 70px rgba(0,0,0,.34);
+    --shadow-soft:0 14px 38px rgba(0,0,0,.24);
+    --radius-xl:28px;
+    --radius-lg:22px;
+    --radius-md:16px;
+    --radius-sm:12px;
+    --content:1540px;
+}
+*,
+*::before,
+*::after{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+    margin:0;
+    min-height:100%;
+    color:var(--text);
+    font-family:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:
+        radial-gradient(circle at top left,rgba(242,177,92,.18),transparent 28%),
+        radial-gradient(circle at 84% 16%,rgba(115,210,175,.16),transparent 24%),
+        linear-gradient(180deg,#0a0f10,#0d1214 38%,#11181a 100%);
+}
+body::before{
+    content:"";
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    background-image:
+        linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);
+    background-size:48px 48px;
+    mask-image:linear-gradient(180deg,rgba(0,0,0,.55),transparent 90%);
+    opacity:.4;
+}
+a{color:inherit;text-decoration:none}
+button,input,textarea{font:inherit}
+button{color:inherit}
+img{display:block;max-width:100%}
+#root{min-height:100vh;position:relative;z-index:1}
+.app{
+    width:min(var(--content),calc(100% - 24px));
+    margin:0 auto;
+    padding:18px 0 32px;
+}
+.surface{
+    position:relative;
+    overflow:hidden;
+    border:1px solid var(--line);
+    border-radius:var(--radius-xl);
+    background:var(--panel);
+    box-shadow:var(--shadow-soft);
+    backdrop-filter:blur(18px);
+}
+.surface::before{
+    content:"";
+    position:absolute;
+    inset:0;
+    pointer-events:none;
+    background:linear-gradient(160deg,rgba(255,255,255,.12),rgba(255,255,255,.03) 28%,transparent 65%);
+}
+.surface > *{position:relative;z-index:1}
+.topbar{
+    position:sticky;
+    top:14px;
+    z-index:50;
+    padding:18px 20px;
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    justify-content:space-between;
+    gap:16px;
+}
+.brandWrap{display:flex;align-items:center;gap:14px;min-width:0}
+.brandMark{
+    width:56px;
+    height:56px;
+    border-radius:18px;
+    display:grid;
+    place-items:center;
+    background:linear-gradient(135deg,var(--warm),var(--warm-2));
+    color:#101618;
+    font-family:"Space Grotesk",sans-serif;
+    font-weight:700;
+    letter-spacing:.08em;
+    box-shadow:0 14px 28px rgba(242,177,92,.22);
+}
+.brandText h1{
+    margin:0;
+    font-family:"Space Grotesk",sans-serif;
+    font-size:clamp(1.6rem,2vw,2rem);
+    letter-spacing:-.04em;
+}
+.eyebrow{
+    display:block;
+    color:var(--warm);
+    font-size:.76rem;
+    text-transform:uppercase;
+    letter-spacing:.16em;
+    font-weight:700;
+}
+.brandMeta{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-top:8px;
+}
+.pill,
+.statusBadge{
+    display:inline-flex;
+    align-items:center;
+    min-height:34px;
+    padding:0 12px;
+    border-radius:999px;
+    border:1px solid var(--line);
+    background:rgba(255,255,255,.04);
+    color:var(--muted);
+    font-size:.84rem;
+    white-space:nowrap;
+}
+.statusBadge strong{color:var(--text);font-weight:600}
+.tone-green{color:var(--mint-2);border-color:rgba(115,210,175,.22);background:rgba(115,210,175,.12)}
+.tone-gold{color:var(--warm-2);border-color:rgba(242,177,92,.24);background:rgba(242,177,92,.12)}
+.tone-blue{color:var(--blue-2);border-color:rgba(129,183,255,.24);background:rgba(129,183,255,.12)}
+.tone-red{color:var(--red-2);border-color:rgba(255,140,116,.24);background:rgba(255,140,116,.12)}
+.toolbar{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    justify-content:flex-end;
+    gap:10px;
+}
+.tabbar{
+    margin-top:16px;
+    padding:8px;
+    display:flex;
+    gap:8px;
+    overflow:auto;
+    scrollbar-width:none;
+}
+.tabbar::-webkit-scrollbar{display:none}
+.tab{
+    border:0;
+    min-height:42px;
+    padding:0 14px;
+    border-radius:999px;
+    background:rgba(255,255,255,.04);
+    color:var(--muted);
+    cursor:pointer;
+    white-space:nowrap;
+    transition:background .18s ease,color .18s ease,transform .18s ease;
+}
+.tab:hover{transform:translateY(-1px);color:var(--text)}
+.tab.active{
+    background:linear-gradient(135deg,var(--warm),var(--warm-2));
+    color:#101618;
+    font-weight:700;
+}
+.button{
+    border:1px solid transparent;
+    min-height:44px;
+    padding:0 16px;
+    border-radius:999px;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    cursor:pointer;
+    transition:transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease;
+}
+.button:hover{transform:translateY(-1px)}
+.button.primary{
+    color:#101618;
+    background:linear-gradient(135deg,var(--warm),var(--warm-2));
+    box-shadow:0 14px 24px rgba(242,177,92,.18);
+}
+.button.secondary{
+    background:rgba(255,255,255,.04);
+    border-color:var(--line);
+}
+.button.success{
+    color:#092018;
+    background:linear-gradient(135deg,var(--mint),var(--mint-2));
+}
+.button.warn{
+    color:#211406;
+    background:linear-gradient(135deg,var(--warm),#ffe0a8);
+}
+.button.danger{
+    color:#fff6f3;
+    background:linear-gradient(135deg,var(--red),#ff7256);
+}
+.button.ghost{
+    background:transparent;
+    border-color:var(--line);
+}
+.button.small{
+    min-height:34px;
+    padding:0 12px;
+    font-size:.84rem;
+}
+.button.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.layout{
+    margin-top:18px;
+    display:grid;
+    gap:18px;
+}
+.hero{
+    padding:24px;
+    display:grid;
+    grid-template-columns:1.1fr .9fr;
+    gap:18px;
+}
+.heroCopy h2,
+.sectionTitle h2,
+.panelTitle,
+.loginPanel h2{
+    margin:0;
+    font-family:"Space Grotesk",sans-serif;
+    letter-spacing:-.04em;
+    line-height:.98;
+}
+.heroCopy h2{
+    font-size:clamp(2rem,4vw,3.5rem);
+    max-width:11ch;
+}
+.subtle{
+    color:var(--muted);
+    line-height:1.65;
+}
+.heroCopy .subtle{margin-top:16px;max-width:60ch}
+.heroActions{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-top:20px;
+}
+.heroMeta{
+    margin-top:20px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+}
+.heroAside{
+    display:grid;
+    gap:16px;
+}
+.statGrid{
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:12px;
+}
+.statCard{
+    padding:16px;
+    border-radius:20px;
+    border:1px solid rgba(255,255,255,.07);
+    background:rgba(255,255,255,.035);
+}
+.statCard small{
+    display:block;
+    color:var(--muted);
+    font-size:.74rem;
+    text-transform:uppercase;
+    letter-spacing:.16em;
+}
+.statCard strong{
+    display:block;
+    margin-top:8px;
+    font-size:1.45rem;
+    letter-spacing:-.05em;
+}
+.statCard span{
+    display:block;
+    margin-top:6px;
+    color:var(--muted);
+    font-size:.84rem;
+}
+.dashboardGrid{
+    display:grid;
+    grid-template-columns:1.1fr .9fr;
+    gap:18px;
+}
+.stack{display:grid;gap:18px}
+.cardBody{padding:22px}
+.sectionTitle{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:14px;
+    flex-wrap:wrap;
+}
+.sectionTitle h2{font-size:1.55rem}
+.sectionTitle p{
+    margin:10px 0 0;
+    color:var(--muted);
+    max-width:64ch;
+}
+.actionGrid{
+    margin-top:18px;
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:12px;
+}
+.actionCard{
+    padding:16px;
+    border-radius:20px;
+    border:1px solid rgba(255,255,255,.07);
+    background:rgba(255,255,255,.03);
+}
+.actionCard h3{
+    margin:0 0 6px;
+    font-size:1rem;
+}
+.actionCard p{
+    margin:0 0 12px;
+    color:var(--muted);
+    font-size:.9rem;
+}
+.actionRow,
+.toggleList,
+.accountList,
+.inlineMeta{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+}
+.toggleCard{
+    padding:18px;
+    border-radius:20px;
+    border:1px solid rgba(255,255,255,.07);
+    background:rgba(255,255,255,.03);
+}
+.toggleHead{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+}
+.toggleHead h3{
+    margin:0;
+    font-size:1rem;
+}
+.toggleCard p{
+    margin:8px 0 14px;
+    color:var(--muted);
+}
+.twoCol{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:18px;
+}
+.threeCol{
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:18px;
+}
+.chartWrap{height:300px}
+.kpiStrip{
+    margin-top:16px;
+    display:grid;
+    grid-template-columns:repeat(4,minmax(0,1fr));
+    gap:12px;
+}
+.kpi{
+    padding:14px;
+    border-radius:18px;
+    border:1px solid rgba(255,255,255,.07);
+    background:rgba(255,255,255,.03);
+}
+.kpi small{
+    display:block;
+    font-size:.74rem;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--muted);
+}
+.kpi strong{
+    display:block;
+    margin-top:8px;
+    font-size:1.2rem;
+}
+.miniList{
+    margin-top:16px;
+    display:grid;
+    gap:10px;
+}
+.miniRow{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    padding:12px 14px;
+    border-radius:16px;
+    border:1px solid rgba(255,255,255,.06);
+    background:rgba(255,255,255,.03);
+}
+.miniRow strong{font-size:.96rem}
+.miniRow span{color:var(--muted);font-size:.88rem}
+.inventoryLayout{
+    margin-top:18px;
+    display:grid;
+    grid-template-columns:1.25fr .75fr;
+    gap:16px;
+}
+.slotGrid{
+    display:grid;
+    grid-template-columns:repeat(9,minmax(0,1fr));
+    gap:10px;
+}
+.slotButton{
+    position:relative;
+    border:1px solid rgba(255,255,255,.07);
+    border-radius:16px;
+    padding:10px;
+    background:rgba(255,255,255,.03);
+    cursor:pointer;
+    text-align:left;
+    transition:border-color .18s ease,transform .18s ease,background .18s ease;
+}
+.slotButton:hover{transform:translateY(-1px);border-color:var(--line-strong)}
+.slotButton.active{
+    border-color:rgba(129,183,255,.35);
+    background:rgba(129,183,255,.12);
+}
+.slotId{
+    display:block;
+    color:var(--muted);
+    font-size:.68rem;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+}
+.slotIcon{
+    margin-top:8px;
+    height:58px;
+    border-radius:14px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+    background:rgba(0,0,0,.24);
+}
+.slotIcon img{
+    width:44px;
+    height:44px;
+    object-fit:contain;
+}
+.slotFallback{
+    font-size:.72rem;
+    color:var(--muted);
+    text-align:center;
+    padding:0 4px;
+    line-height:1.3;
+}
+.slotLabel{
+    margin-top:8px;
+    min-height:32px;
+    font-size:.76rem;
+    color:var(--muted);
+    line-height:1.35;
+}
+.slotCount{
+    position:absolute;
+    right:8px;
+    bottom:8px;
+    padding:2px 7px;
+    border-radius:999px;
+    background:rgba(0,0,0,.58);
+    font-size:.66rem;
+    font-weight:700;
+}
+.detailCard{
+    padding:18px;
+    border-radius:20px;
+    border:1px solid rgba(255,255,255,.07);
+    background:rgba(255,255,255,.03);
+    display:grid;
+    gap:14px;
+    align-content:start;
+}
+.detailTop{
+    display:flex;
+    align-items:center;
+    gap:14px;
+}
+.detailTop .slotIcon{
+    width:72px;
+    min-width:72px;
+    height:72px;
+}
+.detailTitle{
+    margin:0;
+    font-size:1.1rem;
+    word-break:break-word;
+}
+.detailMeta{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+}
+.detailLore{
+    margin:0;
+    padding:0;
+    list-style:none;
+    display:grid;
+    gap:8px;
+    max-height:360px;
+    overflow:auto;
+}
+.detailLore li{
+    padding:10px 12px;
+    border-radius:14px;
+    background:rgba(0,0,0,.18);
+    color:var(--muted);
+    font-size:.88rem;
+    line-height:1.45;
+    white-space:pre-wrap;
+    word-break:break-word;
+}
+.tableShell{
+    margin-top:18px;
+    display:grid;
+    grid-template-columns:1.15fr .85fr;
+    gap:16px;
+}
+.tableWrap{
+    overflow:auto;
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:18px;
+    background:rgba(0,0,0,.16);
+}
+table{
+    width:100%;
+    border-collapse:collapse;
+    min-width:640px;
+}
+th,td{
+    padding:14px 12px;
+    text-align:left;
+    vertical-align:top;
+    border-bottom:1px solid rgba(255,255,255,.06);
+}
+th{
+    position:sticky;
+    top:0;
+    z-index:1;
+    font-size:.72rem;
+    letter-spacing:.16em;
+    text-transform:uppercase;
+    color:var(--muted);
+    background:rgba(17,24,26,.96);
+}
+tbody tr{
+    cursor:pointer;
+    transition:background .18s ease;
+}
+tbody tr:hover{background:rgba(255,255,255,.03)}
+tbody tr.selected{background:rgba(129,183,255,.10)}
+.rowTitle{
+    font-weight:700;
+    line-height:1.35;
+}
+.rowSub{
+    margin-top:4px;
+    color:var(--muted);
+    font-size:.82rem;
+}
+.emptyState{
+    padding:42px 18px;
+    text-align:center;
+    color:var(--muted);
+}
+.tagList{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+}
+.tag{
+    display:inline-flex;
+    align-items:center;
+    min-height:28px;
+    padding:0 10px;
+    border-radius:999px;
+    background:rgba(255,255,255,.05);
+    border:1px solid rgba(255,255,255,.07);
+    color:var(--muted);
+    font-size:.8rem;
+}
+.queueList{
+    margin-top:18px;
+    display:grid;
+    gap:10px;
+}
+.queueEntry{
+    padding:14px 16px;
+    border-radius:18px;
+    border:1px solid rgba(255,255,255,.07);
+    background:rgba(255,255,255,.03);
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    align-items:flex-start;
+}
+.queueEntry.executing{
+    border-color:rgba(115,210,175,.28);
+    background:rgba(115,210,175,.10);
+}
+.queueEntry h3{
+    margin:0;
+    font-size:.98rem;
+}
+.queueEntry p{
+    margin:4px 0 0;
+    color:var(--muted);
+    font-size:.84rem;
+}
+.configTools{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    align-items:center;
+}
+.configMsg{
+    margin-top:14px;
+    padding:12px 14px;
+    border-radius:14px;
+    background:rgba(255,255,255,.04);
+    color:var(--muted);
+}
+.configArea{
+    width:100%;
+    min-height:560px;
+    margin-top:18px;
+    padding:18px;
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:22px;
+    background:rgba(0,0,0,.22);
+    color:var(--text);
+    resize:vertical;
+    outline:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    line-height:1.6;
+}
+.configArea:focus{border-color:rgba(129,183,255,.36)}
+.chatLayout{
+    margin-top:18px;
+    display:grid;
+    grid-template-columns:1.05fr .95fr;
+    gap:16px;
+}
+.chatBox{
+    min-height:460px;
+    max-height:620px;
+    overflow:auto;
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:22px;
+    background:rgba(0,0,0,.22);
+    padding:16px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+.chatLine{
+    padding:10px 0;
+    border-bottom:1px solid rgba(255,255,255,.05);
+    line-height:1.45;
+    white-space:pre-wrap;
+    word-break:break-word;
+}
+.chatLine:last-child{border-bottom:0}
+.chatStatus{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    color:var(--muted);
+    font-size:.84rem;
+}
+.dot{
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    background:var(--muted);
+}
+.dot.live{background:var(--mint)}
+.composer{
+    display:grid;
+    gap:14px;
+}
+.composer textarea{
+    width:100%;
+    min-height:190px;
+    padding:16px;
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:22px;
+    background:rgba(0,0,0,.22);
+    color:var(--text);
+    resize:vertical;
+    outline:none;
+}
+.composer textarea:focus{border-color:rgba(129,183,255,.36)}
+.presetRow{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+}
+.overlay{
+    position:fixed;
+    inset:0;
+    z-index:120;
+    padding:18px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:rgba(6,9,10,.76);
+    backdrop-filter:blur(18px);
+}
+.overlayGrid{
+    width:min(1180px,100%);
+    display:grid;
+    grid-template-columns:.92fr 1.08fr;
+    gap:18px;
+}
+.loginPanel{padding:22px}
+.loginPanel h2{font-size:clamp(1.8rem,3vw,2.8rem)}
+.loginField{
+    width:100%;
+    margin-top:18px;
+    padding:15px 16px;
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:18px;
+    background:rgba(0,0,0,.22);
+    color:var(--text);
+    outline:none;
+}
+.loginField:focus{border-color:rgba(129,183,255,.36)}
+.loginError{
+    margin-top:10px;
+    color:var(--red-2);
+}
+.loginActions{
+    margin-top:16px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+}
+.toast{
+    position:fixed;
+    right:18px;
+    bottom:18px;
+    z-index:140;
+    padding:13px 16px;
+    border-radius:999px;
+    background:rgba(8,12,13,.88);
+    border:1px solid var(--line);
+    box-shadow:var(--shadow);
+}
+.muted{color:var(--muted)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.grow{flex:1}
+.hidden{display:none}
+@media(max-width:1280px){
+    .hero,
+    .dashboardGrid,
+    .twoCol,
+    .threeCol,
+    .overlayGrid,
+    .chatLayout,
+    .inventoryLayout,
+    .tableShell{grid-template-columns:1fr}
+    .actionGrid,
+    .statGrid,
+    .kpiStrip{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:900px){
+    .slotGrid{grid-template-columns:repeat(6,minmax(0,1fr))}
+}
+@media(max-width:720px){
+    .app{width:min(var(--content),calc(100% - 16px))}
+    .topbar,
+    .cardBody,
+    .hero,
+    .loginPanel{padding:16px}
+    .brandWrap{align-items:flex-start}
+    .toolbar{justify-content:flex-start}
+    .actionGrid,
+    .statGrid,
+    .kpiStrip{grid-template-columns:1fr}
+    .slotGrid{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+    .button{width:100%}
+    .toolbar .button{width:auto}
+    .loginActions .button{width:auto}
+}
 </style>
 </head>
 <body>
 <div id="root"></div>
 <script>
-const {useState,useEffect,useMemo,useRef,useCallback}=React;const html=htm.bind(React.createElement);
-const API={status:"/api/status",login:"/api/login",profit:"/api/profit",publicProfit:"/api/profit/public",inventory:"/api/inventory",gameView:"/api/game-view",auctions:"/api/auctions",bazaarOrders:"/api/bazaar_orders",queue:"/api/queue",config:"/api/config",pause:"/api/pause",resume:"/api/resume",toggleAh:"/api/toggle_ah",toggleBazaar:"/api/toggle_bazaar",toggleAnon:"/api/toggle_anonymize",switchAccount:"/api/switch_account",claimPurchases:"/api/claim_purchases",collectBz:"/api/collect_bz_orders",claimBz:"/api/claim_bz_orders",cancelAllBz:"/api/cancel_all_bz_orders",cancelAuction:"/api/cancel_auction",cancelBz:"/api/cancel_bz_order",chatSend:"/api/chat/send",chatWs:()=>`${location.protocol==="https:"?"wss":"ws"}://${location.host}/api/chat/ws`};
-const cls=(...x)=>x.filter(Boolean).join(" ");const stripMc=t=>(t||"").replace(/\u00A7[0-9a-fk-or]/gi,"");
-const coins=v=>v==null||Number.isNaN(v)?"-":Math.abs(v)>=1e9?`${(v/1e9).toFixed(2)}B`:Math.abs(v)>=1e6?`${(v/1e6).toFixed(2)}M`:Math.abs(v)>=1e3?`${(v/1e3).toFixed(1)}K`:`${Math.round(v)}`;
-function uptime(s){if(s==null||Number.isNaN(s))return "-";s=Math.max(0,Math.floor(s));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),sec=s%60;return d>0?`${d}d ${h}h ${m}m`:h>0?`${h}h ${m}m ${sec}s`:`${m}m ${sec}s`;}
-async function req(url,opt={}){const r=await fetch(url,opt);if(r.status===401){const e=new Error("Unauthorized");e.status=401;throw e}if(!r.ok){const t=await r.text().catch(()=>""),e=new Error(t||`HTTP ${r.status}`);e.status=r.status;throw e}const ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
-const Card=({className,children})=>html`<section className=${cls("glass",className)}><div className="inner">${children}</div></section>`;
-const Btn=({children,variant="primary",className,...props})=>html`<button className=${cls("btn",variant,className)} ...${props}>${children}</button>`;
-const Metric=({label,value,accent})=>html`<div className="metric"><small>${label}</small><strong className=${accent}>${value}</strong></div>`;
-function ChartCard({title,sub,points,color,fill}){const ref=useRef(null),chart=useRef(null);useEffect(()=>{if(!ref.current||!window.Chart)return;chart.current&&chart.current.destroy();chart.current=new Chart(ref.current,{type:"line",data:{labels:(points||[]).map(p=>new Date(p[0]*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})),datasets:[{data:(points||[]).map(p=>p[1]),borderColor:color,backgroundColor:fill,fill:true,tension:.34,pointRadius:0,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:"rgba(255,255,255,.04)"},ticks:{color:"#91a2bb",maxTicksLimit:6}},y:{grid:{color:"rgba(255,255,255,.04)"},ticks:{color:"#91a2bb",callback:v=>coins(v)}}}}});return()=>{chart.current&&chart.current.destroy();chart.current=null}},[points,color,fill]);return html`<${Card} className="card"><div style=${{fontSize:"15px",fontWeight:700}}>${title}</div><div className="muted" style=${{fontSize:"12px",marginTop:"4px",marginBottom:"12px"}}>${sub}</div><div className="chart"><canvas ref=${ref}></canvas></div></${Card}>`}
-function Inv({title,label,slots}){const arr=Array.isArray(slots)?slots:[];return html`<${Card} className="card"><div style=${{fontSize:"15px",fontWeight:700}}>${title}</div><div className="muted" style=${{fontSize:"12px",marginTop:"4px",marginBottom:"14px"}}>${label} - ${arr.length} slots</div>${!arr.length?html`<div className="empty">No data yet.</div>`:html`<div className="inv">${arr.map((s,i)=>{const empty=s.empty||(!s.name&&!s.displayName),name=stripMc(s.displayName||s.name||"Empty"),tag=name.toUpperCase().replace(/[^A-Z0-9]+/g,"_").replace(/^_+|_+$/g,""),src=!empty&&tag?`https://sky.coflnet.com/static/icon/${tag}`:"";return html`<div className="slot" key=${`${s.slot??i}-${name}`}><div className="slothead">#${s.slot??i}</div><div className="slotbody">${src?html`<img src=${src} alt=${name} onError=${e=>{e.currentTarget.style.display="none"}} />`:html`<span className="muted" style=${{fontSize:"11px",textAlign:"center",padding:"0 6px"}}>${empty?"Empty":name.slice(0,18)}</span>`}</div>${!empty&&s.count>1?html`<div className="slotcount">${s.count}</div>`:null}<div className="slotname">${empty?"No item":name}</div></div>`})}</div>`}</${Card}>`}
-function Table({title,rows,cols,empty,keyFn}){const safe=Array.isArray(rows)?rows:[];return html`<${Card} className="card"><div style=${{fontSize:"15px",fontWeight:700,marginBottom:"14px"}}>${title}</div>${!safe.length?html`<div className="empty">${empty}</div>`:html`<div className="tableWrap"><table><thead><tr>${cols.map(c=>html`<th key=${c.label}>${c.label}</th>`)}</tr></thead><tbody>${safe.map((r,i)=>html`<tr key=${keyFn?keyFn(r,i):i}>${cols.map(c=>html`<td key=${c.label}>${c.render?c.render(r):r[c.key]}</td>`)}</tr>`)}</tbody></table></div>`}</${Card}>`}
-function Overlay({show,password,setPassword,error,onLogin,profit}){if(!show)return null;const total=(profit.ah_total||0)+(profit.bz_total||0),combined=(profit.ah_points||[]).map((p,i)=>[p[0],p[1]+(((profit.bz_points||[])[i]||[0,0])[1]||0)]);return html`<div className="overlay"><div className="overlayGrid"><${Card} className="card"><div className="kicker">Secure Access</div><h2 className="title" style=${{marginTop:"10px"}}>TWM Web Console</h2><p className="sub">Enter your web GUI password to unlock the live panel.</p><input style=${{marginTop:"18px",padding:"14px 16px"}} type="password" value=${password} placeholder="Password" autoComplete="current-password" onInput=${e=>setPassword(e.target.value)} onKeyDown=${e=>{if(e.key==="Enter")onLogin()}} />${error?html`<div style=${{color:"var(--red)",marginTop:"10px"}}>${error}</div>`:null}<div className="actions"><${Btn} onClick=${onLogin}>Unlock</${Btn}><a className="btn secondary" href="https://github.com/froumes/escrow" target="_blank" rel="noreferrer">GitHub</a></div></${Card}><${Card} className="card"><div className="kicker">Public Snapshot</div><h2 className="title" style=${{marginTop:"10px"}}>Profit pulse before login</h2><div className="metricGrid panel"><${Metric} label="AH Profit" value=${coins(profit.ah_total||0)} accent="green" /><${Metric} label="BZ Profit" value=${coins(profit.bz_total||0)} accent="blue" /><${Metric} label="Total" value=${coins(total)} accent="pink" /></div><div className="panel"><${ChartCard} title="Combined session curve" sub=${`Uptime ${uptime(profit.uptime_seconds||0)}`} points=${combined} color="#5aa7ff" fill="rgba(90,167,255,.16)" /></div></${Card}></div></div>`}
-function App(){const [needsAuth,setNeedsAuth]=useState(false),[password,setPassword]=useState(""),[loginError,setLoginError]=useState(""),[status,setStatus]=useState({}),[profit,setProfit]=useState({ah_points:[],bz_points:[],ah_total:0,bz_total:0,uptime_seconds:0}),[publicProfit,setPublicProfit]=useState({ah_points:[],bz_points:[],ah_total:0,bz_total:0,uptime_seconds:0}),[inventory,setInventory]=useState({slots:[]}),[gameView,setGameView]=useState({open:false,slots:[]}),[auctions,setAuctions]=useState([]),[bzOrders,setBzOrders]=useState([]),[queue,setQueue]=useState([]),[configText,setConfigText]=useState(""),[configMsg,setConfigMsg]=useState(""),[chatInput,setChatInput]=useState(""),[chat,setChat]=useState([]),[tab,setTab]=useState("overview"),[toast,setToast]=useState("");
-const flash=useCallback(m=>{setToast(m);clearTimeout(window.__twmToast);window.__twmToast=setTimeout(()=>setToast(""),2800)},[]);
-const load=useCallback((url,setter)=>req(url).then(v=>{setter(v);setNeedsAuth(false);setLoginError("")}).catch(e=>{if(e.status===401)setNeedsAuth(true)}),[]);
-const refresh=useCallback(()=>{load(API.status,setStatus);load(API.profit,setProfit);load(API.inventory,setInventory);load(API.gameView,setGameView);load(API.auctions,setAuctions);load(API.bazaarOrders,setBzOrders);load(API.queue,setQueue)},[load]);
-const loadConfig=useCallback(()=>load(API.config,setConfigText),[load]);
-useEffect(()=>{req(API.publicProfit).then(setPublicProfit).catch(()=>{});refresh();loadConfig()},[refresh,loadConfig]);
-useEffect(()=>{const ws=new WebSocket(API.chatWs());ws.onmessage=e=>setChat(p=>[...p.slice(-249),e.data]);return()=>ws.close()},[]);
-useEffect(()=>{if(needsAuth)return;const a=setInterval(refresh,5000),b=setInterval(()=>req(API.publicProfit).then(setPublicProfit).catch(()=>{}),15000);return()=>{clearInterval(a);clearInterval(b)}},[needsAuth,refresh]);
-const post=useCallback((url,body,msg)=>{const opt={method:"POST"};if(body){opt.headers={"Content-Type":"application/json"};opt.body=JSON.stringify(body)}return req(url,opt).then(()=>{msg&&flash(msg);refresh()}).catch(e=>{if(e.status===401)setNeedsAuth(true);else flash(e.message||"Request failed")})},[flash,refresh]);
-const login=useCallback(()=>req(API.login,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})}).then(()=>{setNeedsAuth(false);setLoginError("");flash("Panel unlocked");refresh();loadConfig()}).catch(()=>setLoginError("Invalid password")),[password,flash,refresh,loadConfig]);
-const saveConfig=useCallback(()=>req(API.config,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config_toml:configText})}).then(()=>{setConfigMsg("Config saved");flash("Config saved");refresh()}).catch(e=>setConfigMsg(e.message||"Config save failed")),[configText,flash,refresh]);
-const sendChat=useCallback(()=>{if(!chatInput.trim())return;post(API.chatSend,{message:chatInput},"Chat sent");setChatInput("")},[chatInput,post]);
-const total=(profit.ah_total||0)+(profit.bz_total||0),perHour=profit.uptime_seconds?total/(profit.uptime_seconds/3600):0,combined=(profit.ah_points||[]).map((p,i)=>[p[0],p[1]+(((profit.bz_points||[])[i]||[0,0])[1]||0)]);
-const auctionCols=useMemo(()=>[{label:"Item",render:r=>html`<div><div style=${{fontWeight:700}}>${r.item_name}</div><div className="muted" style=${{fontSize:"12px",marginTop:"3px"}}>${r.bin?"BIN auction":"Auction"}</div></div>`},{label:"Start",render:r=>`${coins(r.starting_bid)} coins`},{label:"Highest",render:r=>`${coins(r.highest_bid)} coins`},{label:"Ends In",render:r=>uptime(Math.max(0,r.time_remaining_seconds||0))},{label:"Actions",render:r=>html`<${Btn} variant="secondary" className="mono" onClick=${()=>post(API.cancelAuction,{item_name:r.item_name,starting_bid:r.starting_bid},"Auction cancel queued")}>Cancel</${Btn}>`}],[post]);
-const bzCols=useMemo(()=>[{label:"Item",key:"item_name"},{label:"Type",render:r=>r.is_buy_order?"Buy":"Sell"},{label:"Amount",render:r=>String(r.amount??"-")},{label:"Price",render:r=>`${coins(r.price_per_unit)} coins`},{label:"Actions",render:r=>html`<${Btn} variant="secondary" className="mono" onClick=${()=>post(API.cancelBz,{item_name:r.item_name,is_buy_order:r.is_buy_order},"Bazaar cancel queued")}>Cancel</${Btn}>`}],[post]);
-const queueCols=useMemo(()=>[{label:"Priority",key:"priority"},{label:"Command",render:r=>html`<code>${JSON.stringify(r.command_type,null,2)}</code>`}],[]);
-const tabs=[["overview","Overview"],["profit","Profit"],["inventory","Inventory"],["market","Market"],["queue","Queue"],["config","Config"],["chat","Chat"]];
-return html`<main className="app"><${Card} className="header"><div className="inner" style=${{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",gap:"16px",flexWrap:"wrap"}}><div><div className="kicker">Built-In Web GUI</div><div style=${{fontSize:"1.9rem",fontWeight:900,letterSpacing:"-.05em",marginTop:"8px"}}>TWM Local Control</div></div><nav className="tabs">${tabs.map(([k,l])=>html`<button key=${k} className=${cls("tab",tab===k&&"active")} onClick=${()=>setTab(k)}>${l}</button>`)}</nav></div></${Card}><${Card} className="hero"><div className="inner"><div className="kicker">Live Control Surface</div><h1 className="headline">TWM command deck <span>for faster flips and cleaner runtime control.</span></h1><p className="sub">The local web GUI now runs without in-browser Babel or Tailwind CDN. Profit history persists across restarts, and the panel still talks to the same Rust endpoints.</p><div className="actions"><${Btn} variant="warn" onClick=${()=>post(API.pause,null,"Macro paused")}>Pause Macro</${Btn}><${Btn} variant="success" onClick=${()=>post(API.resume,null,"Macro resumed")}>Resume Macro</${Btn}><${Btn} variant="secondary" onClick=${()=>post(API.claimPurchases,null,"Claim purchases queued")}>Claim Purchases</${Btn}><${Btn} variant="secondary" onClick=${()=>post(API.collectBz,null,"Collect BZ queued")}>Collect BZ</${Btn}><${Btn} variant="secondary" onClick=${()=>post(API.claimBz,null,"Claim BZ queued")}>Claim BZ</${Btn}><${Btn} variant="danger" onClick=${()=>post(API.cancelAllBz,null,"Cancel all BZ queued")}>Cancel All BZ</${Btn}></div></div><div className="inner"><div className="metricGrid"><${Metric} label="State" value=${status.state||"-"} /><${Metric} label="Queue Depth" value=${String(status.queue_depth??"-")} /><${Metric} label="Purse" value=${status.purse!=null?`${coins(status.purse)} coins`:"-"} accent="blue" /><${Metric} label="Uptime" value=${uptime(status.uptime_seconds)} accent="pink" /><${Metric} label="Account" value=${status.current_account||"-"} /><${Metric} label="Macro" value=${status.macro_paused?"Paused":"Running"} accent=${status.macro_paused?"gold":"green"} /></div></div></${Card}>
-${tab==="overview"?html`<section className="grid2"><${Card} className="card"><div className="kicker">Runtime Controls</div><h2 className="title" style=${{marginTop:"10px"}}>Live toggles and account switching</h2><p className="sub">Quick toggles for core runtime features without leaving the local panel.</p><div className="actions"><${Btn} variant=${status.enable_ah_flips?"primary":"secondary"} onClick=${()=>post(API.toggleAh,{enabled:!status.enable_ah_flips},`AH flips ${!status.enable_ah_flips?"enabled":"disabled"}`)}>Auction Flips: ${status.enable_ah_flips?"On":"Off"}</${Btn}><${Btn} variant=${status.enable_bazaar_flips?"primary":"secondary"} onClick=${()=>post(API.toggleBazaar,{enabled:!status.enable_bazaar_flips},`Bazaar flips ${!status.enable_bazaar_flips?"enabled":"disabled"}`)}>Bazaar Flips: ${status.enable_bazaar_flips?"On":"Off"}</${Btn}><${Btn} variant=${status.anonymize_webhook_name?"primary":"secondary"} onClick=${()=>post(API.toggleAnon,{enabled:!status.anonymize_webhook_name},`Anonymize ${!status.anonymize_webhook_name?"enabled":"disabled"}`)}>Anonymize: ${status.anonymize_webhook_name?"On":"Off"}</${Btn}></div><div className="metricGrid panel">${(status.accounts||[]).map((a,i)=>html`<button key=${`${a}-${i}`} className="metric" onClick=${()=>post(API.switchAccount,{index:i},`Switching to ${a}`)}><small>Account ${i+1}</small><strong>${a}</strong></button>`)}</div></${Card}><div><${Card} className="card"><div className="kicker">Session Snapshot</div><h2 className="title" style=${{marginTop:"10px"}}>Profit at a glance</h2><div className="metricGrid panel"><${Metric} label="AH Profit" value=${coins(profit.ah_total)} accent="green" /><${Metric} label="BZ Profit" value=${coins(profit.bz_total)} accent="blue" /><${Metric} label="Total" value=${coins(total)} accent="pink" /><${Metric} label="Per Hour" value=${`${coins(perHour)}/hr`} accent="gold" /></div></${Card}><div className="panel"><${Inv} title=${gameView.open?`Open Window: ${gameView.title||"Unknown"}`:"Live Window View"} label=${gameView.open?`Window ${gameView.windowId||"-"}`:"Game view"} slots=${gameView.slots||[]} /></div></div></section>`:null}
-${tab==="profit"?html`<section className="grid3"><${ChartCard} title="Auction house profit" sub=${`Total ${coins(profit.ah_total)} - persisted across restarts`} points=${profit.ah_points||[]} color="#39d98a" fill="rgba(57,217,138,.17)" /><${ChartCard} title="Bazaar profit" sub=${`Total ${coins(profit.bz_total)} - persisted across restarts`} points=${profit.bz_points||[]} color="#5aa7ff" fill="rgba(90,167,255,.16)" /><${ChartCard} title="Combined curve" sub=${`Uptime ${uptime(profit.uptime_seconds)} - ${coins(perHour)}/hr`} points=${combined} color="#ff4d8d" fill="rgba(255,77,141,.15)" /></section>`:null}
-${tab==="inventory"?html`<section className="grid2"><${Inv} title="Inventory" label="Player inventory" slots=${inventory.slots||[]} /><${Inv} title="Game View" label=${gameView.open?(gameView.title||"Window"):"No active window"} slots=${gameView.slots||[]} /></section>`:null}
-${tab==="market"?html`<section className="grid2"><${Table} title="Active Auctions" rows=${auctions||[]} cols=${auctionCols} empty="No active auctions found." keyFn=${r=>r.uuid||r.item_name} /><${Table} title="Bazaar Orders" rows=${bzOrders||[]} cols=${bzCols} empty="No active bazaar orders found." keyFn=${(r,i)=>`${r.item_name}-${r.is_buy_order}-${i}`} /></section>`:null}
-${tab==="queue"?html`<section className="grid2"><${Card} className="card"><div className="kicker">Bot Condition</div><h2 className="title" style=${{marginTop:"10px"}}>Queue and limits</h2><div className="metricGrid panel"><${Metric} label="Bazaar Limit" value=${status.bazaar_at_limit?"Reached":"Clear"} accent=${status.bazaar_at_limit?"gold":"green"} /><${Metric} label="Auction Limit" value=${status.auction_at_limit?"Reached":"Clear"} accent=${status.auction_at_limit?"gold":"green"} /><${Metric} label="Inventory" value=${status.inventory_full?"Full":"Has Space"} accent=${status.inventory_full?"red":"green"} /><${Metric} label="Current State" value=${status.state||"-"} /></div></${Card}><${Table} title="Command Queue" rows=${queue||[]} cols=${queueCols} empty="Command queue is empty." /></section>`:null}
-${tab==="config"?html`<section className="panel"><${Card} className="card"><div style=${{display:"flex",justifyContent:"space-between",alignItems:"end",gap:"16px",flexWrap:"wrap"}}><div><div className="kicker">Config File</div><h2 className="title" style=${{marginTop:"10px"}}>Raw config editor</h2><p className="sub">Edit the local TOML config directly and save it through the built-in API.</p></div><div className="actions" style=${{marginTop:0}}><${Btn} onClick=${saveConfig}>Save Config</${Btn}><${Btn} variant="secondary" onClick=${loadConfig}>Reload</${Btn}></div></div>${configMsg?html`<div className="metric panel">${configMsg}</div>`:null}<textarea className="mono" style=${{minHeight:"540px",padding:"18px",marginTop:"18px"}} value=${configText} onInput=${e=>setConfigText(e.target.value)}></textarea></${Card}></section>`:null}
-${tab==="chat"?html`<section className="grid2"><${Card} className="card"><div className="kicker">Live Console</div><h2 className="title" style=${{marginTop:"10px"}}>Chat stream</h2><div className="chat panel">${!(chat||[]).length?html`<div className="muted">Waiting for chat traffic...</div>`:(chat||[]).map((m,i)=>html`<div className="line" key=${i}>${stripMc(m)}</div>`)}</div></${Card}><${Card} className="card"><div className="kicker">Send Commands</div><h2 className="title" style=${{marginTop:"10px"}}>Chat input</h2><p className="sub">Use this for in-game chat, COFL commands, and the compatibility command surface.</p><textarea style=${{minHeight:"180px",padding:"16px",marginTop:"18px"}} value=${chatInput} placeholder="Type a message or command..." onInput=${e=>setChatInput(e.target.value)}></textarea><div className="actions"><${Btn} onClick=${sendChat}>Send Chat</${Btn}><${Btn} variant="secondary" onClick=${()=>setChatInput("/cofl ping")}>Insert /cofl ping</${Btn}><${Btn} variant="secondary" onClick=${()=>setChatInput("/baf")}>Insert /baf</${Btn}></div></${Card}></section>`:null}
-${toast?html`<div className="toast">${toast}</div>`:null}<${Overlay} show=${needsAuth} password=${password} setPassword=${setPassword} error=${loginError} onLogin=${login} profit=${publicProfit} /></main>`}
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+const html = htm.bind(React.createElement);
+
+const API = {
+    status: "/api/status",
+    login: "/api/login",
+    profit: "/api/profit",
+    publicProfit: "/api/profit/public",
+    inventory: "/api/inventory",
+    gameView: "/api/game-view",
+    auctions: "/api/auctions",
+    bazaarOrders: "/api/bazaar_orders",
+    queue: "/api/queue",
+    config: "/api/config",
+    pause: "/api/pause",
+    resume: "/api/resume",
+    toggleAh: "/api/toggle_ah",
+    toggleBazaar: "/api/toggle_bazaar",
+    toggleAnon: "/api/toggle_anonymize",
+    switchAccount: "/api/switch_account",
+    claimPurchases: "/api/claim_purchases",
+    collectBz: "/api/collect_bz_orders",
+    claimBz: "/api/claim_bz_orders",
+    cancelAllBz: "/api/cancel_all_bz_orders",
+    cancelAuction: "/api/cancel_auction",
+    cancelBz: "/api/cancel_bz_order",
+    chatSend: "/api/chat/send",
+    logsLatest: "/api/logs/latest",
+    chatWs: () => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/chat/ws`
+};
+
+const TAB_DEFS = [
+    ["dashboard", "Dashboard"],
+    ["analytics", "Analytics"],
+    ["inventory", "Inventory"],
+    ["market", "Market"],
+    ["queue", "Queue"],
+    ["config", "Config"],
+    ["chat", "Chat"]
+];
+
+function cls(...parts) {
+    return parts.filter(Boolean).join(" ");
+}
+
+function stripMc(text) {
+    return (text || "").replace(/\u00A7[0-9A-FK-OR]/gi, "");
+}
+
+function coins(value) {
+    if (value == null || Number.isNaN(Number(value))) return "-";
+    const n = Number(value);
+    const abs = Math.abs(n);
+    if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+    if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+    if (abs >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return `${Math.round(n)}`;
+}
+
+function formatCoinsLong(value) {
+    if (value == null || Number.isNaN(Number(value))) return "-";
+    return `${Number(value).toLocaleString()} coins`;
+}
+
+function uptime(seconds) {
+    if (seconds == null || Number.isNaN(Number(seconds))) return "-";
+    const s = Math.max(0, Math.floor(Number(seconds)));
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (d > 0) return `${d}d ${h}h ${m}m`;
+    if (h > 0) return `${h}h ${m}m ${sec}s`;
+    return `${m}m ${sec}s`;
+}
+
+function ageFromMs(ms) {
+    if (ms == null) return "-";
+    return uptime(Math.floor(ms / 1000));
+}
+
+function formatPlacedAt(epochSeconds) {
+    if (!epochSeconds) return "-";
+    return new Date(epochSeconds * 1000).toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+    });
+}
+
+function safeTag(slot) {
+    const raw = slot?.tag || stripMc(slot?.displayName || slot?.name || "");
+    const normalized = raw
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+    return normalized || "";
+}
+
+function slotName(slot) {
+    return stripMc(slot?.displayName || slot?.name || "Empty");
+}
+
+function slotIconUrl(slot) {
+    const tag = safeTag(slot);
+    return tag ? `https://sky.coflnet.com/static/icon/${tag}` : "";
+}
+
+function mergeProfitSeries(ahPoints, bzPoints) {
+    const map = new Map();
+    (ahPoints || []).forEach(([ts, value]) => {
+        const existing = map.get(ts) || { ah: 0, bz: 0 };
+        existing.ah = value || 0;
+        map.set(ts, existing);
+    });
+    (bzPoints || []).forEach(([ts, value]) => {
+        const existing = map.get(ts) || { ah: 0, bz: 0 };
+        existing.bz = value || 0;
+        map.set(ts, existing);
+    });
+    return [...map.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([ts, values]) => [ts, (values.ah || 0) + (values.bz || 0)]);
+}
+
+async function req(url, options = {}) {
+    const response = await fetch(url, options);
+    if (response.status === 401) {
+        const error = new Error("Unauthorized");
+        error.status = 401;
+        throw error;
+    }
+    if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        const error = new Error(text || `HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    return contentType.includes("json") ? response.json() : response.text();
+}
+
+const Panel = ({ className, children }) => html`
+    <section className=${cls("surface", className)}>
+        ${children}
+    </section>
+`;
+
+const Button = ({ className, kind = "secondary", size = "", children, ...props }) => html`
+    <button className=${cls("button", kind, size, className)} ...${props}>${children}</button>
+`;
+
+const StatusBadge = ({ label, value, tone = "" }) => html`
+    <span className=${cls("statusBadge", tone)}>
+        ${label ? html`<span>${label}&nbsp;</span>` : null}
+        <strong>${value}</strong>
+    </span>
+`;
+
+const StatCard = ({ label, value, sub, tone = "" }) => html`
+    <div className="statCard">
+        <small>${label}</small>
+        <strong className=${tone}>${value}</strong>
+        ${sub ? html`<span>${sub}</span>` : null}
+    </div>
+`;
+
+function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
+    const canvasRef = useRef(null);
+    const chartRef = useRef(null);
+
+    useEffect(() => {
+        if (!canvasRef.current || !window.Chart) return undefined;
+
+        if (chartRef.current) {
+            chartRef.current.destroy();
+        }
+
+        const labels = (points || []).map(([ts]) =>
+            new Date(ts * 1000).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit"
+            })
+        );
+
+        chartRef.current = new Chart(canvasRef.current, {
+            type: "line",
+            data: {
+                labels,
+                datasets: [
+                    {
+                        data: (points || []).map(([, value]) => value),
+                        borderColor: color,
+                        backgroundColor: fill,
+                        fill: true,
+                        tension: 0.32,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { intersect: false, mode: "index" },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: (context) => formatCoinsLong(context.parsed.y)
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        grid: { color: "rgba(255,255,255,.04)" },
+                        ticks: { color: "#9db2ac", maxTicksLimit: 6 }
+                    },
+                    y: {
+                        grid: { color: "rgba(255,255,255,.04)" },
+                        ticks: {
+                            color: "#9db2ac",
+                            callback: (value) => coins(value)
+                        }
+                    }
+                }
+            }
+        });
+
+        return () => {
+            if (chartRef.current) {
+                chartRef.current.destroy();
+                chartRef.current = null;
+            }
+        };
+    }, [points, color, fill]);
+
+    return html`
+        <${Panel}>
+            <div className="cardBody">
+                <div className="sectionTitle">
+                    <div>
+                        <span className="eyebrow">Profit</span>
+                        <h2 className="panelTitle">${title}</h2>
+                        ${subtitle ? html`<p>${subtitle}</p>` : null}
+                    </div>
+                </div>
+                <div className="chartWrap" style=${{ height: `${height}px` }}>
+                    <canvas ref=${canvasRef}></canvas>
+                </div>
+            </div>
+        </${Panel}>
+    `;
+}
+
+function InventoryPanel({ title, subtitle, slots }) {
+    const list = Array.isArray(slots) ? slots : [];
+    const defaultIndex = Math.max(0, list.findIndex((slot) => !slot?.empty && (slot?.name || slot?.displayName)));
+    const [activeIndex, setActiveIndex] = useState(defaultIndex);
+
+    useEffect(() => {
+        if (!list.length) {
+            setActiveIndex(0);
+            return;
+        }
+        if (activeIndex >= list.length || activeIndex < 0) {
+            setActiveIndex(Math.max(0, list.findIndex((slot) => !slot?.empty && (slot?.name || slot?.displayName))));
+        }
+    }, [list, activeIndex]);
+
+    const selected = list[activeIndex] || list[defaultIndex] || {};
+    const selectedName = slotName(selected);
+    const selectedIcon = slotIconUrl(selected);
+    const lore = Array.isArray(selected?.lore) ? selected.lore : [];
+
+    return html`
+        <${Panel}>
+            <div className="cardBody">
+                <div className="sectionTitle">
+                    <div>
+                        <span className="eyebrow">Inspection</span>
+                        <h2 className="panelTitle">${title}</h2>
+                        <p>${subtitle}</p>
+                    </div>
+                    <div className="tagList">
+                        <span className="tag">${list.length} slots</span>
+                        ${selected?.tag ? html`<span className="tag mono">${selected.tag}</span>` : null}
+                    </div>
+                </div>
+
+                ${!list.length ? html`<div className="emptyState">No slot data yet.</div>` : html`
+                    <div className="inventoryLayout">
+                        <div className="slotGrid">
+                            ${list.map((slot, index) => {
+                                const empty = slot?.empty || (!slot?.name && !slot?.displayName);
+                                const icon = slotIconUrl(slot);
+                                const label = slotName(slot);
+                                return html`
+                                    <button
+                                        key=${`${slot?.slot ?? index}-${label}`}
+                                        type="button"
+                                        className=${cls("slotButton", activeIndex === index && "active")}
+                                        onClick=${() => setActiveIndex(index)}
+                                    >
+                                        <span className="slotId">#${slot?.slot ?? index}</span>
+                                        <div className="slotIcon">
+                                            ${icon && !empty ? html`
+                                                <img src=${icon} alt=${label} onError=${(event) => { event.currentTarget.style.display = "none"; }} />
+                                            ` : html`
+                                                <span className="slotFallback">${empty ? "Empty" : label.slice(0, 20)}</span>
+                                            `}
+                                        </div>
+                                        ${!empty && Number(slot?.count) > 1 ? html`<span className="slotCount">${slot.count}</span>` : null}
+                                        <div className="slotLabel">${empty ? "No item" : label}</div>
+                                    </button>
+                                `;
+                            })}
+                        </div>
+
+                        <div className="detailCard">
+                            <div className="detailTop">
+                                <div className="slotIcon">
+                                    ${selectedIcon && !selected?.empty ? html`
+                                        <img src=${selectedIcon} alt=${selectedName} onError=${(event) => { event.currentTarget.style.display = "none"; }} />
+                                    ` : html`
+                                        <span className="slotFallback">${selected?.empty ? "Empty" : selectedName.slice(0, 24)}</span>
+                                    `}
+                                </div>
+                                <div>
+                                    <span className="eyebrow">Selected Slot</span>
+                                    <h3 className="detailTitle">${selectedName}</h3>
+                                    <div className="detailMeta">
+                                        <span className="tag">Slot ${selected?.slot ?? activeIndex}</span>
+                                        <span className="tag">Count ${selected?.count ?? 0}</span>
+                                        ${selected?.tag ? html`<span className="tag mono">${selected.tag}</span>` : null}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="miniList">
+                                <div className="miniRow"><strong>Registry</strong><span className="mono">${selected?.name || "-"}</span></div>
+                                <div className="miniRow"><strong>Display Name</strong><span>${selected?.displayName ? stripMc(selected.displayName) : "-"}</span></div>
+                                <div className="miniRow"><strong>Colored Name</strong><span>${selected?.displayNameColored || "-"}</span></div>
+                            </div>
+
+                            ${lore.length ? html`
+                                <div>
+                                    <span className="eyebrow">Lore</span>
+                                    <ul className="detailLore">
+                                        ${lore.map((line, index) => html`<li key=${index}>${line}</li>`)}
+                                    </ul>
+                                </div>
+                            ` : html`<div className="muted">No lore available for this slot.</div>`}
+                        </div>
+                    </div>
+                `}
+            </div>
+        </${Panel}>
+    `;
+}
+
+function MarketTableCard({ title, subtitle, rows, emptyText, columns, detailRenderer, keyFn, summaryTags }) {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const initialKey = safeRows.length ? keyFn(safeRows[0], 0) : null;
+    const [selectedKey, setSelectedKey] = useState(initialKey);
+
+    useEffect(() => {
+        if (!safeRows.length) {
+            setSelectedKey(null);
+            return;
+        }
+        const currentExists = safeRows.some((row, index) => keyFn(row, index) === selectedKey);
+        if (!currentExists) {
+            setSelectedKey(keyFn(safeRows[0], 0));
+        }
+    }, [safeRows, selectedKey, keyFn]);
+
+    const selectedRow = safeRows.find((row, index) => keyFn(row, index) === selectedKey) || safeRows[0] || null;
+
+    return html`
+        <${Panel}>
+            <div className="cardBody">
+                <div className="sectionTitle">
+                    <div>
+                        <span className="eyebrow">Market</span>
+                        <h2 className="panelTitle">${title}</h2>
+                        <p>${subtitle}</p>
+                    </div>
+                    <div className="tagList">
+                        ${(summaryTags || []).map((tag, index) => html`<span className="tag" key=${index}>${tag}</span>`)}
+                    </div>
+                </div>
+
+                ${!safeRows.length ? html`
+                    <div className="emptyState">${emptyText}</div>
+                ` : html`
+                    <div className="tableShell">
+                        <div className="tableWrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        ${columns.map((column) => html`<th key=${column.label}>${column.label}</th>`)}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${safeRows.map((row, index) => {
+                                        const rowKey = keyFn(row, index);
+                                        return html`
+                                            <tr
+                                                key=${rowKey}
+                                                className=${selectedKey === rowKey ? "selected" : ""}
+                                                onClick=${() => setSelectedKey(rowKey)}
+                                            >
+                                                ${columns.map((column) => html`
+                                                    <td key=${column.label}>
+                                                        ${column.render ? column.render(row, index) : row[column.key]}
+                                                    </td>
+                                                `)}
+                                            </tr>
+                                        `;
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div className="detailCard">
+                            ${selectedRow ? detailRenderer(selectedRow) : html`<div className="muted">No row selected.</div>`}
+                        </div>
+                    </div>
+                `}
+            </div>
+        </${Panel}>
+    `;
+}
+
+function QueueCard({ status, queue }) {
+    const entries = Array.isArray(queue) ? queue : [];
+    return html`
+        <${Panel}>
+            <div className="cardBody">
+                <div className="sectionTitle">
+                    <div>
+                        <span className="eyebrow">Queue</span>
+                        <h2 className="panelTitle">Current work and limits</h2>
+                        <p>See what is executing right now and whether the runtime is blocked by limits or inventory pressure.</p>
+                    </div>
+                </div>
+
+                <div className="kpiStrip">
+                    <div className="kpi"><small>Runtime State</small><strong>${status.state || "-"}</strong></div>
+                    <div className="kpi"><small>Bazaar Limit</small><strong>${status.bazaar_at_limit ? "Reached" : "Clear"}</strong></div>
+                    <div className="kpi"><small>Auction Limit</small><strong>${status.auction_at_limit ? "Reached" : "Clear"}</strong></div>
+                    <div className="kpi"><small>Inventory</small><strong>${status.inventory_full ? "Full" : "Has Space"}</strong></div>
+                </div>
+
+                ${entries.length ? html`
+                    <div className="queueList">
+                        ${entries.map((entry, index) => html`
+                            <div className=${cls("queueEntry", entry.executing && "executing")} key=${`${entry.display_name}-${index}`}>
+                                <div>
+                                    <h3>${entry.display_name}</h3>
+                                    <p>${entry.executing ? "Executing now" : "Waiting in queue"} · Priority ${entry.priority}</p>
+                                </div>
+                                <div className="tagList">
+                                    <span className="tag">${ageFromMs(entry.age_ms)}</span>
+                                    ${entry.executing ? html`<span className="tag tone-green">Active</span>` : null}
+                                </div>
+                            </div>
+                        `)}
+                    </div>
+                ` : html`<div className="emptyState">Command queue is empty.</div>`}
+            </div>
+        </${Panel}>
+    `;
+}
+
+function LoginOverlay({ show, password, setPassword, error, onLogin, publicProfit }) {
+    if (!show) return null;
+
+    const combined = mergeProfitSeries(publicProfit.ah_points, publicProfit.bz_points);
+    const total = (publicProfit.ah_total || 0) + (publicProfit.bz_total || 0);
+    const perHour = publicProfit.uptime_seconds ? total / (publicProfit.uptime_seconds / 3600) : 0;
+
+    return html`
+        <div className="overlay">
+            <div className="overlayGrid">
+                <${Panel}>
+                    <div className="loginPanel">
+                        <span className="eyebrow">Secure Access</span>
+                        <h2>Unlock the local TWM panel.</h2>
+                        <p className="subtle">
+                            The local UI is protected by the web GUI password when one is configured. Authenticate once and the session cookie keeps the panel usable.
+                        </p>
+
+                        <input
+                            className="loginField"
+                            type="password"
+                            value=${password}
+                            placeholder="Web GUI password"
+                            autoComplete="current-password"
+                            onInput=${(event) => setPassword(event.target.value)}
+                            onKeyDown=${(event) => {
+                                if (event.key === "Enter") onLogin();
+                            }}
+                        />
+
+                        ${error ? html`<div className="loginError">${error}</div>` : null}
+
+                        <div className="loginActions">
+                            <${Button} kind="primary" onClick=${onLogin}>Unlock Panel</${Button}>
+                            <a className="button secondary" href="https://github.com/froumes/escrow" target="_blank" rel="noreferrer">Repository</a>
+                        </div>
+
+                        <div className="miniList">
+                            <div className="miniRow"><strong>What stays public</strong><span>Only anonymized profit summary and OG stats.</span></div>
+                            <div className="miniRow"><strong>What stays locked</strong><span>Runtime controls, config, inventory, market state, and chat.</span></div>
+                        </div>
+                    </div>
+                </${Panel}>
+
+                <${Panel}>
+                    <div className="cardBody">
+                        <div className="sectionTitle">
+                            <div>
+                                <span className="eyebrow">Public Snapshot</span>
+                                <h2 className="panelTitle">Session profit before login</h2>
+                                <p>Anonymized totals are still visible so the page is not dead on arrival.</p>
+                            </div>
+                        </div>
+
+                        <div className="statGrid">
+                            <${StatCard} label="AH Profit" value=${coins(publicProfit.ah_total || 0)} tone="tone-green" />
+                            <${StatCard} label="BZ Profit" value=${coins(publicProfit.bz_total || 0)} tone="tone-blue" />
+                            <${StatCard} label="Combined" value=${coins(total)} tone="tone-gold" sub=${`${coins(perHour)}/hr`} />
+                        </div>
+
+                        <div style=${{ marginTop: "18px" }}>
+                            <${ChartCard}
+                                title="Combined session curve"
+                                subtitle=${`Uptime ${uptime(publicProfit.uptime_seconds || 0)}`}
+                                points=${combined}
+                                color="#81b7ff"
+                                fill="rgba(129,183,255,.16)"
+                                height=${280}
+                            />
+                        </div>
+                    </div>
+                </${Panel}>
+            </div>
+        </div>
+    `;
+}
+
+function App() {
+    const [activeTab, setActiveTab] = useState("dashboard");
+    const [needsAuth, setNeedsAuth] = useState(false);
+    const [password, setPassword] = useState("");
+    const [loginError, setLoginError] = useState("");
+    const [toast, setToast] = useState("");
+    const [lastRefresh, setLastRefresh] = useState(null);
+
+    const [status, setStatus] = useState({});
+    const [profit, setProfit] = useState({
+        ah_points: [],
+        bz_points: [],
+        ah_total: 0,
+        bz_total: 0,
+        uptime_seconds: 0
+    });
+    const [publicProfit, setPublicProfit] = useState({
+        ah_points: [],
+        bz_points: [],
+        ah_total: 0,
+        bz_total: 0,
+        uptime_seconds: 0
+    });
+    const [inventory, setInventory] = useState({ slots: [] });
+    const [gameView, setGameView] = useState({ open: false, slots: [] });
+    const [auctions, setAuctions] = useState([]);
+    const [bzOrders, setBzOrders] = useState([]);
+    const [queue, setQueue] = useState([]);
+    const [configText, setConfigText] = useState("");
+    const [savedConfigText, setSavedConfigText] = useState("");
+    const [configMsg, setConfigMsg] = useState("");
+    const [chatInput, setChatInput] = useState("");
+    const [chat, setChat] = useState([]);
+    const [chatConnected, setChatConnected] = useState(false);
+
+    const chatBoxRef = useRef(null);
+    const toastTimerRef = useRef(null);
+
+    const flash = useCallback((message) => {
+        setToast(message);
+        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = window.setTimeout(() => setToast(""), 2600);
+    }, []);
+
+    const handleUnauthorized = useCallback(() => {
+        setNeedsAuth(true);
+        setChatConnected(false);
+    }, []);
+
+    const loadJson = useCallback(async (url, setter, { silent = true } = {}) => {
+        try {
+            const value = await req(url);
+            setter(value);
+            setNeedsAuth(false);
+            setLoginError("");
+            return value;
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+            } else if (!silent) {
+                flash(error.message || "Request failed");
+            }
+            return null;
+        }
+    }, [flash, handleUnauthorized]);
+
+    const loadConfig = useCallback(async ({ silent = true } = {}) => {
+        try {
+            const text = await req(API.config);
+            setConfigText(text);
+            setSavedConfigText(text);
+            setConfigMsg("");
+            setNeedsAuth(false);
+            setLoginError("");
+            return text;
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+            } else if (!silent) {
+                setConfigMsg(error.message || "Failed to load config");
+                flash(error.message || "Failed to load config");
+            }
+            return null;
+        }
+    }, [flash, handleUnauthorized]);
+
+    const refreshCore = useCallback(async () => {
+        const results = await Promise.all([
+            loadJson(API.status, setStatus),
+            loadJson(API.profit, setProfit),
+            loadJson(API.queue, setQueue)
+        ]);
+        if (results.some(Boolean)) {
+            setLastRefresh(Date.now());
+        }
+    }, [loadJson]);
+
+    const refreshSurface = useCallback(async () => {
+        await Promise.all([
+            loadJson(API.inventory, setInventory),
+            loadJson(API.gameView, setGameView)
+        ]);
+    }, [loadJson]);
+
+    const refreshMarket = useCallback(async () => {
+        await Promise.all([
+            loadJson(API.auctions, setAuctions),
+            loadJson(API.bazaarOrders, setBzOrders)
+        ]);
+    }, [loadJson]);
+
+    const refreshEverything = useCallback(async () => {
+        await Promise.all([refreshCore(), refreshSurface(), refreshMarket()]);
+    }, [refreshCore, refreshSurface, refreshMarket]);
+
+    const post = useCallback(async (url, body, successMessage) => {
+        const options = { method: "POST" };
+        if (body != null) {
+            options.headers = { "Content-Type": "application/json" };
+            options.body = JSON.stringify(body);
+        }
+
+        try {
+            await req(url, options);
+            if (successMessage) flash(successMessage);
+            await refreshEverything();
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+            } else {
+                flash(error.message || "Request failed");
+            }
+        }
+    }, [flash, handleUnauthorized, refreshEverything]);
+
+    const login = useCallback(async () => {
+        try {
+            await req(API.login, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ password })
+            });
+            setNeedsAuth(false);
+            setLoginError("");
+            flash("Panel unlocked");
+            await refreshEverything();
+            await loadConfig();
+        } catch (error) {
+            setLoginError("Invalid password");
+        }
+    }, [password, flash, refreshEverything, loadConfig]);
+
+    const saveConfig = useCallback(async () => {
+        try {
+            await req(API.config, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ config_toml: configText })
+            });
+            setSavedConfigText(configText);
+            setConfigMsg("Config saved");
+            flash("Config saved");
+            await refreshCore();
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+            } else {
+                setConfigMsg(error.message || "Config save failed");
+                flash(error.message || "Config save failed");
+            }
+        }
+    }, [configText, flash, handleUnauthorized, refreshCore]);
+
+    const sendChat = useCallback(async () => {
+        if (!chatInput.trim()) return;
+        try {
+            await req(API.chatSend, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: chatInput.trim() })
+            });
+            setChatInput("");
+            flash("Chat sent");
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+            } else {
+                flash(error.message || "Failed to send chat");
+            }
+        }
+    }, [chatInput, flash, handleUnauthorized]);
+
+    useEffect(() => {
+        req(API.publicProfit)
+            .then(setPublicProfit)
+            .catch(() => {});
+        refreshEverything();
+        loadConfig();
+    }, [refreshEverything, loadConfig]);
+
+    useEffect(() => {
+        const interval = window.setInterval(() => {
+            req(API.publicProfit).then(setPublicProfit).catch(() => {});
+        }, 15000);
+        return () => window.clearInterval(interval);
+    }, []);
+
+    useEffect(() => {
+        if (needsAuth) return undefined;
+
+        const tick = () => {
+            refreshCore();
+            if (activeTab === "dashboard" || activeTab === "inventory") {
+                refreshSurface();
+            }
+            if (activeTab === "dashboard" || activeTab === "market") {
+                refreshMarket();
+            }
+        };
+
+        tick();
+        const interval = window.setInterval(tick, 5000);
+        return () => window.clearInterval(interval);
+    }, [needsAuth, activeTab, refreshCore, refreshSurface, refreshMarket]);
+
+    useEffect(() => {
+        if (activeTab === "config" && !configText) {
+            loadConfig();
+        }
+    }, [activeTab, configText, loadConfig]);
+
+    useEffect(() => {
+        if (activeTab !== "config") return undefined;
+        const onKeyDown = (event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+                event.preventDefault();
+                saveConfig();
+            }
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+    }, [activeTab, saveConfig]);
+
+    useEffect(() => {
+        if (needsAuth) return undefined;
+
+        let socket;
+        let closed = false;
+        let reconnectTimer = null;
+
+        const connect = () => {
+            socket = new WebSocket(API.chatWs());
+            socket.onopen = () => setChatConnected(true);
+            socket.onmessage = (event) => {
+                setChat((previous) => [...previous.slice(-299), event.data]);
+            };
+            socket.onerror = () => {
+                setChatConnected(false);
+            };
+            socket.onclose = () => {
+                setChatConnected(false);
+                if (!closed) {
+                    reconnectTimer = window.setTimeout(connect, 3000);
+                }
+            };
+        };
+
+        connect();
+
+        return () => {
+            closed = true;
+            setChatConnected(false);
+            if (reconnectTimer) window.clearTimeout(reconnectTimer);
+            if (socket && socket.readyState <= 1) {
+                socket.close();
+            }
+        };
+    }, [needsAuth]);
+
+    useEffect(() => {
+        const box = chatBoxRef.current;
+        if (!box) return;
+        const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 72;
+        if (nearBottom) {
+            box.scrollTop = box.scrollHeight;
+        }
+    }, [chat]);
+
+    const totalProfit = (profit.ah_total || 0) + (profit.bz_total || 0);
+    const combinedPoints = useMemo(
+        () => mergeProfitSeries(profit.ah_points, profit.bz_points),
+        [profit.ah_points, profit.bz_points]
+    );
+    const perHour = profit.uptime_seconds ? totalProfit / (profit.uptime_seconds / 3600) : 0;
+    const dirtyConfig = configText !== savedConfigText;
+    const selectedWindowLabel = gameView.open ? `${gameView.title || "Unknown window"} · ${gameView.slotCount || (gameView.slots || []).length} slots` : "No active window";
+    const activeAuctionCount = Array.isArray(auctions) ? auctions.length : 0;
+    const activeBzCount = Array.isArray(bzOrders) ? bzOrders.length : 0;
+    const buyOrders = (bzOrders || []).filter((order) => order.is_buy_order).length;
+    const sellOrders = (bzOrders || []).filter((order) => !order.is_buy_order).length;
+    const filledOrders = (bzOrders || []).filter((order) => order.status === "filled").length;
+    const soonestAuction = (auctions || []).reduce((current, auction) => {
+        const remaining = Number(auction.time_remaining_seconds || 0);
+        if (!current || remaining < current) return remaining;
+        return current;
+    }, null);
+
+    const auctionColumns = useMemo(() => ([
+        {
+            label: "Item",
+            render: (row) => html`
+                <div>
+                    <div className="rowTitle">${row.item_name}</div>
+                    <div className="rowSub">${row.bin ? "BIN listing" : "Auction listing"}</div>
+                </div>
+            `
+        },
+        {
+            label: "Starting",
+            render: (row) => formatCoinsLong(row.starting_bid)
+        },
+        {
+            label: "Highest",
+            render: (row) => formatCoinsLong(row.highest_bid)
+        },
+        {
+            label: "Ends In",
+            render: (row) => uptime(Math.max(0, row.time_remaining_seconds || 0))
+        }
+    ]), []);
+
+    const bzColumns = useMemo(() => ([
+        {
+            label: "Item",
+            render: (row) => html`
+                <div>
+                    <div className="rowTitle">${row.item_name}</div>
+                    <div className="rowSub">${row.status || "open"}</div>
+                </div>
+            `
+        },
+        {
+            label: "Side",
+            render: (row) => row.is_buy_order ? "Buy" : "Sell"
+        },
+        {
+            label: "Amount",
+            render: (row) => Number(row.amount || 0).toLocaleString()
+        },
+        {
+            label: "Price",
+            render: (row) => formatCoinsLong(row.price_per_unit)
+        }
+    ]), []);
+
+    return html`
+        <main className="app">
+            <${Panel}>
+                <div className="topbar">
+                    <div className="brandWrap">
+                        <div className="brandMark">TWM</div>
+                        <div className="brandText">
+                            <span className="eyebrow">Local Runtime Control</span>
+                            <h1>Operational panel for live flips, queue state, market cleanup, and config.</h1>
+                            <div className="brandMeta">
+                                <${StatusBadge} label="Macro" value=${status.macro_paused ? "Paused" : "Running"} tone=${status.macro_paused ? "tone-gold" : "tone-green"} />
+                                <${StatusBadge} label="State" value=${status.state || "-"} tone="tone-blue" />
+                                <${StatusBadge} label="Account" value=${status.current_account || "-"} />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="toolbar">
+                        <span className="pill">Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
+                        <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
+                        <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
+                    </div>
+                </div>
+
+                <div className="tabbar">
+                    ${TAB_DEFS.map(([key, label]) => html`
+                        <button key=${key} type="button" className=${cls("tab", activeTab === key && "active")} onClick=${() => setActiveTab(key)}>
+                            ${label}
+                        </button>
+                    `)}
+                </div>
+            </${Panel}>
+
+            <div className="layout">
+                ${activeTab === "dashboard" ? html`
+                    <${Panel}>
+                        <div className="hero">
+                            <div className="heroCopy">
+                                <span className="eyebrow">Runtime Summary</span>
+                                <h2>Keep the bot controllable without hunting across seven cramped tabs.</h2>
+                                <p className="subtle">
+                                    The panel is now organized around actual operating tasks: pause or resume fast, inspect the live state, manage market cleanup, switch accounts, and reach the data that matters without digging.
+                                </p>
+                                <div className="heroActions">
+                                    <${Button} kind="warn" onClick=${() => post(API.pause, null, "Macro paused")}>Pause Macro</${Button}>
+                                    <${Button} kind="success" onClick=${() => post(API.resume, null, "Macro resumed")}>Resume Macro</${Button}>
+                                    <${Button} kind="secondary" onClick=${() => post(API.claimPurchases, null, "Claim purchases queued")}>Claim Purchases</${Button}>
+                                    <${Button} kind="secondary" onClick=${() => post(API.collectBz, null, "Collect bazaar orders queued")}>Collect BZ</${Button}>
+                                    <${Button} kind="secondary" onClick=${() => post(API.claimBz, null, "Claim bazaar orders queued")}>Claim Filled BZ</${Button}>
+                                    <${Button} kind="danger" onClick=${() => post(API.cancelAllBz, null, "Cancel all bazaar orders queued")}>Cancel All BZ</${Button}>
+                                </div>
+                                <div className="heroMeta">
+                                    <span className=${cls("pill", status.enable_ah_flips ? "tone-green" : "tone-red")}>AH ${status.enable_ah_flips ? "enabled" : "disabled"}</span>
+                                    <span className=${cls("pill", status.enable_bazaar_flips ? "tone-green" : "tone-red")}>BZ ${status.enable_bazaar_flips ? "enabled" : "disabled"}</span>
+                                    <span className=${cls("pill", status.anonymize_webhook_name ? "tone-blue" : "")}>Anonymize ${status.anonymize_webhook_name ? "on" : "off"}</span>
+                                    <span className="pill">Queue ${status.queue_depth ?? 0}</span>
+                                </div>
+                            </div>
+
+                            <div className="heroAside">
+                                <div className="statGrid">
+                                    <${StatCard} label="Purse" value=${status.purse != null ? coins(status.purse) : "-"} sub=${status.purse != null ? formatCoinsLong(status.purse) : "No purse cached"} tone="tone-blue" />
+                                    <${StatCard} label="Uptime" value=${uptime(status.uptime_seconds)} sub="Persists across restarts" tone="tone-gold" />
+                                    <${StatCard} label="Per Hour" value=${`${coins(perHour)}/hr`} sub="Combined realized profit" tone="tone-green" />
+                                    <${StatCard} label="AH Profit" value=${coins(profit.ah_total)} sub="Auction house realized" tone="tone-green" />
+                                    <${StatCard} label="BZ Profit" value=${coins(profit.bz_total)} sub="Bazaar realized" tone="tone-blue" />
+                                    <${StatCard} label="Total Profit" value=${coins(totalProfit)} sub=${`${activeAuctionCount} auctions · ${activeBzCount} orders`} tone="tone-gold" />
+                                </div>
+
+                                <div className="detailCard">
+                                    <span className="eyebrow">Live Window</span>
+                                    <h3 className="detailTitle">${gameView.open ? (gameView.title || "Unnamed window") : "No active window"}</h3>
+                                    <div className="detailMeta">
+                                        <span className="tag">${gameView.open ? "Open" : "Closed"}</span>
+                                        <span className="tag">Window ${gameView.windowId ?? "-"}</span>
+                                        <span className="tag">${gameView.slotCount || (gameView.slots || []).length} slots</span>
+                                    </div>
+                                    <p className="subtle">${selectedWindowLabel}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </${Panel}>
+
+                    <div className="dashboardGrid">
+                        <div className="stack">
+                            <${Panel}>
+                                <div className="cardBody">
+                                    <div className="sectionTitle">
+                                        <div>
+                                            <span className="eyebrow">Toggles</span>
+                                            <h2 className="panelTitle">Runtime switches and account routing</h2>
+                                            <p>Frequently used controls stay grouped instead of being scattered across sections.</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="threeCol" style=${{ marginTop: "18px" }}>
+                                        <div className="toggleCard">
+                                            <div className="toggleHead">
+                                                <h3>Auction House flips</h3>
+                                                <${StatusBadge} value=${status.enable_ah_flips ? "On" : "Off"} tone=${status.enable_ah_flips ? "tone-green" : "tone-red"} />
+                                            </div>
+                                            <p>Enable or disable AH flips and persist the toggle to config.</p>
+                                            <${Button}
+                                                kind=${status.enable_ah_flips ? "secondary" : "primary"}
+                                                onClick=${() => post(API.toggleAh, { enabled: !status.enable_ah_flips }, `AH flips ${!status.enable_ah_flips ? "enabled" : "disabled"}`)}
+                                            >
+                                                Turn ${status.enable_ah_flips ? "Off" : "On"}
+                                            </${Button}>
+                                        </div>
+
+                                        <div className="toggleCard">
+                                            <div className="toggleHead">
+                                                <h3>Bazaar flips</h3>
+                                                <${StatusBadge} value=${status.enable_bazaar_flips ? "On" : "Off"} tone=${status.enable_bazaar_flips ? "tone-green" : "tone-red"} />
+                                            </div>
+                                            <p>Control Bazaar order automation independently from AH runtime.</p>
+                                            <${Button}
+                                                kind=${status.enable_bazaar_flips ? "secondary" : "primary"}
+                                                onClick=${() => post(API.toggleBazaar, { enabled: !status.enable_bazaar_flips }, `Bazaar flips ${!status.enable_bazaar_flips ? "enabled" : "disabled"}`)}
+                                            >
+                                                Turn ${status.enable_bazaar_flips ? "Off" : "On"}
+                                            </${Button}>
+                                        </div>
+
+                                        <div className="toggleCard">
+                                            <div className="toggleHead">
+                                                <h3>Anonymize panel/webhook name</h3>
+                                                <${StatusBadge} value=${status.anonymize_webhook_name ? "On" : "Off"} tone="tone-blue" />
+                                            </div>
+                                            <p>Hide account names in screenshots and public-facing webhook surfaces for this session.</p>
+                                            <${Button}
+                                                kind="secondary"
+                                                onClick=${() => post(API.toggleAnon, { enabled: !status.anonymize_webhook_name }, `Anonymize ${!status.anonymize_webhook_name ? "enabled" : "disabled"}`)}
+                                            >
+                                                Toggle Anonymize
+                                            </${Button}>
+                                        </div>
+                                    </div>
+
+                                    <div className="miniList">
+                                        <div className="miniRow">
+                                            <strong>Current account</strong>
+                                            <span>${status.current_account || "-"}</span>
+                                        </div>
+                                        <div className="miniRow">
+                                            <strong>Available accounts</strong>
+                                            <span>${(status.accounts || []).length}</span>
+                                        </div>
+                                    </div>
+
+                                    ${(status.accounts || []).length ? html`
+                                        <div className="accountList" style=${{ marginTop: "16px" }}>
+                                            ${(status.accounts || []).map((account, index) => html`
+                                                <button
+                                                    key=${`${account}-${index}`}
+                                                    type="button"
+                                                    className=${cls("button", index === status.current_account_index ? "primary" : "secondary")}
+                                                    onClick=${() => post(API.switchAccount, { index }, `Switching to ${account}`)}
+                                                >
+                                                    ${index === status.current_account_index ? `Current · ${account}` : `Switch to ${account}`}
+                                                </button>
+                                            `)}
+                                        </div>
+                                    ` : null}
+                                </div>
+                            </${Panel}>
+
+                            <${ChartCard}
+                                title="Combined profit pulse"
+                                subtitle=${`Total ${coins(totalProfit)} · ${coins(perHour)}/hr · uptime ${uptime(profit.uptime_seconds)}`}
+                                points=${combinedPoints}
+                                color="#f2b15c"
+                                fill="rgba(242,177,92,.16)"
+                            />
+                        </div>
+
+                        <div className="stack">
+                            <${Panel}>
+                                <div className="cardBody">
+                                    <div className="sectionTitle">
+                                        <div>
+                                            <span className="eyebrow">Cleanup</span>
+                                            <h2 className="panelTitle">Market maintenance actions</h2>
+                                            <p>Frequent maintenance tasks are grouped with their intent instead of sitting in one long button row.</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="actionGrid">
+                                        <div className="actionCard">
+                                            <h3>Purchases</h3>
+                                            <p>Claim completed AH purchases without leaving the panel.</p>
+                                            <${Button} kind="secondary" onClick=${() => post(API.claimPurchases, null, "Claim purchases queued")}>Queue Claim</${Button}>
+                                        </div>
+                                        <div className="actionCard">
+                                            <h3>Collect BZ</h3>
+                                            <p>Collect finished Bazaar orders and refresh tracked order state.</p>
+                                            <${Button} kind="secondary" onClick=${() => post(API.collectBz, null, "Collect bazaar orders queued")}>Collect Orders</${Button}>
+                                        </div>
+                                        <div className="actionCard">
+                                            <h3>Claim Filled BZ</h3>
+                                            <p>Claim filled Bazaar orders directly from the maintenance surface.</p>
+                                            <${Button} kind="secondary" onClick=${() => post(API.claimBz, null, "Claim bazaar orders queued")}>Claim Filled</${Button}>
+                                        </div>
+                                    </div>
+                                </div>
+                            </${Panel}>
+
+                            <${Panel}>
+                                <div className="cardBody">
+                                    <div className="sectionTitle">
+                                        <div>
+                                            <span className="eyebrow">Health</span>
+                                            <h2 className="panelTitle">Runtime flags</h2>
+                                            <p>These are the blockers you usually need to see before deciding what to click next.</p>
+                                        </div>
+                                    </div>
+                                    <div className="miniList">
+                                        <div className="miniRow"><strong>Queue depth</strong><span>${status.queue_depth ?? 0}</span></div>
+                                        <div className="miniRow"><strong>Bazaar limit</strong><span>${status.bazaar_at_limit ? "Reached" : "Clear"}</span></div>
+                                        <div className="miniRow"><strong>Auction limit</strong><span>${status.auction_at_limit ? "Reached" : "Clear"}</span></div>
+                                        <div className="miniRow"><strong>Inventory capacity</strong><span>${status.inventory_full ? "Full" : "Has space"}</span></div>
+                                        <div className="miniRow"><strong>Open auctions</strong><span>${activeAuctionCount}${soonestAuction != null ? ` · next ends in ${uptime(soonestAuction)}` : ""}</span></div>
+                                        <div className="miniRow"><strong>Bazaar orders</strong><span>${activeBzCount} total · ${filledOrders} filled</span></div>
+                                    </div>
+                                </div>
+                            </${Panel}>
+                        </div>
+                    </div>
+                ` : null}
+
+                ${activeTab === "analytics" ? html`
+                    <div className="threeCol">
+                        <${ChartCard}
+                            title="Auction House profit"
+                            subtitle=${`Realized total ${coins(profit.ah_total)}`}
+                            points=${profit.ah_points || []}
+                            color="#73d2af"
+                            fill="rgba(115,210,175,.16)"
+                        />
+                        <${ChartCard}
+                            title="Bazaar profit"
+                            subtitle=${`Realized total ${coins(profit.bz_total)}`}
+                            points=${profit.bz_points || []}
+                            color="#81b7ff"
+                            fill="rgba(129,183,255,.16)"
+                        />
+                        <${ChartCard}
+                            title="Combined curve"
+                            subtitle=${`Combined total ${coins(totalProfit)} · ${coins(perHour)}/hr`}
+                            points=${combinedPoints}
+                            color="#f2b15c"
+                            fill="rgba(242,177,92,.16)"
+                        />
+                    </div>
+                ` : null}
+
+                ${activeTab === "inventory" ? html`
+                    <div className="twoCol">
+                        <${InventoryPanel}
+                            title="Player inventory"
+                            subtitle="Cached local inventory with slot inspection, icon lookup, tags, and lore."
+                            slots=${inventory.slots || []}
+                        />
+                        <${InventoryPanel}
+                            title=${gameView.open ? (gameView.title || "Active window") : "Game view"}
+                            subtitle=${gameView.open ? "Current GUI window contents and slot detail." : "No live GUI window is currently open."}
+                            slots=${gameView.slots || []}
+                        />
+                    </div>
+                ` : null}
+
+                ${activeTab === "market" ? html`
+                    <div className="twoCol">
+                        <${MarketTableCard}
+                            title="Active auctions"
+                            subtitle="Listings currently visible to the panel, sourced from local cache or remote fallback."
+                            rows=${auctions || []}
+                            emptyText="No active auctions found."
+                            columns=${auctionColumns}
+                            keyFn=${(row, index) => row.uuid || `${row.item_name}-${row.starting_bid}-${index}`}
+                            summaryTags=${[
+                                `${activeAuctionCount} active`,
+                                soonestAuction != null ? `Soonest ${uptime(soonestAuction)}` : "No expiry data"
+                            ]}
+                            detailRenderer=${(row) => html`
+                                <div>
+                                    <span className="eyebrow">Auction Detail</span>
+                                    <h3 className="detailTitle">${row.item_name}</h3>
+                                    <div className="detailMeta">
+                                        <span className="tag">${row.bin ? "BIN" : "Auction"}</span>
+                                        <span className="tag">${uptime(Math.max(0, row.time_remaining_seconds || 0))} left</span>
+                                        ${row.tag ? html`<span className="tag mono">${row.tag}</span>` : null}
+                                    </div>
+                                    <div className="miniList">
+                                        <div className="miniRow"><strong>Starting bid</strong><span>${formatCoinsLong(row.starting_bid)}</span></div>
+                                        <div className="miniRow"><strong>Highest bid</strong><span>${formatCoinsLong(row.highest_bid)}</span></div>
+                                        <div className="miniRow"><strong>Ends at</strong><span>${row.end || "-"}</span></div>
+                                    </div>
+                                    <div style=${{ marginTop: "14px" }}>
+                                        <${Button}
+                                            kind="danger"
+                                            onClick=${() => post(API.cancelAuction, { item_name: row.item_name, starting_bid: row.starting_bid }, "Auction cancel queued")}
+                                        >
+                                            Queue Cancel Auction
+                                        </${Button}>
+                                    </div>
+                                    ${(row.lore || []).length ? html`
+                                        <div style=${{ marginTop: "16px" }}>
+                                            <span className="eyebrow">Lore</span>
+                                            <ul className="detailLore">
+                                                ${(row.lore || []).map((line, index) => html`<li key=${index}>${line}</li>`)}
+                                            </ul>
+                                        </div>
+                                    ` : null}
+                                </div>
+                            `}
+                        />
+
+                        <${MarketTableCard}
+                            title="Bazaar orders"
+                            subtitle="Tracked Bazaar orders with side, size, price, and fill state."
+                            rows=${bzOrders || []}
+                            emptyText="No active bazaar orders found."
+                            columns=${bzColumns}
+                            keyFn=${(row, index) => `${row.item_name}-${row.is_buy_order}-${row.placed_at || index}-${index}`}
+                            summaryTags=${[
+                                `${activeBzCount} orders`,
+                                `${buyOrders} buy`,
+                                `${sellOrders} sell`,
+                                `${filledOrders} filled`
+                            ]}
+                            detailRenderer=${(row) => html`
+                                <div>
+                                    <span className="eyebrow">Order Detail</span>
+                                    <h3 className="detailTitle">${row.item_name}</h3>
+                                    <div className="detailMeta">
+                                        <span className="tag">${row.is_buy_order ? "Buy order" : "Sell order"}</span>
+                                        <span className="tag">${row.status || "open"}</span>
+                                        <span className="tag">${formatPlacedAt(row.placed_at)}</span>
+                                    </div>
+                                    <div className="miniList">
+                                        <div className="miniRow"><strong>Amount</strong><span>${Number(row.amount || 0).toLocaleString()}</span></div>
+                                        <div className="miniRow"><strong>Price per unit</strong><span>${formatCoinsLong(row.price_per_unit)}</span></div>
+                                        <div className="miniRow"><strong>Placed</strong><span>${formatPlacedAt(row.placed_at)}</span></div>
+                                    </div>
+                                    <div style=${{ marginTop: "14px" }}>
+                                        <${Button}
+                                            kind="danger"
+                                            onClick=${() => post(API.cancelBz, { item_name: row.item_name, is_buy_order: row.is_buy_order }, "Bazaar cancel queued")}
+                                        >
+                                            Queue Cancel Order
+                                        </${Button}>
+                                    </div>
+                                </div>
+                            `}
+                        />
+                    </div>
+                ` : null}
+
+                ${activeTab === "queue" ? html`
+                    <${QueueCard} status=${status} queue=${queue} />
+                ` : null}
+
+                ${activeTab === "config" ? html`
+                    <${Panel}>
+                        <div className="cardBody">
+                            <div className="sectionTitle">
+                                <div>
+                                    <span className="eyebrow">Config</span>
+                                    <h2 className="panelTitle">Raw TOML editor with safer affordances</h2>
+                                    <p>Save, reload, and download logs from the same place. Ctrl/Cmd + S also saves while this tab is open.</p>
+                                </div>
+                                <div className="configTools">
+                                    <span className=${cls("pill", dirtyConfig ? "tone-gold" : "tone-green")}>
+                                        ${dirtyConfig ? "Unsaved changes" : "Saved"}
+                                    </span>
+                                    <${Button} kind="primary" onClick=${saveConfig}>Save Config</${Button}>
+                                    <${Button} kind="secondary" onClick=${() => loadConfig({ silent: false })}>Reload From Disk</${Button}>
+                                    <${Button} kind="ghost" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
+                                </div>
+                            </div>
+
+                            ${configMsg ? html`<div className="configMsg">${configMsg}</div>` : null}
+
+                            <textarea
+                                className="configArea"
+                                value=${configText}
+                                onInput=${(event) => setConfigText(event.target.value)}
+                                spellCheck="false"
+                            ></textarea>
+                        </div>
+                    </${Panel}>
+                ` : null}
+
+                ${activeTab === "chat" ? html`
+                    <${Panel}>
+                        <div className="cardBody">
+                            <div className="sectionTitle">
+                                <div>
+                                    <span className="eyebrow">Chat</span>
+                                    <h2 className="panelTitle">Live console stream and command composer</h2>
+                                    <p>Watch chat in one pane and send commands in another without the current cramped split.</p>
+                                </div>
+                                <div className="chatStatus">
+                                    <span className=${cls("dot", chatConnected && "live")}></span>
+                                    <span>${chatConnected ? "WebSocket connected" : "Reconnecting chat stream"}</span>
+                                </div>
+                            </div>
+
+                            <div className="chatLayout">
+                                <div>
+                                    <div className="chatBox" ref=${chatBoxRef}>
+                                        ${(chat || []).length ? (chat || []).map((line, index) => html`
+                                            <div key=${index} className="chatLine">${stripMc(line)}</div>
+                                        `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
+                                    </div>
+                                </div>
+
+                                <div className="composer">
+                                    <textarea
+                                        value=${chatInput}
+                                        placeholder="Type in-game chat, /cofl commands, or compatibility commands here..."
+                                        onInput=${(event) => setChatInput(event.target.value)}
+                                        onKeyDown=${(event) => {
+                                            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                                                event.preventDefault();
+                                                sendChat();
+                                            }
+                                        }}
+                                    ></textarea>
+
+                                    <div className="presetRow">
+                                        <${Button} kind="secondary" size="small" onClick=${() => setChatInput("/cofl ping")}>Insert /cofl ping</${Button}>
+                                        <${Button} kind="secondary" size="small" onClick=${() => setChatInput("/bz")}>Insert /bz</${Button}>
+                                        <${Button} kind="secondary" size="small" onClick=${() => setChatInput("/ah")}>Insert /ah</${Button}>
+                                        <${Button} kind="secondary" size="small" onClick=${() => setChatInput("/baf")}>Insert /baf</${Button}>
+                                    </div>
+
+                                    <div className="miniList">
+                                        <div className="miniRow"><strong>Send message</strong><span>Use the button or Ctrl/Cmd + Enter.</span></div>
+                                        <div className="miniRow"><strong>Console history</strong><span>Recent lines are kept in memory for this browser session.</span></div>
+                                    </div>
+
+                                    <div className="actionRow">
+                                        <${Button} kind="primary" onClick=${sendChat}>Send Chat</${Button}>
+                                        <${Button} kind="ghost" onClick=${() => setChatInput("")}>Clear Draft</${Button}>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </${Panel}>
+                ` : null}
+            </div>
+
+            ${toast ? html`<div className="toast">${toast}</div>` : null}
+
+            <${LoginOverlay}
+                show=${needsAuth}
+                password=${password}
+                setPassword=${setPassword}
+                error=${loginError}
+                onLogin=${login}
+                publicProfit=${publicProfit}
+            />
+        </main>
+    `;
+}
+
 ReactDOM.createRoot(document.getElementById("root")).render(html`<${App} />`);
 </script>
 </body>
