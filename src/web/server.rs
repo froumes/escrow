@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::bot::BotClient;
 use crate::bazaar_tracker::BazaarOrderTracker;
+use crate::logging::print_mc_chat;
 use crate::state::CommandQueue;
 use crate::types::{CommandPriority, CommandType};
 use crate::websocket::CoflWebSocket;
@@ -474,14 +475,18 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
 async fn pause_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
     s.macro_paused.store(true, Ordering::Relaxed);
     info!("[WebGUI] Macro paused via web panel");
-    let _ = s.chat_tx.send("[BAF Web] Macro paused".to_string());
+    let msg = "[BAF Web] Macro paused".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
     StatusCode::OK
 }
 
 async fn resume_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
     s.macro_paused.store(false, Ordering::Relaxed);
     info!("[WebGUI] Macro resumed via web panel");
-    let _ = s.chat_tx.send("[BAF Web] Macro resumed".to_string());
+    let msg = "[BAF Web] Macro resumed".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
     StatusCode::OK
 }
 
@@ -506,6 +511,7 @@ async fn toggle_ah(
     s.enable_ah_flips.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] AH flips set to {} via web panel", payload.enabled);
     let msg = format!("[BAF Web] AH flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     // Persist to config file
     let enabled = payload.enabled;
@@ -525,6 +531,7 @@ async fn toggle_bazaar(
     s.enable_bazaar_flips.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] Bazaar flips set to {} via web panel", payload.enabled);
     let msg = format!("[BAF Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     // Persist to config file
     let enabled = payload.enabled;
@@ -544,6 +551,7 @@ async fn toggle_anonymize(
     s.anonymize_webhook_name.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] Anonymize set to {} via web panel", payload.enabled);
     let msg = format!("[BAF Web] Anonymize {}", if payload.enabled { "enabled" } else { "disabled" });
+    print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
 }
@@ -592,7 +600,9 @@ async fn process_chat_input(input: &str, state: &WebSharedState) {
         }
     }
 
-    let _ = state.chat_tx.send(format!("> {}", input));
+    let echo = format!("> {}", input);
+    print_mc_chat(&echo);
+    let _ = state.chat_tx.send(echo);
 }
 
 async fn send_chat(
@@ -665,10 +675,12 @@ async fn cancel_auction(
         payload.item_name, payload.starting_bid
     );
 
-    let _ = s.chat_tx.send(format!(
+    let msg = format!(
         "[BAF Web] Cancelling auction: {}...",
         payload.item_name
-    ));
+    );
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
         CommandType::CancelAuction {
@@ -687,7 +699,9 @@ async fn claim_purchases(
 ) -> impl IntoResponse {
     info!("[WebGUI] Claim purchases requested");
 
-    let _ = s.chat_tx.send("[BAF Web] Checking unclaimed purchases...".to_string());
+    let msg = "[BAF Web] Checking unclaimed purchases...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
         CommandType::ClaimPurchasedItem,
@@ -703,7 +717,9 @@ async fn collect_bz_orders(
 ) -> impl IntoResponse {
     info!("[WebGUI] Sell inventory instantly on bazaar requested");
 
-    let _ = s.chat_tx.send("[BAF Web] Selling inventory on bazaar...".to_string());
+    let msg = "[BAF Web] Selling inventory on bazaar...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
         CommandType::SellInventoryBz,
@@ -719,7 +735,9 @@ async fn claim_bz_orders(
 ) -> impl IntoResponse {
     info!("[WebGUI] Force claim bazaar orders requested");
 
-    let _ = s.chat_tx.send("[BAF Web] Checking and claiming bazaar orders...".to_string());
+    let msg = "[BAF Web] Checking and claiming bazaar orders...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
         CommandType::ManageOrders { cancel_open: false },
@@ -740,10 +758,12 @@ async fn cancel_bz_order(
         payload.item_name, order_type
     );
 
-    let _ = s.chat_tx.send(format!(
+    let msg = format!(
         "[BAF Web] Cancelling bazaar {} order: {}...",
         order_type, payload.item_name
-    ));
+    );
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
 
     // Remove the order from the tracker immediately so the web GUI reflects
     // the intent.  The in-game cancellation happens asynchronously via
@@ -764,9 +784,9 @@ async fn cancel_all_bz_orders(
 ) -> impl IntoResponse {
     info!("[WebGUI] Cancel ALL bazaar orders requested");
 
-    let _ = s.chat_tx.send(
-        "[BAF Web] Cancelling all bazaar orders...".to_string(),
-    );
+    let msg = "[BAF Web] Cancelling all bazaar orders...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
 
     // Clear the tracker immediately so the web GUI reflects the intent.
     let removed = s.bazaar_tracker.clear_all_orders();
@@ -1096,7 +1116,9 @@ async fn save_config(
     }).await {
         Ok(Ok(())) => {
             info!("[WebGUI] Config saved via web panel");
-            let _ = s.chat_tx.send("[BAF Web] Config saved".to_string());
+            let msg = "[BAF Web] Config saved".to_string();
+            print_mc_chat(&msg);
+            let _ = s.chat_tx.send(msg);
             StatusCode::OK.into_response()
         }
         Ok(Err(msg)) => {
@@ -1261,7 +1283,9 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
 
-    let png = super::og_image::generate_og_image(total, per_hour, uptime);
+    let ah_pts = s.profit_tracker.ah_points();
+    let bz_pts = s.profit_tracker.bz_points();
+    let png = super::og_image::generate_og_image(total, per_hour, uptime, &ah_pts, &bz_pts);
 
     (
         StatusCode::OK,

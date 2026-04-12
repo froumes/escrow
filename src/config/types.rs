@@ -114,10 +114,14 @@ pub struct Config {
     #[serde(default = "default_auction_listing_delay_ms")]
     pub auction_listing_delay_ms: u64,
     
-    #[serde(default = "default_true")]
+    /// **Deprecated**: COFL now handles flip type selection automatically.
+    /// This field is kept for backward compatibility but is always treated as true.
+    #[serde(default = "default_true", skip_serializing)]
     pub enable_bazaar_flips: bool,
     
-    #[serde(default = "default_true")]
+    /// **Deprecated**: COFL now handles flip type selection automatically.
+    /// This field is kept for backward compatibility but is always treated as true.
+    #[serde(default = "default_true", skip_serializing)]
     pub enable_ah_flips: bool,
     
     #[serde(default)]
@@ -143,6 +147,12 @@ pub struct Config {
     
     #[serde(default = "default_auction_duration_hours")]
     pub auction_duration_hours: u64,
+
+    /// Maximum number of flip items allowed in inventory at once.
+    /// Sent to COFL on startup via `/cofl set maxitemsininventory`.
+    /// Default: 12.
+    #[serde(default = "default_max_items_in_inventory")]
+    pub max_items_in_inventory: u64,
     
     /// Enable proxy for both the Minecraft and WebSocket connections.
     #[serde(default)]
@@ -200,6 +210,29 @@ pub struct Config {
     
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
+
+    // ── Humanization / Rest Breaks ──────────────────────────────
+    /// Enable periodic "human-like" rest breaks where the macro disconnects
+    /// for a randomized period before reconnecting. Does NOT reset the
+    /// account-switching session timer. Default: false.
+    #[serde(default)]
+    pub humanization_enabled: bool,
+
+    /// Minimum time between rest breaks in minutes. Default: 45.
+    #[serde(default = "default_humanization_min_interval_minutes")]
+    pub humanization_min_interval_minutes: u64,
+
+    /// Maximum time between rest breaks in minutes. Default: 120.
+    #[serde(default = "default_humanization_max_interval_minutes")]
+    pub humanization_max_interval_minutes: u64,
+
+    /// Minimum rest break duration in minutes. Default: 2.
+    #[serde(default = "default_humanization_min_break_minutes")]
+    pub humanization_min_break_minutes: u64,
+
+    /// Maximum rest break duration in minutes. Default: 10.
+    #[serde(default = "default_humanization_max_break_minutes")]
+    pub humanization_max_break_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,8 +290,28 @@ fn default_auction_duration_hours() -> u64 {
     24
 }
 
+fn default_max_items_in_inventory() -> u64 {
+    12
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_humanization_min_interval_minutes() -> u64 {
+    45
+}
+
+fn default_humanization_max_interval_minutes() -> u64 {
+    120
+}
+
+fn default_humanization_min_break_minutes() -> u64 {
+    2
+}
+
+fn default_humanization_max_break_minutes() -> u64 {
+    10
 }
 
 impl Default for Config {
@@ -287,6 +340,7 @@ impl Default for Config {
             auto_cookie: 0,
             enable_console_input: true,
             auction_duration_hours: default_auction_duration_hours(),
+            max_items_in_inventory: default_max_items_in_inventory(),
             proxy_enabled: false,
             proxy_address: None,
             proxy_credentials: None,
@@ -298,6 +352,11 @@ impl Default for Config {
             share_legendary_flips: true,
             anonymize_webhook_name: false,
             sessions: HashMap::new(),
+            humanization_enabled: false,
+            humanization_min_interval_minutes: default_humanization_min_interval_minutes(),
+            humanization_max_interval_minutes: default_humanization_max_interval_minutes(),
+            humanization_min_break_minutes: default_humanization_min_break_minutes(),
+            humanization_max_break_minutes: default_humanization_max_break_minutes(),
         }
     }
 }
