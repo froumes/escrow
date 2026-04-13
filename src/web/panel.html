@@ -432,19 +432,19 @@ img{display:block;max-width:100%}
 .inventoryLayout{
     margin-top:18px;
     display:grid;
-    grid-template-columns:1.25fr .75fr;
+    grid-template-columns:1fr;
     gap:16px;
 }
 .slotGrid{
     display:grid;
-    grid-template-columns:repeat(9,minmax(0,1fr));
-    gap:10px;
+    grid-template-columns:repeat(7,minmax(0,1fr));
+    gap:12px;
 }
 .slotButton{
     position:relative;
     border:1px solid rgba(255,255,255,.07);
     border-radius:16px;
-    padding:10px;
+    padding:12px;
     background:rgba(255,255,255,.03);
     cursor:pointer;
     text-align:left;
@@ -464,7 +464,7 @@ img{display:block;max-width:100%}
 }
 .slotIcon{
     margin-top:8px;
-    height:58px;
+    height:72px;
     border-radius:14px;
     display:flex;
     align-items:center;
@@ -473,8 +473,8 @@ img{display:block;max-width:100%}
     background:rgba(0,0,0,.24);
 }
 .slotIcon img{
-    width:44px;
-    height:44px;
+    width:52px;
+    height:52px;
     object-fit:contain;
 }
 .slotFallback{
@@ -805,9 +805,10 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     .actionGrid,
     .statGrid,
     .kpiStrip{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .slotGrid{grid-template-columns:repeat(6,minmax(0,1fr))}
 }
 @media(max-width:900px){
-    .slotGrid{grid-template-columns:repeat(6,minmax(0,1fr))}
+    .slotGrid{grid-template-columns:repeat(5,minmax(0,1fr))}
 }
 @media(max-width:720px){
     .app{width:min(var(--content),calc(100% - 16px))}
@@ -1693,6 +1694,11 @@ function App() {
     const dirtyConfig = configText !== savedConfigText;
     const selectedWindowLabel = gameView.open ? `${gameView.title || "Unknown window"} · ${gameView.slotCount || (gameView.slots || []).length} slots` : "No active window";
     const activeAuctionCount = Array.isArray(auctions) ? auctions.length : 0;
+    const totalAuctionValue = (auctions || []).reduce((sum, auction) => {
+        const starting = Number(auction.starting_bid || 0);
+        const highest = Number(auction.highest_bid || 0);
+        return sum + Math.max(starting, highest);
+    }, 0);
     const activeBzCount = Array.isArray(bzOrders) ? bzOrders.length : 0;
     const buyOrders = (bzOrders || []).filter((order) => order.is_buy_order).length;
     const sellOrders = (bzOrders || []).filter((order) => !order.is_buy_order).length;
@@ -1813,6 +1819,7 @@ function App() {
                             <div className="heroAside">
                                 <div className="statGrid">
                                     <${StatCard} label="Purse" value=${status.purse != null ? coins(status.purse) : "-"} sub=${status.purse != null ? formatCoinsLong(status.purse) : "No purse cached"} tone="tone-blue" />
+                                    <${StatCard} label="In AH" value=${coins(totalAuctionValue)} sub=${activeAuctionCount ? `${activeAuctionCount} active listings` : "No active auctions"} tone="tone-gold" />
                                     <${StatCard} label="Uptime" value=${uptime(status.uptime_seconds)} sub="Persists across restarts" tone="tone-gold" />
                                     <${StatCard} label="Per Hour" value=${`${coins(perHour)}/hr`} sub="Combined realized profit" tone="tone-green" />
                                     <${StatCard} label="AH Profit" value=${coins(profit.ah_total)} sub="Auction house realized" tone="tone-green" />
@@ -1972,8 +1979,9 @@ function App() {
                                         <div className="miniRow"><strong>Bazaar limit</strong><span>${status.bazaar_at_limit ? "Reached" : "Clear"}</span></div>
                                         <div className="miniRow"><strong>Auction limit</strong><span>${status.auction_at_limit ? "Reached" : "Clear"}</span></div>
                                         <div className="miniRow"><strong>Inventory capacity</strong><span>${status.inventory_full ? "Full" : "Has space"}</span></div>
-                                        <div className="miniRow"><strong>Open auctions</strong><span>${activeAuctionCount}${soonestAuction != null ? ` · next ends in ${uptime(soonestAuction)}` : ""}</span></div>
-                                        <div className="miniRow"><strong>Bazaar orders</strong><span>${activeBzCount} total · ${filledOrders} filled</span></div>
+                                        <div className="miniRow"><strong>Open auctions</strong><span>${activeAuctionCount}${soonestAuction != null ? ` ? next ends in ${uptime(soonestAuction)}` : ""}</span></div>
+                                        <div className="miniRow"><strong>Value in AH</strong><span>${formatCoinsLong(totalAuctionValue)}</span></div>
+                                        <div className="miniRow"><strong>Bazaar orders</strong><span>${activeBzCount} total ? ${filledOrders} filled</span></div>
                                     </div>
                                 </div>
                             </${Panel}>
@@ -2008,7 +2016,7 @@ function App() {
                 ` : null}
 
                 ${activeTab === "inventory" ? html`
-                    <div className="twoCol">
+                    <div className="layout">
                         <${InventoryPanel}
                             title="Player inventory"
                             subtitle="Cached local inventory with slot inspection, icon lookup, tags, and lore."
@@ -2023,7 +2031,7 @@ function App() {
                 ` : null}
 
                 ${activeTab === "market" ? html`
-                    <div className="twoCol">
+                    <div className="layout">
                         <${MarketTableCard}
                             title="Active auctions"
                             subtitle="Listings currently visible to the panel, sourced from local cache or remote fallback."
@@ -2175,7 +2183,7 @@ function App() {
                                         placeholder="Type in-game chat, /cofl commands, or compatibility commands here..."
                                         onInput=${(event) => setChatInput(event.target.value)}
                                         onKeyDown=${(event) => {
-                                            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                                            if (event.key === "Enter" && !event.shiftKey) {
                                                 event.preventDefault();
                                                 sendChat();
                                             }
@@ -2190,7 +2198,7 @@ function App() {
                                     </div>
 
                                     <div className="miniList">
-                                        <div className="miniRow"><strong>Send message</strong><span>Use the button or Ctrl/Cmd + Enter.</span></div>
+                                        <div className="miniRow"><strong>Send message</strong><span>Press Enter to send. Use Shift + Enter for a new line.</span></div>
                                         <div className="miniRow"><strong>Console history</strong><span>Recent lines are kept in memory for this browser session.</span></div>
                                     </div>
 
