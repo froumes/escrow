@@ -385,7 +385,13 @@ pub enum BotEvent {
         orders_cancelled: u64,
     },
     /// Item purchased from AH
-    ItemPurchased { item_name: String, price: u64, buy_speed_ms: Option<u64> },
+    ItemPurchased {
+        item_name: String,
+        price: u64,
+        buy_speed_ms: Option<u64>,
+        ping_ms: Option<u64>,
+        estimated_server_ack_ms: Option<u64>,
+    },
     /// Item sold on AH
     ItemSold { item_name: String, price: u64, buyer: String, auction_uuid: Option<String> },
     /// Bazaar order placed successfully
@@ -2183,7 +2189,17 @@ async fn event_handler(
                 if let Some((item_name, price)) = parse_purchased_message(&clean_message) {
                     // Include the buy speed measured from flip received to escrow message
                     let buy_speed_ms = state.last_buy_speed_ms.write().take();
-                    let _ = state.event_tx.send(BotEvent::ItemPurchased { item_name, price, buy_speed_ms });
+                    let ping_ms = current_tab_ping_ms(&bot);
+                    let estimated_server_ack_ms = buy_speed_ms
+                        .zip(ping_ms)
+                        .map(|(speed, ping)| speed.saturating_sub((ping / 2).max(1)));
+                    let _ = state.event_tx.send(BotEvent::ItemPurchased {
+                        item_name,
+                        price,
+                        buy_speed_ms,
+                        ping_ms,
+                        estimated_server_ack_ms,
+                    });
                 }
             } else if clean_message.contains("Putting coins in escrow") {
                 // "Putting coins in escrow..." — purchase accepted by server.
@@ -2191,8 +2207,15 @@ async fn event_handler(
                 if let Some(start) = state.purchase_start_time.write().take() {
                     let speed_ms = start.elapsed().as_millis() as u64;
                     *state.last_buy_speed_ms.write() = Some(speed_ms);
+                    let ping_ms = current_tab_ping_ms(&bot);
+                    let est_server_ms = ping_ms.map(|ping| speed_ms.saturating_sub((ping / 2).max(1)));
+                    let timing_suffix = match (ping_ms, est_server_ms) {
+                        (Some(ping), Some(est)) => format!(" (~{}ms server, {}ms ping)", est, ping),
+                        (Some(ping), None) => format!(" ({}ms ping)", ping),
+                        _ => String::new(),
+                    };
                     let _ = state.event_tx.send(BotEvent::ChatMessage(
-                        format!("§f[§4BAF§f]: §aAuction bought in {}ms", speed_ms)
+                        format!("\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}aAuction bought in {}ms{}", speed_ms, timing_suffix)
                     ));
                     info!("[AH] Buy speed: {}ms", speed_ms);
                 }
@@ -6563,6 +6586,13 @@ fn parse_purchased_message(msg: &str) -> Option<(String, u64)> {
     let price_str = rest[..coins_idx].replace(',', "");
     let price: u64 = price_str.trim().parse().ok()?;
     Some((item_name, price))
+}
+
+fn current_tab_ping_ms(bot: &Client) -> Option<u64> {
+    let own_uuid = bot.uuid();
+    bot.tab_list()
+        .get(&own_uuid)
+        .and_then(|info| (info.latency >= 0).then_some(info.latency as u64))
 }
 
 /// Parse "[Auction] <buyer> bought <item> for <price> coins" → (buyer, item_name, price)

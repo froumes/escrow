@@ -1011,7 +1011,13 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                twm::bot::BotEvent::ItemPurchased { item_name, price, buy_speed_ms: event_buy_speed_ms } => {
+                twm::bot::BotEvent::ItemPurchased {
+                    item_name,
+                    price,
+                    buy_speed_ms: event_buy_speed_ms,
+                    ping_ms: event_ping_ms,
+                    estimated_server_ack_ms: event_estimated_server_ack_ms,
+                } => {
                     // Send uploadScoreboard (with real data) and uploadTab to COFL
                     let ws = ws_client_for_events.clone();
                     let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
@@ -1084,10 +1090,15 @@ async fn main() -> Result<()> {
                         let color = if p >= 0 { "§a" } else { "§c" };
                         format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
                     }).unwrap_or_default();
-                    let speed_str = event_buy_speed_ms.map(|ms| format!(" §7| Buy speed: §e{}ms§r", ms)).unwrap_or_default();
+                    let speed_str = event_buy_speed_ms
+                        .map(|ms| format!(" \u{00A7}7| Buy speed: \u{00A7}e{}ms\u{00A7}r", ms))
+                        .unwrap_or_default();
+                    let est_server_str = event_estimated_server_ack_ms
+                        .map(|ms| format!(" \u{00A7}7| Est. server: \u{00A7}b{}ms\u{00A7}r", ms))
+                        .unwrap_or_default();
                     let baf_msg = format!(
-                        "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}{}",
-                        colored_name, format_coins(price as i64), profit_str, speed_str
+                        "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}a\u{2726} PURCHASED \u{00A7}r{}\u{00A7}r \u{00A7}7for \u{00A7}6{}\u{00A7}7 coins!{}{}{}",
+                        colored_name, format_coins(price as i64), profit_str, speed_str, est_server_str
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -1122,7 +1133,8 @@ async fn main() -> Result<()> {
                                     tokio::spawn(async move {
                                         twm::webhook::send_webhook_divine_flip(
                                             &name, &item, price, opt_target, profit, purse,
-                                            event_buy_speed_ms, uuid_str.as_deref(), finder.as_deref(),
+                                            event_buy_speed_ms, event_ping_ms, event_estimated_server_ack_ms,
+                                            uuid_str.as_deref(), finder.as_deref(),
                                             did.as_deref(), &url,
                                         ).await;
                                     });
@@ -1130,7 +1142,8 @@ async fn main() -> Result<()> {
                                     tokio::spawn(async move {
                                         twm::webhook::send_webhook_legendary_flip(
                                             &name, &item, price, opt_target, profit, purse,
-                                            event_buy_speed_ms, uuid_str.as_deref(), finder.as_deref(),
+                                            event_buy_speed_ms, event_ping_ms, event_estimated_server_ack_ms,
+                                            uuid_str.as_deref(), finder.as_deref(),
                                             did.as_deref(), &url,
                                         ).await;
                                     });
@@ -1148,7 +1161,8 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 twm::webhook::send_webhook_item_purchased(
                                     &name, &item, price, opt_target, opt_profit, purse,
-                                    event_buy_speed_ms, uuid_str.as_deref(), opt_finder.as_deref(), &url,
+                                    event_buy_speed_ms, event_ping_ms, event_estimated_server_ack_ms,
+                                    uuid_str.as_deref(), opt_finder.as_deref(), &url,
                                 ).await;
                             });
                         }
@@ -3423,26 +3437,6 @@ async fn main() -> Result<()> {
                 restart_process();
             });
         }
-    }
-
-    // Periodic profit summary webhook every 30 minutes
-    if let Some(webhook_url) = config.active_webhook_url() {
-        let profit_tracker_webhook = profit_tracker.clone();
-        let webhook_url = webhook_url.to_string();
-        let name = ingame_name.clone();
-        let started = std::time::Instant::now();
-        let prev_secs_summary = previous_session_secs;
-        tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(30 * 60)).await;
-                let (ah, bz) = profit_tracker_webhook.totals();
-                let uptime = prev_secs_summary + started.elapsed().as_secs();
-                twm::webhook::send_webhook_profit_summary(
-                    &name, ah, bz, uptime, &webhook_url,
-                )
-                .await;
-            }
-        });
     }
 
     // Periodic session-time persistence — save the accumulated running time for

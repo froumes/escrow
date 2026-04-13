@@ -37,7 +37,7 @@
     --radius-lg:22px;
     --radius-md:16px;
     --radius-sm:12px;
-    --content:1540px;
+    --content:1360px;
 }
 *,
 *::before,
@@ -240,8 +240,8 @@ img{display:block;max-width:100%}
 .hero{
     padding:24px;
     display:grid;
-    grid-template-columns:1.1fr .9fr;
-    gap:18px;
+    grid-template-columns:1fr;
+    gap:22px;
 }
 .heroCopy h2,
 .sectionTitle h2,
@@ -254,7 +254,7 @@ img{display:block;max-width:100%}
 }
 .heroCopy h2{
     font-size:clamp(2rem,4vw,3.5rem);
-    max-width:11ch;
+    max-width:13ch;
 }
 .subtle{
     color:var(--muted);
@@ -275,11 +275,12 @@ img{display:block;max-width:100%}
 }
 .heroAside{
     display:grid;
+    grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr);
     gap:16px;
 }
 .statGrid{
     display:grid;
-    grid-template-columns:repeat(3,minmax(0,1fr));
+    grid-template-columns:repeat(2,minmax(0,1fr));
     gap:12px;
 }
 .statCard{
@@ -309,7 +310,7 @@ img{display:block;max-width:100%}
 }
 .dashboardGrid{
     display:grid;
-    grid-template-columns:1.1fr .9fr;
+    grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);
     gap:18px;
 }
 .stack{display:grid;gap:18px}
@@ -330,7 +331,7 @@ img{display:block;max-width:100%}
 .actionGrid{
     margin-top:18px;
     display:grid;
-    grid-template-columns:repeat(3,minmax(0,1fr));
+    grid-template-columns:repeat(2,minmax(0,1fr));
     gap:12px;
 }
 .actionCard{
@@ -378,12 +379,12 @@ img{display:block;max-width:100%}
 }
 .twoCol{
     display:grid;
-    grid-template-columns:repeat(2,minmax(0,1fr));
+    grid-template-columns:minmax(0,1.08fr) minmax(320px,.92fr);
     gap:18px;
 }
 .threeCol{
     display:grid;
-    grid-template-columns:repeat(3,minmax(0,1fr));
+    grid-template-columns:repeat(2,minmax(0,1fr));
     gap:18px;
 }
 .chartWrap{height:300px}
@@ -787,6 +788,11 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .grow{flex:1}
 .hidden{display:none}
+@media(max-width:1440px){
+    .heroAside{
+        grid-template-columns:1fr;
+    }
+}
 @media(max-width:1280px){
     .hero,
     .dashboardGrid,

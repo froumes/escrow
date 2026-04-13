@@ -237,11 +237,22 @@ pub async fn send_webhook_item_purchased(
     profit: Option<i64>,
     purse: Option<u64>,
     buy_speed_ms: Option<u64>,
+    ping_ms: Option<u64>,
+    estimated_server_ack_ms: Option<u64>,
     auction_uuid: Option<&str>,
     finder: Option<&str>,
     webhook_url: &str,
 ) {
-    let fields = build_purchase_fields(price, target, profit, buy_speed_ms, finder, auction_uuid);
+    let fields = build_purchase_fields(
+        price,
+        target,
+        profit,
+        buy_speed_ms,
+        ping_ms,
+        estimated_server_ack_ms,
+        finder,
+        auction_uuid,
+    );
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
         "embeds": [{
@@ -717,12 +728,23 @@ pub async fn send_webhook_legendary_flip(
     profit: i64,
     purse: Option<u64>,
     buy_speed_ms: Option<u64>,
+    ping_ms: Option<u64>,
+    estimated_server_ack_ms: Option<u64>,
     auction_uuid: Option<&str>,
     finder: Option<&str>,
     discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, auction_uuid);
+    let fields = build_purchase_fields(
+        price,
+        target,
+        Some(profit),
+        buy_speed_ms,
+        ping_ms,
+        estimated_server_ack_ms,
+        finder,
+        auction_uuid,
+    );
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
         "embeds": [{
@@ -752,12 +774,23 @@ pub async fn send_webhook_divine_flip(
     profit: i64,
     purse: Option<u64>,
     buy_speed_ms: Option<u64>,
+    ping_ms: Option<u64>,
+    estimated_server_ack_ms: Option<u64>,
     auction_uuid: Option<&str>,
     finder: Option<&str>,
     discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, auction_uuid);
+    let fields = build_purchase_fields(
+        price,
+        target,
+        Some(profit),
+        buy_speed_ms,
+        ping_ms,
+        estimated_server_ack_ms,
+        finder,
+        auction_uuid,
+    );
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
         "embeds": [{
@@ -793,7 +826,16 @@ pub async fn send_webhook_flip_channel(
         ("🌟 Legendary Flip!", 0xFFD700u32)
     };
     // No auction_uuid for anonymized channel webhook
-    let mut fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, None);
+    let mut fields = build_purchase_fields(
+        price,
+        target,
+        Some(profit),
+        buy_speed_ms,
+        None,
+        None,
+        finder,
+        None,
+    );
     // Append clickable footer-style links below the purchase info fields
     fields.push(serde_json::json!({
         "name": "\u{200b}",
@@ -863,6 +905,8 @@ fn build_purchase_fields(
     target: Option<u64>,
     profit: Option<i64>,
     buy_speed_ms: Option<u64>,
+    ping_ms: Option<u64>,
+    estimated_server_ack_ms: Option<u64>,
     finder: Option<&str>,
     auction_uuid: Option<&str>,
 ) -> Vec<serde_json::Value> {
@@ -900,6 +944,20 @@ fn build_purchase_fields(
     if let Some(ms) = buy_speed_ms {
         fields.push(serde_json::json!({
             "name": "⚡ Buy Speed",
+            "value": format!("```\n{}ms\n```", ms),
+            "inline": true
+        }));
+    }
+    if let Some(ms) = estimated_server_ack_ms {
+        fields.push(serde_json::json!({
+            "name": "🛰️ Est. Server Ack",
+            "value": format!("```\n{}ms\n```", ms),
+            "inline": true
+        }));
+    }
+    if let Some(ms) = ping_ms {
+        fields.push(serde_json::json!({
+            "name": "📶 Ping",
             "value": format!("```\n{}ms\n```", ms),
             "inline": true
         }));
