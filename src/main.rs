@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use tokio::time::{sleep, Duration};
 use tokio::sync::broadcast;
 use serde_json;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use twm::utils::restart_process;
@@ -73,6 +73,7 @@ const DEFERRED_AH_FLIP_TTL_MS: u64 = 1_500;
 const DEFERRED_AH_FLIP_RETRY_MS: u64 = 75;
 /// Cap the number of deferred AH flips kept in memory at once.
 const MAX_DEFERRED_AH_FLIPS: usize = 3;
+const AH_FLIP_COUNTDOWN_PAUSE_SECS: u64 = 20;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -566,6 +567,7 @@ async fn main() -> Result<()> {
     // Bazaar-flip pause flag (matches TypeScript bazaarFlipPauser.ts).
     // Set to true for 20 seconds when a `countdown` message arrives (AH flips incoming).
     let bazaar_flips_paused = Arc::new(AtomicBool::new(false));
+    let bazaar_pause_generation = Arc::new(AtomicU64::new(0));
 
     // Master macro pause — web panel can set this to pause all command processing.
     let macro_paused = Arc::new(AtomicBool::new(false));
@@ -1689,6 +1691,7 @@ async fn main() -> Result<()> {
     let ws_client_clone = ws_client.clone();
     let bot_client_for_ws = bot_client.clone();
     let bazaar_flips_paused_ws = bazaar_flips_paused.clone();
+    let bazaar_pause_generation_ws = bazaar_pause_generation.clone();
     let flip_tracker_ws = flip_tracker.clone();
     let cofl_connection_id_ws = cofl_connection_id.clone();
     let cofl_premium_ws = cofl_premium.clone();
@@ -2494,27 +2497,38 @@ async fn main() -> Result<()> {
                     // Relaxed ordering is fine here — these are simple toggle flags where
                     // eventual visibility across threads is sufficient.
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
-                        let baf_msg = "§f[§4BAF§f]: §c⚡ AH Flips incoming in ~10s — closing windows, pausing bazaar".to_string();
-                        print_mc_chat(&baf_msg);
-                        let _ = chat_tx_ws.send(baf_msg);
                         let flag = bazaar_flips_paused_ws.clone();
-                        flag.store(true, Ordering::Relaxed);
+                        let generation = bazaar_pause_generation_ws.fetch_add(1, Ordering::Relaxed) + 1;
+                        let already_paused = flag.swap(true, Ordering::Relaxed);
 
-                        // Close any open window so the bot is free for AH flips.
-                        // Also force state to Idle if it's in an interruptible state
-                        // so the AH flip can be processed immediately.
-                        bot_client_for_ws.close_current_window();
-                        let current_state = bot_client_for_ws.state();
-                        if current_state != twm::types::BotState::Purchasing
-                            && current_state != twm::types::BotState::Startup
-                        {
-                            bot_client_for_ws.set_state(twm::types::BotState::Idle);
+                        if !already_paused {
+                            let baf_msg = "§f[§4BAF§f]: §c⚡ AH Flips incoming in ~10s — closing windows, pausing bazaar".to_string();
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx_ws.send(baf_msg);
+
+                            // Close any open window so the bot is free for AH flips.
+                            // Also force state to Idle if it's in an interruptible state
+                            // so the AH flip can be processed immediately.
+                            bot_client_for_ws.close_current_window();
+                            let current_state = bot_client_for_ws.state();
+                            if current_state != twm::types::BotState::Purchasing
+                                && current_state != twm::types::BotState::Startup
+                            {
+                                bot_client_for_ws.set_state(twm::types::BotState::Idle);
+                            }
+                        } else {
+                            debug!("[BazaarFlips] Countdown refreshed while already paused");
                         }
 
                         let chat_tx_resume = chat_tx_ws.clone();
                         let command_queue_resume = command_queue_clone.clone();
+                        let pause_generation_resume = bazaar_pause_generation_ws.clone();
                         tokio::spawn(async move {
-                            sleep(Duration::from_secs(20)).await;
+                            sleep(Duration::from_secs(AH_FLIP_COUNTDOWN_PAUSE_SECS)).await;
+                            if pause_generation_resume.load(Ordering::Relaxed) != generation {
+                                debug!("[BazaarFlips] Ignoring stale resume task for superseded countdown");
+                                return;
+                            }
                             flag.store(false, Ordering::Relaxed);
                             // Notify user that bazaar flips are resuming (matching TypeScript bazaarFlipPauser.ts)
                             let baf_msg = "§f[§4BAF§f]: §aBazaar flips resumed".to_string();
