@@ -37,30 +37,6 @@ jobs:
             asset_name: twm-linux-x86_64
             loader_artifact_name: TWM-loader
             loader_asset_name: TWM-loader-linux-x86_64
-            
-          # macOS x86_64 (Intel)
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: twm
-            asset_name: twm-macos-x86_64
-            loader_artifact_name: TWM-loader
-            loader_asset_name: TWM-loader-macos-x86_64
-            
-          # macOS ARM64 (Apple Silicon)
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: twm
-            asset_name: twm-macos-arm64
-            loader_artifact_name: TWM-loader
-            loader_asset_name: TWM-loader-macos-arm64
-            
-          # Windows x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: twm.exe
-            asset_name: twm-windows-x86_64.exe
-            loader_artifact_name: TWM-loader.exe
-            loader_asset_name: TWM-loader-windows-x86_64.exe
 
     steps:
       - name: Checkout code
@@ -153,30 +129,17 @@ jobs:
             Just run the loader instead of the main binary.
             
             - **Linux (x86_64)**: `TWM-loader-linux-x86_64`
-            - **macOS (Intel)**: `TWM-loader-macos-x86_64`
-            - **macOS (Apple Silicon)**: `TWM-loader-macos-arm64`
-            - **Windows (x86_64)**: `TWM-loader-windows-x86_64.exe`
             
             ### Manual Downloads (main binary)
             - **Linux (x86_64)**: `twm-linux-x86_64`
-            - **macOS (Intel)**: `twm-macos-x86_64`
-            - **macOS (Apple Silicon)**: `twm-macos-arm64`
-            - **Windows (x86_64)**: `twm-windows-x86_64.exe`
             
             ### Installation
             
-            **Linux/macOS (using loader):**
+            **Linux (using loader):**
             ```bash
-            chmod +x TWM-loader-*
-            chmod +x twm-*
-            # Place both files in the same directory, then run:
-            ./TWM-loader-*
-            ```
-            
-            **Windows (using loader):**
-            ```
-            # Place both .exe files in the same directory, then run:
-            TWM-loader-windows-x86_64.exe
+            chmod +x TWM-loader-linux-x86_64
+            chmod +x twm-linux-x86_64
+            ./TWM-loader-linux-x86_64
             ```
             
             See [README.md](https://github.com/froumes/escrow/blob/main/README.md) for usage instructions.
