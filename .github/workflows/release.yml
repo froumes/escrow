@@ -20,6 +20,11 @@ permissions:
   contents: write
   pull-requests: read
 
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -50,19 +55,36 @@ jobs:
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
 
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/heads/codex/* ]]; then
+            cargo build --profile ci-artifact --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Strip binaries (Linux and macOS)
         if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
         run: |
-          strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          strip target/${{ matrix.target }}/release/${{ matrix.loader_artifact_name }}
+          PROFILE_DIR="release"
+          if [[ "${GITHUB_REF}" == refs/heads/codex/* ]]; then
+            PROFILE_DIR="ci-artifact"
+          fi
+          strip target/${{ matrix.target }}/${PROFILE_DIR}/${{ matrix.artifact_name }}
+          strip target/${{ matrix.target }}/${PROFILE_DIR}/${{ matrix.loader_artifact_name }}
 
       - name: Rename binaries
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
+          PROFILE_DIR="release"
+          if [[ "${GITHUB_REF}" == refs/heads/codex/* ]]; then
+            PROFILE_DIR="ci-artifact"
+          fi
+          cd target/${{ matrix.target }}/${PROFILE_DIR}
           mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
           mv ${{ matrix.loader_artifact_name }} ${{ matrix.loader_asset_name }}
 
@@ -70,13 +92,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          path: target/${{ matrix.target }}/**/${{ matrix.asset_name }}
 
       - name: Upload loader artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.loader_asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.loader_asset_name }}
+          path: target/${{ matrix.target }}/**/${{ matrix.loader_asset_name }}
 
   release:
     name: Create Release

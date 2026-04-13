@@ -70,6 +70,13 @@ lto = true
 codegen-units = 1
 strip = true
 
+[profile.ci-artifact]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+strip = true
+
 [patch.crates-io]
 # Use a locally patched azalea-client that runs the ECS Update schedule at
 # 300 fps instead of the default 60 fps.  This reduces average packet-detection

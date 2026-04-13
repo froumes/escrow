@@ -20,6 +20,7 @@ env:
 jobs:
   test:
     name: Test Suite
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/copilot/') || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -36,6 +37,7 @@ jobs:
 
   fmt:
     name: Rustfmt
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/copilot/') || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -51,6 +53,7 @@ jobs:
 
   clippy:
     name: Clippy
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/copilot/') || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -83,3 +86,26 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+  codex-quick-check:
+    name: Codex Quick Check
+    if: startsWith(github.ref, 'refs/heads/codex/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Quick compile check
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+        run: cargo check --profile ci-artifact --verbose
