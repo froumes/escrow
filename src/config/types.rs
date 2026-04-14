@@ -103,9 +103,10 @@ pub struct Config {
     #[serde(default = "default_auction_listing_delay_ms")]
     pub auction_listing_delay_ms: u64,
     
-    /// **Deprecated**: COFL now handles flip type selection automatically.
-    /// This field is kept for backward compatibility but is always treated as true.
-    #[serde(default = "default_true", skip_serializing)]
+    /// Enable or disable Bazaar flipping features.
+    /// When false, Bazaar websocket recommendations are ignored and periodic
+    /// Bazaar order management stays idle.
+    #[serde(default = "default_true")]
     pub enable_bazaar_flips: bool,
     
     /// **Deprecated**: COFL now handles flip type selection automatically.
@@ -604,6 +605,18 @@ bazaar_webhook_url = "https://discord.com/api/webhooks/bazaar""#
 bazaar_webhook_url = """#
         ).expect("config should parse");
         assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+    }
+
+    #[test]
+    fn default_config_includes_bazaar_flip_toggle() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(toml.contains("enable_bazaar_flips = true"));
+    }
+
+    #[test]
+    fn parses_bazaar_flip_toggle_false() {
+        let config: Config = toml::from_str("enable_bazaar_flips = false").expect("config should parse");
+        assert!(!config.enable_bazaar_flips);
     }
 
 }

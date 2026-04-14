@@ -581,7 +581,7 @@ async fn main() -> Result<()> {
     // settings — these flags are always true for backward compatibility with
     // internal code paths that check them.
     let enable_ah_flips = Arc::new(AtomicBool::new(true));
-    let enable_bazaar_flips = Arc::new(AtomicBool::new(true));
+    let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
     let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
 
     // Broadcast channel for chat messages → web panel clients.
@@ -3070,11 +3070,12 @@ async fn main() -> Result<()> {
 
     // Periodic bazaar order check — collect filled orders and cancel stale ones.
     // Driven by config.bazaar_order_check_interval_seconds (default 30s).
-    if config.enable_bazaar_flips {
+    {
         let bot_client_orders = bot_client.clone();
         let command_queue_orders = command_queue.clone();
         let bazaar_flips_paused_orders = bazaar_flips_paused.clone();
         let bazaar_tracker_orders = bazaar_tracker.clone();
+        let enable_bazaar_flips_orders = enable_bazaar_flips.clone();
         let order_interval = config.bazaar_order_check_interval_seconds;
         tokio::spawn(async move {
             use twm::types::{CommandType, CommandPriority};
@@ -3082,6 +3083,10 @@ async fn main() -> Result<()> {
             sleep(Duration::from_secs(120)).await;
             loop {
                 sleep(Duration::from_secs(order_interval)).await;
+                if !enable_bazaar_flips_orders.load(Ordering::Relaxed) {
+                    debug!("[BazaarOrders] Skipping periodic order check — Bazaar flips disabled");
+                    continue;
+                }
                 // Skip during AH pause — ManageOrders would be deferred anyway
                 // and will be re-queued when bazaar flips resume.
                 if bazaar_flips_paused_orders.load(Ordering::Relaxed) {
