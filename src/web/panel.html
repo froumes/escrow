@@ -941,20 +941,22 @@ function slotIconUrl(slot) {
 }
 
 function mergeProfitSeries(ahPoints, bzPoints) {
-    const map = new Map();
-    (ahPoints || []).forEach(([ts, value]) => {
-        const existing = map.get(ts) || { ah: 0, bz: 0 };
-        existing.ah = value || 0;
-        map.set(ts, existing);
+    const events = [
+        ...((ahPoints || []).map(([ts, value]) => ({ ts, kind: "ah", value: value || 0 }))),
+        ...((bzPoints || []).map(([ts, value]) => ({ ts, kind: "bz", value: value || 0 }))),
+    ].sort((a, b) => a.ts - b.ts);
+
+    let currentAh = 0;
+    let currentBz = 0;
+
+    return events.map((event) => {
+        if (event.kind === "ah") {
+            currentAh = event.value;
+        } else {
+            currentBz = event.value;
+        }
+        return [event.ts, currentAh + currentBz];
     });
-    (bzPoints || []).forEach(([ts, value]) => {
-        const existing = map.get(ts) || { ah: 0, bz: 0 };
-        existing.bz = value || 0;
-        map.set(ts, existing);
-    });
-    return [...map.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([ts, values]) => [ts, (values.ah || 0) + (values.bz || 0)]);
 }
 
 async function req(url, options = {}) {
