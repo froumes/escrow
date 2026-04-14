@@ -10,6 +10,7 @@ pub mod gui;
 pub mod handlers;
 pub mod inventory;
 pub mod logging;
+pub mod persistence;
 pub mod profit;
 pub mod state;
 pub mod types;

@@ -6,17 +6,22 @@
 //! Orders and buy costs are persisted to disk so profit tracking survives
 //! across bot restarts.
 
+use crate::persistence::AsyncJsonWriter;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// File name for persisted orders (stored next to the executable / in the logs dir).
 const ORDERS_FILE: &str = "bazaar_orders.json";
 /// File name for persisted buy costs.
 const BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
+#[cfg(test)]
+const BAZAAR_PERSIST_DEBOUNCE: Duration = Duration::from_millis(0);
+#[cfg(not(test))]
+const BAZAAR_PERSIST_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// A single tracked bazaar order visible on the web panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,11 +40,13 @@ pub struct TrackedBazaarOrder {
 #[derive(Clone)]
 pub struct BazaarOrderTracker {
     orders: Arc<RwLock<Vec<TrackedBazaarOrder>>>,
+    orders_writer: Option<AsyncJsonWriter<Vec<TrackedBazaarOrder>>>,
     /// Stores (price_per_unit, amount) for all collected buy orders per item,
     /// so that profit can be computed when the corresponding sell offer is
     /// collected.  Multiple buy orders for the same item are accumulated
     /// (weighted-average PPU) instead of overwriting.
     last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
+    buy_costs_writer: Option<AsyncJsonWriter<HashMap<String, (f64, u64)>>>,
     /// Per-item profit data from `/cofl bz l` output.
     /// Maps normalized item name → (total_profit, flip_count).
     /// Used as a fallback when local buy-cost tracking has no data for a sell.
@@ -48,9 +55,18 @@ pub struct BazaarOrderTracker {
 
 impl BazaarOrderTracker {
     pub fn new() -> Self {
+        let persistence_dir = Self::persistence_dir();
         let tracker = Self {
             orders: Arc::new(RwLock::new(Vec::new())),
+            orders_writer: Some(AsyncJsonWriter::new(
+                persistence_dir.join(ORDERS_FILE),
+                BAZAAR_PERSIST_DEBOUNCE,
+            )),
             last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+            buy_costs_writer: Some(AsyncJsonWriter::new(
+                persistence_dir.join(BUY_COSTS_FILE),
+                BAZAAR_PERSIST_DEBOUNCE,
+            )),
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
         };
         tracker.load_from_disk();
@@ -63,7 +79,9 @@ impl BazaarOrderTracker {
     pub fn new_in_memory() -> Self {
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
+            orders_writer: None,
             last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+            buy_costs_writer: None,
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -271,46 +289,16 @@ impl BazaarOrderTracker {
     }
 
     fn save_orders_to_disk(&self) {
-        #[cfg(test)]
-        return;
-        #[cfg(not(test))]
-        {
+        if let Some(writer) = &self.orders_writer {
         let orders = self.orders.read().clone();
-        let path = Self::persistence_dir().join(ORDERS_FILE);
-        if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
-            warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
-            return;
-        }
-        match serde_json::to_string(&orders) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
-                }
-            }
-            Err(e) => warn!("[BazaarTracker] Failed to serialize orders: {}", e),
-        }
+            writer.schedule(orders);
         }
     }
 
     fn save_buy_costs_to_disk(&self) {
-        #[cfg(test)]
-        return;
-        #[cfg(not(test))]
-        {
+        if let Some(writer) = &self.buy_costs_writer {
         let costs = self.last_buy_costs.read().clone();
-        let path = Self::persistence_dir().join(BUY_COSTS_FILE);
-        if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
-            warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
-            return;
-        }
-        match serde_json::to_string(&costs) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
-                }
-            }
-            Err(e) => warn!("[BazaarTracker] Failed to serialize buy costs: {}", e),
-        }
+            writer.schedule(costs);
         }
     }
 

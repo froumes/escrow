@@ -4,6 +4,7 @@ use rustyline;
 use twm::{
     config::ConfigLoader,
     logging::{init_logger, print_mc_chat},
+    persistence::AsyncJsonWriter,
     state::CommandQueue,
     websocket::CoflWebSocket,
     bot::BotClient,
@@ -74,6 +75,7 @@ const DEFERRED_AH_FLIP_RETRY_MS: u64 = 75;
 /// Cap the number of deferred AH flips kept in memory at once.
 const MAX_DEFERRED_AH_FLIPS: usize = 3;
 const AH_FLIP_COUNTDOWN_PAUSE_SECS: u64 = 20;
+const JSON_PERSIST_DEBOUNCE_MS: u64 = 150;
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -400,12 +402,11 @@ fn load_ah_purchase_ledger(path: &std::path::Path) -> HashMap<String, AhPurchase
     serde_json::from_str::<HashMap<String, AhPurchaseEntry>>(&raw).unwrap_or_default()
 }
 
-fn save_ah_purchase_ledger(path: &std::path::Path, ledger: &HashMap<String, AhPurchaseEntry>) {
-    if let Ok(json) = serde_json::to_string_pretty(ledger) {
-        if let Err(e) = std::fs::write(path, json) {
-            tracing::warn!("[AhLedger] Failed to save AH purchase ledger: {}", e);
-        }
-    }
+fn save_ah_purchase_ledger(
+    writer: &AsyncJsonWriter<HashMap<String, AhPurchaseEntry>>,
+    ledger: &HashMap<String, AhPurchaseEntry>,
+) {
+    writer.schedule(ledger.clone());
 }
 
 /// Clear the session time for a given IGN (reset to 0).
@@ -544,6 +545,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("ah_purchase_ledger.json")))
         .unwrap_or_else(|| std::path::PathBuf::from("ah_purchase_ledger.json"));
+    let ah_purchase_ledger_writer = AsyncJsonWriter::new(
+        ah_purchase_ledger_path.clone(),
+        Duration::from_millis(JSON_PERSIST_DEBOUNCE_MS),
+    );
     let ah_purchase_ledger: Arc<Mutex<HashMap<String, AhPurchaseEntry>>> =
         Arc::new(Mutex::new(load_ah_purchase_ledger(&ah_purchase_ledger_path)));
     if let Ok(ledger) = ah_purchase_ledger.lock() {
@@ -839,7 +844,7 @@ async fn main() -> Result<()> {
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let ah_purchase_ledger_events = ah_purchase_ledger.clone();
-    let ah_purchase_ledger_path_events = ah_purchase_ledger_path.clone();
+    let ah_purchase_ledger_writer_events = ah_purchase_ledger_writer.clone();
     // Tracks when the last AH auction was listed; the idle-inventory timer uses
     // this to detect 30-minute stalls and force `/cofl sellinventory`.
     let last_auction_listed_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
@@ -1084,7 +1089,7 @@ async fn main() -> Result<()> {
                             };
                             ledger.insert(key, entry.clone());
                             ledger.insert(fallback_name_key, entry);
-                            save_ah_purchase_ledger(&ah_purchase_ledger_path_events, &ledger);
+                            save_ah_purchase_ledger(&ah_purchase_ledger_writer_events, &ledger);
                         }
                     }
                     // Print colorful purchase announcement (item rarity shown via color code)
@@ -1211,7 +1216,7 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                                 ledger.remove(&fallback_name_key);
-                                                save_ah_purchase_ledger(&ah_purchase_ledger_path_events, &ledger);
+                                                save_ah_purchase_ledger(&ah_purchase_ledger_writer_events, &ledger);
                                                 let ah_fee = calculate_ah_fee(price);
                                                 let profit = price as i64 - entry.buy_price as i64 - ah_fee as i64;
                                                 let time_secs = unix_now().saturating_sub(entry.purchased_at_unix);
@@ -1245,7 +1250,7 @@ async fn main() -> Result<()> {
                             let removed = ledger.remove(&key).is_some()
                                 || (key != fallback_name_key && ledger.remove(&fallback_name_key).is_some());
                             if removed {
-                                save_ah_purchase_ledger(&ah_purchase_ledger_path_events, &ledger);
+                                save_ah_purchase_ledger(&ah_purchase_ledger_writer_events, &ledger);
                             }
                         }
                     }

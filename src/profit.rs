@@ -1,8 +1,14 @@
+use crate::persistence::AsyncJsonWriter;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+const PROFIT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(0);
+#[cfg(not(test))]
+const PROFIT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// A single profit data point: (unix_timestamp_secs, cumulative_profit_coins)
 pub type ProfitPoint = (u64, i64);
@@ -10,7 +16,7 @@ pub type ProfitPoint = (u64, i64);
 /// Thread-safe profit tracker for AH and Bazaar realized profits.
 pub struct ProfitTracker {
     inner: Mutex<ProfitTrackerInner>,
-    storage_path: Option<PathBuf>,
+    writer: Option<AsyncJsonWriter<ProfitTrackerInner>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -42,7 +48,8 @@ impl ProfitTracker {
                 ah_total: 0,
                 bz_total: 0,
             }),
-            storage_path,
+            writer: storage_path
+                .map(|path| AsyncJsonWriter::new(path, PROFIT_PERSIST_DEBOUNCE)),
         }
     }
 
@@ -57,7 +64,7 @@ impl ProfitTracker {
         }
         Self {
             inner: Mutex::new(inner),
-            storage_path: Some(storage_path),
+            writer: Some(AsyncJsonWriter::new(storage_path, PROFIT_PERSIST_DEBOUNCE)),
         }
     }
 
@@ -141,15 +148,10 @@ impl ProfitTracker {
     }
 
     fn persist_locked(&self, inner: &ProfitTrackerInner) {
-        let Some(path) = &self.storage_path else {
+        let Some(writer) = &self.writer else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(inner) {
-            let _ = fs::write(path, json);
-        }
+        writer.schedule(inner.clone());
     }
 }
 
