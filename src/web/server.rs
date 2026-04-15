@@ -1114,14 +1114,7 @@ async fn save_config(
     let enable_bz = s.enable_bazaar_flips.clone();
     let toml_str = payload.config_toml;
     match tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // Parse the TOML to validate it first
-        let config: crate::config::Config = toml::from_str(&toml_str)
-            .map_err(|e| format!("Invalid config TOML: {}", e))?;
-        // Update in-memory toggle flags to match the saved config
-        enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
-        enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
-        // Save validated config
-        loader.save(&config).map_err(|e| format!("Failed to save config: {}", e))
+        save_config_inner(loader, enable_ah, enable_bz, &toml_str)
     }).await {
         Ok(Ok(())) => {
             info!("[WebGUI] Config saved via web panel");
@@ -1139,6 +1132,23 @@ async fn save_config(
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()).into_response()
         }
     }
+}
+
+fn save_config_inner(
+    loader: Arc<crate::config::ConfigLoader>,
+    enable_ah: Arc<AtomicBool>,
+    enable_bz: Arc<AtomicBool>,
+    toml_str: &str,
+) -> Result<(), String> {
+    // Parse the TOML to validate it first
+    let config: crate::config::Config = toml::from_str(toml_str)
+        .map_err(|e| format!("Invalid config TOML: {}", e))?;
+    // Save validated config first so runtime toggles only change if persistence succeeds.
+    loader.save(&config).map_err(|e| format!("Failed to save config: {}", e))?;
+    // Update in-memory toggle flags to match the saved config
+    enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
+    enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Parse auctions from Hypixel API response format.
@@ -1353,6 +1363,8 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn derive_tag_from_item_name() {
@@ -1409,5 +1421,44 @@ mod tests {
         assert!(entries[0].bin);
         assert!(entries[0].tag.is_some());
         assert_eq!(entries[0].tag.as_deref(), Some("DIAMOND_SWORD"));
+    }
+
+    #[test]
+    fn save_config_does_not_mutate_runtime_toggles_when_save_fails() {
+        let unique = format!(
+            "twm-config-save-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        );
+        let dir_path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir_path).expect("temp test directory should be created");
+
+        // Use a directory path as the "file" path so fs::write fails.
+        let loader = Arc::new(crate::config::ConfigLoader::with_path(PathBuf::from(&dir_path)));
+        let enable_ah = Arc::new(AtomicBool::new(false));
+        let enable_bz = Arc::new(AtomicBool::new(true));
+        let config_toml = "enable_ah_flips = true\nenable_bazaar_flips = false\n";
+
+        let result = save_config_inner(loader, enable_ah.clone(), enable_bz.clone(), config_toml);
+        assert!(result.is_err(), "saving to a directory path should fail");
+        assert!(
+            result
+                .expect_err("save should fail")
+                .starts_with("Failed to save config:"),
+            "error should use existing save-failure BAD_REQUEST message path"
+        );
+        assert!(
+            !enable_ah.load(Ordering::Relaxed),
+            "AH toggle must remain unchanged on save failure"
+        );
+        assert!(
+            enable_bz.load(Ordering::Relaxed),
+            "Bazaar toggle must remain unchanged on save failure"
+        );
+
+        std::fs::remove_dir_all(&dir_path).expect("temp test directory should be removed");
     }
 }
