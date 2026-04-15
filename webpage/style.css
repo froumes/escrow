@@ -1,26 +1,8 @@
+@import url("../src/web/shared-theme.css");
+
 :root {
-    --bg: #0e1517;
-    --bg-soft: #152025;
-    --panel: rgba(15, 24, 27, 0.86);
-    --panel-strong: #18252a;
-    --panel-alt: #1d2d33;
-    --line: rgba(214, 233, 228, 0.14);
-    --line-strong: rgba(214, 233, 228, 0.22);
-    --text: #e8f3ef;
-    --muted: #9eb5ae;
-    --warm: #f3b45b;
-    --warm-strong: #ffca7a;
-    --mint: #76d8b7;
-    --mint-soft: rgba(118, 216, 183, 0.14);
-    --danger: #ff8a6b;
-    --shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
-    --shadow-soft: 0 16px 45px rgba(0, 0, 0, 0.24);
-    --radius-lg: 30px;
-    --radius-md: 20px;
-    --radius-sm: 14px;
     --content: 1200px;
     --nav-height: 84px;
-    --transition: 180ms ease;
 }
 
 *,
@@ -208,25 +190,8 @@ pre {
     transform: translateY(-7px) rotate(-45deg);
 }
 
-.button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    min-height: 50px;
-    padding: 0 20px;
-    border-radius: 999px;
-    font-weight: 600;
-    transition: transform var(--transition), background var(--transition), border-color var(--transition), color var(--transition), box-shadow var(--transition);
-    cursor: pointer;
-}
-
-.button:hover {
-    transform: translateY(-1px);
-}
-
 .button-solid {
-    color: #101618;
+    color: var(--ink-strong);
     background: linear-gradient(135deg, var(--warm), var(--warm-strong));
     box-shadow: 0 16px 32px rgba(243, 180, 91, 0.22);
 }
@@ -295,15 +260,7 @@ pre {
 .eyebrow,
 .mini-label,
 .panel-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
     margin-bottom: 18px;
-    color: var(--warm);
-    font-size: 0.8rem;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
 }
 
 .hero h1,
@@ -363,7 +320,7 @@ pre {
     min-height: 38px;
     padding: 0 14px;
     border-radius: 999px;
-    border: 1px solid rgba(118, 216, 183, 0.24);
+    border: 1px solid color-mix(in srgb, var(--mint) 40%, transparent);
     background: var(--mint-soft);
     color: var(--text);
     font-size: 0.88rem;
