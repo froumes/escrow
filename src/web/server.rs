@@ -193,6 +193,31 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 
 /// Middleware logic that enforces authentication when a password is configured.
 /// Allows unauthenticated access to `GET /` (panel HTML) and `POST /api/login`.
+fn has_valid_auth_session(
+    req: &Request,
+    valid_sessions: &Mutex<HashSet<String>>,
+) -> bool {
+    // Collect all tokens to check
+    let mut tokens_to_check: Vec<String> = Vec::new();
+
+    // Session cookie
+    if let Some(token) = extract_session_cookie(req) {
+        tokens_to_check.push(token);
+    }
+
+    // Authorization: Bearer <token> header
+    if let Some(auth) = req.headers().get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                tokens_to_check.push(token.to_string());
+            }
+        }
+    }
+
+    let sessions = valid_sessions.lock().unwrap();
+    tokens_to_check.iter().any(|t| sessions.contains(t))
+}
+
 async fn check_auth(
     s: WebSharedState,
     req: Request,
@@ -214,39 +239,7 @@ async fn check_auth(
         return next.run(req).await;
     }
 
-    // Collect all tokens to check
-    let mut tokens_to_check: Vec<String> = Vec::new();
-
-    // Session cookie
-    if let Some(token) = extract_session_cookie(&req) {
-        tokens_to_check.push(token);
-    }
-
-    // Authorization: Bearer <token> header
-    if let Some(auth) = req.headers().get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                tokens_to_check.push(token.to_string());
-            }
-        }
-    }
-
-    // Query parameter `token=` (for WebSocket connections)
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=") {
-                tokens_to_check.push(token.to_string());
-            }
-        }
-    }
-
-    // Check all tokens against valid sessions (lock + release before await)
-    let is_valid = {
-        let sessions = s.valid_sessions.lock().unwrap();
-        tokens_to_check.iter().any(|t| sessions.contains(t))
-    };
-
-    if is_valid {
+    if has_valid_auth_session(&req, &s.valid_sessions) {
         return next.run(req).await;
     }
 
@@ -1353,6 +1346,7 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request as HttpRequest;
 
     #[test]
     fn derive_tag_from_item_name() {
@@ -1409,5 +1403,32 @@ mod tests {
         assert!(entries[0].bin);
         assert!(entries[0].tag.is_some());
         assert_eq!(entries[0].tag.as_deref(), Some("DIAMOND_SWORD"));
+    }
+
+    #[test]
+    fn auth_rejects_query_token_for_chat_ws() {
+        let mut sessions = HashSet::new();
+        sessions.insert("legacy-query-token".to_string());
+
+        let req = HttpRequest::builder()
+            .uri("/api/chat/ws?token=legacy-query-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        assert!(!has_valid_auth_session(&req, &Mutex::new(sessions)));
+    }
+
+    #[test]
+    fn auth_accepts_bearer_token() {
+        let mut sessions = HashSet::new();
+        sessions.insert("header-token".to_string());
+
+        let req = HttpRequest::builder()
+            .uri("/api/chat/ws")
+            .header("authorization", "Bearer header-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        assert!(has_valid_auth_session(&req, &Mutex::new(sessions)));
     }
 }
