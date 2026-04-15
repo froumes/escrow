@@ -235,6 +235,31 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 
 /// Middleware logic that enforces authentication when a password is configured.
 /// Allows unauthenticated access to `GET /` (panel HTML) and `POST /api/login`.
+fn has_valid_auth_session(
+    req: &Request,
+    valid_sessions: &Mutex<HashSet<String>>,
+) -> bool {
+    // Collect all tokens to check
+    let mut tokens_to_check: Vec<String> = Vec::new();
+
+    // Session cookie
+    if let Some(token) = extract_session_cookie(req) {
+        tokens_to_check.push(token);
+    }
+
+    // Authorization: Bearer <token> header
+    if let Some(auth) = req.headers().get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                tokens_to_check.push(token.to_string());
+            }
+        }
+    }
+
+    let sessions = valid_sessions.lock().unwrap();
+    tokens_to_check.iter().any(|t| sessions.contains(t))
+}
+
 async fn check_auth(
     s: WebSharedState,
     req: Request,
@@ -256,39 +281,7 @@ async fn check_auth(
         return next.run(req).await;
     }
 
-    // Collect all tokens to check
-    let mut tokens_to_check: Vec<String> = Vec::new();
-
-    // Session cookie
-    if let Some(token) = extract_session_cookie(&req) {
-        tokens_to_check.push(token);
-    }
-
-    // Authorization: Bearer <token> header
-    if let Some(auth) = req.headers().get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                tokens_to_check.push(token.to_string());
-            }
-        }
-    }
-
-    // Query parameter `token=` (for WebSocket connections)
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=") {
-                tokens_to_check.push(token.to_string());
-            }
-        }
-    }
-
-    // Check all tokens against valid sessions (lock + release before await)
-    let is_valid = {
-        let sessions = s.valid_sessions.lock().unwrap();
-        tokens_to_check.iter().any(|t| sessions.contains(t))
-    };
-
-    if is_valid {
+    if has_valid_auth_session(&req, &s.valid_sessions) {
         return next.run(req).await;
     }
 

@@ -1179,6 +1179,9 @@ const API = {
     cancelBz: "/api/cancel_bz_order",
     chatSend: "/api/chat/send",
     logsLatest: "/api/logs/latest",
+    // Migration note: `?token=` URL auth is no longer accepted by the backend.
+    // Chat WS auth now relies on the twm_session cookie (login flow) or an
+    // Authorization header for non-browser clients.
     chatWs: () => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/chat/ws`
 };
 
@@ -2360,6 +2363,7 @@ function App() {
         let socket;
         let closed = false;
         let reconnectTimer = null;
+        let warnedAuthMigration = false;
 
         const connect = () => {
             socket = new WebSocket(API.chatWs());
@@ -2394,6 +2398,12 @@ function App() {
             };
             socket.onclose = () => {
                 setChatConnected(false);
+                if (!closed && !warnedAuthMigration) {
+                    warnedAuthMigration = true;
+                    console.warn(
+                        "[WebGUI] Chat websocket closed. If you use a custom client, remove '?token=' from the WS URL and authenticate via twm_session cookie or Authorization header."
+                    );
+                }
                 if (!closed) {
                     chatReconnectAttemptsRef.current += 1;
                     setChatReconnectAttempts(chatReconnectAttemptsRef.current);
