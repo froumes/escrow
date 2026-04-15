@@ -35,6 +35,11 @@
     --content: 1200px;
     --nav-height: 84px;
     --transition: 180ms ease;
+    --motion-fast: 140ms;
+    --motion-base: 220ms;
+    --motion-slow: 360ms;
+    --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+    --ease-emphasized: cubic-bezier(0.2, 0, 0, 1.2);
 }
 
 :root[data-theme="dark"] {
@@ -972,6 +977,53 @@ pre {
 [data-reveal].is-visible {
     opacity: 1;
     transform: translateY(0);
+}
+
+.motion-panel-enter {
+    animation: panel-enter var(--motion-base) var(--ease-emphasized) both;
+}
+
+.motion-panel-exit {
+    animation: panel-exit var(--motion-fast) var(--ease-standard) both;
+}
+
+.motion-tab-enter {
+    animation: tab-enter var(--motion-base) var(--ease-emphasized) both;
+}
+
+.motion-status-pulse {
+    animation: status-pulse 1100ms var(--ease-emphasized);
+}
+
+.motion-skeleton {
+    opacity: 0.62;
+    filter: saturate(0.7);
+    transition: opacity var(--motion-base) var(--ease-standard), filter var(--motion-base) var(--ease-standard);
+}
+
+.motion-skeleton.is-loaded {
+    opacity: 1;
+    filter: none;
+}
+
+@keyframes panel-enter {
+    from { opacity: 0; transform: translateY(10px) scale(0.995); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes panel-exit {
+    from { opacity: 1; transform: translateY(0); }
+    to { opacity: 0; transform: translateY(8px); }
+}
+
+@keyframes tab-enter {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes status-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(118, 216, 183, 0.42); }
+    100% { box-shadow: 0 0 0 12px rgba(118, 216, 183, 0); }
 }
 
 @media (prefers-reduced-motion: reduce) {
