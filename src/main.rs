@@ -739,7 +739,7 @@ async fn main() -> Result<()> {
             chat_tx: chat_tx.clone(),
             web_gui_password: config.web_gui_password.clone(),
             valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
+                twm::web::SessionStore::new(),
             )),
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),

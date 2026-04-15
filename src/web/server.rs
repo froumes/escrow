@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -47,8 +47,8 @@ pub struct WebSharedState {
     pub chat_tx: broadcast::Sender<String>,
     /// Password required to access the web panel (`None` = no auth).
     pub web_gui_password: Option<String>,
-    /// Set of valid session tokens for authenticated clients.
-    pub valid_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Active web sessions with deterministic FIFO eviction at capacity.
+    pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
     /// Resolved lazily from the Mojang API on first `/api/auctions` request.
     pub player_uuid: Arc<tokio::sync::RwLock<Option<String>>>,
@@ -70,6 +70,48 @@ pub struct WebSharedState {
     pub bazaar_tracker: Arc<BazaarOrderTracker>,
     /// Config loader for persisting changes to config.toml.
     pub config_loader: Arc<crate::config::ConfigLoader>,
+}
+
+/// Ordered set-like storage for active web sessions.
+///
+/// - `order` preserves insertion order for deterministic eviction.
+/// - `members` provides O(1) membership checks for auth validation.
+pub struct SessionStore {
+    order: VecDeque<String>,
+    members: HashSet<String>,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            members: HashSet::new(),
+        }
+    }
+
+    pub fn contains(&self, token: &str) -> bool {
+        self.members.contains(token)
+    }
+
+    /// Inserts a session token while enforcing a hard max session count.
+    ///
+    /// When full, this evicts the oldest inserted token first (FIFO).
+    pub fn insert_with_capacity(&mut self, token: String, max_sessions: usize) {
+        if self.members.contains(&token) {
+            self.order.retain(|t| t != &token);
+            self.order.push_back(token);
+            return;
+        }
+
+        if self.members.len() >= max_sessions {
+            if let Some(oldest) = self.order.pop_front() {
+                self.members.remove(&oldest);
+            }
+        }
+
+        self.order.push_back(token.clone());
+        self.members.insert(token);
+    }
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -419,17 +461,12 @@ async fn login(
             .into_response();
     }
 
-    // Generate a random session token and cap the number of active sessions
+    // Generate a random session token and cap active sessions with FIFO eviction.
     let token = uuid::Uuid::new_v4().to_string();
     {
         let mut sessions = s.valid_sessions.lock().unwrap();
-        // Limit to 64 active sessions; evict oldest when full
-        if sessions.len() >= 64 {
-            if let Some(oldest) = sessions.iter().next().cloned() {
-                sessions.remove(&oldest);
-            }
-        }
-        sessions.insert(token.clone());
+        // Hard limit of 64 active sessions; always evicts the true oldest token first.
+        sessions.insert_with_capacity(token.clone(), 64);
     }
 
     info!("[WebGUI] Successful login via web panel");
