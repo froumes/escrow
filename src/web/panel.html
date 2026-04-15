@@ -141,6 +141,7 @@ img{display:block;max-width:100%}
 .statusBadge{
     display:inline-flex;
     align-items:center;
+    gap:6px;
     min-height:34px;
     padding:0 12px;
     border-radius:999px;
@@ -432,50 +433,121 @@ img{display:block;max-width:100%}
 .inventoryLayout{
     margin-top:18px;
     display:grid;
-    grid-template-columns:1fr;
-    gap:16px;
+    grid-template-columns:minmax(0,1fr) 320px;
+    gap:18px;
+}
+.inventoryBoard{
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:18px;
+    padding:16px;
+    background:
+        linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01)),
+        linear-gradient(180deg,#162024,#11181b);
+    box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.06),
+        inset 0 0 0 1px rgba(0,0,0,.24),
+        0 12px 24px rgba(0,0,0,.18);
+}
+.inventoryBoardBar{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    margin-bottom:14px;
+}
+.inventoryBoardTitle{
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+}
+.inventoryBoardTitle strong{
+    font-size:.95rem;
+    letter-spacing:.02em;
+}
+.inventoryBoardTitle span{
+    color:var(--muted);
+    font-size:.8rem;
+}
+.inventoryHint{
+    display:inline-flex;
+    align-items:center;
+    min-height:28px;
+    padding:0 10px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.08);
+    background:rgba(0,0,0,.18);
+    color:var(--muted);
+    font-size:.76rem;
 }
 .slotGrid{
     display:grid;
-    grid-template-columns:repeat(7,minmax(0,1fr));
-    gap:12px;
+    grid-template-columns:repeat(9,minmax(0,1fr));
+    gap:8px;
 }
 .slotButton{
     position:relative;
-    border:1px solid rgba(255,255,255,.07);
-    border-radius:16px;
-    padding:12px;
-    background:rgba(255,255,255,.03);
+    aspect-ratio:1 / 1;
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:10px;
+    padding:6px;
+    background:
+        linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.01)),
+        linear-gradient(180deg,#27343a,#1a2428);
+    box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.06),
+        inset 0 -1px 0 rgba(0,0,0,.42);
     cursor:pointer;
     text-align:left;
-    transition:border-color .18s ease,transform .18s ease,background .18s ease;
+    transition:border-color .18s ease,transform .18s ease,background .18s ease,box-shadow .18s ease;
 }
-.slotButton:hover{transform:translateY(-1px);border-color:var(--line-strong)}
+.slotButton:hover{
+    transform:translateY(-1px);
+    border-color:rgba(255,255,255,.14);
+    box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.08),
+        inset 0 -1px 0 rgba(0,0,0,.46),
+        0 8px 18px rgba(0,0,0,.18);
+}
+.slotButton.empty{
+    background:
+        linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.01)),
+        linear-gradient(180deg,#1d272b,#141b1f);
+}
 .slotButton.active{
-    border-color:rgba(129,183,255,.35);
-    background:rgba(129,183,255,.12);
+    border-color:rgba(242,177,92,.55);
+    background:
+        linear-gradient(180deg,rgba(255,208,138,.18),rgba(255,208,138,.04)),
+        linear-gradient(180deg,#314046,#212d31);
+    box-shadow:
+        inset 0 0 0 1px rgba(255,208,138,.18),
+        0 0 0 1px rgba(242,177,92,.16),
+        0 10px 22px rgba(0,0,0,.22);
 }
 .slotId{
     display:block;
     color:var(--muted);
-    font-size:.68rem;
-    letter-spacing:.14em;
+    font-size:.58rem;
+    letter-spacing:.12em;
     text-transform:uppercase;
 }
 .slotIcon{
-    margin-top:8px;
-    height:72px;
-    border-radius:14px;
+    margin-top:4px;
+    height:calc(100% - 18px);
+    min-height:54px;
+    border-radius:8px;
     display:flex;
     align-items:center;
     justify-content:center;
     overflow:hidden;
-    background:rgba(0,0,0,.24);
+    background:
+        linear-gradient(180deg,rgba(0,0,0,.28),rgba(0,0,0,.18)),
+        rgba(0,0,0,.22);
 }
 .slotIcon img{
-    width:52px;
-    height:52px;
+    width:70%;
+    height:70%;
     object-fit:contain;
+    image-rendering:pixelated;
 }
 .slotFallback{
     font-size:.72rem;
@@ -485,21 +557,38 @@ img{display:block;max-width:100%}
     line-height:1.3;
 }
 .slotLabel{
-    margin-top:8px;
-    min-height:32px;
-    font-size:.76rem;
-    color:var(--muted);
-    line-height:1.35;
+    display:none;
 }
 .slotCount{
     position:absolute;
-    right:8px;
-    bottom:8px;
-    padding:2px 7px;
-    border-radius:999px;
-    background:rgba(0,0,0,.58);
-    font-size:.66rem;
+    right:6px;
+    bottom:5px;
+    min-width:18px;
+    padding:0 3px;
+    border-radius:6px;
+    background:rgba(0,0,0,.54);
+    font-size:.72rem;
     font-weight:700;
+    text-align:center;
+    text-shadow:1px 1px 0 rgba(0,0,0,.82);
+}
+.inventoryInspector{
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:18px;
+    padding:16px;
+    background:
+        linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015)),
+        linear-gradient(180deg,#131b1f,#0f1518);
+    box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.06),
+        inset 0 0 0 1px rgba(0,0,0,.2);
+}
+.inventoryInspector .detailCard{
+    padding:0;
+    border:0;
+    border-radius:0;
+    background:transparent;
+    box-shadow:none;
 }
 .detailCard{
     padding:18px;
@@ -520,6 +609,16 @@ img{display:block;max-width:100%}
     min-width:72px;
     height:72px;
 }
+.inventoryInspector .detailTop .slotIcon{
+    width:88px;
+    min-width:88px;
+    height:88px;
+    border-radius:12px;
+}
+.inventoryInspector .miniRow{
+    border-radius:12px;
+    background:rgba(0,0,0,.18);
+}
 .detailTitle{
     margin:0;
     font-size:1.1rem;
@@ -529,24 +628,6 @@ img{display:block;max-width:100%}
     display:flex;
     flex-wrap:wrap;
     gap:8px;
-}
-.detailLore{
-    margin:0;
-    padding:0;
-    list-style:none;
-    display:grid;
-    gap:8px;
-    max-height:360px;
-    overflow:auto;
-}
-.detailLore li{
-    padding:10px 12px;
-    border-radius:14px;
-    background:rgba(0,0,0,.18);
-    font-size:.88rem;
-    line-height:1.45;
-    white-space:pre-wrap;
-    word-break:break-word;
 }
 .mcTooltipAnchor{
     display:block;
@@ -622,9 +703,6 @@ img{display:block;max-width:100%}
 .mcColorD{color:#ff55ff}
 .mcColorE{color:#ffff55}
 .mcColorF{color:#ffffff}
-.detailLore .mcTooltipLine{
-    font-size:.88rem;
-}
 .tableShell{
     margin-top:18px;
     display:grid;
@@ -881,10 +959,11 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     .actionGrid,
     .statGrid,
     .kpiStrip{grid-template-columns:repeat(2,minmax(0,1fr))}
-    .slotGrid{grid-template-columns:repeat(6,minmax(0,1fr))}
+    .inventoryLayout{grid-template-columns:1fr}
+    .slotGrid{grid-template-columns:repeat(8,minmax(0,1fr))}
 }
 @media(max-width:900px){
-    .slotGrid{grid-template-columns:repeat(5,minmax(0,1fr))}
+    .slotGrid{grid-template-columns:repeat(6,minmax(0,1fr))}
 }
 @media(max-width:720px){
     .app{width:min(var(--content),calc(100% - 16px))}
@@ -897,6 +976,8 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     .actionGrid,
     .statGrid,
     .kpiStrip{grid-template-columns:1fr}
+    .inventoryBoard,
+    .inventoryInspector{padding:12px}
     .slotGrid{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
     .button{width:100%}
     .toolbar .button{width:auto}
@@ -1198,7 +1279,7 @@ const Button = ({ className, kind = "secondary", size = "", children, ...props }
 
 const StatusBadge = ({ label, value, tone = "" }) => html`
     <span className=${cls("statusBadge", tone)}>
-        ${label ? html`<span>${label} </span>` : null}
+        ${label ? html`<span>${label}</span>` : null}
         <strong>${value}</strong>
     </span>
 `;
@@ -1220,23 +1301,6 @@ function MinecraftText({ text, className = "" }) {
                 <span key=${index} className=${mcSegmentClass(segment)}>${segment.text}</span>
             `)}
         </span>
-    `;
-}
-
-function MinecraftLore({ lines = [] }) {
-    const safeLines = Array.isArray(lines) ? lines.filter((line) => line != null && line !== "") : [];
-    if (!safeLines.length) return null;
-
-    return html`
-        <ul className="detailLore">
-            ${safeLines.map((line, index) => html`
-                <li key=${index}>
-                    <div className="mcTooltipLine">
-                        <${MinecraftText} text=${line} />
-                    </div>
-                </li>
-            `)}
-        </ul>
     `;
 }
 
@@ -1448,7 +1512,6 @@ function InventoryPanel({ title, subtitle, slots }) {
     const selected = list[activeIndex] || list[defaultIndex] || {};
     const selectedName = slotName(selected);
     const selectedIcon = slotIconUrl(selected);
-    const lore = Array.isArray(selected?.lore) ? selected.lore : [];
     const selectedTooltip = getTooltipData(selected);
     const selectedTitle = selected?.displayNameColored || selected?.displayName || selectedName;
 
@@ -1469,36 +1532,47 @@ function InventoryPanel({ title, subtitle, slots }) {
 
                 ${!list.length ? html`<div className="emptyState">No slot data yet.</div>` : html`
                     <div className="inventoryLayout">
-                        <div className="slotGrid">
-                            ${list.map((slot, index) => {
-                                const empty = slot?.empty || (!slot?.name && !slot?.displayName);
-                                const icon = slotIconUrl(slot);
-                                const label = slotName(slot);
-                                const tooltip = getTooltipData(slot);
-                                return html`
-                                    <${TooltipAnchor}
-                                        key=${`${slot?.slot ?? index}-${label}`}
-                                        as="button"
-                                        type="button"
-                                        tooltip=${tooltip}
-                                        className=${cls("slotButton", activeIndex === index && "active")}
-                                        onClick=${() => setActiveIndex(index)}
-                                    >
-                                        <span className="slotId">#${slot?.slot ?? index}</span>
-                                        <div className="slotIcon">
-                                            ${icon && !empty ? html`
-                                                <img src=${icon} alt=${label} onError=${(event) => { event.currentTarget.style.display = "none"; }} />
-                                            ` : html`
-                                                <span className="slotFallback">${empty ? "Empty" : label.slice(0, 20)}</span>
-                                            `}
-                                        </div>
-                                        ${!empty && Number(slot?.count) > 1 ? html`<span className="slotCount">${slot.count}</span>` : null}
-                                        <div className="slotLabel">${empty ? "No item" : label}</div>
-                                    </${TooltipAnchor}>
-                                `;
-                            })}
+                        <div className="inventoryBoard">
+                            <div className="inventoryBoardBar">
+                                <div className="inventoryBoardTitle">
+                                    <strong>${title}</strong>
+                                    <span>Hover for tooltip, click to inspect</span>
+                                </div>
+                                <span className="inventoryHint">${list.length} slots</span>
+                            </div>
+
+                            <div className="slotGrid">
+                                ${list.map((slot, index) => {
+                                    const empty = slot?.empty || (!slot?.name && !slot?.displayName);
+                                    const icon = slotIconUrl(slot);
+                                    const label = slotName(slot);
+                                    const tooltip = getTooltipData(slot);
+                                    return html`
+                                        <${TooltipAnchor}
+                                            key=${`${slot?.slot ?? index}-${label}`}
+                                            as="button"
+                                            type="button"
+                                            tooltip=${tooltip}
+                                            aria-label=${empty ? `Empty slot ${slot?.slot ?? index}` : `${label} in slot ${slot?.slot ?? index}`}
+                                            className=${cls("slotButton", empty && "empty", activeIndex === index && "active")}
+                                            onClick=${() => setActiveIndex(index)}
+                                        >
+                                            <span className="slotId">#${slot?.slot ?? index}</span>
+                                            <div className="slotIcon">
+                                                ${icon && !empty ? html`
+                                                    <img src=${icon} alt=${label} onError=${(event) => { event.currentTarget.style.display = "none"; }} />
+                                                ` : html`
+                                                    <span className="slotFallback">${empty ? "Empty" : label.slice(0, 20)}</span>
+                                                `}
+                                            </div>
+                                            ${!empty && Number(slot?.count) > 1 ? html`<span className="slotCount">${slot.count}</span>` : null}
+                                        </${TooltipAnchor}>
+                                    `;
+                                })}
+                            </div>
                         </div>
 
+                        <div className="inventoryInspector">
                         <div className="detailCard">
                             <div className="detailTop">
                                 <${TooltipAnchor} tooltip=${selectedTooltip} className="inline">
@@ -1510,6 +1584,7 @@ function InventoryPanel({ title, subtitle, slots }) {
                                     `}
                                 </div>
                                 </${TooltipAnchor}>
+                                <${TooltipAnchor} tooltip=${selectedTooltip} className="inline">
                                 <div>
                                     <span className="eyebrow">Selected Slot</span>
                                     <h3 className="detailTitle"><${MinecraftText} text=${selectedTitle} /></h3>
@@ -1519,6 +1594,7 @@ function InventoryPanel({ title, subtitle, slots }) {
                                         ${selected?.tag ? html`<span className="tag mono">${selected.tag}</span>` : null}
                                     </div>
                                 </div>
+                                </${TooltipAnchor}>
                             </div>
 
                             <div className="miniList">
@@ -1526,13 +1602,7 @@ function InventoryPanel({ title, subtitle, slots }) {
                                 <div className="miniRow"><strong>Display Name</strong><span>${selected?.displayName ? stripMc(selected.displayName) : "-"}</span></div>
                                 <div className="miniRow"><strong>Colored Name</strong><span>${selected?.displayNameColored ? html`<${MinecraftText} text=${selected.displayNameColored} />` : "-"}</span></div>
                             </div>
-
-                            ${lore.length ? html`
-                                <div>
-                                    <span className="eyebrow">Lore</span>
-                                    <${MinecraftLore} lines=${lore} />
-                                </div>
-                            ` : html`<div className="muted">No lore available for this slot.</div>`}
+                        </div>
                         </div>
                     </div>
                 `}
@@ -2443,7 +2513,9 @@ function App() {
                             detailRenderer=${(row) => html`
                                 <div>
                                     <span className="eyebrow">Auction Detail</span>
+                                    <${TooltipAnchor} tooltip=${getTooltipData(row)} className="inline">
                                     <h3 className="detailTitle"><${MinecraftText} text=${row.displayNameColored || row.item_name} /></h3>
+                                    </${TooltipAnchor}>
                                     <div className="detailMeta">
                                         <span className="tag">${row.bin ? "BIN" : "Auction"}</span>
                                         <span className="tag">${uptime(Math.max(0, row.time_remaining_seconds || 0))} left</span>
@@ -2462,12 +2534,6 @@ function App() {
                                             Queue Cancel Auction
                                         </${Button}>
                                     </div>
-                                    ${(row.lore || []).length ? html`
-                                        <div style=${{ marginTop: "16px" }}>
-                                            <span className="eyebrow">Lore</span>
-                                            <${MinecraftLore} lines=${row.lore || []} />
-                                        </div>
-                                    ` : null}
                                 </div>
                             `}
                         />
