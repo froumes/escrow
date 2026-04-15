@@ -82,6 +82,9 @@ If `web_gui_password` is empty, the panel is open on the configured port.
 
 If `web_gui_password` is set, the panel requires login and uses a local session cookie.
 
+By default, the login cookie is issued without `Secure` so local HTTP setups (for example `http://localhost:8080`) continue to work.
+If you serve the panel through HTTPS (directly or via a reverse proxy like Nginx/Caddy/Traefik), set `web_gui_cookie_secure = true` so authentication cookies include `Secure`.
+
 ## Configuration
 
 TWM writes a `config.toml` file next to the executable.
@@ -96,6 +99,8 @@ Useful settings include:
   Local control panel port. Default: `8080`.
 - `web_gui_password`
   Password-protect the web panel.
+- `web_gui_cookie_secure`
+  Adds `Secure` to the web panel session cookie. Enable for HTTPS/reverse-proxy deployments.
 - `enable_bazaar_flips`
   Enables or disables Bazaar flipping logic at startup.
 - `fastbuy`
