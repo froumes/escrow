@@ -38,6 +38,11 @@
     --radius-md:16px;
     --radius-sm:12px;
     --content:1360px;
+    --motion-fast:140ms;
+    --motion-base:220ms;
+    --motion-slow:360ms;
+    --ease-standard:cubic-bezier(.2,0,0,1);
+    --ease-emphasized:cubic-bezier(.2,0,0,1.2);
 }
 *,
 *::before,
@@ -181,7 +186,7 @@ img{display:block;max-width:100%}
     color:var(--muted);
     cursor:pointer;
     white-space:nowrap;
-    transition:background .18s ease,color .18s ease,transform .18s ease;
+    transition:background var(--motion-fast) var(--ease-standard),color var(--motion-fast) var(--ease-standard),transform var(--motion-fast) var(--ease-standard);
 }
 .tab:hover{transform:translateY(-1px);color:var(--text)}
 .tab.active{
@@ -199,7 +204,7 @@ img{display:block;max-width:100%}
     justify-content:center;
     gap:10px;
     cursor:pointer;
-    transition:transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease;
+    transition:transform var(--motion-fast) var(--ease-standard),border-color var(--motion-fast) var(--ease-standard),background var(--motion-fast) var(--ease-standard),box-shadow var(--motion-fast) var(--ease-standard);
 }
 .button:hover{transform:translateY(-1px)}
 .button.primary{
@@ -938,6 +943,99 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     border:1px solid var(--line);
     box-shadow:var(--shadow);
 }
+
+.tabBodyStage{
+    position:relative;
+    min-height:260px;
+}
+.tabPanelMotion{
+    animation:tab-content-enter var(--motion-base) var(--ease-emphasized) both;
+}
+.motion-panel-enter{
+    animation:panel-enter var(--motion-base) var(--ease-emphasized) both;
+}
+.motion-panel-exit{
+    animation:panel-exit var(--motion-fast) var(--ease-standard) both;
+}
+.motion-status-pulse{
+    animation:status-pulse 1000ms var(--ease-emphasized);
+}
+.motion-skeleton{
+    opacity:.58;
+    filter:saturate(.72);
+    transition:opacity var(--motion-base) var(--ease-standard),filter var(--motion-base) var(--ease-standard);
+}
+.motion-skeleton.is-loaded{
+    opacity:1;
+    filter:none;
+}
+.dot.live{
+    box-shadow:0 0 0 0 rgba(115,210,175,.46);
+}
+.dot.live.reconnectPulse{
+    animation:dot-live-pulse var(--motion-slow) var(--ease-emphasized) 2;
+}
+.chatLine.is-new{
+    animation:chat-line-flash 980ms var(--ease-standard) both;
+}
+.toast{
+    transform-origin:100% 100%;
+    animation:toast-enter var(--motion-base) var(--ease-emphasized) both;
+}
+.toast.toast-exit{
+    animation:toast-exit var(--motion-fast) var(--ease-standard) both;
+}
+@keyframes panel-enter{
+    from{opacity:0;transform:translateY(10px) scale(.995)}
+    to{opacity:1;transform:translateY(0) scale(1)}
+}
+@keyframes panel-exit{
+    from{opacity:1;transform:translateY(0)}
+    to{opacity:0;transform:translateY(8px)}
+}
+@keyframes tab-content-enter{
+    from{opacity:0;transform:translateX(10px) translateY(8px)}
+    to{opacity:1;transform:translateX(0) translateY(0)}
+}
+@keyframes status-pulse{
+    0%{box-shadow:0 0 0 0 rgba(115,210,175,.45)}
+    100%{box-shadow:0 0 0 11px rgba(115,210,175,0)}
+}
+@keyframes dot-live-pulse{
+    0%{transform:scale(1)}
+    40%{transform:scale(1.45)}
+    100%{transform:scale(1)}
+}
+@keyframes toast-enter{
+    from{opacity:0;transform:translateY(10px) scale(.96)}
+    to{opacity:1;transform:translateY(0) scale(1)}
+}
+@keyframes toast-exit{
+    from{opacity:1;transform:translateY(0) scale(1)}
+    to{opacity:0;transform:translateY(8px) scale(.98)}
+}
+@keyframes chat-line-flash{
+    0%{background:rgba(129,183,255,.18)}
+    100%{background:transparent}
+}
+@media (prefers-reduced-motion: reduce){
+    .tabPanelMotion,
+    .motion-panel-enter,
+    .motion-panel-exit,
+    .motion-status-pulse,
+    .dot.live.reconnectPulse,
+    .chatLine.is-new,
+    .toast,
+    .toast.toast-exit{
+        animation:none !important;
+    }
+    .motion-skeleton{
+        opacity:1;
+        filter:none;
+        transition:none;
+    }
+}
+
 .muted{color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .grow{flex:1}
@@ -1268,7 +1366,7 @@ async function req(url, options = {}) {
 }
 
 const Panel = ({ className, children }) => html`
-    <section className=${cls("surface", className)}>
+    <section className=${cls("surface", "motion-panel-enter", className)}>
         ${children}
     </section>
 `;
@@ -1277,8 +1375,8 @@ const Button = ({ className, kind = "secondary", size = "", children, ...props }
     <button className=${cls("button", kind, size, className)} ...${props}>${children}</button>
 `;
 
-const StatusBadge = ({ label, value, tone = "" }) => html`
-    <span className=${cls("statusBadge", tone)}>
+const StatusBadge = ({ label, value, tone = "", className = "" }) => html`
+    <span className=${cls("statusBadge", tone, className)}>
         ${label ? html`<span>${label}</span>` : null}
         <strong>${value}</strong>
     </span>
@@ -1850,14 +1948,25 @@ function App() {
     const [chatInput, setChatInput] = useState("");
     const [chat, setChat] = useState([]);
     const [chatConnected, setChatConnected] = useState(false);
+    const [chatPulseTick, setChatPulseTick] = useState(0);
+    const [toastVisible, setToastVisible] = useState(false);
+    const [newChatStartIndex, setNewChatStartIndex] = useState(null);
+    const [renderedTab, setRenderedTab] = useState("dashboard");
+    const [statusPulseTick, setStatusPulseTick] = useState(0);
 
     const chatBoxRef = useRef(null);
     const toastTimerRef = useRef(null);
+    const toastExitTimerRef = useRef(null);
+    const chatFlashTimerRef = useRef(null);
+    const previousChatLengthRef = useRef(0);
 
     const flash = useCallback((message) => {
         setToast(message);
+        setToastVisible(true);
         if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-        toastTimerRef.current = window.setTimeout(() => setToast(""), 2600);
+        if (toastExitTimerRef.current) window.clearTimeout(toastExitTimerRef.current);
+        toastTimerRef.current = window.setTimeout(() => setToastVisible(false), 2200);
+        toastExitTimerRef.current = window.setTimeout(() => setToast(""), 2600);
     }, []);
 
     const handleUnauthorized = useCallback(() => {
@@ -2048,6 +2157,15 @@ function App() {
     }, [activeTab, configText, loadConfig]);
 
     useEffect(() => {
+        setRenderedTab(activeTab);
+    }, [activeTab]);
+
+    useEffect(() => {
+        if (!Object.keys(status || {}).length) return;
+        setStatusPulseTick((tick) => tick + 1);
+    }, [status.state, status.macro_paused, status.current_account]);
+
+    useEffect(() => {
         if (activeTab !== "config") return undefined;
         const onKeyDown = (event) => {
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
@@ -2068,7 +2186,10 @@ function App() {
 
         const connect = () => {
             socket = new WebSocket(API.chatWs());
-            socket.onopen = () => setChatConnected(true);
+            socket.onopen = () => {
+                setChatConnected(true);
+                setChatPulseTick((tick) => tick + 1);
+            };
             socket.onmessage = (event) => {
                 setChat((previous) => [...previous.slice(-299), event.data]);
             };
@@ -2102,7 +2223,20 @@ function App() {
         if (nearBottom) {
             box.scrollTop = box.scrollHeight;
         }
+
+        if (chat.length > previousChatLengthRef.current) {
+            setNewChatStartIndex(previousChatLengthRef.current);
+            if (chatFlashTimerRef.current) window.clearTimeout(chatFlashTimerRef.current);
+            chatFlashTimerRef.current = window.setTimeout(() => setNewChatStartIndex(null), 1000);
+        }
+        previousChatLengthRef.current = chat.length;
     }, [chat]);
+
+    useEffect(() => () => {
+        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+        if (toastExitTimerRef.current) window.clearTimeout(toastExitTimerRef.current);
+        if (chatFlashTimerRef.current) window.clearTimeout(chatFlashTimerRef.current);
+    }, []);
 
     const sessionTotalProfit = (profit.session_ah_total || 0) + (profit.session_bz_total || 0);
     const allTimeTotalProfit = (profit.all_time_ah_total || 0) + (profit.all_time_bz_total || 0);
@@ -2193,15 +2327,15 @@ function App() {
                             <span className="eyebrow">Local Runtime Control</span>
                             <h1>Operational panel for live flips, queue state, market cleanup, and config.</h1>
                             <div className="brandMeta">
-                                <${StatusBadge} label="Macro" value=${status.macro_paused ? "Paused" : "Running"} tone=${status.macro_paused ? "tone-gold" : "tone-green"} />
-                                    <${StatusBadge} label="State" value=${humanizeIdentifier(status.state)} tone="tone-blue" />
-                                <${StatusBadge} label="Account" value=${status.current_account || "-"} />
+                                <${StatusBadge} key=${`macro-${statusPulseTick}`} label="Macro" value=${status.macro_paused ? "Paused" : "Running"} tone=${status.macro_paused ? "tone-gold" : "tone-green"} className="motion-status-pulse" />
+                                    <${StatusBadge} key=${`state-${statusPulseTick}`} label="State" value=${humanizeIdentifier(status.state)} tone="tone-blue" className="motion-status-pulse" />
+                                <${StatusBadge} key=${`account-${statusPulseTick}`} label="Account" value=${status.current_account || "-"} className="motion-status-pulse" />
                             </div>
                         </div>
                     </div>
 
                     <div className="toolbar">
-                        <span className="pill">Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
+                        <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
                     </div>
@@ -2216,8 +2350,9 @@ function App() {
                 </div>
             </${Panel}>
 
-            <div className="layout">
-                ${activeTab === "dashboard" ? html`
+            <div className="layout tabBodyStage">
+                <div key=${renderedTab} className="tabPanelMotion">
+                ${renderedTab === "dashboard" ? html`
                     <${Panel}>
                         <div className="hero">
                             <div className="heroCopy">
@@ -2416,7 +2551,7 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "analytics" ? html`
+                ${renderedTab === "analytics" ? html`
                     <div className="layout">
                         <div className="sectionTitle">
                             <div>
@@ -2482,7 +2617,7 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "inventory" ? html`
+                ${renderedTab === "inventory" ? html`
                     <div className="layout">
                         <${InventoryPanel}
                             title="Player inventory"
@@ -2497,7 +2632,7 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "market" ? html`
+                ${renderedTab === "market" ? html`
                     <div className="layout">
                         <${MarketTableCard}
                             title="Active auctions"
@@ -2579,11 +2714,11 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "queue" ? html`
+                ${renderedTab === "queue" ? html`
                     <${QueueCard} status=${status} queue=${queue} />
                 ` : null}
 
-                ${activeTab === "config" ? html`
+                ${renderedTab === "config" ? html`
                     <${Panel}>
                         <div className="cardBody">
                             <div className="sectionTitle">
@@ -2614,7 +2749,7 @@ function App() {
                     </${Panel}>
                 ` : null}
 
-                ${activeTab === "chat" ? html`
+                ${renderedTab === "chat" ? html`
                     <${Panel}>
                         <div className="cardBody">
                             <div className="sectionTitle">
@@ -2624,7 +2759,7 @@ function App() {
                                     <p>Watch chat in one pane and send commands in another without the current cramped split.</p>
                                 </div>
                                 <div className="chatStatus">
-                                    <span className=${cls("dot", chatConnected && "live")}></span>
+                                    <span key=${chatPulseTick} className=${cls("dot", chatConnected && "live", chatConnected && "reconnectPulse")}></span>
                                     <span>${chatConnected ? "WebSocket connected" : "Reconnecting chat stream"}</span>
                                 </div>
                             </div>
@@ -2633,7 +2768,7 @@ function App() {
                                 <div>
                                     <div className="chatBox" ref=${chatBoxRef}>
                                         ${(chat || []).length ? (chat || []).map((line, index) => html`
-                                            <div key=${index} className="chatLine">${stripMc(line)}</div>
+                                            <div key=${index} className=${cls("chatLine", newChatStartIndex != null && index >= newChatStartIndex && "is-new")}>${stripMc(line)}</div>
                                         `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
                                     </div>
                                 </div>
@@ -2672,9 +2807,10 @@ function App() {
                         </div>
                     </${Panel}>
                 ` : null}
+                </div>
             </div>
 
-            ${toast ? html`<div className="toast">${toast}</div>` : null}
+            ${toast ? html`<div className=${cls("toast", !toastVisible && "toast-exit")}>${toast}</div>` : null}
 
             <${LoginOverlay}
                 show=${needsAuth}
