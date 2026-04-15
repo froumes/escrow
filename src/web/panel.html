@@ -1325,9 +1325,12 @@ function QueueCard({ status, queue }) {
 function LoginOverlay({ show, password, setPassword, error, onLogin, publicProfit }) {
     if (!show) return null;
 
-    const combined = mergeProfitSeries(publicProfit.ah_points, publicProfit.bz_points);
-    const total = (publicProfit.ah_total || 0) + (publicProfit.bz_total || 0);
-    const perHour = publicProfit.uptime_seconds ? total / (publicProfit.uptime_seconds / 3600) : 0;
+    const sessionCombined = mergeProfitSeries(publicProfit.session_ah_points, publicProfit.session_bz_points);
+    const sessionTotal = publicProfit.session_total || ((publicProfit.session_ah_total || 0) + (publicProfit.session_bz_total || 0));
+    const allTimeTotal = publicProfit.all_time_total || ((publicProfit.all_time_ah_total || 0) + (publicProfit.all_time_bz_total || 0));
+    const sessionPerHour = publicProfit.session_per_hour || (
+        publicProfit.session_uptime_seconds ? sessionTotal / (publicProfit.session_uptime_seconds / 3600) : 0
+    );
 
     return html`
         <div className="overlay">
@@ -1371,22 +1374,23 @@ function LoginOverlay({ show, password, setPassword, error, onLogin, publicProfi
                         <div className="sectionTitle">
                             <div>
                                 <span className="eyebrow">Public Snapshot</span>
-                                <h2 className="panelTitle">Session profit before login</h2>
-                                <p>Anonymized totals are still visible so the page is not dead on arrival.</p>
+                                <h2 className="panelTitle">Session pace and all-time profit</h2>
+                                <p>The public view keeps session performance separate from lifetime totals so the pace number stays believable.</p>
                             </div>
                         </div>
 
                         <div className="statGrid">
-                            <${StatCard} label="AH Profit" value=${coins(publicProfit.ah_total || 0)} tone="tone-green" />
-                            <${StatCard} label="BZ Profit" value=${coins(publicProfit.bz_total || 0)} tone="tone-blue" />
-                            <${StatCard} label="Combined" value=${coins(total)} tone="tone-gold" sub=${`${coins(perHour)}/hr`} />
+                            <${StatCard} label="Session AH" value=${coins(publicProfit.session_ah_total || 0)} tone="tone-green" />
+                            <${StatCard} label="Session BZ" value=${coins(publicProfit.session_bz_total || 0)} tone="tone-blue" />
+                            <${StatCard} label="Session Total" value=${coins(sessionTotal)} tone="tone-gold" sub=${`${coins(sessionPerHour)}/hr`} />
+                            <${StatCard} label="All-Time Total" value=${coins(allTimeTotal)} tone="tone-gold" sub="Persists across restarts" />
                         </div>
 
                         <div style=${{ marginTop: "18px" }}>
                             <${ChartCard}
                                 title="Combined session curve"
-                                subtitle=${`Uptime ${uptime(publicProfit.uptime_seconds || 0)}`}
-                                points=${combined}
+                                subtitle=${`Session uptime ${uptime(publicProfit.session_uptime_seconds || 0)}`}
+                                points=${sessionCombined}
                                 color="#81b7ff"
                                 fill="rgba(129,183,255,.16)"
                                 height=${280}
@@ -1409,18 +1413,27 @@ function App() {
 
     const [status, setStatus] = useState({});
     const [profit, setProfit] = useState({
-        ah_points: [],
-        bz_points: [],
-        ah_total: 0,
-        bz_total: 0,
-        uptime_seconds: 0
+        all_time_ah_points: [],
+        all_time_bz_points: [],
+        all_time_ah_total: 0,
+        all_time_bz_total: 0,
+        session_ah_points: [],
+        session_bz_points: [],
+        session_ah_total: 0,
+        session_bz_total: 0,
+        session_uptime_seconds: 0
     });
     const [publicProfit, setPublicProfit] = useState({
-        ah_points: [],
-        bz_points: [],
-        ah_total: 0,
-        bz_total: 0,
-        uptime_seconds: 0
+        all_time_ah_total: 0,
+        all_time_bz_total: 0,
+        all_time_total: 0,
+        session_ah_total: 0,
+        session_bz_total: 0,
+        session_total: 0,
+        session_per_hour: 0,
+        session_uptime_seconds: 0,
+        session_ah_points: [],
+        session_bz_points: []
     });
     const [inventory, setInventory] = useState({ slots: [] });
     const [gameView, setGameView] = useState({ open: false, slots: [] });
@@ -1687,12 +1700,17 @@ function App() {
         }
     }, [chat]);
 
-    const totalProfit = (profit.ah_total || 0) + (profit.bz_total || 0);
-    const combinedPoints = useMemo(
-        () => mergeProfitSeries(profit.ah_points, profit.bz_points),
-        [profit.ah_points, profit.bz_points]
+    const sessionTotalProfit = (profit.session_ah_total || 0) + (profit.session_bz_total || 0);
+    const allTimeTotalProfit = (profit.all_time_ah_total || 0) + (profit.all_time_bz_total || 0);
+    const sessionCombinedPoints = useMemo(
+        () => mergeProfitSeries(profit.session_ah_points, profit.session_bz_points),
+        [profit.session_ah_points, profit.session_bz_points]
     );
-    const perHour = profit.uptime_seconds ? totalProfit / (profit.uptime_seconds / 3600) : 0;
+    const allTimeCombinedPoints = useMemo(
+        () => mergeProfitSeries(profit.all_time_ah_points, profit.all_time_bz_points),
+        [profit.all_time_ah_points, profit.all_time_bz_points]
+    );
+    const sessionPerHour = profit.session_uptime_seconds ? sessionTotalProfit / (profit.session_uptime_seconds / 3600) : 0;
     const dirtyConfig = configText !== savedConfigText;
     const selectedWindowLabel = gameView.open ? `${gameView.title || "Unknown window"} · ${gameView.slotCount || (gameView.slots || []).length} slots` : "No active window";
     const activeAuctionCount = Array.isArray(auctions) ? auctions.length : 0;
@@ -1822,11 +1840,12 @@ function App() {
                                 <div className="statGrid">
                                     <${StatCard} label="Purse" value=${status.purse != null ? coins(status.purse) : "-"} sub=${status.purse != null ? formatCoinsLong(status.purse) : "No purse cached"} tone="tone-blue" />
                                     <${StatCard} label="In AH" value=${coins(totalAuctionValue)} sub=${activeAuctionCount ? `${activeAuctionCount} active listings` : "No active auctions"} tone="tone-gold" />
-                                    <${StatCard} label="Uptime" value=${uptime(status.uptime_seconds)} sub="Persists across restarts" tone="tone-gold" />
-                                    <${StatCard} label="Per Hour" value=${`${coins(perHour)}/hr`} sub="Combined realized profit" tone="tone-green" />
-                                    <${StatCard} label="AH Profit" value=${coins(profit.ah_total)} sub="Auction house realized" tone="tone-green" />
-                                    <${StatCard} label="BZ Profit" value=${coins(profit.bz_total)} sub="Bazaar realized" tone="tone-blue" />
-                                    <${StatCard} label="Total Profit" value=${coins(totalProfit)} sub=${`${activeAuctionCount} auctions · ${activeBzCount} orders`} tone="tone-gold" />
+                                    <${StatCard} label="Runtime Uptime" value=${uptime(status.uptime_seconds)} sub="Persists across restarts" tone="tone-gold" />
+                                    <${StatCard} label="Session P/H" value=${`${coins(sessionPerHour)}/hr`} sub="Session-only realized pace" tone="tone-green" />
+                                    <${StatCard} label="Session AH" value=${coins(profit.session_ah_total)} sub="Auction house this session" tone="tone-green" />
+                                    <${StatCard} label="Session BZ" value=${coins(profit.session_bz_total)} sub="Bazaar this session" tone="tone-blue" />
+                                    <${StatCard} label="Session Total" value=${coins(sessionTotalProfit)} sub=${`Session uptime ${uptime(profit.session_uptime_seconds)}`} tone="tone-gold" />
+                                    <${StatCard} label="All-Time Total" value=${coins(allTimeTotalProfit)} sub=${`${activeAuctionCount} auctions · ${activeBzCount} orders`} tone="tone-gold" />
                                 </div>
 
                                 <div className="detailCard">
@@ -1929,8 +1948,8 @@ function App() {
 
                             <${ChartCard}
                                 title="Combined profit pulse"
-                                subtitle=${`Total ${coins(totalProfit)} · ${coins(perHour)}/hr · uptime ${uptime(profit.uptime_seconds)}`}
-                                points=${combinedPoints}
+                                subtitle=${`Session total ${coins(sessionTotalProfit)} · ${coins(sessionPerHour)}/hr · session uptime ${uptime(profit.session_uptime_seconds)}`}
+                                points=${sessionCombinedPoints}
                                 color="#f2b15c"
                                 fill="rgba(242,177,92,.16)"
                             />
@@ -1992,28 +2011,68 @@ function App() {
                 ` : null}
 
                 ${activeTab === "analytics" ? html`
-                    <div className="threeCol">
-                        <${ChartCard}
-                            title="Auction House profit"
-                            subtitle=${`Realized total ${coins(profit.ah_total)}`}
-                            points=${profit.ah_points || []}
-                            color="#73d2af"
-                            fill="rgba(115,210,175,.16)"
-                        />
-                        <${ChartCard}
-                            title="Bazaar profit"
-                            subtitle=${`Realized total ${coins(profit.bz_total)}`}
-                            points=${profit.bz_points || []}
-                            color="#81b7ff"
-                            fill="rgba(129,183,255,.16)"
-                        />
-                        <${ChartCard}
-                            title="Combined curve"
-                            subtitle=${`Combined total ${coins(totalProfit)} · ${coins(perHour)}/hr`}
-                            points=${combinedPoints}
-                            color="#f2b15c"
-                            fill="rgba(242,177,92,.16)"
-                        />
+                    <div className="layout">
+                        <div className="sectionTitle">
+                            <div>
+                                <span className="eyebrow">Session</span>
+                                <h2 className="panelTitle">Current session profit</h2>
+                                <p>These curves reset when the bot restarts, so the pace number stays tied to the runtime that generated it.</p>
+                            </div>
+                        </div>
+                        <div className="threeCol">
+                            <${ChartCard}
+                                title="Session AH profit"
+                                subtitle=${`Realized total ${coins(profit.session_ah_total)}`}
+                                points=${profit.session_ah_points || []}
+                                color="#73d2af"
+                                fill="rgba(115,210,175,.16)"
+                            />
+                            <${ChartCard}
+                                title="Session BZ profit"
+                                subtitle=${`Realized total ${coins(profit.session_bz_total)}`}
+                                points=${profit.session_bz_points || []}
+                                color="#81b7ff"
+                                fill="rgba(129,183,255,.16)"
+                            />
+                            <${ChartCard}
+                                title="Session combined curve"
+                                subtitle=${`Combined total ${coins(sessionTotalProfit)} · ${coins(sessionPerHour)}/hr`}
+                                points=${sessionCombinedPoints}
+                                color="#f2b15c"
+                                fill="rgba(242,177,92,.16)"
+                            />
+                        </div>
+
+                        <div className="sectionTitle">
+                            <div>
+                                <span className="eyebrow">All-Time</span>
+                                <h2 className="panelTitle">Lifetime realized profit</h2>
+                                <p>These totals persist across restarts and stay separate from the session pace calculations.</p>
+                            </div>
+                        </div>
+                        <div className="threeCol">
+                            <${ChartCard}
+                                title="All-time AH profit"
+                                subtitle=${`Realized total ${coins(profit.all_time_ah_total)}`}
+                                points=${profit.all_time_ah_points || []}
+                                color="#73d2af"
+                                fill="rgba(115,210,175,.16)"
+                            />
+                            <${ChartCard}
+                                title="All-time BZ profit"
+                                subtitle=${`Realized total ${coins(profit.all_time_bz_total)}`}
+                                points=${profit.all_time_bz_points || []}
+                                color="#81b7ff"
+                                fill="rgba(129,183,255,.16)"
+                            />
+                            <${ChartCard}
+                                title="All-time combined curve"
+                                subtitle=${`Combined total ${coins(allTimeTotalProfit)}`}
+                                points=${allTimeCombinedPoints}
+                                color="#f2b15c"
+                                fill="rgba(242,177,92,.16)"
+                            />
+                        </div>
                     </div>
                 ` : null}
 

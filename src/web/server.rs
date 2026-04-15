@@ -131,24 +131,31 @@ struct LoginResponse {
 
 #[derive(Serialize)]
 struct ProfitResponse {
-    ah_points: Vec<(u64, i64)>,
-    bz_points: Vec<(u64, i64)>,
-    ah_total: i64,
-    bz_total: i64,
-    uptime_seconds: u64,
+    all_time_ah_points: Vec<(u64, i64)>,
+    all_time_bz_points: Vec<(u64, i64)>,
+    all_time_ah_total: i64,
+    all_time_bz_total: i64,
+    session_ah_points: Vec<(u64, i64)>,
+    session_bz_points: Vec<(u64, i64)>,
+    session_ah_total: i64,
+    session_bz_total: i64,
+    session_uptime_seconds: u64,
 }
 
 /// Public (unauthenticated) profit summary — no IGN, no account info.
 /// Used by the login page and OpenGraph embeds.
 #[derive(Serialize)]
 struct PublicProfitResponse {
-    ah_total: i64,
-    bz_total: i64,
-    total: i64,
-    per_hour: f64,
-    uptime_seconds: u64,
-    ah_points: Vec<(u64, i64)>,
-    bz_points: Vec<(u64, i64)>,
+    all_time_ah_total: i64,
+    all_time_bz_total: i64,
+    all_time_total: i64,
+    session_ah_total: i64,
+    session_bz_total: i64,
+    session_total: i64,
+    session_per_hour: f64,
+    session_uptime_seconds: u64,
+    session_ah_points: Vec<(u64, i64)>,
+    session_bz_points: Vec<(u64, i64)>,
 }
 
 #[derive(Serialize)]
@@ -348,16 +355,18 @@ fn format_og_uptime(secs: u64) -> String {
 }
 
 async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
-    let total = ah_total + bz_total;
-    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
+    let snapshot = s.profit_tracker.snapshot();
+    let session_total = snapshot.session_ah_total + snapshot.session_bz_total;
+    let all_time_total = snapshot.all_time_ah_total + snapshot.all_time_bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
-    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+    let per_hour = if hours > 0.0 { session_total as f64 / hours } else { 0.0 };
 
     let og_title = "TWM — Control Panel";
     let og_description = format!(
-        "💰 Total Profit: {} coins | ⏱️ P/H: {} coins/h | 🕐 Uptime: {}",
-        format_og_number(total as f64),
+        "💰 Session Profit: {} | 🏦 All-Time Profit: {} | ⏱️ P/H: {} | 🕐 Uptime: {}",
+        format_og_number(session_total as f64),
+        format_og_number(all_time_total as f64),
         format_og_number(per_hour),
         format_og_uptime(uptime),
     );
@@ -1244,13 +1253,17 @@ async fn download_latest_log() -> impl IntoResponse {
 // ── WebSocket handler for live chat ──────────────────────────
 
 async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let snapshot = s.profit_tracker.snapshot();
     Json(ProfitResponse {
-        ah_points: s.profit_tracker.ah_points(),
-        bz_points: s.profit_tracker.bz_points(),
-        ah_total,
-        bz_total,
-        uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
+        all_time_ah_points: snapshot.all_time_ah_points,
+        all_time_bz_points: snapshot.all_time_bz_points,
+        all_time_ah_total: snapshot.all_time_ah_total,
+        all_time_bz_total: snapshot.all_time_bz_total,
+        session_ah_points: snapshot.session_ah_points,
+        session_bz_points: snapshot.session_bz_points,
+        session_ah_total: snapshot.session_ah_total,
+        session_bz_total: snapshot.session_bz_total,
+        session_uptime_seconds: s.started_at.elapsed().as_secs(),
     })
 }
 
@@ -1258,33 +1271,37 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
 /// Returns anonymized profit data (no IGN, no account info) for the
 /// login page display and OpenGraph embeds.
 async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfitResponse> {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
-    let total = ah_total + bz_total;
-    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
+    let snapshot = s.profit_tracker.snapshot();
+    let session_total = snapshot.session_ah_total + snapshot.session_bz_total;
+    let all_time_total = snapshot.all_time_ah_total + snapshot.all_time_bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
-    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+    let per_hour = if hours > 0.0 { session_total as f64 / hours } else { 0.0 };
     Json(PublicProfitResponse {
-        ah_total,
-        bz_total,
-        total,
-        per_hour,
-        uptime_seconds: uptime,
-        ah_points: s.profit_tracker.ah_points(),
-        bz_points: s.profit_tracker.bz_points(),
+        all_time_ah_total: snapshot.all_time_ah_total,
+        all_time_bz_total: snapshot.all_time_bz_total,
+        all_time_total,
+        session_ah_total: snapshot.session_ah_total,
+        session_bz_total: snapshot.session_bz_total,
+        session_total,
+        session_per_hour: per_hour,
+        session_uptime_seconds: uptime,
+        session_ah_points: snapshot.session_ah_points,
+        session_bz_points: snapshot.session_bz_points,
     })
 }
 
 /// Public OG image endpoint — no authentication required.
 /// Generates a 1200×630 PNG stats card for Discord / social media embeds.
 async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
-    let total = ah_total + bz_total;
-    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
+    let snapshot = s.profit_tracker.snapshot();
+    let total = snapshot.session_ah_total + snapshot.session_bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
 
-    let ah_pts = s.profit_tracker.ah_points();
-    let bz_pts = s.profit_tracker.bz_points();
+    let ah_pts = snapshot.session_ah_points;
+    let bz_pts = snapshot.session_bz_points;
     let png = super::og_image::generate_og_image(total, per_hour, uptime, &ah_pts, &bz_pts);
 
     (
