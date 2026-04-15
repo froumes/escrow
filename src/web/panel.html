@@ -12,20 +12,146 @@
 <script>
 (() => {
     const STORAGE_KEY = "theme";
-    const OPTIONS = ["dark", "light", "auto"];
     const media = window.matchMedia("(prefers-color-scheme: dark)");
+
+    const THEME_PRESETS = {
+        dark:    { label: "Dark",    base: "dark"  },
+        light:   { label: "Light",   base: "light" },
+        forest:  { label: "Forest",  base: "dark"  },
+        ocean:   { label: "Ocean",   base: "dark"  },
+        ember:   { label: "Ember",   base: "dark"  },
+        violet:  { label: "Violet",  base: "dark"  },
+        slate:   { label: "Slate",   base: "dark"  },
+        sand:    { label: "Sand",    base: "light" },
+        rose:    { label: "Rosé",    base: "light" },
+    };
+
+    const PRESET_VARS = {
+        forest: {
+            "--bg":"#0b1a12","--bg-soft":"#112218","--panel":"rgba(12,28,18,.88)","--panel-2":"#152e1c","--panel-3":"#1c3a24",
+            "--text":"#e0f5e8","--muted":"#8fbf9e","--line":"rgba(180,230,200,.12)","--line-strong":"rgba(180,230,200,.24)",
+            "--surface-soft":"rgba(80,200,120,.06)","--surface-soft-hover":"rgba(80,200,120,.12)",
+            "--bg-gradient":"linear-gradient(180deg,#081208,#0b1a12 38%,#0f1e15 100%)",
+            "--hero-glow-warm":"rgba(120,220,140,.16)","--hero-glow-mint":"rgba(60,180,100,.14)",
+            "--warm":"#7de89a","--warm-2":"#a4f4b8","--mint":"#5cd88a","--mint-2":"#8cf0ae",
+            "--blue":"#8cc8e8","--chart-grid":"rgba(120,220,140,.08)","--chart-ticks":"#8fbf9e",
+            "--chart-fill-mint":"rgba(92,216,138,.18)","--chart-fill-blue":"rgba(140,200,232,.18)","--chart-fill-warm":"rgba(125,232,154,.18)",
+            "--theme-color":"#0b1a12","--focus-ring":"rgba(120,220,140,.6)","--grid-line":"rgba(255,255,255,.025)",
+            "--ink-strong":"#0a1a0f","--ink-success":"#081a0e","--ink-warn":"#1a1a06","--danger":"#ff8a6b"
+        },
+        ocean: {
+            "--bg":"#0a1420","--bg-soft":"#0f1c2c","--panel":"rgba(12,22,38,.88)","--panel-2":"#142638","--panel-3":"#1a3048",
+            "--text":"#e0eef8","--muted":"#8aafc8","--line":"rgba(160,210,255,.12)","--line-strong":"rgba(160,210,255,.24)",
+            "--surface-soft":"rgba(80,160,240,.06)","--surface-soft-hover":"rgba(80,160,240,.12)",
+            "--bg-gradient":"linear-gradient(180deg,#06101a,#0a1420 38%,#0e1a28 100%)",
+            "--hero-glow-warm":"rgba(100,180,255,.16)","--hero-glow-mint":"rgba(60,140,220,.14)",
+            "--warm":"#6cb4ff","--warm-2":"#9cd0ff","--mint":"#56c8e8","--mint-2":"#80dcf0",
+            "--blue":"#88b8ff","--chart-grid":"rgba(100,180,255,.08)","--chart-ticks":"#8aafc8",
+            "--chart-fill-mint":"rgba(86,200,232,.18)","--chart-fill-blue":"rgba(136,184,255,.18)","--chart-fill-warm":"rgba(108,180,255,.18)",
+            "--theme-color":"#0a1420","--focus-ring":"rgba(100,180,255,.6)","--grid-line":"rgba(255,255,255,.025)",
+            "--ink-strong":"#0a1420","--ink-success":"#081a20","--ink-warn":"#1a1806","--danger":"#ff8a6b"
+        },
+        ember: {
+            "--bg":"#1a0e0a","--bg-soft":"#24140e","--panel":"rgba(32,18,12,.88)","--panel-2":"#2e1a12","--panel-3":"#3a2218",
+            "--text":"#f8e8e0","--muted":"#c89e8a","--line":"rgba(255,180,140,.12)","--line-strong":"rgba(255,180,140,.24)",
+            "--surface-soft":"rgba(255,120,60,.06)","--surface-soft-hover":"rgba(255,120,60,.12)",
+            "--bg-gradient":"linear-gradient(180deg,#140a06,#1a0e0a 38%,#1e1210 100%)",
+            "--hero-glow-warm":"rgba(255,140,80,.18)","--hero-glow-mint":"rgba(255,100,50,.14)",
+            "--warm":"#ff9d5c","--warm-2":"#ffbd8a","--mint":"#f0845c","--mint-2":"#ffaa88",
+            "--blue":"#e8a880","--chart-grid":"rgba(255,140,80,.08)","--chart-ticks":"#c89e8a",
+            "--chart-fill-mint":"rgba(240,132,92,.18)","--chart-fill-blue":"rgba(232,168,128,.18)","--chart-fill-warm":"rgba(255,157,92,.18)",
+            "--theme-color":"#1a0e0a","--focus-ring":"rgba(255,140,80,.6)","--grid-line":"rgba(255,255,255,.025)",
+            "--ink-strong":"#1a0e0a","--ink-success":"#14180a","--ink-warn":"#1a1406","--danger":"#ff6a4a"
+        },
+        violet: {
+            "--bg":"#120e1e","--bg-soft":"#1a142a","--panel":"rgba(22,16,38,.88)","--panel-2":"#201838","--panel-3":"#2a2048",
+            "--text":"#eee4f8","--muted":"#a898c8","--line":"rgba(200,170,255,.12)","--line-strong":"rgba(200,170,255,.24)",
+            "--surface-soft":"rgba(160,100,255,.06)","--surface-soft-hover":"rgba(160,100,255,.12)",
+            "--bg-gradient":"linear-gradient(180deg,#0e0a16,#120e1e 38%,#161220 100%)",
+            "--hero-glow-warm":"rgba(180,120,255,.16)","--hero-glow-mint":"rgba(140,80,220,.14)",
+            "--warm":"#b88cff","--warm-2":"#d0b0ff","--mint":"#a078e8","--mint-2":"#c0a0f0",
+            "--blue":"#9890ff","--chart-grid":"rgba(180,120,255,.08)","--chart-ticks":"#a898c8",
+            "--chart-fill-mint":"rgba(160,120,232,.18)","--chart-fill-blue":"rgba(152,144,255,.18)","--chart-fill-warm":"rgba(184,140,255,.18)",
+            "--theme-color":"#120e1e","--focus-ring":"rgba(180,120,255,.6)","--grid-line":"rgba(255,255,255,.025)",
+            "--ink-strong":"#120e1e","--ink-success":"#0e1a14","--ink-warn":"#1a1406","--danger":"#ff8a6b"
+        },
+        slate: {
+            "--bg":"#151820","--bg-soft":"#1c2028","--panel":"rgba(24,28,36,.88)","--panel-2":"#222630","--panel-3":"#2a2e3a",
+            "--text":"#e4e8f0","--muted":"#98a0b4","--line":"rgba(190,200,220,.12)","--line-strong":"rgba(190,200,220,.24)",
+            "--surface-soft":"rgba(140,160,200,.06)","--surface-soft-hover":"rgba(140,160,200,.12)",
+            "--bg-gradient":"linear-gradient(180deg,#10131a,#151820 38%,#181c24 100%)",
+            "--hero-glow-warm":"rgba(160,180,220,.14)","--hero-glow-mint":"rgba(120,140,180,.12)",
+            "--warm":"#a0b8e0","--warm-2":"#c0d0f0","--mint":"#88a8d0","--mint-2":"#a8c0e0",
+            "--blue":"#90a8e0","--chart-grid":"rgba(160,180,220,.08)","--chart-ticks":"#98a0b4",
+            "--chart-fill-mint":"rgba(136,168,208,.18)","--chart-fill-blue":"rgba(144,168,224,.18)","--chart-fill-warm":"rgba(160,184,224,.18)",
+            "--theme-color":"#151820","--focus-ring":"rgba(160,180,220,.6)","--grid-line":"rgba(255,255,255,.025)",
+            "--ink-strong":"#151820","--ink-success":"#0e1a18","--ink-warn":"#1a1806","--danger":"#ff8a6b"
+        },
+        sand: {
+            "--bg":"#f6f2ec","--bg-soft":"#eae4da","--panel":"rgba(255,252,246,.9)","--panel-2":"#f0eae0","--panel-3":"#e4ded4",
+            "--text":"#2a2418","--muted":"#7a6e58","--line":"rgba(60,48,30,.14)","--line-strong":"rgba(60,48,30,.26)",
+            "--surface-soft":"rgba(60,48,30,.05)","--surface-soft-hover":"rgba(60,48,30,.1)",
+            "--bg-gradient":"linear-gradient(180deg,#faf6f0,#f2ede4 42%,#eae4da 100%)",
+            "--hero-glow-warm":"rgba(200,160,80,.2)","--hero-glow-mint":"rgba(160,140,80,.16)",
+            "--warm":"#b8923c","--warm-2":"#d4aa4c","--mint":"#8a9848","--mint-2":"#a0b058",
+            "--blue":"#7896b8","--chart-grid":"rgba(60,48,30,.1)","--chart-ticks":"#7a6e58",
+            "--chart-fill-mint":"rgba(138,152,72,.2)","--chart-fill-blue":"rgba(120,150,184,.2)","--chart-fill-warm":"rgba(184,146,60,.2)",
+            "--theme-color":"#f2ede4","--focus-ring":"rgba(184,146,60,.5)","--grid-line":"rgba(0,0,0,.04)",
+            "--ink-strong":"#2a2418","--ink-success":"#1a2a14","--ink-warn":"#2a2010","--danger":"#c84a30"
+        },
+        rose: {
+            "--bg":"#f8f2f4","--bg-soft":"#f0e4e8","--panel":"rgba(255,248,250,.9)","--panel-2":"#f4eaee","--panel-3":"#e8dce2",
+            "--text":"#2a1820","--muted":"#886878","--line":"rgba(100,40,60,.14)","--line-strong":"rgba(100,40,60,.26)",
+            "--surface-soft":"rgba(200,80,120,.05)","--surface-soft-hover":"rgba(200,80,120,.1)",
+            "--bg-gradient":"linear-gradient(180deg,#faf6f8,#f4eef0 42%,#ece4e8 100%)",
+            "--hero-glow-warm":"rgba(220,100,140,.18)","--hero-glow-mint":"rgba(180,80,120,.14)",
+            "--warm":"#d06888","--warm-2":"#e888a0","--mint":"#c85878","--mint-2":"#e07898",
+            "--blue":"#a088c0","--chart-grid":"rgba(100,40,60,.1)","--chart-ticks":"#886878",
+            "--chart-fill-mint":"rgba(200,88,120,.2)","--chart-fill-blue":"rgba(160,136,192,.2)","--chart-fill-warm":"rgba(208,104,136,.2)",
+            "--theme-color":"#f4eef0","--focus-ring":"rgba(208,104,136,.5)","--grid-line":"rgba(0,0,0,.04)",
+            "--ink-strong":"#2a1820","--ink-success":"#142a1a","--ink-warn":"#2a2010","--danger":"#c84040"
+        },
+    };
+
+    const OPTIONS = Object.keys(THEME_PRESETS);
+
     const readTheme = () => {
         const saved = localStorage.getItem(STORAGE_KEY);
-        return OPTIONS.includes(saved) ? saved : "auto";
+        return OPTIONS.includes(saved) ? saved : "dark";
     };
-    const resolveTheme = (theme) => (theme === "auto" ? (media.matches ? "dark" : "light") : theme);
+
+    const applyPresetVars = (theme) => {
+        const root = document.documentElement;
+        root.removeAttribute("data-preset");
+        const oldCustom = root.getAttribute("data-custom-vars");
+        if (oldCustom) {
+            oldCustom.split(",").forEach((k) => root.style.removeProperty(k));
+            root.removeAttribute("data-custom-vars");
+        }
+        const vars = PRESET_VARS[theme];
+        if (vars) {
+            const keys = Object.keys(vars);
+            keys.forEach((k) => root.style.setProperty(k, vars[k]));
+            root.setAttribute("data-custom-vars", keys.join(","));
+            root.setAttribute("data-preset", theme);
+        }
+    };
+
+    const resolveTheme = (theme) => {
+        const preset = THEME_PRESETS[theme];
+        return preset ? preset.base : "dark";
+    };
+
     const applyTheme = (theme) => {
         const resolved = resolveTheme(theme);
         document.documentElement.dataset.theme = resolved;
+        applyPresetVars(theme);
         return resolved;
     };
+
     window.__twmTheme = {
         options: OPTIONS,
+        presets: THEME_PRESETS,
         media,
         readTheme,
         resolveTheme,
@@ -1047,6 +1173,107 @@ tbody tr.selected{background:var(--surface-soft-hover)}
     box-shadow:var(--shadow);
 }
 
+.notifStack{
+    position:fixed;
+    top:18px;
+    right:18px;
+    z-index:160;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    pointer-events:none;
+    max-width:min(420px,calc(100vw - 36px));
+}
+.notifCard{
+    pointer-events:auto;
+    display:flex;
+    align-items:flex-start;
+    gap:12px;
+    padding:14px 16px;
+    border-radius:16px;
+    border:1px solid var(--line-strong);
+    background:var(--panel);
+    backdrop-filter:blur(22px);
+    box-shadow:0 18px 48px rgba(0,0,0,.32),0 0 0 1px rgba(255,255,255,.04);
+    animation:notif-enter var(--motion-base) var(--ease-emphasized) both;
+    cursor:pointer;
+    transition:opacity var(--motion-fast) var(--ease-standard),transform var(--motion-fast) var(--ease-standard);
+}
+.notifCard:hover{transform:translateX(-4px)}
+.notifCard.notif-exit{
+    animation:notif-exit var(--motion-fast) var(--ease-standard) both;
+}
+.notifIcon{
+    flex-shrink:0;
+    width:36px;
+    height:36px;
+    border-radius:10px;
+    display:grid;
+    place-items:center;
+    font-size:1.1rem;
+    font-weight:700;
+}
+.notifIcon.ah{
+    background:linear-gradient(135deg,var(--warm),var(--warm-2));
+    color:var(--ink-strong);
+}
+.notifIcon.bz{
+    background:linear-gradient(135deg,var(--mint),var(--mint-2));
+    color:var(--ink-success);
+}
+.notifBody{flex:1;min-width:0}
+.notifTitle{
+    font-size:.88rem;
+    font-weight:700;
+    line-height:1.3;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.notifSub{
+    margin-top:3px;
+    font-size:.78rem;
+    color:var(--muted);
+    line-height:1.35;
+}
+.notifTime{
+    flex-shrink:0;
+    font-size:.7rem;
+    color:var(--muted);
+    margin-top:2px;
+}
+@keyframes notif-enter{
+    from{opacity:0;transform:translateX(60px) scale(.92)}
+    to{opacity:1;transform:translateX(0) scale(1)}
+}
+@keyframes notif-exit{
+    from{opacity:1;transform:translateX(0) scale(1)}
+    to{opacity:0;transform:translateX(40px) scale(.95)}
+}
+
+.themeSelect{
+    min-height:34px;
+    padding:0 10px 0 12px;
+    border-radius:999px;
+    border:1px solid var(--line);
+    background:var(--surface-soft);
+    color:var(--text);
+    cursor:pointer;
+    font-size:.84rem;
+    font-weight:600;
+    font-family:inherit;
+    -webkit-appearance:none;
+    appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%239db2ac'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;
+    background-position:right 10px center;
+    padding-right:26px;
+}
+.themeSelect:focus-visible{
+    outline:2px solid var(--focus-ring);
+    outline-offset:2px;
+}
+
 .tabBodyStage{
     position:relative;
     min-height:260px;
@@ -1129,7 +1356,9 @@ tbody tr.selected{background:var(--surface-soft-hover)}
     .dot.live.reconnectPulse,
     .chatLine.is-new,
     .toast,
-    .toast.toast-exit{
+    .toast.toast-exit,
+    .notifCard,
+    .notifCard.notif-exit{
         animation:none !important;
     }
     .motion-skeleton{
@@ -1190,7 +1419,8 @@ tbody tr.selected{background:var(--surface-soft-hover)}
     .slotGrid{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
     .button{width:100%}
     .toolbar .button,
-    .toolbar .themeToggle{width:auto}
+    .toolbar .themeToggle,
+    .toolbar .themeSelect{width:auto}
     .loginActions .button{width:auto}
 }
 </style>
@@ -1469,16 +1699,64 @@ function formatPlacedAt(epochSeconds) {
 }
 
 function getThemePreference() {
-    return window.__twmTheme?.readTheme?.() || "auto";
+    return window.__twmTheme?.readTheme?.() || "dark";
 }
 
-const THEME_ICONS = { dark: "\u{263E}", light: "\u{2600}", auto: "\u{25D0}" };
-const THEME_CYCLE = ["dark", "light", "auto"];
-function cycleTheme() {
-    const current = getThemePreference();
-    const next = THEME_CYCLE[(THEME_CYCLE.indexOf(current) + 1) % THEME_CYCLE.length];
-    window.__twmTheme?.setTheme?.(next);
-    return next;
+function getThemeOptions() {
+    return window.__twmTheme?.options || ["dark", "light"];
+}
+
+function getThemePresets() {
+    return window.__twmTheme?.presets || {};
+}
+
+function setThemePreference(theme) {
+    window.__twmTheme?.setTheme?.(theme);
+    return theme;
+}
+
+const FLIP_PATTERNS = {
+    ahBuy:  /\[BAF\].*?(?:Trying to purchase flip|purchase).*?:\s*(.+?)(?:\s+for\s+)/i,
+    bzOrder:/\[BAF\].*?\[BZ\]\s*(BUY|SELL)\s*order:\s*(.+?)\s+x/i,
+};
+
+function detectFlipEvent(rawText) {
+    const text = stripMc(rawText || "");
+    let m = text.match(FLIP_PATTERNS.bzOrder);
+    if (m) {
+        return { type: "bz", side: m[1].toLowerCase(), item: m[2].trim(), raw: text };
+    }
+    m = text.match(FLIP_PATTERNS.ahBuy);
+    if (m) {
+        return { type: "ah", side: "buy", item: m[1].trim(), raw: text };
+    }
+    return null;
+}
+
+const _audioCtxRef = { current: null };
+function playNotifDing() {
+    try {
+        if (!_audioCtxRef.current) {
+            _audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        const ctx = _audioCtxRef.current;
+        const now = ctx.currentTime;
+
+        const notes = [880, 1108.73, 1318.51];
+        notes.forEach((freq, i) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(freq, now + i * 0.08);
+            gain.gain.setValueAtTime(0, now + i * 0.08);
+            gain.gain.linearRampToValueAtTime(0.13, now + i * 0.08 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.08 + 0.35);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now + i * 0.08);
+            osc.stop(now + i * 0.08 + 0.4);
+        });
+    } catch (_) {}
 }
 
 function resolveCssColor(value, styles) {
@@ -2173,6 +2451,14 @@ function App() {
     const renderedTab = activeTab;
     const [statusPulseTick, setStatusPulseTick] = useState(0);
     const [themeTick, setThemeTick] = useState(0);
+    const [notifications, setNotifications] = useState([]);
+    const [notifSoundEnabled, setNotifSoundEnabled] = useState(() => {
+        const saved = localStorage.getItem("twm_notif_sound");
+        return saved !== "false";
+    });
+    const notifSoundEnabledRef = useRef(notifSoundEnabled);
+    const notifNextIdRef = useRef(1);
+    const pushNotificationRef = useRef(null);
 
     const chatBoxRef = useRef(null);
     const chatNextIdRef = useRef(1);
@@ -2191,6 +2477,33 @@ function App() {
         if (toastExitTimerRef.current) window.clearTimeout(toastExitTimerRef.current);
         toastTimerRef.current = window.setTimeout(() => setToastVisible(false), 2200);
         toastExitTimerRef.current = window.setTimeout(() => setToast(""), 2600);
+    }, []);
+
+    const pushNotification = useCallback((flipEvent) => {
+        const id = notifNextIdRef.current++;
+        const notif = { id, ...flipEvent, ts: Date.now(), exiting: false };
+        setNotifications((prev) => [...prev.slice(-6), notif]);
+        window.setTimeout(() => {
+            setNotifications((prev) => prev.map((n) => n.id === id ? { ...n, exiting: true } : n));
+        }, 5000);
+        window.setTimeout(() => {
+            setNotifications((prev) => prev.filter((n) => n.id !== id));
+        }, 5400);
+    }, []);
+
+    const dismissNotification = useCallback((id) => {
+        setNotifications((prev) => prev.map((n) => n.id === id ? { ...n, exiting: true } : n));
+        window.setTimeout(() => {
+            setNotifications((prev) => prev.filter((n) => n.id !== id));
+        }, 300);
+    }, []);
+
+    const toggleNotifSound = useCallback(() => {
+        setNotifSoundEnabled((prev) => {
+            const next = !prev;
+            localStorage.setItem("twm_notif_sound", String(next));
+            return next;
+        });
     }, []);
 
     const handleUnauthorized = useCallback(() => {
@@ -2461,6 +2774,14 @@ function App() {
     }, [chatAutoSuspended]);
 
     useEffect(() => {
+        notifSoundEnabledRef.current = notifSoundEnabled;
+    }, [notifSoundEnabled]);
+
+    useEffect(() => {
+        pushNotificationRef.current = pushNotification;
+    }, [pushNotification]);
+
+    useEffect(() => {
         if (needsAuth) return undefined;
 
         let socket;
@@ -2475,13 +2796,21 @@ function App() {
                 setChatPulseTick((tick) => tick + 1);
             };
             socket.onmessage = (event) => {
-                const normalized = normalizeChatMessages(event.data).map((entry) => ({
+                const raw = event.data;
+                const normalized = normalizeChatMessages(raw).map((entry) => ({
                     id: chatNextIdRef.current++,
                     text: stripMc(entry.text),
                     ts: entry.ts,
                     source: entry.source || "ws"
                 }));
                 if (!normalized.length) return;
+
+                const flipEvent = detectFlipEvent(typeof raw === "string" ? raw : normalized[0]?.text || "");
+                if (flipEvent) {
+                    if (pushNotificationRef.current) pushNotificationRef.current(flipEvent);
+                    if (notifSoundEnabledRef.current) playNotifDing();
+                }
+
                 const shouldAutoScroll = !chatPausedRef.current && !chatSuspendedRef.current;
                 setChat((previous) => {
                     const pruned = pruneChatMessages([...previous, ...normalized]);
@@ -2660,7 +2989,10 @@ function App() {
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
-                        <button type="button" className="themeToggle" onClick=${() => { const next = cycleTheme(); setThemeTick(t => t + 1); updateThemeMeta(); }} title=${`Theme: ${getThemePreference()}`}>${THEME_ICONS[getThemePreference()] || THEME_ICONS.auto} ${getThemePreference().charAt(0).toUpperCase() + getThemePreference().slice(1)}</button>
+                        <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">
+                            ${getThemeOptions().map((key) => html`<option key=${key} value=${key}>${(getThemePresets()[key] || {}).label || key}</option>`)}
+                        </select>
+                        <button type="button" className="themeToggle" onClick=${toggleNotifSound} title=${notifSoundEnabled ? "Mute flip notifications" : "Unmute flip notifications"} aria-pressed=${String(notifSoundEnabled)}>${notifSoundEnabled ? "\u{1F514}" : "\u{1F515}"}</button>
                     </div>
                 </div>
 
@@ -3173,6 +3505,23 @@ function App() {
             </div>
 
             ${toast ? html`<div className=${cls("toast", !toastVisible && "toast-exit")}>${toast}</div>` : null}
+
+            ${notifications.length > 0 ? html`
+                <div className="notifStack">
+                    ${notifications.map((n) => html`
+                        <div key=${n.id} className=${cls("notifCard", n.exiting && "notif-exit")} onClick=${() => dismissNotification(n.id)}>
+                            <div className=${cls("notifIcon", n.type === "bz" ? "bz" : "ah")}>
+                                ${n.type === "bz" ? "BZ" : "AH"}
+                            </div>
+                            <div className="notifBody">
+                                <div className="notifTitle">${n.item || "Flip"}</div>
+                                <div className="notifSub">${n.type === "bz" ? `Bazaar ${n.side} order placed` : "Auction flip purchased"}</div>
+                            </div>
+                            <span className="notifTime">${new Date(n.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                        </div>
+                    `)}
+                </div>
+            ` : null}
 
             <${LoginOverlay}
                 show=${needsAuth}
