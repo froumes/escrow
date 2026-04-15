@@ -839,6 +839,27 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     grid-template-columns:1.05fr .95fr;
     gap:16px;
 }
+.chatTools{
+    margin-bottom:10px;
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:8px;
+}
+.chatTools .button{min-height:34px}
+.chatFilter{
+    flex:1;
+    min-width:180px;
+    min-height:36px;
+    padding:0 12px;
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:999px;
+    background:rgba(0,0,0,.22);
+    color:var(--text);
+    outline:none;
+}
+.chatFilter:focus{border-color:rgba(129,183,255,.36)}
+.chatFrame{position:relative}
 .chatBox{
     min-height:460px;
     max-height:620px;
@@ -855,14 +876,50 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     line-height:1.45;
     white-space:pre-wrap;
     word-break:break-word;
+    animation:chatLineIn .22s ease-out;
 }
 .chatLine:last-child{border-bottom:0}
+.chatMeta{
+    margin-bottom:4px;
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:8px;
+}
+.chatTime{
+    color:var(--muted);
+    font-size:.78rem;
+}
+.chatBadge{
+    display:inline-flex;
+    align-items:center;
+    min-height:20px;
+    padding:0 8px;
+    border-radius:999px;
+    font-size:.72rem;
+    border:1px solid rgba(255,255,255,.10);
+    color:var(--blue-2);
+    background:rgba(129,183,255,.12);
+}
+.chatBody{color:var(--text)}
 .chatStatus{
     display:flex;
     align-items:center;
     gap:8px;
     color:var(--muted);
     font-size:.84rem;
+}
+.chatJump{
+    position:absolute;
+    right:14px;
+    bottom:14px;
+    z-index:2;
+    animation:chatLineIn .2s ease-out;
+}
+.chatHint{
+    margin-top:10px;
+    color:var(--muted);
+    font-size:.8rem;
 }
 .dot{
     width:8px;
@@ -1040,6 +1097,14 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .grow{flex:1}
 .hidden{display:none}
+@keyframes chatLineIn{
+    from{opacity:0;transform:translateY(4px)}
+    to{opacity:1;transform:translateY(0)}
+}
+@media (prefers-reduced-motion:reduce){
+    .chatLine,
+    .chatJump{animation:none}
+}
 @media(max-width:1440px){
     .heroAside{
         grid-template-columns:1fr;
@@ -1133,6 +1198,69 @@ function cls(...parts) {
 
 function stripMc(text) {
     return (text || "").replace(/\u00A7[0-9A-FK-OR]/gi, "");
+}
+
+const CHAT_MAX_COUNT = 500;
+const CHAT_MAX_BYTES = 220000;
+
+function approxChatBytes(entry) {
+    if (!entry) return 0;
+    return ((entry.text || "").length * 2) + ((entry.source || "").length * 2) + 48;
+}
+
+function pruneChatMessages(messages) {
+    let totalBytes = 0;
+    const kept = [];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        const size = approxChatBytes(message);
+        if (kept.length >= CHAT_MAX_COUNT) continue;
+        if (kept.length > 0 && (totalBytes + size) > CHAT_MAX_BYTES) continue;
+        kept.push(message);
+        totalBytes += size;
+    }
+    kept.reverse();
+    return { messages: kept, evicted: messages.length - kept.length, approxBytes: totalBytes };
+}
+
+function normalizeChatMessages(raw) {
+    const normalizeOne = (value) => {
+        if (value == null) return null;
+        if (typeof value === "string") {
+            return { text: value, source: "ws", ts: Date.now() };
+        }
+        if (typeof value !== "object") {
+            return { text: String(value), source: "ws", ts: Date.now() };
+        }
+        const text = value.text ?? value.message ?? value.body ?? value.content;
+        if (text == null) return null;
+        const source = value.source ?? value.channel ?? value.type ?? "ws";
+        const tsRaw = value.ts ?? value.timestamp ?? value.time;
+        const parsedTs = typeof tsRaw === "number" ? tsRaw : Date.parse(tsRaw || "");
+        return {
+            text: typeof text === "string" ? text : JSON.stringify(text),
+            source: typeof source === "string" ? source : String(source),
+            ts: Number.isFinite(parsedTs) ? parsedTs : Date.now()
+        };
+    };
+
+    let payload = raw;
+    if (typeof raw === "string") {
+        try {
+            payload = JSON.parse(raw);
+        } catch (_) {
+            payload = raw;
+        }
+    }
+
+    if (Array.isArray(payload)) {
+        return payload.map(normalizeOne).filter(Boolean);
+    }
+    if (payload && Array.isArray(payload.messages)) {
+        return payload.messages.map(normalizeOne).filter(Boolean);
+    }
+    const normalized = normalizeOne(payload);
+    return normalized ? [normalized] : [];
 }
 
 const MC_COLOR_CLASS = {
@@ -1948,6 +2076,13 @@ function App() {
     const [chatInput, setChatInput] = useState("");
     const [chat, setChat] = useState([]);
     const [chatConnected, setChatConnected] = useState(false);
+    const [chatFilter, setChatFilter] = useState("");
+    const [chatPaused, setChatPaused] = useState(false);
+    const [chatAutoSuspended, setChatAutoSuspended] = useState(false);
+    const [chatUnread, setChatUnread] = useState(0);
+    const [chatReconnectAttempts, setChatReconnectAttempts] = useState(0);
+    const [lastChatConnectedAt, setLastChatConnectedAt] = useState(null);
+    const [chatEvictionNotice, setChatEvictionNotice] = useState("");
     const [chatPulseTick, setChatPulseTick] = useState(0);
     const [toastVisible, setToastVisible] = useState(false);
     const [newChatStartIndex, setNewChatStartIndex] = useState(null);
@@ -1955,6 +2090,10 @@ function App() {
     const [statusPulseTick, setStatusPulseTick] = useState(0);
 
     const chatBoxRef = useRef(null);
+    const chatNextIdRef = useRef(1);
+    const chatPausedRef = useRef(false);
+    const chatSuspendedRef = useRef(false);
+    const chatReconnectAttemptsRef = useRef(0);
     const toastTimerRef = useRef(null);
     const toastExitTimerRef = useRef(null);
     const chatFlashTimerRef = useRef(null);
@@ -2117,6 +2256,36 @@ function App() {
         }
     }, [chatInput, flash, handleUnauthorized]);
 
+    const clearChat = useCallback(() => {
+        setChat([]);
+        setChatUnread(0);
+        setChatEvictionNotice("");
+    }, []);
+
+    const exportChat = useCallback(() => {
+        const payload = {
+            exported_at: new Date().toISOString(),
+            count: chat.length,
+            messages: chat
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `chat-export-${Date.now()}.json`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+        flash("Chat exported");
+    }, [chat, flash]);
+
+    const jumpToBottom = useCallback(() => {
+        const box = chatBoxRef.current;
+        if (!box) return;
+        box.scrollTop = box.scrollHeight;
+        setChatAutoSuspended(false);
+        setChatUnread(0);
+    }, []);
+
     useEffect(() => {
         req(API.publicProfit)
             .then(setPublicProfit)
@@ -2178,6 +2347,14 @@ function App() {
     }, [activeTab, saveConfig]);
 
     useEffect(() => {
+        chatPausedRef.current = chatPaused;
+    }, [chatPaused]);
+
+    useEffect(() => {
+        chatSuspendedRef.current = chatAutoSuspended;
+    }, [chatAutoSuspended]);
+
+    useEffect(() => {
         if (needsAuth) return undefined;
 
         let socket;
@@ -2191,7 +2368,26 @@ function App() {
                 setChatPulseTick((tick) => tick + 1);
             };
             socket.onmessage = (event) => {
-                setChat((previous) => [...previous.slice(-299), event.data]);
+                const normalized = normalizeChatMessages(event.data).map((entry) => ({
+                    id: chatNextIdRef.current++,
+                    text: stripMc(entry.text),
+                    ts: entry.ts,
+                    source: entry.source || "ws"
+                }));
+                if (!normalized.length) return;
+                const shouldAutoScroll = !chatPausedRef.current && !chatSuspendedRef.current;
+                setChat((previous) => {
+                    const pruned = pruneChatMessages([...previous, ...normalized]);
+                    if (pruned.evicted > 0) {
+                        setChatEvictionNotice(`Evicted ${pruned.evicted} older message${pruned.evicted === 1 ? "" : "s"} to keep memory bounded.`);
+                    }
+                    return pruned.messages;
+                });
+                if (shouldAutoScroll) {
+                    setChatUnread(0);
+                } else {
+                    setChatUnread((count) => count + normalized.length);
+                }
             };
             socket.onerror = () => {
                 setChatConnected(false);
@@ -2199,6 +2395,8 @@ function App() {
             socket.onclose = () => {
                 setChatConnected(false);
                 if (!closed) {
+                    chatReconnectAttemptsRef.current += 1;
+                    setChatReconnectAttempts(chatReconnectAttemptsRef.current);
                     reconnectTimer = window.setTimeout(connect, 3000);
                 }
             };
@@ -2219,8 +2417,8 @@ function App() {
     useEffect(() => {
         const box = chatBoxRef.current;
         if (!box) return;
-        const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 72;
-        if (nearBottom) {
+        const shouldStick = !chatPaused && !chatAutoSuspended;
+        if (shouldStick) {
             box.scrollTop = box.scrollHeight;
         }
 
@@ -2261,6 +2459,17 @@ function App() {
     const buyOrders = (bzOrders || []).filter((order) => order.is_buy_order).length;
     const sellOrders = (bzOrders || []).filter((order) => !order.is_buy_order).length;
     const filledOrders = (bzOrders || []).filter((order) => order.status === "filled").length;
+    const filteredChat = useMemo(() => {
+        const query = chatFilter.trim().toLowerCase();
+        if (!query) return chat;
+        return chat.filter((entry) => (
+            (entry.text || "").toLowerCase().includes(query) ||
+            (entry.source || "").toLowerCase().includes(query)
+        ));
+    }, [chat, chatFilter]);
+    const lastConnectedLabel = lastChatConnectedAt
+        ? new Date(lastChatConnectedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        : "never";
     const soonestAuction = (auctions || []).reduce((current, auction) => {
         const remaining = Number(auction.time_remaining_seconds || 0);
         if (!current || remaining < current) return remaining;
@@ -2771,6 +2980,38 @@ function App() {
                                             <div key=${index} className=${cls("chatLine", newChatStartIndex != null && index >= newChatStartIndex && "is-new")}>${stripMc(line)}</div>
                                         `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
                                     </div>
+                                    <div className="chatFrame">
+                                        <div
+                                            className="chatBox"
+                                            ref=${chatBoxRef}
+                                            onScroll=${(event) => {
+                                                const box = event.target;
+                                                const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 72;
+                                                if (nearBottom) {
+                                                    setChatAutoSuspended(false);
+                                                    setChatUnread(0);
+                                                } else if (!chatPaused) {
+                                                    setChatAutoSuspended(true);
+                                                }
+                                            }}
+                                        >
+                                            ${filteredChat.length ? filteredChat.map((line) => html`
+                                                <div key=${line.id} className="chatLine">
+                                                    <div className="chatMeta">
+                                                        <span className="chatTime">${new Date(line.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                                                        <span className="chatBadge">${line.source || "ws"}</span>
+                                                    </div>
+                                                    <div className="chatBody">${line.text}</div>
+                                                </div>
+                                            `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
+                                        </div>
+                                        ${chatUnread > 0 ? html`
+                                            <${Button} className="chatJump" kind="primary" size="small" onClick=${jumpToBottom}>
+                                                New messages (${chatUnread})
+                                            </${Button}>
+                                        ` : null}
+                                    </div>
+                                    ${chatEvictionNotice ? html`<div className="chatHint">${chatEvictionNotice}</div>` : null}
                                 </div>
 
                                 <div className="composer">
@@ -2779,6 +3020,11 @@ function App() {
                                         placeholder="Type in-game chat, /cofl commands, or compatibility commands here..."
                                         onInput=${(event) => setChatInput(event.target.value)}
                                         onKeyDown=${(event) => {
+                                            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                                                event.preventDefault();
+                                                sendChat();
+                                                return;
+                                            }
                                             if (event.key === "Enter" && !event.shiftKey) {
                                                 event.preventDefault();
                                                 sendChat();
@@ -2794,7 +3040,7 @@ function App() {
                                     </div>
 
                                     <div className="miniList">
-                                        <div className="miniRow"><strong>Send message</strong><span>Press Enter to send. Use Shift + Enter for a new line.</span></div>
+                                        <div className="miniRow"><strong>Send message</strong><span>Press Enter or Ctrl/Cmd + Enter to send. Use Shift + Enter for a new line.</span></div>
                                         <div className="miniRow"><strong>Console history</strong><span>Recent lines are kept in memory for this browser session.</span></div>
                                     </div>
 
