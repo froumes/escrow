@@ -430,7 +430,10 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
 
 async fn shared_theme_css() -> impl IntoResponse {
     (
-        [("content-type", "text/css; charset=utf-8")],
+        [
+            ("content-type", "text/css; charset=utf-8"),
+            ("cache-control", "public, max-age=3600, stale-while-revalidate=86400"),
+        ],
         include_str!("shared-theme.css"),
     )
 }

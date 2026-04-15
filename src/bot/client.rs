@@ -2430,7 +2430,6 @@ async fn event_handler(
                             const MAX_FAILED_CLICKS: usize = 5;
                             let mut failed_clicks: usize = 0;
                             loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
                                 let current_window_id = *shared_window_id.read();
                                 if current_window_id != window_id {
                                     info!(
@@ -2465,6 +2464,7 @@ async fn event_handler(
                                         break;
                                     }
                                 }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
                             }
                             spam_flag.store(false, Ordering::Relaxed);
                         });
@@ -3120,7 +3120,6 @@ async fn execute_command(
             }
         }
         CommandType::PurchaseAuction { flip } => {
-            // Send /viewauction command
             let uuid = match flip.uuid.as_deref().filter(|s| !s.is_empty()) {
                 Some(u) => u,
                 None => {
@@ -3128,8 +3127,14 @@ async fn execute_command(
                     return;
                 }
             };
-            let chat_command = format!("/viewauction {}", uuid);
 
+            let profit = flip.target.saturating_sub(flip.starting_bid);
+            info!(
+                "Trying to purchase flip: {} for {} coins (Target: {}, Profit: {})",
+                flip.item_name, flip.starting_bid, flip.target, profit
+            );
+
+            let chat_command = format!("/viewauction {}", uuid);
             info!("Sending chat command: {}", chat_command);
 
             // Clear stale observer data from any previous window so the timing
@@ -3527,8 +3532,6 @@ async fn handle_window_interaction(
                     let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
                     let mut failed_clicks: usize = 0;
                     loop {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
-
                         if tokio::time::Instant::now() >= bed_deadline {
                             warn!("[AH] Bed timing: grace period did not end — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
@@ -3560,7 +3563,10 @@ async fn handle_window_interaction(
                             }
                             break;
                         } else if current_kind.contains("potato") {
-                            info!("[AH] Bed timing: potato detected — auction not purchasable, closing");
+                            warn!("[AH] Bed timing: potato detected — auction not purchasable, closing");
+                            let _ = state.event_tx.send(BotEvent::ChatMessage(
+                                "§f[§4BAF§f]: §cAuction already bought by someone else".to_string()
+                            ));
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
@@ -3585,6 +3591,7 @@ async fn handle_window_interaction(
                                 return;
                             }
                         }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
                     }
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction (SAFE: gold_nugget confirmed) ----
@@ -3653,7 +3660,17 @@ async fn handle_window_interaction(
                         }
                     };
                     if should_close {
+                        let msg = if slot_31_kind.contains("poisonous_potato") {
+                            "§f[§4BAF§f]: §cCan't afford auction"
+                        } else if slot_31_kind.contains("potato") {
+                            "§f[§4BAF§f]: §cAuction already bought by someone else"
+                        } else if slot_31_kind.contains("feather") {
+                            "§f[§4BAF§f]: §cAuction no longer available"
+                        } else {
+                            "§f[§4BAF§f]: §cAuction not purchasable"
+                        };
                         warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
+                        let _ = state.event_tx.send(BotEvent::ChatMessage(msg.to_string()));
                         *state.purchase_start_time.write() = None;
                         *state.pending_purchase_at_ms.write() = None;
                         send_raw_close(bot, window_id, &state.handlers);
@@ -3683,17 +3700,10 @@ async fn handle_window_interaction(
                 }
 
                 // When skip-click was sent, the server already has the confirm
-                // click queued from the same TCP burst as the buy-click.  Wait
-                // just long enough for the server to process it (2 ticks =
-                // 100 ms) before retrying.  The previous 300 ms value was
-                // overly conservative and caused a redundant retry click on
-                // low-latency connections where the purchase completes in
-                // ~50 ms but the window lingers for ~300 ms.
-                //
-                // Without skip-click the initial wait is shorter because the
-                // click was just sent above and we want to retry quickly if it
-                // was lost.
-                let initial_wait_ms = if skip_was_sent { 100u64 } else { CONFIRM_PURCHASE_RETRY_MS };
+                // click queued from the same TCP burst as the buy-click.  Use
+                // the same retry interval — the safety loop below handles any
+                // cases where the server needs more time.
+                let initial_wait_ms = CONFIRM_PURCHASE_RETRY_MS;
                 tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
                 // Safety retry loop: if the window is still open (pre-click failed,

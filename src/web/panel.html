@@ -498,16 +498,11 @@ img{display:block;max-width:100%}
     gap:18px;
 }
 .inventoryBoard{
-    border:1px solid rgba(255,255,255,.06);
+    border:1px solid var(--line);
     border-radius:18px;
     padding:16px;
-    background:
-        linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01)),
-        linear-gradient(180deg,#162024,#11181b);
-    box-shadow:
-        inset 0 1px 0 rgba(255,255,255,.06),
-        inset 0 0 0 1px rgba(0,0,0,.24),
-        0 12px 24px rgba(0,0,0,.18);
+    background:var(--panel-2);
+    box-shadow:0 12px 24px rgba(0,0,0,.12);
 }
 .inventoryBoardBar{
     display:flex;
@@ -634,15 +629,10 @@ img{display:block;max-width:100%}
     text-shadow:1px 1px 0 rgba(0,0,0,.82);
 }
 .inventoryInspector{
-    border:1px solid rgba(255,255,255,.06);
+    border:1px solid var(--line);
     border-radius:18px;
     padding:16px;
-    background:
-        linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.015)),
-        linear-gradient(180deg,#131b1f,#0f1518);
-    box-shadow:
-        inset 0 1px 0 rgba(255,255,255,.06),
-        inset 0 0 0 1px rgba(0,0,0,.2);
+    background:var(--panel-2);
 }
 .inventoryInspector .detailCard{
     padding:0;
@@ -772,9 +762,9 @@ img{display:block;max-width:100%}
 }
 .tableWrap{
     overflow:auto;
-    border:1px solid rgba(255,255,255,.06);
+    border:1px solid var(--line);
     border-radius:18px;
-    background:rgba(0,0,0,.16);
+    background:var(--surface-soft);
 }
 table{
     width:100%;
@@ -785,7 +775,7 @@ th,td{
     padding:14px 12px;
     text-align:left;
     vertical-align:top;
-    border-bottom:1px solid rgba(255,255,255,.06);
+    border-bottom:1px solid var(--line);
 }
 th{
     position:sticky;
@@ -795,14 +785,14 @@ th{
     letter-spacing:.16em;
     text-transform:uppercase;
     color:var(--muted);
-    background:rgba(17,24,26,.96);
+    background:var(--panel-2);
 }
 tbody tr{
     cursor:pointer;
     transition:background .18s ease;
 }
-tbody tr:hover{background:rgba(255,255,255,.03)}
-tbody tr.selected{background:rgba(129,183,255,.10)}
+tbody tr:hover{background:var(--surface-soft-hover)}
+tbody tr.selected{background:var(--surface-soft-hover)}
 .rowTitle{
     font-weight:700;
     line-height:1.35;
@@ -879,16 +869,16 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     min-height:560px;
     margin-top:18px;
     padding:18px;
-    border:1px solid rgba(255,255,255,.08);
+    border:1px solid var(--line);
     border-radius:22px;
-    background:rgba(0,0,0,.22);
+    background:var(--surface-soft);
     color:var(--text);
     resize:vertical;
     outline:none;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     line-height:1.6;
 }
-.configArea:focus{border-color:rgba(129,183,255,.36)}
+.configArea:focus{border-color:var(--focus-ring)}
 .chatLayout{
     margin-top:18px;
     display:grid;
@@ -908,27 +898,27 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     min-width:180px;
     min-height:36px;
     padding:0 12px;
-    border:1px solid rgba(255,255,255,.08);
+    border:1px solid var(--line);
     border-radius:999px;
-    background:rgba(0,0,0,.22);
+    background:var(--surface-soft);
     color:var(--text);
     outline:none;
 }
-.chatFilter:focus{border-color:rgba(129,183,255,.36)}
+.chatFilter:focus{border-color:var(--focus-ring)}
 .chatFrame{position:relative}
 .chatBox{
     min-height:460px;
     max-height:620px;
     overflow:auto;
-    border:1px solid rgba(255,255,255,.06);
+    border:1px solid var(--line);
     border-radius:22px;
-    background:rgba(0,0,0,.22);
+    background:var(--surface-soft);
     padding:16px;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 .chatLine{
     padding:10px 0;
-    border-bottom:1px solid rgba(255,255,255,.05);
+    border-bottom:1px solid var(--line);
     line-height:1.45;
     white-space:pre-wrap;
     word-break:break-word;
@@ -992,14 +982,14 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     width:100%;
     min-height:190px;
     padding:16px;
-    border:1px solid rgba(255,255,255,.08);
+    border:1px solid var(--line);
     border-radius:22px;
-    background:rgba(0,0,0,.22);
+    background:var(--surface-soft);
     color:var(--text);
     resize:vertical;
     outline:none;
 }
-.composer textarea:focus{border-color:rgba(129,183,255,.36)}
+.composer textarea:focus{border-color:var(--focus-ring)}
 .presetRow{
     display:flex;
     flex-wrap:wrap;
@@ -1482,6 +1472,15 @@ function getThemePreference() {
     return window.__twmTheme?.readTheme?.() || "auto";
 }
 
+const THEME_ICONS = { dark: "\u{263E}", light: "\u{2600}", auto: "\u{25D0}" };
+const THEME_CYCLE = ["dark", "light", "auto"];
+function cycleTheme() {
+    const current = getThemePreference();
+    const next = THEME_CYCLE[(THEME_CYCLE.indexOf(current) + 1) % THEME_CYCLE.length];
+    window.__twmTheme?.setTheme?.(next);
+    return next;
+}
+
 function resolveCssColor(value, styles) {
     if (!value) return value;
     const trimmed = String(value).trim();
@@ -1710,53 +1709,59 @@ function TooltipAnchor({
 function ChartCard({ title, subtitle, points, color, fill, height = 300, themeTick = 0 }) {
     const canvasRef = useRef(null);
     const chartRef = useRef(null);
+    const themeTickRef = useRef(themeTick);
 
     useEffect(() => {
         if (!canvasRef.current || !window.Chart) return undefined;
-
-        if (chartRef.current) {
-            chartRef.current.destroy();
-        }
-
-        const labels = (points || []).map(([ts]) =>
-            new Date(ts * 1000).toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit"
-            })
-        );
 
         const styles = getComputedStyle(document.documentElement);
         const lineColor = resolveCssColor(color, styles);
         const fillColor = resolveCssColor(fill, styles);
         const gridColor = styles.getPropertyValue("--chart-grid").trim() || "rgba(255,255,255,.06)";
         const tickColor = styles.getPropertyValue("--chart-ticks").trim() || "#9db2ac";
+        const labels = (points || []).map(([ts]) =>
+            new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        );
+        const data = (points || []).map(([, value]) => value);
+
+        const themeChanged = themeTickRef.current !== themeTick;
+        themeTickRef.current = themeTick;
+
+        if (chartRef.current && !themeChanged) {
+            const chart = chartRef.current;
+            chart.data.labels = labels;
+            chart.data.datasets[0].data = data;
+            chart.data.datasets[0].borderColor = lineColor;
+            chart.data.datasets[0].backgroundColor = fillColor;
+            chart.update("none");
+            return undefined;
+        }
+
+        if (chartRef.current) chartRef.current.destroy();
 
         chartRef.current = new Chart(canvasRef.current, {
             type: "line",
             data: {
                 labels,
-                datasets: [
-                    {
-                        data: (points || []).map(([, value]) => value),
-                        borderColor: lineColor,
-                        backgroundColor: fillColor,
-                        fill: true,
-                        tension: 0.32,
-                        pointRadius: 0,
-                        borderWidth: 2
-                    }
-                ]
+                datasets: [{
+                    data,
+                    borderColor: lineColor,
+                    backgroundColor: fillColor,
+                    fill: true,
+                    tension: 0.32,
+                    pointRadius: 0,
+                    borderWidth: 2
+                }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
+                animation: false,
                 interaction: { intersect: false, mode: "index" },
                 plugins: {
                     legend: { display: false },
                     tooltip: {
-                        callbacks: {
-                            label: (context) => formatCoinsLong(context.parsed.y)
-                        }
+                        callbacks: { label: (context) => formatCoinsLong(context.parsed.y) }
                     }
                 },
                 scales: {
@@ -1766,10 +1771,7 @@ function ChartCard({ title, subtitle, points, color, fill, height = 300, themeTi
                     },
                     y: {
                         grid: { color: gridColor },
-                        ticks: {
-                            color: tickColor,
-                            callback: (value) => coins(value)
-                        }
+                        ticks: { color: tickColor, callback: (value) => coins(value) }
                     }
                 }
             }
@@ -2168,7 +2170,7 @@ function App() {
     const [chatPulseTick, setChatPulseTick] = useState(0);
     const [toastVisible, setToastVisible] = useState(false);
     const [newChatStartIndex, setNewChatStartIndex] = useState(null);
-    const [renderedTab, setRenderedTab] = useState("dashboard");
+    const renderedTab = activeTab;
     const [statusPulseTick, setStatusPulseTick] = useState(0);
     const [themeTick, setThemeTick] = useState(0);
 
@@ -2434,10 +2436,6 @@ function App() {
     }, [activeTab, configText, loadConfig]);
 
     useEffect(() => {
-        setRenderedTab(activeTab);
-    }, [activeTab]);
-
-    useEffect(() => {
         if (!Object.keys(status || {}).length) return;
         setStatusPulseTick((tick) => tick + 1);
     }, [status.state, status.macro_paused, status.current_account]);
@@ -2662,6 +2660,7 @@ function App() {
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
+                        <button type="button" className="themeToggle" onClick=${() => { const next = cycleTheme(); setThemeTick(t => t + 1); updateThemeMeta(); }} title=${`Theme: ${getThemePreference()}`}>${THEME_ICONS[getThemePreference()] || THEME_ICONS.auto} ${getThemePreference().charAt(0).toUpperCase() + getThemePreference().slice(1)}</button>
                     </div>
                 </div>
 
@@ -2866,9 +2865,9 @@ function App() {
                                         <div className="miniRow"><strong>Bazaar limit</strong><span>${status.bazaar_at_limit ? "Reached" : "Clear"}</span></div>
                                         <div className="miniRow"><strong>Auction limit</strong><span>${status.auction_at_limit ? "Reached" : "Clear"}</span></div>
                                         <div className="miniRow"><strong>Inventory capacity</strong><span>${status.inventory_full ? "Full" : "Has space"}</span></div>
-                                        <div className="miniRow"><strong>Open auctions</strong><span>${activeAuctionCount}${soonestAuction != null ? ` ? next ends in ${uptime(soonestAuction)}` : ""}</span></div>
+                                        <div className="miniRow"><strong>Open auctions</strong><span>${activeAuctionCount}${soonestAuction != null ? ` · next ends in ${uptime(soonestAuction)}` : ""}</span></div>
                                         <div className="miniRow"><strong>Value in AH</strong><span>${formatCoinsLong(totalAuctionValue)}</span></div>
-                                        <div className="miniRow"><strong>Bazaar orders</strong><span>${activeBzCount} total ? ${filledOrders} filled</span></div>
+                                        <div className="miniRow"><strong>Bazaar orders</strong><span>${activeBzCount} total · ${filledOrders} filled</span></div>
                                     </div>
                                 </div>
                             </${Panel}>
