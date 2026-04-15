@@ -38,6 +38,11 @@
     --radius-md:16px;
     --radius-sm:12px;
     --content:1360px;
+    --motion-fast:140ms;
+    --motion-base:220ms;
+    --motion-slow:360ms;
+    --ease-standard:cubic-bezier(.2,0,0,1);
+    --ease-emphasized:cubic-bezier(.2,0,0,1.2);
 }
 *,
 *::before,
@@ -181,7 +186,7 @@ img{display:block;max-width:100%}
     color:var(--muted);
     cursor:pointer;
     white-space:nowrap;
-    transition:background .18s ease,color .18s ease,transform .18s ease;
+    transition:background var(--motion-fast) var(--ease-standard),color var(--motion-fast) var(--ease-standard),transform var(--motion-fast) var(--ease-standard);
 }
 .tab:hover{transform:translateY(-1px);color:var(--text)}
 .tab.active{
@@ -199,7 +204,7 @@ img{display:block;max-width:100%}
     justify-content:center;
     gap:10px;
     cursor:pointer;
-    transition:transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease;
+    transition:transform var(--motion-fast) var(--ease-standard),border-color var(--motion-fast) var(--ease-standard),background var(--motion-fast) var(--ease-standard),box-shadow var(--motion-fast) var(--ease-standard);
 }
 .button:hover{transform:translateY(-1px)}
 .button.primary{
@@ -834,6 +839,27 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     grid-template-columns:1.05fr .95fr;
     gap:16px;
 }
+.chatTools{
+    margin-bottom:10px;
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:8px;
+}
+.chatTools .button{min-height:34px}
+.chatFilter{
+    flex:1;
+    min-width:180px;
+    min-height:36px;
+    padding:0 12px;
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:999px;
+    background:rgba(0,0,0,.22);
+    color:var(--text);
+    outline:none;
+}
+.chatFilter:focus{border-color:rgba(129,183,255,.36)}
+.chatFrame{position:relative}
 .chatBox{
     min-height:460px;
     max-height:620px;
@@ -850,14 +876,50 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     line-height:1.45;
     white-space:pre-wrap;
     word-break:break-word;
+    animation:chatLineIn .22s ease-out;
 }
 .chatLine:last-child{border-bottom:0}
+.chatMeta{
+    margin-bottom:4px;
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:8px;
+}
+.chatTime{
+    color:var(--muted);
+    font-size:.78rem;
+}
+.chatBadge{
+    display:inline-flex;
+    align-items:center;
+    min-height:20px;
+    padding:0 8px;
+    border-radius:999px;
+    font-size:.72rem;
+    border:1px solid rgba(255,255,255,.10);
+    color:var(--blue-2);
+    background:rgba(129,183,255,.12);
+}
+.chatBody{color:var(--text)}
 .chatStatus{
     display:flex;
     align-items:center;
     gap:8px;
     color:var(--muted);
     font-size:.84rem;
+}
+.chatJump{
+    position:absolute;
+    right:14px;
+    bottom:14px;
+    z-index:2;
+    animation:chatLineIn .2s ease-out;
+}
+.chatHint{
+    margin-top:10px;
+    color:var(--muted);
+    font-size:.8rem;
 }
 .dot{
     width:8px;
@@ -938,10 +1000,111 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     border:1px solid var(--line);
     box-shadow:var(--shadow);
 }
+
+.tabBodyStage{
+    position:relative;
+    min-height:260px;
+}
+.tabPanelMotion{
+    animation:tab-content-enter var(--motion-base) var(--ease-emphasized) both;
+}
+.motion-panel-enter{
+    animation:panel-enter var(--motion-base) var(--ease-emphasized) both;
+}
+.motion-panel-exit{
+    animation:panel-exit var(--motion-fast) var(--ease-standard) both;
+}
+.motion-status-pulse{
+    animation:status-pulse 1000ms var(--ease-emphasized);
+}
+.motion-skeleton{
+    opacity:.58;
+    filter:saturate(.72);
+    transition:opacity var(--motion-base) var(--ease-standard),filter var(--motion-base) var(--ease-standard);
+}
+.motion-skeleton.is-loaded{
+    opacity:1;
+    filter:none;
+}
+.dot.live{
+    box-shadow:0 0 0 0 rgba(115,210,175,.46);
+}
+.dot.live.reconnectPulse{
+    animation:dot-live-pulse var(--motion-slow) var(--ease-emphasized) 2;
+}
+.chatLine.is-new{
+    animation:chat-line-flash 980ms var(--ease-standard) both;
+}
+.toast{
+    transform-origin:100% 100%;
+    animation:toast-enter var(--motion-base) var(--ease-emphasized) both;
+}
+.toast.toast-exit{
+    animation:toast-exit var(--motion-fast) var(--ease-standard) both;
+}
+@keyframes panel-enter{
+    from{opacity:0;transform:translateY(10px) scale(.995)}
+    to{opacity:1;transform:translateY(0) scale(1)}
+}
+@keyframes panel-exit{
+    from{opacity:1;transform:translateY(0)}
+    to{opacity:0;transform:translateY(8px)}
+}
+@keyframes tab-content-enter{
+    from{opacity:0;transform:translateX(10px) translateY(8px)}
+    to{opacity:1;transform:translateX(0) translateY(0)}
+}
+@keyframes status-pulse{
+    0%{box-shadow:0 0 0 0 rgba(115,210,175,.45)}
+    100%{box-shadow:0 0 0 11px rgba(115,210,175,0)}
+}
+@keyframes dot-live-pulse{
+    0%{transform:scale(1)}
+    40%{transform:scale(1.45)}
+    100%{transform:scale(1)}
+}
+@keyframes toast-enter{
+    from{opacity:0;transform:translateY(10px) scale(.96)}
+    to{opacity:1;transform:translateY(0) scale(1)}
+}
+@keyframes toast-exit{
+    from{opacity:1;transform:translateY(0) scale(1)}
+    to{opacity:0;transform:translateY(8px) scale(.98)}
+}
+@keyframes chat-line-flash{
+    0%{background:rgba(129,183,255,.18)}
+    100%{background:transparent}
+}
+@media (prefers-reduced-motion: reduce){
+    .tabPanelMotion,
+    .motion-panel-enter,
+    .motion-panel-exit,
+    .motion-status-pulse,
+    .dot.live.reconnectPulse,
+    .chatLine.is-new,
+    .toast,
+    .toast.toast-exit{
+        animation:none !important;
+    }
+    .motion-skeleton{
+        opacity:1;
+        filter:none;
+        transition:none;
+    }
+}
+
 .muted{color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .grow{flex:1}
 .hidden{display:none}
+@keyframes chatLineIn{
+    from{opacity:0;transform:translateY(4px)}
+    to{opacity:1;transform:translateY(0)}
+}
+@media (prefers-reduced-motion:reduce){
+    .chatLine,
+    .chatJump{animation:none}
+}
 @media(max-width:1440px){
     .heroAside{
         grid-template-columns:1fr;
@@ -1016,6 +1179,9 @@ const API = {
     cancelBz: "/api/cancel_bz_order",
     chatSend: "/api/chat/send",
     logsLatest: "/api/logs/latest",
+    // Migration note: `?token=` URL auth is no longer accepted by the backend.
+    // Chat WS auth now relies on the twm_session cookie (login flow) or an
+    // Authorization header for non-browser clients.
     chatWs: () => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/chat/ws`
 };
 
@@ -1035,6 +1201,69 @@ function cls(...parts) {
 
 function stripMc(text) {
     return (text || "").replace(/\u00A7[0-9A-FK-OR]/gi, "");
+}
+
+const CHAT_MAX_COUNT = 500;
+const CHAT_MAX_BYTES = 220000;
+
+function approxChatBytes(entry) {
+    if (!entry) return 0;
+    return ((entry.text || "").length * 2) + ((entry.source || "").length * 2) + 48;
+}
+
+function pruneChatMessages(messages) {
+    let totalBytes = 0;
+    const kept = [];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        const size = approxChatBytes(message);
+        if (kept.length >= CHAT_MAX_COUNT) continue;
+        if (kept.length > 0 && (totalBytes + size) > CHAT_MAX_BYTES) continue;
+        kept.push(message);
+        totalBytes += size;
+    }
+    kept.reverse();
+    return { messages: kept, evicted: messages.length - kept.length, approxBytes: totalBytes };
+}
+
+function normalizeChatMessages(raw) {
+    const normalizeOne = (value) => {
+        if (value == null) return null;
+        if (typeof value === "string") {
+            return { text: value, source: "ws", ts: Date.now() };
+        }
+        if (typeof value !== "object") {
+            return { text: String(value), source: "ws", ts: Date.now() };
+        }
+        const text = value.text ?? value.message ?? value.body ?? value.content;
+        if (text == null) return null;
+        const source = value.source ?? value.channel ?? value.type ?? "ws";
+        const tsRaw = value.ts ?? value.timestamp ?? value.time;
+        const parsedTs = typeof tsRaw === "number" ? tsRaw : Date.parse(tsRaw || "");
+        return {
+            text: typeof text === "string" ? text : JSON.stringify(text),
+            source: typeof source === "string" ? source : String(source),
+            ts: Number.isFinite(parsedTs) ? parsedTs : Date.now()
+        };
+    };
+
+    let payload = raw;
+    if (typeof raw === "string") {
+        try {
+            payload = JSON.parse(raw);
+        } catch (_) {
+            payload = raw;
+        }
+    }
+
+    if (Array.isArray(payload)) {
+        return payload.map(normalizeOne).filter(Boolean);
+    }
+    if (payload && Array.isArray(payload.messages)) {
+        return payload.messages.map(normalizeOne).filter(Boolean);
+    }
+    const normalized = normalizeOne(payload);
+    return normalized ? [normalized] : [];
 }
 
 const MC_COLOR_CLASS = {
@@ -1268,7 +1497,7 @@ async function req(url, options = {}) {
 }
 
 const Panel = ({ className, children }) => html`
-    <section className=${cls("surface", className)}>
+    <section className=${cls("surface", "motion-panel-enter", className)}>
         ${children}
     </section>
 `;
@@ -1277,8 +1506,8 @@ const Button = ({ className, kind = "secondary", size = "", children, ...props }
     <button className=${cls("button", kind, size, className)} ...${props}>${children}</button>
 `;
 
-const StatusBadge = ({ label, value, tone = "" }) => html`
-    <span className=${cls("statusBadge", tone)}>
+const StatusBadge = ({ label, value, tone = "", className = "" }) => html`
+    <span className=${cls("statusBadge", tone, className)}>
         ${label ? html`<span>${label}</span>` : null}
         <strong>${value}</strong>
     </span>
@@ -1850,14 +2079,36 @@ function App() {
     const [chatInput, setChatInput] = useState("");
     const [chat, setChat] = useState([]);
     const [chatConnected, setChatConnected] = useState(false);
+    const [chatFilter, setChatFilter] = useState("");
+    const [chatPaused, setChatPaused] = useState(false);
+    const [chatAutoSuspended, setChatAutoSuspended] = useState(false);
+    const [chatUnread, setChatUnread] = useState(0);
+    const [chatReconnectAttempts, setChatReconnectAttempts] = useState(0);
+    const [lastChatConnectedAt, setLastChatConnectedAt] = useState(null);
+    const [chatEvictionNotice, setChatEvictionNotice] = useState("");
+    const [chatPulseTick, setChatPulseTick] = useState(0);
+    const [toastVisible, setToastVisible] = useState(false);
+    const [newChatStartIndex, setNewChatStartIndex] = useState(null);
+    const [renderedTab, setRenderedTab] = useState("dashboard");
+    const [statusPulseTick, setStatusPulseTick] = useState(0);
 
     const chatBoxRef = useRef(null);
+    const chatNextIdRef = useRef(1);
+    const chatPausedRef = useRef(false);
+    const chatSuspendedRef = useRef(false);
+    const chatReconnectAttemptsRef = useRef(0);
     const toastTimerRef = useRef(null);
+    const toastExitTimerRef = useRef(null);
+    const chatFlashTimerRef = useRef(null);
+    const previousChatLengthRef = useRef(0);
 
     const flash = useCallback((message) => {
         setToast(message);
+        setToastVisible(true);
         if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-        toastTimerRef.current = window.setTimeout(() => setToast(""), 2600);
+        if (toastExitTimerRef.current) window.clearTimeout(toastExitTimerRef.current);
+        toastTimerRef.current = window.setTimeout(() => setToastVisible(false), 2200);
+        toastExitTimerRef.current = window.setTimeout(() => setToast(""), 2600);
     }, []);
 
     const handleUnauthorized = useCallback(() => {
@@ -2008,6 +2259,36 @@ function App() {
         }
     }, [chatInput, flash, handleUnauthorized]);
 
+    const clearChat = useCallback(() => {
+        setChat([]);
+        setChatUnread(0);
+        setChatEvictionNotice("");
+    }, []);
+
+    const exportChat = useCallback(() => {
+        const payload = {
+            exported_at: new Date().toISOString(),
+            count: chat.length,
+            messages: chat
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `chat-export-${Date.now()}.json`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+        flash("Chat exported");
+    }, [chat, flash]);
+
+    const jumpToBottom = useCallback(() => {
+        const box = chatBoxRef.current;
+        if (!box) return;
+        box.scrollTop = box.scrollHeight;
+        setChatAutoSuspended(false);
+        setChatUnread(0);
+    }, []);
+
     useEffect(() => {
         req(API.publicProfit)
             .then(setPublicProfit)
@@ -2048,6 +2329,15 @@ function App() {
     }, [activeTab, configText, loadConfig]);
 
     useEffect(() => {
+        setRenderedTab(activeTab);
+    }, [activeTab]);
+
+    useEffect(() => {
+        if (!Object.keys(status || {}).length) return;
+        setStatusPulseTick((tick) => tick + 1);
+    }, [status.state, status.macro_paused, status.current_account]);
+
+    useEffect(() => {
         if (activeTab !== "config") return undefined;
         const onKeyDown = (event) => {
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
@@ -2060,24 +2350,63 @@ function App() {
     }, [activeTab, saveConfig]);
 
     useEffect(() => {
+        chatPausedRef.current = chatPaused;
+    }, [chatPaused]);
+
+    useEffect(() => {
+        chatSuspendedRef.current = chatAutoSuspended;
+    }, [chatAutoSuspended]);
+
+    useEffect(() => {
         if (needsAuth) return undefined;
 
         let socket;
         let closed = false;
         let reconnectTimer = null;
+        let warnedAuthMigration = false;
 
         const connect = () => {
             socket = new WebSocket(API.chatWs());
-            socket.onopen = () => setChatConnected(true);
+            socket.onopen = () => {
+                setChatConnected(true);
+                setChatPulseTick((tick) => tick + 1);
+            };
             socket.onmessage = (event) => {
-                setChat((previous) => [...previous.slice(-299), event.data]);
+                const normalized = normalizeChatMessages(event.data).map((entry) => ({
+                    id: chatNextIdRef.current++,
+                    text: stripMc(entry.text),
+                    ts: entry.ts,
+                    source: entry.source || "ws"
+                }));
+                if (!normalized.length) return;
+                const shouldAutoScroll = !chatPausedRef.current && !chatSuspendedRef.current;
+                setChat((previous) => {
+                    const pruned = pruneChatMessages([...previous, ...normalized]);
+                    if (pruned.evicted > 0) {
+                        setChatEvictionNotice(`Evicted ${pruned.evicted} older message${pruned.evicted === 1 ? "" : "s"} to keep memory bounded.`);
+                    }
+                    return pruned.messages;
+                });
+                if (shouldAutoScroll) {
+                    setChatUnread(0);
+                } else {
+                    setChatUnread((count) => count + normalized.length);
+                }
             };
             socket.onerror = () => {
                 setChatConnected(false);
             };
             socket.onclose = () => {
                 setChatConnected(false);
+                if (!closed && !warnedAuthMigration) {
+                    warnedAuthMigration = true;
+                    console.warn(
+                        "[WebGUI] Chat websocket closed. If you use a custom client, remove '?token=' from the WS URL and authenticate via twm_session cookie or Authorization header."
+                    );
+                }
                 if (!closed) {
+                    chatReconnectAttemptsRef.current += 1;
+                    setChatReconnectAttempts(chatReconnectAttemptsRef.current);
                     reconnectTimer = window.setTimeout(connect, 3000);
                 }
             };
@@ -2098,11 +2427,24 @@ function App() {
     useEffect(() => {
         const box = chatBoxRef.current;
         if (!box) return;
-        const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 72;
-        if (nearBottom) {
+        const shouldStick = !chatPaused && !chatAutoSuspended;
+        if (shouldStick) {
             box.scrollTop = box.scrollHeight;
         }
+
+        if (chat.length > previousChatLengthRef.current) {
+            setNewChatStartIndex(previousChatLengthRef.current);
+            if (chatFlashTimerRef.current) window.clearTimeout(chatFlashTimerRef.current);
+            chatFlashTimerRef.current = window.setTimeout(() => setNewChatStartIndex(null), 1000);
+        }
+        previousChatLengthRef.current = chat.length;
     }, [chat]);
+
+    useEffect(() => () => {
+        if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+        if (toastExitTimerRef.current) window.clearTimeout(toastExitTimerRef.current);
+        if (chatFlashTimerRef.current) window.clearTimeout(chatFlashTimerRef.current);
+    }, []);
 
     const sessionTotalProfit = (profit.session_ah_total || 0) + (profit.session_bz_total || 0);
     const allTimeTotalProfit = (profit.all_time_ah_total || 0) + (profit.all_time_bz_total || 0);
@@ -2127,6 +2469,17 @@ function App() {
     const buyOrders = (bzOrders || []).filter((order) => order.is_buy_order).length;
     const sellOrders = (bzOrders || []).filter((order) => !order.is_buy_order).length;
     const filledOrders = (bzOrders || []).filter((order) => order.status === "filled").length;
+    const filteredChat = useMemo(() => {
+        const query = chatFilter.trim().toLowerCase();
+        if (!query) return chat;
+        return chat.filter((entry) => (
+            (entry.text || "").toLowerCase().includes(query) ||
+            (entry.source || "").toLowerCase().includes(query)
+        ));
+    }, [chat, chatFilter]);
+    const lastConnectedLabel = lastChatConnectedAt
+        ? new Date(lastChatConnectedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        : "never";
     const soonestAuction = (auctions || []).reduce((current, auction) => {
         const remaining = Number(auction.time_remaining_seconds || 0);
         if (!current || remaining < current) return remaining;
@@ -2193,15 +2546,15 @@ function App() {
                             <span className="eyebrow">Local Runtime Control</span>
                             <h1>Operational panel for live flips, queue state, market cleanup, and config.</h1>
                             <div className="brandMeta">
-                                <${StatusBadge} label="Macro" value=${status.macro_paused ? "Paused" : "Running"} tone=${status.macro_paused ? "tone-gold" : "tone-green"} />
-                                    <${StatusBadge} label="State" value=${humanizeIdentifier(status.state)} tone="tone-blue" />
-                                <${StatusBadge} label="Account" value=${status.current_account || "-"} />
+                                <${StatusBadge} key=${`macro-${statusPulseTick}`} label="Macro" value=${status.macro_paused ? "Paused" : "Running"} tone=${status.macro_paused ? "tone-gold" : "tone-green"} className="motion-status-pulse" />
+                                    <${StatusBadge} key=${`state-${statusPulseTick}`} label="State" value=${humanizeIdentifier(status.state)} tone="tone-blue" className="motion-status-pulse" />
+                                <${StatusBadge} key=${`account-${statusPulseTick}`} label="Account" value=${status.current_account || "-"} className="motion-status-pulse" />
                             </div>
                         </div>
                     </div>
 
                     <div className="toolbar">
-                        <span className="pill">Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
+                        <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
                     </div>
@@ -2216,8 +2569,9 @@ function App() {
                 </div>
             </${Panel}>
 
-            <div className="layout">
-                ${activeTab === "dashboard" ? html`
+            <div className="layout tabBodyStage">
+                <div key=${renderedTab} className="tabPanelMotion">
+                ${renderedTab === "dashboard" ? html`
                     <${Panel}>
                         <div className="hero">
                             <div className="heroCopy">
@@ -2416,7 +2770,7 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "analytics" ? html`
+                ${renderedTab === "analytics" ? html`
                     <div className="layout">
                         <div className="sectionTitle">
                             <div>
@@ -2482,7 +2836,7 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "inventory" ? html`
+                ${renderedTab === "inventory" ? html`
                     <div className="layout">
                         <${InventoryPanel}
                             title="Player inventory"
@@ -2497,7 +2851,7 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "market" ? html`
+                ${renderedTab === "market" ? html`
                     <div className="layout">
                         <${MarketTableCard}
                             title="Active auctions"
@@ -2579,11 +2933,11 @@ function App() {
                     </div>
                 ` : null}
 
-                ${activeTab === "queue" ? html`
+                ${renderedTab === "queue" ? html`
                     <${QueueCard} status=${status} queue=${queue} />
                 ` : null}
 
-                ${activeTab === "config" ? html`
+                ${renderedTab === "config" ? html`
                     <${Panel}>
                         <div className="cardBody">
                             <div className="sectionTitle">
@@ -2614,7 +2968,7 @@ function App() {
                     </${Panel}>
                 ` : null}
 
-                ${activeTab === "chat" ? html`
+                ${renderedTab === "chat" ? html`
                     <${Panel}>
                         <div className="cardBody">
                             <div className="sectionTitle">
@@ -2624,7 +2978,7 @@ function App() {
                                     <p>Watch chat in one pane and send commands in another without the current cramped split.</p>
                                 </div>
                                 <div className="chatStatus">
-                                    <span className=${cls("dot", chatConnected && "live")}></span>
+                                    <span key=${chatPulseTick} className=${cls("dot", chatConnected && "live", chatConnected && "reconnectPulse")}></span>
                                     <span>${chatConnected ? "WebSocket connected" : "Reconnecting chat stream"}</span>
                                 </div>
                             </div>
@@ -2633,9 +2987,41 @@ function App() {
                                 <div>
                                     <div className="chatBox" ref=${chatBoxRef}>
                                         ${(chat || []).length ? (chat || []).map((line, index) => html`
-                                            <div key=${index} className="chatLine">${stripMc(line)}</div>
+                                            <div key=${index} className=${cls("chatLine", newChatStartIndex != null && index >= newChatStartIndex && "is-new")}>${stripMc(line)}</div>
                                         `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
                                     </div>
+                                    <div className="chatFrame">
+                                        <div
+                                            className="chatBox"
+                                            ref=${chatBoxRef}
+                                            onScroll=${(event) => {
+                                                const box = event.target;
+                                                const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 72;
+                                                if (nearBottom) {
+                                                    setChatAutoSuspended(false);
+                                                    setChatUnread(0);
+                                                } else if (!chatPaused) {
+                                                    setChatAutoSuspended(true);
+                                                }
+                                            }}
+                                        >
+                                            ${filteredChat.length ? filteredChat.map((line) => html`
+                                                <div key=${line.id} className="chatLine">
+                                                    <div className="chatMeta">
+                                                        <span className="chatTime">${new Date(line.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                                                        <span className="chatBadge">${line.source || "ws"}</span>
+                                                    </div>
+                                                    <div className="chatBody">${line.text}</div>
+                                                </div>
+                                            `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
+                                        </div>
+                                        ${chatUnread > 0 ? html`
+                                            <${Button} className="chatJump" kind="primary" size="small" onClick=${jumpToBottom}>
+                                                New messages (${chatUnread})
+                                            </${Button}>
+                                        ` : null}
+                                    </div>
+                                    ${chatEvictionNotice ? html`<div className="chatHint">${chatEvictionNotice}</div>` : null}
                                 </div>
 
                                 <div className="composer">
@@ -2644,6 +3030,11 @@ function App() {
                                         placeholder="Type in-game chat, /cofl commands, or compatibility commands here..."
                                         onInput=${(event) => setChatInput(event.target.value)}
                                         onKeyDown=${(event) => {
+                                            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                                                event.preventDefault();
+                                                sendChat();
+                                                return;
+                                            }
                                             if (event.key === "Enter" && !event.shiftKey) {
                                                 event.preventDefault();
                                                 sendChat();
@@ -2659,7 +3050,7 @@ function App() {
                                     </div>
 
                                     <div className="miniList">
-                                        <div className="miniRow"><strong>Send message</strong><span>Press Enter to send. Use Shift + Enter for a new line.</span></div>
+                                        <div className="miniRow"><strong>Send message</strong><span>Press Enter or Ctrl/Cmd + Enter to send. Use Shift + Enter for a new line.</span></div>
                                         <div className="miniRow"><strong>Console history</strong><span>Recent lines are kept in memory for this browser session.</span></div>
                                     </div>
 
@@ -2672,9 +3063,10 @@ function App() {
                         </div>
                     </${Panel}>
                 ` : null}
+                </div>
             </div>
 
-            ${toast ? html`<div className="toast">${toast}</div>` : null}
+            ${toast ? html`<div className=${cls("toast", !toastVisible && "toast-exit")}>${toast}</div>` : null}
 
             <${LoginOverlay}
                 show=${needsAuth}
