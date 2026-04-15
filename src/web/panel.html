@@ -2170,6 +2170,7 @@ function App() {
     const [newChatStartIndex, setNewChatStartIndex] = useState(null);
     const [renderedTab, setRenderedTab] = useState("dashboard");
     const [statusPulseTick, setStatusPulseTick] = useState(0);
+    const [themeTick, setThemeTick] = useState(0);
 
     const chatBoxRef = useRef(null);
     const chatNextIdRef = useRef(1);
@@ -2375,6 +2376,14 @@ function App() {
         refreshEverything();
         loadConfig();
     }, [refreshEverything, loadConfig]);
+
+    const updateThemeMeta = useCallback(() => {
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) {
+            const styles = getComputedStyle(document.documentElement);
+            meta.setAttribute("content", styles.getPropertyValue("--theme-color").trim() || "#0d1214");
+        }
+    }, []);
 
     useEffect(() => {
         updateThemeMeta();
@@ -3088,11 +3097,6 @@ function App() {
 
                             <div className="chatLayout">
                                 <div>
-                                    <div className="chatBox" ref=${chatBoxRef}>
-                                        ${(chat || []).length ? (chat || []).map((line, index) => html`
-                                            <div key=${index} className=${cls("chatLine", newChatStartIndex != null && index >= newChatStartIndex && "is-new")}>${stripMc(line)}</div>
-                                        `) : html`<div className="emptyState">Waiting for chat traffic...</div>`}
-                                    </div>
                                     <div className="chatFrame">
                                         <div
                                             className="chatBox"

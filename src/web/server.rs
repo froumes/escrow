@@ -419,8 +419,7 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
          <meta property=\"og:image:width\" content=\"1200\">\n\
          <meta property=\"og:image:height\" content=\"630\">\n\
          <meta name=\"twitter:card\" content=\"summary_large_image\">\n\
-         <meta name=\"twitter:image\" content=\"/api/og-image.png\">\n\
-         <meta name=\"theme-color\" content=\"#6c5ce7\">",
+         <meta name=\"twitter:image\" content=\"/api/og-image.png\">",
     );
 
     let html = include_str!("panel.html")
@@ -570,40 +569,58 @@ async fn toggle_ah(
     State(s): State<WebSharedState>,
     Json(payload): Json<TogglePayload>,
 ) -> impl IntoResponse {
-    s.enable_ah_flips.store(payload.enabled, Ordering::Relaxed);
-    info!("[WebGUI] AH flips set to {} via web panel", payload.enabled);
-    let msg = format!("[TWM Web] AH flips {}", if payload.enabled { "enabled" } else { "disabled" });
-    print_mc_chat(&msg);
-    let _ = s.chat_tx.send(msg);
-    // Persist to config file
     let enabled = payload.enabled;
     let loader = s.config_loader.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = loader.update_property(|c| c.enable_ah_flips = enabled) {
-            error!("[WebGUI] Failed to persist AH flips toggle to config: {}", e);
+    let persist = tokio::task::spawn_blocking(move || {
+        loader.update_property(|c| c.enable_ah_flips = enabled)
+    }).await;
+    match persist {
+        Ok(Ok(())) => {
+            s.enable_ah_flips.store(enabled, Ordering::Relaxed);
+            info!("[WebGUI] AH flips set to {} via web panel", enabled);
+            let msg = format!("[TWM Web] AH flips {}", if enabled { "enabled" } else { "disabled" });
+            print_mc_chat(&msg);
+            let _ = s.chat_tx.send(msg);
+            StatusCode::OK.into_response()
         }
-    });
-    StatusCode::OK
+        Ok(Err(e)) => {
+            error!("[WebGUI] Failed to persist AH flips toggle to config: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Config save failed: {e}")).into_response()
+        }
+        Err(e) => {
+            error!("[WebGUI] AH flips toggle task panicked: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()).into_response()
+        }
+    }
 }
 
 async fn toggle_bazaar(
     State(s): State<WebSharedState>,
     Json(payload): Json<TogglePayload>,
 ) -> impl IntoResponse {
-    s.enable_bazaar_flips.store(payload.enabled, Ordering::Relaxed);
-    info!("[WebGUI] Bazaar flips set to {} via web panel", payload.enabled);
-    let msg = format!("[TWM Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
-    print_mc_chat(&msg);
-    let _ = s.chat_tx.send(msg);
-    // Persist to config file
     let enabled = payload.enabled;
     let loader = s.config_loader.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = loader.update_property(|c| c.enable_bazaar_flips = enabled) {
-            error!("[WebGUI] Failed to persist Bazaar flips toggle to config: {}", e);
+    let persist = tokio::task::spawn_blocking(move || {
+        loader.update_property(|c| c.enable_bazaar_flips = enabled)
+    }).await;
+    match persist {
+        Ok(Ok(())) => {
+            s.enable_bazaar_flips.store(enabled, Ordering::Relaxed);
+            info!("[WebGUI] Bazaar flips set to {} via web panel", enabled);
+            let msg = format!("[TWM Web] Bazaar flips {}", if enabled { "enabled" } else { "disabled" });
+            print_mc_chat(&msg);
+            let _ = s.chat_tx.send(msg);
+            StatusCode::OK.into_response()
         }
-    });
-    StatusCode::OK
+        Ok(Err(e)) => {
+            error!("[WebGUI] Failed to persist Bazaar flips toggle to config: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Config save failed: {e}")).into_response()
+        }
+        Err(e) => {
+            error!("[WebGUI] Bazaar flips toggle task panicked: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()).into_response()
+        }
+    }
 }
 
 async fn toggle_anonymize(

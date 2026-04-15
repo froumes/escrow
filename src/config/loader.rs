@@ -53,11 +53,6 @@ impl ConfigLoader {
         
         let config = Self::parse_config(&contents)?;
         
-        // Re-save after every load so that newly added config fields
-        // appear in the file with their default values (matches TypeScript
-        // initConfigHelper: "add new default values to existing config").
-        self.save(&config)?;
-        
         info!("Loaded configuration from {:?}", self.config_path);
         Ok(config)
     }
