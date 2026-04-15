@@ -1252,26 +1252,53 @@ tbody tr.selected{background:var(--surface-soft-hover)}
 }
 
 .themeSelect{
+    position:relative;
     min-height:34px;
-    padding:0 10px 0 12px;
+    padding:0 26px 0 12px;
     border-radius:999px;
     border:1px solid var(--line);
     background:var(--surface-soft);
     color:var(--text);
+    color-scheme:inherit;
     cursor:pointer;
     font-size:.84rem;
     font-weight:600;
     font-family:inherit;
     -webkit-appearance:none;
     appearance:none;
-    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%239db2ac'/%3E%3C/svg%3E");
-    background-repeat:no-repeat;
-    background-position:right 10px center;
-    padding-right:26px;
+    background-image:none;
+    transition:border-color var(--motion-fast) var(--ease-standard),background var(--motion-fast) var(--ease-standard),color var(--motion-fast) var(--ease-standard);
+}
+.themeSelectWrap{
+    position:relative;
+    display:inline-flex;
+    align-items:center;
+}
+.themeSelectWrap::after{
+    content:"";
+    position:absolute;
+    right:10px;
+    top:50%;
+    transform:translateY(-50%);
+    width:10px;
+    height:6px;
+    pointer-events:none;
+    background:var(--muted);
+    -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z'/%3E%3C/svg%3E") no-repeat center;
+    mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z'/%3E%3C/svg%3E") no-repeat center;
+    transition:background var(--motion-fast) var(--ease-standard);
+}
+.themeSelect:hover{
+    border-color:var(--line-strong);
+    background-color:var(--surface-soft-hover);
 }
 .themeSelect:focus-visible{
     outline:2px solid var(--focus-ring);
     outline-offset:2px;
+}
+.themeSelect option{
+    background:var(--bg);
+    color:var(--text);
 }
 
 .tabBodyStage{
@@ -2989,9 +3016,11 @@ function App() {
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
-                        <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">
-                            ${getThemeOptions().map((key) => html`<option key=${key} value=${key}>${(getThemePresets()[key] || {}).label || key}</option>`)}
-                        </select>
+                        <span className="themeSelectWrap">
+                            <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">
+                                ${getThemeOptions().map((key) => html`<option key=${key} value=${key}>${(getThemePresets()[key] || {}).label || key}</option>`)}
+                            </select>
+                        </span>
                         <button type="button" className="themeToggle" onClick=${toggleNotifSound} title=${notifSoundEnabled ? "Mute flip notifications" : "Unmute flip notifications"} aria-pressed=${String(notifSoundEnabled)}>${notifSoundEnabled ? "\u{1F514}" : "\u{1F515}"}</button>
                     </div>
                 </div>
