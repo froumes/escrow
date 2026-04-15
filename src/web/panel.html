@@ -543,11 +543,87 @@ img{display:block;max-width:100%}
     padding:10px 12px;
     border-radius:14px;
     background:rgba(0,0,0,.18);
-    color:var(--muted);
     font-size:.88rem;
     line-height:1.45;
     white-space:pre-wrap;
     word-break:break-word;
+}
+.mcTooltipAnchor{
+    display:block;
+}
+.mcTooltipAnchor.inline{
+    display:inline-block;
+    width:100%;
+}
+.mcTooltip{
+    position:fixed;
+    z-index:260;
+    pointer-events:none;
+    min-width:220px;
+    max-width:min(420px,calc(100vw - 24px));
+    padding:4px;
+    border:2px solid rgba(51,16,102,.96);
+    background:rgba(16,1,16,.96);
+    box-shadow:
+        0 0 0 2px rgba(0,0,0,.78),
+        0 12px 28px rgba(0,0,0,.45);
+}
+.mcTooltip::before{
+    content:"";
+    position:absolute;
+    inset:2px;
+    border:1px solid rgba(112,72,196,.78);
+    pointer-events:none;
+}
+.mcTooltipInner{
+    position:relative;
+    z-index:1;
+}
+.mcTooltipTitle,
+.mcTooltipLine{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:.92rem;
+    line-height:1.35;
+    text-shadow:2px 2px 0 rgba(0,0,0,.78);
+    white-space:pre-wrap;
+    word-break:break-word;
+}
+.mcTooltipTitle{
+    margin-bottom:4px;
+}
+.mcTooltipLine + .mcTooltipLine{
+    margin-top:2px;
+}
+.mcLine{
+    display:block;
+}
+.mcFragment{}
+.mcBold{font-weight:700}
+.mcItalic{font-style:italic}
+.mcUnderline{text-decoration:underline}
+.mcStrike{text-decoration:line-through}
+.mcObfuscated{
+    letter-spacing:.08em;
+    filter:blur(.35px);
+}
+.mcColor0{color:#000000}
+.mcColor1{color:#0000aa}
+.mcColor2{color:#00aa00}
+.mcColor3{color:#00aaaa}
+.mcColor4{color:#aa0000}
+.mcColor5{color:#aa00aa}
+.mcColor6{color:#ffaa00}
+.mcColor7{color:#aaaaaa}
+.mcColor8{color:#555555}
+.mcColor9{color:#5555ff}
+.mcColorA{color:#55ff55}
+.mcColorB{color:#55ffff}
+.mcColorC{color:#ff5555}
+.mcColorD{color:#ff55ff}
+.mcColorE{color:#ffff55}
+.mcColorF{color:#ffffff}
+.detailLore .mcTooltipLine{
+    font-size:.88rem;
 }
 .tableShell{
     margin-top:18px;
@@ -880,6 +956,118 @@ function stripMc(text) {
     return (text || "").replace(/\u00A7[0-9A-FK-OR]/gi, "");
 }
 
+const MC_COLOR_CLASS = {
+    "0": "mcColor0",
+    "1": "mcColor1",
+    "2": "mcColor2",
+    "3": "mcColor3",
+    "4": "mcColor4",
+    "5": "mcColor5",
+    "6": "mcColor6",
+    "7": "mcColor7",
+    "8": "mcColor8",
+    "9": "mcColor9",
+    "a": "mcColorA",
+    "b": "mcColorB",
+    "c": "mcColorC",
+    "d": "mcColorD",
+    "e": "mcColorE",
+    "f": "mcColorF",
+};
+
+function defaultMcStyle() {
+    return {
+        colorClass: "mcColorF",
+        bold: false,
+        italic: false,
+        underline: false,
+        strike: false,
+        obfuscated: false,
+    };
+}
+
+function parseMcSegments(text) {
+    const source = String(text ?? "");
+    const segments = [];
+    let style = defaultMcStyle();
+    let buffer = "";
+
+    const flush = () => {
+        if (!buffer) return;
+        segments.push({
+            text: buffer,
+            colorClass: style.colorClass,
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            strike: style.strike,
+            obfuscated: style.obfuscated,
+        });
+        buffer = "";
+    };
+
+    for (let i = 0; i < source.length; i += 1) {
+        const char = source[i];
+        if (char === "\u00A7" && i + 1 < source.length) {
+            const code = source[i + 1].toLowerCase();
+            i += 1;
+            flush();
+            if (MC_COLOR_CLASS[code]) {
+                style = { ...defaultMcStyle(), colorClass: MC_COLOR_CLASS[code] };
+                continue;
+            }
+            if (code === "l") {
+                style = { ...style, bold: true };
+            } else if (code === "m") {
+                style = { ...style, strike: true };
+            } else if (code === "n") {
+                style = { ...style, underline: true };
+            } else if (code === "o") {
+                style = { ...style, italic: true };
+            } else if (code === "k") {
+                style = { ...style, obfuscated: true };
+            } else if (code === "r") {
+                style = defaultMcStyle();
+            }
+            continue;
+        }
+        buffer += char;
+    }
+
+    flush();
+
+    if (!segments.length) {
+        segments.push({ text: source, ...defaultMcStyle() });
+    }
+
+    return segments;
+}
+
+function mcSegmentClass(segment) {
+    return cls(
+        "mcFragment",
+        segment.colorClass,
+        segment.bold && "mcBold",
+        segment.italic && "mcItalic",
+        segment.underline && "mcUnderline",
+        segment.strike && "mcStrike",
+        segment.obfuscated && "mcObfuscated"
+    );
+}
+
+function getTooltipData(item) {
+    if (!item || item.empty) return null;
+    const title =
+        item.displayNameColored ||
+        item.displayName ||
+        item.item_name ||
+        item.name ||
+        "";
+    const lines = Array.isArray(item.lore) ? item.lore.filter((line) => line != null && line !== "") : [];
+    if (!title && !lines.length) return null;
+    return { title, lines };
+}
+
 function coins(value) {
     if (value == null || Number.isNaN(Number(value))) return "-";
     const n = Number(value);
@@ -920,6 +1108,16 @@ function formatPlacedAt(epochSeconds) {
         hour: "2-digit",
         minute: "2-digit"
     });
+}
+
+function humanizeIdentifier(value) {
+    if (value == null || value === "") return "-";
+    return String(value)
+        .replace(/^Status(?=[A-Z])/, "")
+        .replace(/[_-]+/g, " ")
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z])([A-Z][a-z])/g, "$1 $2")
+        .trim();
 }
 
 function safeTag(slot) {
@@ -1012,6 +1210,137 @@ const StatCard = ({ label, value, sub, tone = "" }) => html`
         ${sub ? html`<span>${sub}</span>` : null}
     </div>
 `;
+
+function MinecraftText({ text, className = "" }) {
+    const segments = useMemo(() => parseMcSegments(text), [text]);
+
+    return html`
+        <span className=${cls("mcLine", className)}>
+            ${segments.map((segment, index) => html`
+                <span key=${index} className=${mcSegmentClass(segment)}>${segment.text}</span>
+            `)}
+        </span>
+    `;
+}
+
+function MinecraftLore({ lines = [] }) {
+    const safeLines = Array.isArray(lines) ? lines.filter((line) => line != null && line !== "") : [];
+    if (!safeLines.length) return null;
+
+    return html`
+        <ul className="detailLore">
+            ${safeLines.map((line, index) => html`
+                <li key=${index}>
+                    <div className="mcTooltipLine">
+                        <${MinecraftText} text=${line} />
+                    </div>
+                </li>
+            `)}
+        </ul>
+    `;
+}
+
+function MinecraftHoverTooltip({ tooltip, position }) {
+    if (!tooltip) return null;
+    const viewportWidth = window.innerWidth || 1280;
+    const viewportHeight = window.innerHeight || 720;
+    const width = Math.min(420, Math.max(220, viewportWidth - 24));
+    let left = position.x + 18;
+    if (left + width > viewportWidth - 12) {
+        left = Math.max(12, position.x - width - 18);
+    }
+    let top = position.y + 18;
+    if (top > viewportHeight - 180) {
+        top = Math.max(12, position.y - 18);
+    }
+
+    return ReactDOM.createPortal(
+        html`
+            <div className="mcTooltip" style=${{ left: `${left}px`, top: `${top}px`, maxWidth: `${width}px` }}>
+                <div className="mcTooltipInner">
+                    ${tooltip.title ? html`
+                        <div className="mcTooltipTitle">
+                            <${MinecraftText} text=${tooltip.title} />
+                        </div>
+                    ` : null}
+                    ${(tooltip.lines || []).map((line, index) => html`
+                        <div key=${index} className="mcTooltipLine">
+                            <${MinecraftText} text=${line} />
+                        </div>
+                    `)}
+                </div>
+            </div>
+        `,
+        document.body
+    );
+}
+
+function TooltipAnchor({
+    as = "div",
+    tooltip = null,
+    className = "",
+    children,
+    onMouseEnter,
+    onMouseMove,
+    onMouseLeave,
+    onFocus,
+    onBlur,
+    ...props
+}) {
+    const Tag = as;
+    const [visible, setVisible] = useState(false);
+    const [position, setPosition] = useState({ x: 0, y: 0 });
+
+    const anchorPoint = (event) => {
+        const rect = event.currentTarget?.getBoundingClientRect?.();
+        return {
+            x: event.clientX || (rect ? rect.left + Math.min(rect.width * 0.5, 120) : 0),
+            y: event.clientY || (rect ? rect.top + Math.min(rect.height * 0.5, 40) : 0),
+        };
+    };
+
+    const showTooltip = (event) => {
+        if (!tooltip) return;
+        setVisible(true);
+        setPosition(anchorPoint(event));
+    };
+
+    const hideTooltip = () => setVisible(false);
+
+    return html`
+        <${React.Fragment}>
+            <${Tag}
+                className=${cls("mcTooltipAnchor", className)}
+                onMouseEnter=${(event) => {
+                    showTooltip(event);
+                    if (onMouseEnter) onMouseEnter(event);
+                }}
+                onMouseMove=${(event) => {
+                    if (tooltip) {
+                        setPosition(anchorPoint(event));
+                    }
+                    if (onMouseMove) onMouseMove(event);
+                }}
+                onMouseLeave=${(event) => {
+                    hideTooltip();
+                    if (onMouseLeave) onMouseLeave(event);
+                }}
+                onFocus=${(event) => {
+                    showTooltip(event);
+                    if (onFocus) onFocus(event);
+                }}
+                onBlur=${(event) => {
+                    hideTooltip();
+                    if (onBlur) onBlur(event);
+                }}
+                ...${props}
+            >
+                ${children}
+            </${Tag}>
+            ${visible && tooltip ? html`<${MinecraftHoverTooltip} tooltip=${tooltip} position=${position} />` : null}
+        </${React.Fragment}>
+    `;
+}
 
 function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
     const canvasRef = useRef(null);
@@ -1120,6 +1449,8 @@ function InventoryPanel({ title, subtitle, slots }) {
     const selectedName = slotName(selected);
     const selectedIcon = slotIconUrl(selected);
     const lore = Array.isArray(selected?.lore) ? selected.lore : [];
+    const selectedTooltip = getTooltipData(selected);
+    const selectedTitle = selected?.displayNameColored || selected?.displayName || selectedName;
 
     return html`
         <${Panel}>
@@ -1143,10 +1474,13 @@ function InventoryPanel({ title, subtitle, slots }) {
                                 const empty = slot?.empty || (!slot?.name && !slot?.displayName);
                                 const icon = slotIconUrl(slot);
                                 const label = slotName(slot);
+                                const tooltip = getTooltipData(slot);
                                 return html`
-                                    <button
+                                    <${TooltipAnchor}
                                         key=${`${slot?.slot ?? index}-${label}`}
+                                        as="button"
                                         type="button"
+                                        tooltip=${tooltip}
                                         className=${cls("slotButton", activeIndex === index && "active")}
                                         onClick=${() => setActiveIndex(index)}
                                     >
@@ -1160,13 +1494,14 @@ function InventoryPanel({ title, subtitle, slots }) {
                                         </div>
                                         ${!empty && Number(slot?.count) > 1 ? html`<span className="slotCount">${slot.count}</span>` : null}
                                         <div className="slotLabel">${empty ? "No item" : label}</div>
-                                    </button>
+                                    </${TooltipAnchor}>
                                 `;
                             })}
                         </div>
 
                         <div className="detailCard">
                             <div className="detailTop">
+                                <${TooltipAnchor} tooltip=${selectedTooltip} className="inline">
                                 <div className="slotIcon">
                                     ${selectedIcon && !selected?.empty ? html`
                                         <img src=${selectedIcon} alt=${selectedName} onError=${(event) => { event.currentTarget.style.display = "none"; }} />
@@ -1174,9 +1509,10 @@ function InventoryPanel({ title, subtitle, slots }) {
                                         <span className="slotFallback">${selected?.empty ? "Empty" : selectedName.slice(0, 24)}</span>
                                     `}
                                 </div>
+                                </${TooltipAnchor}>
                                 <div>
                                     <span className="eyebrow">Selected Slot</span>
-                                    <h3 className="detailTitle">${selectedName}</h3>
+                                    <h3 className="detailTitle"><${MinecraftText} text=${selectedTitle} /></h3>
                                     <div className="detailMeta">
                                         <span className="tag">Slot ${selected?.slot ?? activeIndex}</span>
                                         <span className="tag">Count ${selected?.count ?? 0}</span>
@@ -1188,15 +1524,13 @@ function InventoryPanel({ title, subtitle, slots }) {
                             <div className="miniList">
                                 <div className="miniRow"><strong>Registry</strong><span className="mono">${selected?.name || "-"}</span></div>
                                 <div className="miniRow"><strong>Display Name</strong><span>${selected?.displayName ? stripMc(selected.displayName) : "-"}</span></div>
-                                <div className="miniRow"><strong>Colored Name</strong><span>${selected?.displayNameColored || "-"}</span></div>
+                                <div className="miniRow"><strong>Colored Name</strong><span>${selected?.displayNameColored ? html`<${MinecraftText} text=${selected.displayNameColored} />` : "-"}</span></div>
                             </div>
 
                             ${lore.length ? html`
                                 <div>
                                     <span className="eyebrow">Lore</span>
-                                    <ul className="detailLore">
-                                        ${lore.map((line, index) => html`<li key=${index}>${line}</li>`)}
-                                    </ul>
+                                    <${MinecraftLore} lines=${lore} />
                                 </div>
                             ` : html`<div className="muted">No lore available for this slot.</div>`}
                         </div>
@@ -1295,7 +1629,7 @@ function QueueCard({ status, queue }) {
                 </div>
 
                 <div className="kpiStrip">
-                    <div className="kpi"><small>Runtime State</small><strong>${status.state || "-"}</strong></div>
+                    <div className="kpi"><small>Runtime State</small><strong>${humanizeIdentifier(status.state)}</strong></div>
                     <div className="kpi"><small>Bazaar Limit</small><strong>${status.bazaar_at_limit ? "Reached" : "Clear"}</strong></div>
                     <div className="kpi"><small>Auction Limit</small><strong>${status.auction_at_limit ? "Reached" : "Clear"}</strong></div>
                     <div className="kpi"><small>Inventory</small><strong>${status.inventory_full ? "Full" : "Has Space"}</strong></div>
@@ -1733,10 +2067,12 @@ function App() {
         {
             label: "Item",
             render: (row) => html`
+                <${TooltipAnchor} tooltip=${getTooltipData(row)} className="inline">
                 <div>
                     <div className="rowTitle">${row.item_name}</div>
                     <div className="rowSub">${row.bin ? "BIN listing" : "Auction listing"}</div>
                 </div>
+                </${TooltipAnchor}>
             `
         },
         {
@@ -1744,8 +2080,8 @@ function App() {
             render: (row) => formatCoinsLong(row.starting_bid)
         },
         {
-            label: "Highest",
-            render: (row) => formatCoinsLong(row.highest_bid)
+            label: "Current Price",
+            render: (row) => formatCoinsLong(Math.max(Number(row.starting_bid || 0), Number(row.highest_bid || 0)))
         },
         {
             label: "Ends In",
@@ -1788,7 +2124,7 @@ function App() {
                             <h1>Operational panel for live flips, queue state, market cleanup, and config.</h1>
                             <div className="brandMeta">
                                 <${StatusBadge} label="Macro" value=${status.macro_paused ? "Paused" : "Running"} tone=${status.macro_paused ? "tone-gold" : "tone-green"} />
-                                <${StatusBadge} label="State" value=${status.state || "-"} tone="tone-blue" />
+                                    <${StatusBadge} label="State" value=${humanizeIdentifier(status.state)} tone="tone-blue" />
                                 <${StatusBadge} label="Account" value=${status.current_account || "-"} />
                             </div>
                         </div>
@@ -2107,7 +2443,7 @@ function App() {
                             detailRenderer=${(row) => html`
                                 <div>
                                     <span className="eyebrow">Auction Detail</span>
-                                    <h3 className="detailTitle">${row.item_name}</h3>
+                                    <h3 className="detailTitle"><${MinecraftText} text=${row.displayNameColored || row.item_name} /></h3>
                                     <div className="detailMeta">
                                         <span className="tag">${row.bin ? "BIN" : "Auction"}</span>
                                         <span className="tag">${uptime(Math.max(0, row.time_remaining_seconds || 0))} left</span>
@@ -2129,9 +2465,7 @@ function App() {
                                     ${(row.lore || []).length ? html`
                                         <div style=${{ marginTop: "16px" }}>
                                             <span className="eyebrow">Lore</span>
-                                            <ul className="detailLore">
-                                                ${(row.lore || []).map((line, index) => html`<li key=${index}>${line}</li>`)}
-                                            </ul>
+                                            <${MinecraftLore} lines=${row.lore || []} />
                                         </div>
                                     ` : null}
                                 </div>
