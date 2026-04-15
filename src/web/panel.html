@@ -3,11 +3,41 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0d1214">
 <!-- OG_META_TAGS -->
 <title>TWM Control Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;700&amp;display=swap" rel="stylesheet">
+<script>
+(() => {
+    const STORAGE_KEY = "theme";
+    const OPTIONS = ["dark", "light", "auto"];
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const readTheme = () => {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        return OPTIONS.includes(saved) ? saved : "auto";
+    };
+    const resolveTheme = (theme) => (theme === "auto" ? (media.matches ? "dark" : "light") : theme);
+    const applyTheme = (theme) => {
+        const resolved = resolveTheme(theme);
+        document.documentElement.dataset.theme = resolved;
+        return resolved;
+    };
+    window.__twmTheme = {
+        options: OPTIONS,
+        media,
+        readTheme,
+        resolveTheme,
+        applyTheme,
+        setTheme(theme) {
+            localStorage.setItem(STORAGE_KEY, theme);
+            return applyTheme(theme);
+        },
+    };
+    applyTheme(readTheme());
+})();
+</script>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
@@ -19,10 +49,24 @@
     --panel:rgba(19,27,30,.88);
     --panel-2:#1a2529;
     --panel-3:#223136;
-    --line:rgba(217,231,226,.12);
-    --line-strong:rgba(217,231,226,.22);
     --text:#edf5f2;
     --muted:#9db2ac;
+    --line:rgba(217,231,226,.12);
+    --line-strong:rgba(217,231,226,.24);
+    --surface-soft:rgba(255,255,255,.04);
+    --surface-soft-hover:rgba(255,255,255,.08);
+    --bg-gradient:linear-gradient(180deg,#0a0f10,#0d1214 38%,#11181a 100%);
+    --hero-glow-warm:rgba(242,177,92,.18);
+    --hero-glow-mint:rgba(115,210,175,.16);
+    --grid-line:rgba(255,255,255,.025);
+    --focus-ring:rgba(242,177,92,.6);
+    --focus-offset:rgba(13,18,20,.95);
+    --chart-grid:rgba(255,255,255,.06);
+    --chart-ticks:#9db2ac;
+    --chart-fill-mint:rgba(115,210,175,.18);
+    --chart-fill-blue:rgba(129,183,255,.18);
+    --chart-fill-warm:rgba(242,177,92,.18);
+    --theme-color:#0d1214;
     --warm:#f2b15c;
     --warm-2:#ffd08a;
     --mint:#73d2af;
@@ -44,6 +88,34 @@
     --ease-standard:cubic-bezier(.2,0,0,1);
     --ease-emphasized:cubic-bezier(.2,0,0,1.2);
 }
+:root[data-theme="dark"]{color-scheme:dark}
+:root[data-theme="light"]{
+    color-scheme:light;
+    --bg:#f4f8f7;
+    --bg-soft:#e8f0ee;
+    --panel:rgba(255,255,255,.9);
+    --panel-2:#f2f7f5;
+    --panel-3:#e5eeeb;
+    --text:#12221e;
+    --muted:#4d635e;
+    --line:rgba(18,34,30,.16);
+    --line-strong:rgba(18,34,30,.28);
+    --surface-soft:rgba(18,34,30,.05);
+    --surface-soft-hover:rgba(18,34,30,.1);
+    --bg-gradient:linear-gradient(180deg,#f8fbfa,#f0f6f4 42%,#e8f0ee 100%);
+    --hero-glow-warm:rgba(242,177,92,.2);
+    --hero-glow-mint:rgba(115,210,175,.2);
+    --grid-line:rgba(18,34,30,.06);
+    --focus-ring:rgba(181,114,31,.56);
+    --focus-offset:rgba(244,248,247,.98);
+    --chart-grid:rgba(18,34,30,.1);
+    --chart-ticks:#4d635e;
+    --chart-fill-mint:rgba(115,210,175,.26);
+    --chart-fill-blue:rgba(129,183,255,.24);
+    --chart-fill-warm:rgba(242,177,92,.26);
+    --theme-color:#f0f6f4;
+}
+
 *,
 *::before,
 *::after{box-sizing:border-box}
@@ -54,9 +126,9 @@ body{
     color:var(--text);
     font-family:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     background:
-        radial-gradient(circle at top left,rgba(242,177,92,.18),transparent 28%),
-        radial-gradient(circle at 84% 16%,rgba(115,210,175,.16),transparent 24%),
-        linear-gradient(180deg,#0a0f10,#0d1214 38%,#11181a 100%);
+        radial-gradient(circle at top left,var(--hero-glow-warm),transparent 28%),
+        radial-gradient(circle at 84% 16%,var(--hero-glow-mint),transparent 24%),
+        var(--bg-gradient);
 }
 body::before{
     content:"";
@@ -64,8 +136,8 @@ body::before{
     inset:0;
     pointer-events:none;
     background-image:
-        linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),
-        linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);
+        linear-gradient(var(--grid-line) 1px,transparent 1px),
+        linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
     background-size:48px 48px;
     mask-image:linear-gradient(180deg,rgba(0,0,0,.55),transparent 90%);
     opacity:.4;
@@ -151,7 +223,7 @@ img{display:block;max-width:100%}
     padding:0 12px;
     border-radius:999px;
     border:1px solid var(--line);
-    background:rgba(255,255,255,.04);
+    background:var(--surface-soft);
     color:var(--muted);
     font-size:.84rem;
     white-space:nowrap;
@@ -168,6 +240,25 @@ img{display:block;max-width:100%}
     justify-content:flex-end;
     gap:10px;
 }
+.themeToggle{
+    min-height:34px;
+    padding:0 12px;
+    border-radius:999px;
+    border:1px solid var(--line);
+    background:var(--surface-soft);
+    color:var(--text);
+    cursor:pointer;
+    font-size:.84rem;
+    font-weight:600;
+}
+.themeToggle[aria-pressed="true"]{
+    border-color:var(--line-strong);
+    background:var(--surface-soft-hover);
+}
+:where(a,button,input,textarea):focus-visible{
+    outline:2px solid var(--focus-ring);
+    outline-offset:2px;
+}
 .tabbar{
     margin-top:16px;
     padding:8px;
@@ -182,7 +273,7 @@ img{display:block;max-width:100%}
     min-height:42px;
     padding:0 14px;
     border-radius:999px;
-    background:rgba(255,255,255,.04);
+    background:var(--surface-soft);
     color:var(--muted);
     cursor:pointer;
     white-space:nowrap;
@@ -210,10 +301,10 @@ img{display:block;max-width:100%}
 .button.primary{
     color:#101618;
     background:linear-gradient(135deg,var(--warm),var(--warm-2));
-    box-shadow:0 14px 24px rgba(242,177,92,.18);
+    box-shadow:0 14px 24px var(--hero-glow-warm);
 }
 .button.secondary{
-    background:rgba(255,255,255,.04);
+    background:var(--surface-soft);
     border-color:var(--line);
 }
 .button.success{
@@ -293,7 +384,7 @@ img{display:block;max-width:100%}
     padding:16px;
     border-radius:20px;
     border:1px solid rgba(255,255,255,.07);
-    background:rgba(255,255,255,.035);
+    background:var(--surface-soft);
 }
 .statCard small{
     display:block;
@@ -344,7 +435,7 @@ img{display:block;max-width:100%}
     padding:16px;
     border-radius:20px;
     border:1px solid rgba(255,255,255,.07);
-    background:rgba(255,255,255,.03);
+    background:var(--surface-soft);
 }
 .actionCard h3{
     margin:0 0 6px;
@@ -367,7 +458,7 @@ img{display:block;max-width:100%}
     padding:18px;
     border-radius:20px;
     border:1px solid rgba(255,255,255,.07);
-    background:rgba(255,255,255,.03);
+    background:var(--surface-soft);
 }
 .toggleHead{
     display:flex;
@@ -404,7 +495,7 @@ img{display:block;max-width:100%}
     padding:14px;
     border-radius:18px;
     border:1px solid rgba(255,255,255,.07);
-    background:rgba(255,255,255,.03);
+    background:var(--surface-soft);
 }
 .kpi small{
     display:block;
@@ -431,7 +522,7 @@ img{display:block;max-width:100%}
     padding:12px 14px;
     border-radius:16px;
     border:1px solid rgba(255,255,255,.06);
-    background:rgba(255,255,255,.03);
+    background:var(--surface-soft);
 }
 .miniRow strong{font-size:.96rem}
 .miniRow span{color:var(--muted);font-size:.88rem}
@@ -599,7 +690,7 @@ img{display:block;max-width:100%}
     padding:18px;
     border-radius:20px;
     border:1px solid rgba(255,255,255,.07);
-    background:rgba(255,255,255,.03);
+    background:var(--surface-soft);
     display:grid;
     gap:14px;
     align-content:start;
@@ -786,7 +877,7 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     padding:14px 16px;
     border-radius:18px;
     border:1px solid rgba(255,255,255,.07);
-    background:rgba(255,255,255,.03);
+    background:var(--surface-soft);
     display:flex;
     justify-content:space-between;
     gap:12px;
@@ -815,7 +906,7 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     margin-top:14px;
     padding:12px 14px;
     border-radius:14px;
-    background:rgba(255,255,255,.04);
+    background:var(--surface-soft);
     color:var(--muted);
 }
 .configArea{
@@ -1143,7 +1234,8 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
     .inventoryInspector{padding:12px}
     .slotGrid{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
     .button{width:100%}
-    .toolbar .button{width:auto}
+    .toolbar .button,
+    .toolbar .themeToggle{width:auto}
     .loginActions .button{width:auto}
 }
 </style>
@@ -1153,6 +1245,7 @@ tbody tr.selected{background:rgba(129,183,255,.10)}
 <script>
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const html = htm.bind(React.createElement);
+window.__twmTheme?.applyTheme?.(window.__twmTheme.readTheme());
 
 const API = {
     status: "/api/status",
@@ -1420,6 +1513,20 @@ function formatPlacedAt(epochSeconds) {
     });
 }
 
+function getThemePreference() {
+    return window.__twmTheme?.readTheme?.() || "auto";
+}
+
+function resolveCssColor(value, styles) {
+    if (!value) return value;
+    const trimmed = String(value).trim();
+    if (trimmed.startsWith("var(")) {
+        const token = trimmed.slice(4, -1).trim();
+        return styles.getPropertyValue(token).trim();
+    }
+    return trimmed;
+}
+
 function humanizeIdentifier(value) {
     if (value == null || value === "") return "-";
     return String(value)
@@ -1635,7 +1742,7 @@ function TooltipAnchor({
     `;
 }
 
-function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
+function ChartCard({ title, subtitle, points, color, fill, height = 300, themeTick = 0 }) {
     const canvasRef = useRef(null);
     const chartRef = useRef(null);
 
@@ -1653,6 +1760,12 @@ function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
             })
         );
 
+        const styles = getComputedStyle(document.documentElement);
+        const lineColor = resolveCssColor(color, styles);
+        const fillColor = resolveCssColor(fill, styles);
+        const gridColor = styles.getPropertyValue("--chart-grid").trim() || "rgba(255,255,255,.06)";
+        const tickColor = styles.getPropertyValue("--chart-ticks").trim() || "#9db2ac";
+
         chartRef.current = new Chart(canvasRef.current, {
             type: "line",
             data: {
@@ -1660,8 +1773,8 @@ function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
                 datasets: [
                     {
                         data: (points || []).map(([, value]) => value),
-                        borderColor: color,
-                        backgroundColor: fill,
+                        borderColor: lineColor,
+                        backgroundColor: fillColor,
                         fill: true,
                         tension: 0.32,
                         pointRadius: 0,
@@ -1683,13 +1796,13 @@ function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
                 },
                 scales: {
                     x: {
-                        grid: { color: "rgba(255,255,255,.04)" },
-                        ticks: { color: "#9db2ac", maxTicksLimit: 6 }
+                        grid: { color: gridColor },
+                        ticks: { color: tickColor, maxTicksLimit: 6 }
                     },
                     y: {
-                        grid: { color: "rgba(255,255,255,.04)" },
+                        grid: { color: gridColor },
                         ticks: {
-                            color: "#9db2ac",
+                            color: tickColor,
                             callback: (value) => coins(value)
                         }
                     }
@@ -1703,7 +1816,7 @@ function ChartCard({ title, subtitle, points, color, fill, height = 300 }) {
                 chartRef.current = null;
             }
         };
-    }, [points, color, fill]);
+    }, [points, color, fill, themeTick]);
 
     return html`
         <${Panel}>
@@ -1955,7 +2068,7 @@ function QueueCard({ status, queue }) {
     `;
 }
 
-function LoginOverlay({ show, password, setPassword, error, onLogin, publicProfit }) {
+function LoginOverlay({ show, password, setPassword, error, onLogin, publicProfit, themeTick = 0 }) {
     if (!show) return null;
 
     const sessionCombined = mergeProfitSeries(publicProfit.session_ah_points, publicProfit.session_bz_points);
@@ -2024,9 +2137,10 @@ function LoginOverlay({ show, password, setPassword, error, onLogin, publicProfi
                                 title="Combined session curve"
                                 subtitle=${`Session uptime ${uptime(publicProfit.session_uptime_seconds || 0)}`}
                                 points=${sessionCombined}
-                                color="#81b7ff"
-                                fill="rgba(129,183,255,.16)"
+                                color="var(--blue)"
+                                fill="var(--chart-fill-blue)"
                                 height=${280}
+                                themeTick=${themeTick}
                             />
                         </div>
                     </div>
@@ -2296,6 +2410,23 @@ function App() {
         refreshEverything();
         loadConfig();
     }, [refreshEverything, loadConfig]);
+
+    useEffect(() => {
+        updateThemeMeta();
+    }, [updateThemeMeta]);
+
+    useEffect(() => {
+        const media = window.__twmTheme?.media || window.matchMedia("(prefers-color-scheme: dark)");
+        const onChange = () => {
+            if (getThemePreference() === "auto") {
+                window.__twmTheme?.applyTheme?.("auto");
+                setThemeTick((tick) => tick + 1);
+                updateThemeMeta();
+            }
+        };
+        media.addEventListener("change", onChange);
+        return () => media.removeEventListener("change", onChange);
+    }, [updateThemeMeta]);
 
     useEffect(() => {
         const interval = window.setInterval(() => {
@@ -2710,8 +2841,9 @@ function App() {
                                 title="Combined profit pulse"
                                 subtitle=${`Session total ${coins(sessionTotalProfit)} · ${coins(sessionPerHour)}/hr · session uptime ${uptime(profit.session_uptime_seconds)}`}
                                 points=${sessionCombinedPoints}
-                                color="#f2b15c"
-                                fill="rgba(242,177,92,.16)"
+                                color="var(--warm)"
+                                fill="var(--chart-fill-warm)"
+                                themeTick=${themeTick}
                             />
                         </div>
 
@@ -2784,22 +2916,25 @@ function App() {
                                 title="Session AH profit"
                                 subtitle=${`Realized total ${coins(profit.session_ah_total)}`}
                                 points=${profit.session_ah_points || []}
-                                color="#73d2af"
-                                fill="rgba(115,210,175,.16)"
+                                color="var(--mint)"
+                                fill="var(--chart-fill-mint)"
+                                themeTick=${themeTick}
                             />
                             <${ChartCard}
                                 title="Session BZ profit"
                                 subtitle=${`Realized total ${coins(profit.session_bz_total)}`}
                                 points=${profit.session_bz_points || []}
-                                color="#81b7ff"
-                                fill="rgba(129,183,255,.16)"
+                                color="var(--blue)"
+                                fill="var(--chart-fill-blue)"
+                                themeTick=${themeTick}
                             />
                             <${ChartCard}
                                 title="Session combined curve"
                                 subtitle=${`Combined total ${coins(sessionTotalProfit)} · ${coins(sessionPerHour)}/hr`}
                                 points=${sessionCombinedPoints}
-                                color="#f2b15c"
-                                fill="rgba(242,177,92,.16)"
+                                color="var(--warm)"
+                                fill="var(--chart-fill-warm)"
+                                themeTick=${themeTick}
                             />
                         </div>
 
@@ -2815,22 +2950,25 @@ function App() {
                                 title="All-time AH profit"
                                 subtitle=${`Realized total ${coins(profit.all_time_ah_total)}`}
                                 points=${profit.all_time_ah_points || []}
-                                color="#73d2af"
-                                fill="rgba(115,210,175,.16)"
+                                color="var(--mint)"
+                                fill="var(--chart-fill-mint)"
+                                themeTick=${themeTick}
                             />
                             <${ChartCard}
                                 title="All-time BZ profit"
                                 subtitle=${`Realized total ${coins(profit.all_time_bz_total)}`}
                                 points=${profit.all_time_bz_points || []}
-                                color="#81b7ff"
-                                fill="rgba(129,183,255,.16)"
+                                color="var(--blue)"
+                                fill="var(--chart-fill-blue)"
+                                themeTick=${themeTick}
                             />
                             <${ChartCard}
                                 title="All-time combined curve"
                                 subtitle=${`Combined total ${coins(allTimeTotalProfit)}`}
                                 points=${allTimeCombinedPoints}
-                                color="#f2b15c"
-                                fill="rgba(242,177,92,.16)"
+                                color="var(--warm)"
+                                fill="var(--chart-fill-warm)"
+                                themeTick=${themeTick}
                             />
                         </div>
                     </div>
@@ -3075,6 +3213,7 @@ function App() {
                 error=${loginError}
                 onLogin=${login}
                 publicProfit=${publicProfit}
+                themeTick=${themeTick}
             />
         </main>
     `;
