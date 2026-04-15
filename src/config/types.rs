@@ -180,6 +180,12 @@ pub struct Config {
     #[serde(default, with = "opt_string_as_empty")]
     pub web_gui_password: Option<String>,
 
+    /// When true, add the `Secure` attribute to the web panel auth session cookie.
+    /// Enable this when the panel is served behind HTTPS (for example, via a reverse proxy).
+    /// Keep this false for plain HTTP/local-only deployments.
+    #[serde(default)]
+    pub web_gui_cookie_secure: bool,
+
     /// Hypixel API key for fetching active auctions. Obtain one from https://developer.hypixel.net/
     /// Leave empty to use the Coflnet API as a fallback.
     #[serde(default, with = "opt_string_as_empty")]
@@ -328,6 +334,7 @@ impl Default for Config {
             bazaar_webhook_url: None,
             discord_id: None,
             web_gui_password: None,
+            web_gui_cookie_secure: false,
             hypixel_api_key: None,
             share_legendary_flips: true,
             anonymize_webhook_name: false,
@@ -501,6 +508,18 @@ mod tests {
     fn web_gui_password_empty_string_is_none() {
         let config: Config = toml::from_str(r#"web_gui_password = """#).expect("config should parse");
         assert_eq!(config.web_gui_password, None);
+    }
+
+    #[test]
+    fn web_gui_cookie_secure_defaults_to_false() {
+        let config = Config::default();
+        assert!(!config.web_gui_cookie_secure);
+    }
+
+    #[test]
+    fn parses_web_gui_cookie_secure_true() {
+        let config: Config = toml::from_str("web_gui_cookie_secure = true").expect("config should parse");
+        assert!(config.web_gui_cookie_secure);
     }
 
     #[test]

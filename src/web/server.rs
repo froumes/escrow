@@ -47,6 +47,8 @@ pub struct WebSharedState {
     pub chat_tx: broadcast::Sender<String>,
     /// Password required to access the web panel (`None` = no auth).
     pub web_gui_password: Option<String>,
+    /// When true, add `Secure` to the authentication session cookie.
+    pub web_gui_cookie_secure: bool,
     /// Set of valid session tokens for authenticated clients.
     pub valid_sessions: Arc<Mutex<HashSet<String>>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -434,16 +436,28 @@ async fn login(
 
     info!("[WebGUI] Successful login via web panel");
 
-    let cookie = format!(
-        "twm_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800",
-        token
-    );
+    let cookie = build_session_cookie(&token, s.web_gui_cookie_secure);
     (
         StatusCode::OK,
         [("set-cookie", cookie)],
         Json(LoginResponse { success: true }),
     )
         .into_response()
+}
+
+/// Build `Set-Cookie` value for an authenticated web panel session.
+fn build_session_cookie(token: &str, secure: bool) -> String {
+    let mut attrs = vec![
+        format!("twm_session={token}"),
+        "Path=/".to_string(),
+        "HttpOnly".to_string(),
+        "SameSite=Strict".to_string(),
+        "Max-Age=604800".to_string(),
+    ];
+    if secure {
+        attrs.push("Secure".to_string());
+    }
+    attrs.join("; ")
 }
 
 async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
