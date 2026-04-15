@@ -47,6 +47,8 @@ pub struct WebSharedState {
     pub chat_tx: broadcast::Sender<String>,
     /// Password required to access the web panel (`None` = no auth).
     pub web_gui_password: Option<String>,
+    /// Whether auth session cookies should include the `Secure` attribute.
+    pub web_gui_cookie_secure: bool,
     /// Active web sessions with deterministic FIFO eviction at capacity.
     pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -237,7 +239,7 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 /// Allows unauthenticated access to `GET /` (panel HTML) and `POST /api/login`.
 fn has_valid_auth_session(
     req: &Request,
-    valid_sessions: &Mutex<HashSet<String>>,
+    valid_sessions: &Arc<Mutex<SessionStore>>,
 ) -> bool {
     // Collect all tokens to check
     let mut tokens_to_check: Vec<String> = Vec::new();
