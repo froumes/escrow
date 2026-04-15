@@ -14,6 +14,11 @@ impl ConfigLoader {
         Self { config_path }
     }
 
+    #[cfg(test)]
+    pub fn with_path(config_path: PathBuf) -> Self {
+        Self { config_path }
+    }
+
     fn get_config_path() -> PathBuf {
         // Use executable directory for config file
         // This allows multiple instances to run with different configs

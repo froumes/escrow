@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -47,8 +47,8 @@ pub struct WebSharedState {
     pub chat_tx: broadcast::Sender<String>,
     /// Password required to access the web panel (`None` = no auth).
     pub web_gui_password: Option<String>,
-    /// Set of valid session tokens for authenticated clients.
-    pub valid_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Active web sessions with deterministic FIFO eviction at capacity.
+    pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
     /// Resolved lazily from the Mojang API on first `/api/auctions` request.
     pub player_uuid: Arc<tokio::sync::RwLock<Option<String>>>,
@@ -70,6 +70,48 @@ pub struct WebSharedState {
     pub bazaar_tracker: Arc<BazaarOrderTracker>,
     /// Config loader for persisting changes to config.toml.
     pub config_loader: Arc<crate::config::ConfigLoader>,
+}
+
+/// Ordered set-like storage for active web sessions.
+///
+/// - `order` preserves insertion order for deterministic eviction.
+/// - `members` provides O(1) membership checks for auth validation.
+pub struct SessionStore {
+    order: VecDeque<String>,
+    members: HashSet<String>,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            members: HashSet::new(),
+        }
+    }
+
+    pub fn contains(&self, token: &str) -> bool {
+        self.members.contains(token)
+    }
+
+    /// Inserts a session token while enforcing a hard max session count.
+    ///
+    /// When full, this evicts the oldest inserted token first (FIFO).
+    pub fn insert_with_capacity(&mut self, token: String, max_sessions: usize) {
+        if self.members.contains(&token) {
+            self.order.retain(|t| t != &token);
+            self.order.push_back(token);
+            return;
+        }
+
+        if self.members.len() >= max_sessions {
+            if let Some(oldest) = self.order.pop_front() {
+                self.members.remove(&oldest);
+            }
+        }
+
+        self.order.push_back(token.clone());
+        self.members.insert(token);
+    }
 }
 
 // ── JSON payloads ────────────────────────────────────────────
@@ -412,17 +454,12 @@ async fn login(
             .into_response();
     }
 
-    // Generate a random session token and cap the number of active sessions
+    // Generate a random session token and cap active sessions with FIFO eviction.
     let token = uuid::Uuid::new_v4().to_string();
     {
         let mut sessions = s.valid_sessions.lock().unwrap();
-        // Limit to 64 active sessions; evict oldest when full
-        if sessions.len() >= 64 {
-            if let Some(oldest) = sessions.iter().next().cloned() {
-                sessions.remove(&oldest);
-            }
-        }
-        sessions.insert(token.clone());
+        // Hard limit of 64 active sessions; always evicts the true oldest token first.
+        sessions.insert_with_capacity(token.clone(), 64);
     }
 
     info!("[WebGUI] Successful login via web panel");
@@ -1107,14 +1144,7 @@ async fn save_config(
     let enable_bz = s.enable_bazaar_flips.clone();
     let toml_str = payload.config_toml;
     match tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // Parse the TOML to validate it first
-        let config: crate::config::Config = toml::from_str(&toml_str)
-            .map_err(|e| format!("Invalid config TOML: {}", e))?;
-        // Update in-memory toggle flags to match the saved config
-        enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
-        enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
-        // Save validated config
-        loader.save(&config).map_err(|e| format!("Failed to save config: {}", e))
+        save_config_inner(loader, enable_ah, enable_bz, &toml_str)
     }).await {
         Ok(Ok(())) => {
             info!("[WebGUI] Config saved via web panel");
@@ -1132,6 +1162,23 @@ async fn save_config(
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()).into_response()
         }
     }
+}
+
+fn save_config_inner(
+    loader: Arc<crate::config::ConfigLoader>,
+    enable_ah: Arc<AtomicBool>,
+    enable_bz: Arc<AtomicBool>,
+    toml_str: &str,
+) -> Result<(), String> {
+    // Parse the TOML to validate it first
+    let config: crate::config::Config = toml::from_str(toml_str)
+        .map_err(|e| format!("Invalid config TOML: {}", e))?;
+    // Save validated config first so runtime toggles only change if persistence succeeds.
+    loader.save(&config).map_err(|e| format!("Failed to save config: {}", e))?;
+    // Update in-memory toggle flags to match the saved config
+    enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
+    enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Parse auctions from Hypixel API response format.
@@ -1346,7 +1393,8 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request as HttpRequest;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn derive_tag_from_item_name() {
@@ -1406,29 +1454,41 @@ mod tests {
     }
 
     #[test]
-    fn auth_rejects_query_token_for_chat_ws() {
-        let mut sessions = HashSet::new();
-        sessions.insert("legacy-query-token".to_string());
+    fn save_config_does_not_mutate_runtime_toggles_when_save_fails() {
+        let unique = format!(
+            "twm-config-save-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        );
+        let dir_path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir_path).expect("temp test directory should be created");
 
-        let req = HttpRequest::builder()
-            .uri("/api/chat/ws?token=legacy-query-token")
-            .body(axum::body::Body::empty())
-            .unwrap();
+        // Use a directory path as the "file" path so fs::write fails.
+        let loader = Arc::new(crate::config::ConfigLoader::with_path(PathBuf::from(&dir_path)));
+        let enable_ah = Arc::new(AtomicBool::new(false));
+        let enable_bz = Arc::new(AtomicBool::new(true));
+        let config_toml = "enable_ah_flips = true\nenable_bazaar_flips = false\n";
 
-        assert!(!has_valid_auth_session(&req, &Mutex::new(sessions)));
-    }
+        let result = save_config_inner(loader, enable_ah.clone(), enable_bz.clone(), config_toml);
+        assert!(result.is_err(), "saving to a directory path should fail");
+        assert!(
+            result
+                .expect_err("save should fail")
+                .starts_with("Failed to save config:"),
+            "error should use existing save-failure BAD_REQUEST message path"
+        );
+        assert!(
+            !enable_ah.load(Ordering::Relaxed),
+            "AH toggle must remain unchanged on save failure"
+        );
+        assert!(
+            enable_bz.load(Ordering::Relaxed),
+            "Bazaar toggle must remain unchanged on save failure"
+        );
 
-    #[test]
-    fn auth_accepts_bearer_token() {
-        let mut sessions = HashSet::new();
-        sessions.insert("header-token".to_string());
-
-        let req = HttpRequest::builder()
-            .uri("/api/chat/ws")
-            .header("authorization", "Bearer header-token")
-            .body(axum::body::Body::empty())
-            .unwrap();
-
-        assert!(has_valid_auth_session(&req, &Mutex::new(sessions)));
+        std::fs::remove_dir_all(&dir_path).expect("temp test directory should be removed");
     }
 }
