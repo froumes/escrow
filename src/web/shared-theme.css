@@ -1,0 +1,146 @@
+/*
+Design token map
+- Color: surfaces/text/status tones use semantic aliases (`--color-*`, `--tone-*`).
+- Radius: component shape scale from pill to card (`--radius-*`).
+- Shadows: depth scale for elevated UI (`--shadow-*`).
+- Spacing: base rhythm for consistent paddings/gaps (`--space-*`).
+- Motion: shared interaction timing/easing (`--motion-*`).
+*/
+:root {
+    --color-bg-base: #0e1517;
+    --color-bg-alt: #152025;
+    --color-surface: rgba(15, 24, 27, 0.86);
+    --color-surface-strong: #18252a;
+    --color-surface-alt: #1d2d33;
+    --color-border: rgba(214, 233, 228, 0.14);
+    --color-border-strong: rgba(214, 233, 228, 0.22);
+    --color-text: #e8f3ef;
+    --color-text-muted: #9eb5ae;
+    --color-accent-warm: #f3b45b;
+    --color-accent-warm-strong: #ffca7a;
+    --color-accent-mint: #76d8b7;
+    --color-accent-mint-soft: rgba(118, 216, 183, 0.14);
+    --color-danger: #ff8a6b;
+
+    --tone-green: #9ce8c7;
+    --tone-blue: #b8d4ff;
+    --tone-red: #ffb0a0;
+    --ink-strong: #101618;
+    --ink-success: #092018;
+    --ink-warn: #211406;
+    --ink-danger: #fff6f3;
+
+    --shadow-strong: 0 24px 70px rgba(0, 0, 0, 0.32);
+    --shadow-soft: 0 16px 45px rgba(0, 0, 0, 0.24);
+
+    --radius-xl: 30px;
+    --radius-lg: 20px;
+    --radius-md: 14px;
+    --radius-sm: 12px;
+    --radius-pill: 999px;
+
+    --space-1: 8px;
+    --space-2: 12px;
+    --space-3: 16px;
+    --space-4: 20px;
+
+    --motion-fast: 180ms;
+    --motion-ease: ease;
+
+    /* Backward-compatible aliases used across the two UIs */
+    --bg: var(--color-bg-base);
+    --bg-soft: var(--color-bg-alt);
+    --panel: var(--color-surface);
+    --panel-strong: var(--color-surface-strong);
+    --panel-alt: var(--color-surface-alt);
+    --line: var(--color-border);
+    --line-strong: var(--color-border-strong);
+    --text: var(--color-text);
+    --muted: var(--color-text-muted);
+    --warm: var(--color-accent-warm);
+    --warm-strong: var(--color-accent-warm-strong);
+    --mint: var(--color-accent-mint);
+    --mint-soft: var(--color-accent-mint-soft);
+    --danger: var(--color-danger);
+    --shadow: var(--shadow-strong);
+    --transition: var(--motion-fast) var(--motion-ease);
+
+    /* Panel aliases */
+    --warm-2: var(--color-accent-warm-strong);
+    --mint-2: var(--tone-green);
+    --blue-2: var(--tone-blue);
+    --red: var(--color-danger);
+    --red-2: var(--tone-red);
+}
+
+.surface {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
+    background: var(--panel);
+    box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(18px);
+}
+
+.surface::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(160deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.03) 28%, transparent 65%);
+}
+
+.surface > * {
+    position: relative;
+    z-index: 1;
+}
+
+.button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 44px;
+    padding: 0 16px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    transition: transform var(--transition), border-color var(--transition), background var(--transition), color var(--transition), box-shadow var(--transition);
+}
+
+.button:hover {
+    transform: translateY(-1px);
+}
+
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 34px;
+    padding: 0 12px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--muted);
+    font-size: 0.84rem;
+    white-space: nowrap;
+}
+
+.panelTitle {
+    margin: 0;
+    font-family: "Space Grotesk", sans-serif;
+    letter-spacing: -0.04em;
+    line-height: 0.98;
+}
+
+.eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--warm);
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}

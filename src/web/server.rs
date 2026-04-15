@@ -272,8 +272,9 @@ async fn check_auth(
 
     let path = req.uri().path().to_string();
 
-    // Always allow the panel page, login endpoint, public profit, and OG image without auth
+    // Always allow the panel page, shared theme css, login endpoint, public profit, and OG image without auth
     if path == "/"
+        || path == "/shared-theme.css"
         || path == "/api/login"
         || path == "/api/profit/public"
         || path == "/api/og-image.png"
@@ -300,6 +301,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
     let auth_state = state.clone();
     let app = Router::new()
         .route("/", get(index_page))
+        .route("/shared-theme.css", get(shared_theme_css))
         .route("/api/login", axum::routing::post(login))
         .route("/api/profit/public", get(get_profit_public))
         .route("/api/og-image.png", get(get_og_image))
@@ -423,6 +425,13 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
         .replacen("<!-- OG_META_TAGS -->", &og_tags, 1);
 
     Html(html)
+}
+
+async fn shared_theme_css() -> impl IntoResponse {
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("shared-theme.css"),
+    )
 }
 
 async fn login(
