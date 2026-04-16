@@ -1746,6 +1746,7 @@ function setThemePreference(theme) {
 
 const FLIP_PATTERNS = {
     ahBuy:  /\[BAF\].*?PURCHASED\s+(.+?)(?:\s+for\s+)/i,
+    ahSell: /\[BAF\].*?SOLD\s+(.+?)(?:\s+to\s+.+?\s+for\s+)/i,
     bzOrder:/\[BAF\].*?\[BZ\]\s*(BUY|SELL)\s*order:\s*(.+?)\s+x/i,
 };
 
@@ -1758,6 +1759,10 @@ function detectFlipEvent(rawText) {
     m = text.match(FLIP_PATTERNS.ahBuy);
     if (m) {
         return { type: "ah", side: "buy", item: m[1].trim(), raw: text };
+    }
+    m = text.match(FLIP_PATTERNS.ahSell);
+    if (m) {
+        return { type: "ah", side: "sell", item: m[1].trim(), raw: text };
     }
     return null;
 }
@@ -3638,7 +3643,9 @@ function App() {
                             </div>
                             <div className="notifBody">
                                 <div className="notifTitle">${n.item || "Flip"}</div>
-                                <div className="notifSub">${n.type === "bz" ? `Bazaar ${n.side} order placed` : "Auction flip purchased"}</div>
+                                <div className="notifSub">${n.type === "bz"
+                                    ? `Bazaar ${n.side} order placed`
+                                    : (n.side === "sell" ? "Auction flip sold" : "Auction flip purchased")}</div>
                             </div>
                             <span className="notifTime">${new Date(n.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
                         </div>
