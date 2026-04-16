@@ -582,6 +582,8 @@ async fn main() -> Result<()> {
     // internal code paths that check them.
     let enable_ah_flips = Arc::new(AtomicBool::new(true));
     let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
+    let skip_flips_when_inventory_full =
+        Arc::new(AtomicBool::new(config.skip_flips_when_inventory_full));
     let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
 
     // Broadcast channel for chat messages → web panel clients.
@@ -733,6 +735,7 @@ async fn main() -> Result<()> {
             macro_paused: macro_paused.clone(),
             enable_ah_flips: enable_ah_flips.clone(),
             enable_bazaar_flips: enable_bazaar_flips.clone(),
+            skip_flips_when_inventory_full: skip_flips_when_inventory_full.clone(),
             ingame_names: ingame_names.clone(),
             current_account_index,
             account_index_path: account_index_path.clone(),
@@ -1703,6 +1706,7 @@ async fn main() -> Result<()> {
     let cofl_premium_ws = cofl_premium.clone();
     let enable_ah_flips_ws = enable_ah_flips.clone();
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
+    let skip_flips_when_inv_full_ws = skip_flips_when_inventory_full.clone();
     let chat_tx_ws = chat_tx.clone();
     let detected_cofl_license_ws = detected_cofl_license.clone();
     let cofl_authenticated_ws = cofl_authenticated.clone();
@@ -1726,6 +1730,7 @@ async fn main() -> Result<()> {
     let command_queue_deferred = command_queue.clone();
     let bot_client_deferred = bot_client.clone();
     let enable_ah_flips_deferred = enable_ah_flips.clone();
+    let skip_flips_when_inv_full_deferred = skip_flips_when_inventory_full.clone();
     let cofl_authenticated_deferred = cofl_authenticated.clone();
     let chat_tx_deferred = chat_tx.clone();
     tokio::spawn(async move {
@@ -1736,7 +1741,8 @@ async fn main() -> Result<()> {
                 || !cofl_authenticated_deferred.load(Ordering::Relaxed)
                 || bot_client_deferred.is_startup_in_progress()
                 || !bot_client_deferred.state().allows_commands()
-                || bot_client_deferred.is_inventory_full()
+                || (skip_flips_when_inv_full_deferred.load(Ordering::Relaxed)
+                    && bot_client_deferred.is_inventory_full())
                 || command_queue_deferred.has_purchase_auction()
             {
                 continue;
@@ -1801,7 +1807,7 @@ async fn main() -> Result<()> {
                     // Briefly hold AH flips while the bot is busy instead of dropping
                     // them immediately. This helps flips survive short claim/sell GUIs.
                     if !bot_client_for_ws.state().allows_commands() {
-                        debug!("Deferring flip - bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);
+                        warn!("Deferring flip — bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);
                         let mut held = deferred_ah_flips_ws.lock().unwrap();
                         let key = flip
                             .uuid
@@ -1825,9 +1831,13 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Skip AH flips when inventory is full — selling mode
-                    if bot_client_for_ws.is_inventory_full() {
-                        debug!("Skipping AH flip — inventory full (selling mode): {}", flip.item_name);
+                    // Skip AH flips when inventory is full — selling mode.  Opt-in via
+                    // `skip_flips_when_inventory_full` config; defaults to false so
+                    // flips are always attempted regardless of inventory state.
+                    if skip_flips_when_inv_full_ws.load(Ordering::Relaxed)
+                        && bot_client_for_ws.is_inventory_full()
+                    {
+                        warn!("Skipping AH flip — inventory full (selling mode): {}", flip.item_name);
                         continue;
                     }
 
@@ -2671,6 +2681,7 @@ async fn main() -> Result<()> {
     let chat_tx_proc = chat_tx.clone();
     let ws_client_proc = ws_client.clone();
     let bot_client_proc_inv = bot_client.clone();
+    let skip_flips_when_inv_full_proc = skip_flips_when_inventory_full.clone();
     tokio::spawn(async move {
         use twm::types::BotState;
         // Debounce: avoid requesting sellinventory too frequently when inventory is full
@@ -2749,7 +2760,9 @@ async fn main() -> Result<()> {
                 // order management, claims of SOLD items).  Everything else —
                 // including ClaimPurchasedItem (which adds items) — is dropped so
                 // the bot focuses exclusively on selling until there's space again.
-                if bot_client_clone.is_inventory_full() {
+                if skip_flips_when_inv_full_proc.load(Ordering::Relaxed)
+                    && bot_client_clone.is_inventory_full()
+                {
                     let is_selling_cmd = matches!(
                         cmd.command_type,
                         twm::types::CommandType::SellToAuction { .. }
@@ -2760,7 +2773,7 @@ async fn main() -> Result<()> {
                         | twm::types::CommandType::CancelAuction { .. }
                     );
                     if !is_selling_cmd {
-                        debug!("[Queue] Dropping {:?} — inventory full (selling mode)", cmd.command_type);
+                        warn!("[Queue] Dropping {:?} — inventory full (selling mode)", cmd.command_type);
                         // Proactively request /cofl sellinventory to get sell
                         // recommendations (especially bazaar) when inventory is full.
                         // Debounce to avoid spamming COFL.

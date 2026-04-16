@@ -39,6 +39,9 @@ pub struct WebSharedState {
     pub macro_paused: Arc<AtomicBool>,
     pub enable_ah_flips: Arc<AtomicBool>,
     pub enable_bazaar_flips: Arc<AtomicBool>,
+    /// Mirror of `config.skip_flips_when_inventory_full`.  Updated from the
+    /// raw config save path so runtime behavior tracks the persisted value.
+    pub skip_flips_when_inventory_full: Arc<AtomicBool>,
     /// Account names from config (may be single or multi).
     pub ingame_names: Vec<String>,
     pub current_account_index: usize,
@@ -1185,9 +1188,10 @@ async fn save_config(
     let loader = s.config_loader.clone();
     let enable_ah = s.enable_ah_flips.clone();
     let enable_bz = s.enable_bazaar_flips.clone();
+    let skip_inv_full = s.skip_flips_when_inventory_full.clone();
     let toml_str = payload.config_toml;
     match tokio::task::spawn_blocking(move || -> Result<(), String> {
-        save_config_inner(loader, enable_ah, enable_bz, &toml_str)
+        save_config_inner(loader, enable_ah, enable_bz, skip_inv_full, &toml_str)
     }).await {
         Ok(Ok(())) => {
             info!("[WebGUI] Config saved via web panel");
@@ -1211,6 +1215,7 @@ fn save_config_inner(
     loader: Arc<crate::config::ConfigLoader>,
     enable_ah: Arc<AtomicBool>,
     enable_bz: Arc<AtomicBool>,
+    skip_inv_full: Arc<AtomicBool>,
     toml_str: &str,
 ) -> Result<(), String> {
     // Parse the TOML to validate it first
@@ -1221,6 +1226,7 @@ fn save_config_inner(
     // Update in-memory toggle flags to match the saved config
     enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
     enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
+    skip_inv_full.store(config.skip_flips_when_inventory_full, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1513,9 +1519,16 @@ mod tests {
         let loader = Arc::new(crate::config::ConfigLoader::with_path(PathBuf::from(&dir_path)));
         let enable_ah = Arc::new(AtomicBool::new(false));
         let enable_bz = Arc::new(AtomicBool::new(true));
+        let skip_inv_full = Arc::new(AtomicBool::new(false));
         let config_toml = "enable_ah_flips = true\nenable_bazaar_flips = false\n";
 
-        let result = save_config_inner(loader, enable_ah.clone(), enable_bz.clone(), config_toml);
+        let result = save_config_inner(
+            loader,
+            enable_ah.clone(),
+            enable_bz.clone(),
+            skip_inv_full.clone(),
+            config_toml,
+        );
         assert!(result.is_err(), "saving to a directory path should fail");
         assert!(
             result

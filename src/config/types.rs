@@ -113,7 +113,15 @@ pub struct Config {
     /// This field is kept for backward compatibility but is always treated as true.
     #[serde(default = "default_true", skip_serializing)]
     pub enable_ah_flips: bool,
-    
+
+    /// When true, AH flip purchases are skipped while the bot's inventory is full
+    /// and PurchaseAuction commands are dropped from the queue.  Defaults to false —
+    /// flips are always attempted regardless of inventory state.  Hypixel will
+    /// silently drop the purchase if there is truly no space, so this gate is
+    /// mostly an optimization, not a safety requirement.
+    #[serde(default)]
+    pub skip_flips_when_inventory_full: bool,
+
     #[serde(default)]
     pub bed_spam: bool,
 
@@ -319,6 +327,7 @@ impl Default for Config {
             auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,
             enable_ah_flips: true,
+            skip_flips_when_inventory_full: false,
             bed_spam: false,
             fastbuy: Some(true),
             freemoney: None,
