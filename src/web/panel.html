@@ -1469,6 +1469,7 @@ const API = {
     auctions: "/api/auctions",
     bazaarOrders: "/api/bazaar_orders",
     queue: "/api/queue",
+    flipHistory: "/api/flip-history",
     config: "/api/config",
     pause: "/api/pause",
     resume: "/api/resume",
@@ -1493,6 +1494,7 @@ const API = {
 const TAB_DEFS = [
     ["dashboard", "Dashboard"],
     ["analytics", "Analytics"],
+    ["flips", "Flips"],
     ["inventory", "Inventory"],
     ["market", "Market"],
     ["queue", "Queue"],
@@ -1743,7 +1745,7 @@ function setThemePreference(theme) {
 }
 
 const FLIP_PATTERNS = {
-    ahBuy:  /\[BAF\].*?(?:Trying to purchase flip|purchase).*?:\s*(.+?)(?:\s+for\s+)/i,
+    ahBuy:  /\[BAF\].*?PURCHASED\s+(.+?)(?:\s+for\s+)/i,
     bzOrder:/\[BAF\].*?\[BZ\]\s*(BUY|SELL)\s*order:\s*(.+?)\s+x/i,
 };
 
@@ -2459,6 +2461,7 @@ function App() {
     const [auctions, setAuctions] = useState([]);
     const [bzOrders, setBzOrders] = useState([]);
     const [queue, setQueue] = useState([]);
+    const [flipHistory, setFlipHistory] = useState([]);
     const [configText, setConfigText] = useState("");
     const [savedConfigText, setSavedConfigText] = useState("");
     const [configMsg, setConfigMsg] = useState("");
@@ -2599,6 +2602,29 @@ function App() {
             loadJson(API.bazaarOrders, setBzOrders)
         ]);
     }, [loadJson]);
+
+    useEffect(() => {
+        if (activeTab !== "flips") return;
+        let cancelled = false;
+
+        const load = async () => {
+            try {
+                const data = await req(API.flipHistory);
+                if (!cancelled && Array.isArray(data)) {
+                    setFlipHistory(data);
+                }
+            } catch {
+                // ignore — surfaced via other health signals
+            }
+        };
+
+        load();
+        const id = window.setInterval(load, 10000);
+        return () => {
+            cancelled = true;
+            window.clearInterval(id);
+        };
+    }, [activeTab]);
 
     const refreshEverything = useCallback(async () => {
         await Promise.all([refreshCore(), refreshSurface(), refreshMarket()]);
@@ -3402,6 +3428,74 @@ function App() {
                                 </div>
                             `}
                         />
+                    </div>
+                ` : null}
+
+                ${renderedTab === "flips" ? html`
+                    <div className="layout">
+                        <${Panel}>
+                            <div className="cardBody">
+                                <div className="sectionTitle">
+                                    <div>
+                                        <span className="eyebrow">Recent flips</span>
+                                        <h2 className="panelTitle">Last ${flipHistory.length || 0} realized AH flips</h2>
+                                        <p>Shows completed flips with realized profit, buy/sell price, and time to sell.</p>
+                                    </div>
+                                </div>
+
+                                <div className="tableWrap">
+                                    <table className="table">
+                                        <thead>
+                                            <tr>
+                                                <th>When</th>
+                                                <th>Item</th>
+                                                <th style=${{ textAlign: "right" }}>Buy</th>
+                                                <th style=${{ textAlign: "right" }}>Sell</th>
+                                                <th style=${{ textAlign: "right" }}>Profit</th>
+                                                <th style=${{ textAlign: "right" }}>Time to sell</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            ${flipHistory.length ? flipHistory.map((row, index) => {
+                                                const soldDate = row.sold_at_unix != null
+                                                    ? new Date(row.sold_at_unix * 1000)
+                                                    : null;
+                                                const when = soldDate
+                                                    ? soldDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                                                    : "-";
+                                                const profitText = row.profit != null ? formatCoinsLong(row.profit) : "-";
+                                                const profitClass = row.profit > 0 ? "tone-green" : (row.profit < 0 ? "tone-red" : "");
+                                                const buyText = row.buy_price != null ? formatCoinsLong(row.buy_price) : "-";
+                                                const sellText = row.sell_price != null ? formatCoinsLong(row.sell_price) : "-";
+                                                const tts = row.time_to_sell_secs != null
+                                                    ? uptime(row.time_to_sell_secs)
+                                                    : "-";
+                                                return html`
+                                                    <tr key=${row.auction_uuid || `${row.item_name}-${index}`}>
+                                                        <td>${when}</td>
+                                                        <td><${MinecraftText} text=${row.item_name} /></td>
+                                                        <td style=${{ textAlign: "right" }}>${buyText}</td>
+                                                        <td style=${{ textAlign: "right" }}>${sellText}</td>
+                                                        <td style=${{ textAlign: "right" }}>
+                                                            <span className=${profitClass}>${profitText}</span>
+                                                        </td>
+                                                        <td style=${{ textAlign: "right" }}>${tts}</td>
+                                                    </tr>
+                                                `;
+                                            }) : html`
+                                                <tr>
+                                                    <td colspan="6">
+                                                        <div className="emptyState">
+                                                            No completed flips tracked yet this session.
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            `}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </${Panel}>
                     </div>
                 ` : null}
 

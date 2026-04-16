@@ -26,6 +26,18 @@ use crate::state::CommandQueue;
 use crate::types::{CommandPriority, CommandType};
 use crate::websocket::CoflWebSocket;
 
+/// A single realized AH flip used for the flip-history panel.
+#[derive(Clone, Serialize)]
+pub struct FlipHistoryEntry {
+    pub sold_at_unix: u64,
+    pub item_name: String,
+    pub buy_price: i64,
+    pub sell_price: i64,
+    pub profit: i64,
+    pub time_to_sell_secs: u64,
+    pub auction_uuid: Option<String>,
+}
+
 // ── Shared state passed to every handler ─────────────────────
 
 /// Holds references to all bot state that the web UI needs.
@@ -73,6 +85,8 @@ pub struct WebSharedState {
     pub anonymize_webhook_name: Arc<AtomicBool>,
     /// Tracks active bazaar orders for the web panel and profit calculation.
     pub bazaar_tracker: Arc<BazaarOrderTracker>,
+    /// Recent realized AH flips for the flip-history panel.
+    pub flip_history: Arc<Mutex<VecDeque<FlipHistoryEntry>>>,
     /// Config loader for persisting changes to config.toml.
     pub config_loader: Arc<crate::config::ConfigLoader>,
 }
@@ -333,6 +347,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/config", get(get_config).post(save_config))
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
+        .route("/api/flip-history", get(get_flip_history))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -1354,6 +1369,16 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
         session_bz_total: snapshot.session_bz_total,
         session_uptime_seconds: s.started_at.elapsed().as_secs(),
     })
+}
+
+/// Recent realized AH flips for the flip-history panel.
+async fn get_flip_history(State(s): State<WebSharedState>) -> Json<Vec<FlipHistoryEntry>> {
+    let history = s
+        .flip_history
+        .lock()
+        .map(|h| h.clone().into_iter().collect())
+        .unwrap_or_else(|_| Vec::new());
+    Json(history)
 }
 
 /// Public profit endpoint — no authentication required.

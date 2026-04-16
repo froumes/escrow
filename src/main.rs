@@ -10,7 +10,7 @@ use twm::{
     bot::BotClient,
     types::Flip,
     CommandPriority,
-    web::{start_web_server, WebSharedState},
+    web::{start_web_server, FlipHistoryEntry, WebSharedState},
 };
 use tracing::{debug, error, info, warn};
 use tokio::time::{sleep, Duration};
@@ -721,6 +721,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("profit_history.json"));
     let profit_tracker = Arc::new(twm::profit::ProfitTracker::load_or_new(profit_tracker_path));
 
+    // Recent realized AH flips for the flip-history panel.
+    let flip_history: Arc<Mutex<VecDeque<FlipHistoryEntry>>> =
+        Arc::new(VecDeque::new().into());
+
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(twm::bazaar_tracker::BazaarOrderTracker::new());
 
@@ -753,6 +757,7 @@ async fn main() -> Result<()> {
             profit_tracker: profit_tracker.clone(),
             anonymize_webhook_name: anonymize_webhook_name.clone(),
             bazaar_tracker: bazaar_tracker.clone(),
+            flip_history: flip_history.clone(),
             config_loader: config_loader.clone(),
         };
         let web_port = config.web_gui_port;
@@ -846,6 +851,7 @@ async fn main() -> Result<()> {
     let enable_bazaar_flips_events = enable_bazaar_flips.clone();
     let enable_ah_flips_events = enable_ah_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
+    let flip_history_events = flip_history.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let ah_purchase_ledger_events = ah_purchase_ledger.clone();
     let ah_purchase_ledger_writer_events = ah_purchase_ledger_writer.clone();
@@ -1261,6 +1267,27 @@ async fn main() -> Result<()> {
                     // Record realized AH profit
                     if let Some(profit) = opt_profit {
                         profit_tracker_events.record_ah_profit(profit);
+                    }
+                    // Append to in-memory flip history for the web panel.
+                    if let (Some(profit), Some(buy_price), Some(time_secs)) =
+                        (opt_profit, opt_buy_price, opt_time_secs)
+                    {
+                        if let Ok(mut history) = flip_history_events.lock() {
+                            const MAX_FLIP_HISTORY: usize = 200;
+                            let entry = FlipHistoryEntry {
+                                sold_at_unix: unix_now(),
+                                item_name: item_name.clone(),
+                                buy_price: buy_price as i64,
+                                sell_price: price as i64,
+                                profit,
+                                time_to_sell_secs: time_secs,
+                                auction_uuid: opt_auction_uuid.clone(),
+                            };
+                            history.push_front(entry);
+                            while history.len() > MAX_FLIP_HISTORY {
+                                history.pop_back();
+                            }
+                        }
                     }
                     // Print colorful sold announcement
                     let profit_str = opt_profit.map(|p| {
