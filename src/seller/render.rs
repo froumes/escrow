@@ -114,6 +114,62 @@ pub fn strip_mc_codes(s: &str) -> String {
     out
 }
 
+/// Line-prefix patterns (after stripping §-codes and leading whitespace)
+/// that identify Hypixel auction-house metadata appended to an item's lore.
+/// We strip these from the rendered card so the Discord post doesn't
+/// reveal that the item is currently listed on the AH.
+const AUCTION_META_PREFIXES: &[&str] = &[
+    "Seller:",
+    "Buy it now:",
+    "Starting bid:",
+    "Starting Bid:",
+    "Current bid:",
+    "Top bid:",
+    "Top bidder:",
+    "Bids:",
+    "Seller is in your",
+    "Seller is your",
+    "Ends in:",
+    "Ended!",
+    "Click to inspect",
+    "Click to view",
+    "Click to see",
+    "Right-click to",
+    "Shift + Right-click",
+    "Shift + right-click",
+    "Shift + R-Click",
+];
+
+/// Trim any trailing Hypixel auction-house metadata block from a lore list.
+///
+/// Hypixel appends a block of lines to every AH-listed item's lore — seller
+/// name, BIN/bid price, expiry, inspect hints, etc. — separated from the
+/// item's own lore by one or two blank lines.  We locate the first AH
+/// metadata line and drop everything from that point onward (including the
+/// separator blanks) so the rendered card looks like a plain inventory item.
+pub fn strip_auction_meta_lore(mut lore: Vec<String>) -> Vec<String> {
+    let cut = lore.iter().position(|raw| {
+        let plain = strip_mc_codes(raw);
+        let trimmed = plain.trim_start();
+        AUCTION_META_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+    });
+
+    let Some(mut idx) = cut else {
+        return lore;
+    };
+
+    // Drop any blank / whitespace-only spacer lines that sit directly
+    // before the first metadata line — those are the visual separator
+    // Hypixel inserts between item lore and auction metadata.
+    while idx > 0 && strip_mc_codes(&lore[idx - 1]).trim().is_empty() {
+        idx -= 1;
+    }
+    lore.truncate(idx);
+    lore
+}
+
 // ── Embedded 5×7 bitmap font (same layout as og_image) ────────────────────
 
 const FONT: &[(char, [u8; 5])] = &[
@@ -701,6 +757,49 @@ mod tests {
     fn strips_color_codes() {
         assert_eq!(strip_mc_codes("§6Gold §7Gray"), "Gold Gray");
         assert_eq!(strip_mc_codes("no codes"), "no codes");
+    }
+
+    #[test]
+    fn strips_auction_metadata_lines_from_lore() {
+        let lore = vec![
+            "§7Damage: §c+260".to_string(),
+            "§7Strength: §c+150".to_string(),
+            "".to_string(),
+            "§7A legendary weapon with lore.".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "§7Seller: §b[VIP] sylvaticus".to_string(),
+            "§7Buy it now: §638,900,000 coins".to_string(),
+            "".to_string(),
+            "§aSeller is in your co-op!".to_string(),
+            "".to_string(),
+            "§7Ends in: §e47h".to_string(),
+            "".to_string(),
+            "§eClick to inspect!".to_string(),
+        ];
+        let cleaned = strip_auction_meta_lore(lore);
+        // Keep the item's own stats + description …
+        assert_eq!(cleaned.len(), 4);
+        assert!(cleaned[3].contains("legendary weapon"));
+        // … but drop everything from the "Seller:" block onward and the
+        // trailing spacer blanks that introduced it.
+        for line in &cleaned {
+            let plain = strip_mc_codes(line);
+            assert!(!plain.contains("Seller:"), "line leaked: {plain:?}");
+            assert!(!plain.contains("Buy it now"), "line leaked: {plain:?}");
+            assert!(!plain.contains("Ends in"), "line leaked: {plain:?}");
+            assert!(!plain.contains("Click to inspect"), "line leaked: {plain:?}");
+        }
+    }
+
+    #[test]
+    fn strip_auction_meta_lore_is_noop_on_inventory_lore() {
+        let lore = vec![
+            "§7Rarity: §6LEGENDARY".to_string(),
+            "§7This item has no AH metadata.".to_string(),
+        ];
+        let cleaned = strip_auction_meta_lore(lore.clone());
+        assert_eq!(cleaned, lore);
     }
 
     #[test]

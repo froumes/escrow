@@ -1933,38 +1933,19 @@ async fn build_auction_renderable(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    // Filter out the auction-house metadata block so the preview matches
+    // what actually gets posted, and drop the BIN/Bid price footer — both
+    // would give the recipient a hint that the item is listed on the AH.
+    let lore = crate::seller::render::strip_auction_meta_lore(lore);
     let tag = entry.get("tag").and_then(|v| v.as_str());
-    let price = entry
-        .get("starting_bid")
-        .or_else(|| entry.get("highest_bid"))
-        .and_then(|v| v.as_i64());
-    let bin = entry.get("bin").and_then(|v| v.as_bool()).unwrap_or(false);
-    let footer = price.map(|p| {
-        let label = if bin { "BIN" } else { "Bid" };
-        format!("§e{label}: {}", fmt_thousands(p))
-    });
     let icon_png = fetch_icon_bytes(tag).await;
     crate::seller::render::RenderableItem {
         title,
         lore,
         count: 1,
         icon_png,
-        footer,
+        footer: None,
     }
-}
-
-fn fmt_thousands(n: i64) -> String {
-    let neg = n < 0;
-    let mag = n.unsigned_abs().to_string();
-    let bytes = mag.as_bytes();
-    let mut out = String::with_capacity(mag.len() + mag.len() / 3);
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(b as char);
-    }
-    if neg { format!("-{out}") } else { out }
 }
 
 /// Lightweight summary of everything the panel can select from — inventory

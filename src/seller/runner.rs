@@ -486,24 +486,14 @@ async fn resolve_auction(
                 .collect()
         })
         .unwrap_or_default();
+    // Drop the auction-house metadata block (Seller / Buy it now / Ends in
+    // / Click to inspect / …) and omit the BIN/Bid price footer — both
+    // would give away that the item is currently listed on the AH.
+    let lore = crate::seller::render::strip_auction_meta_lore(lore);
     let tag = found
         .get("tag")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let price = found
-        .get("startingBid")
-        .or_else(|| found.get("starting_bid"))
-        .or_else(|| found.get("highestBidAmount"))
-        .or_else(|| found.get("highest_bid"))
-        .and_then(|v| v.as_i64());
-    let bin = found
-        .get("bin")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let footer = price.map(|p| {
-        let label = if bin { "BIN" } else { "Bid" };
-        format!("§e{} {}: {}", label, "Price", format_coins(p))
-    });
 
     let icon_png = fetch_icon(http, tag.as_deref(), cache).await;
     Some(RenderableItem {
@@ -511,7 +501,7 @@ async fn resolve_auction(
         lore,
         count: 1,
         icon_png,
-        footer,
+        footer: None,
     })
 }
 
@@ -543,25 +533,6 @@ async fn fetch_icon(
     fetched
 }
 
-fn format_coins(n: i64) -> String {
-    // 1_234_567 -> "1,234,567"
-    let neg = n < 0;
-    let mag = n.unsigned_abs().to_string();
-    let bytes = mag.as_bytes();
-    let mut out = String::with_capacity(mag.len() + mag.len() / 3);
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(b as char);
-    }
-    if neg {
-        format!("-{out}")
-    } else {
-        out
-    }
-}
-
 fn sanitize_filename(title: &str) -> String {
     let plain = strip_mc_codes(title);
     let mut out = String::with_capacity(plain.len());
@@ -582,14 +553,6 @@ fn sanitize_filename(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_coins_inserts_separators() {
-        assert_eq!(format_coins(0), "0");
-        assert_eq!(format_coins(1_000), "1,000");
-        assert_eq!(format_coins(1_234_567), "1,234,567");
-        assert_eq!(format_coins(-42_000), "-42,000");
-    }
 
     #[test]
     fn sanitize_filename_keeps_ascii_alphanum() {
