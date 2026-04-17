@@ -296,7 +296,8 @@ fn draw_rect_outline(
 }
 
 /// Downsample long strings so they fit within `max_width` pixels at the given
-/// scale, appending an ellipsis when truncation occurs.
+/// scale, appending an ellipsis when truncation occurs.  Used for the title
+/// and footer — single-line fields where "…" is preferable to wrapping.
 fn truncate_to_width(s: &str, max_width: u32, scale: u32) -> String {
     if text_width(s, scale) <= max_width {
         return s.to_string();
@@ -311,6 +312,131 @@ fn truncate_to_width(s: &str, max_width: u32, scale: u32) -> String {
         chars.pop();
     }
     format!("{}...", chars.iter().collect::<String>())
+}
+
+/// Greatest `n` such that a string of `n` chars fits within `max_width`
+/// pixels at the given bitmap scale.  The font is monospace so this is
+/// a straight divide; stays in sync with [`text_width`] by construction.
+fn chars_per_line(max_width: u32, scale: u32) -> usize {
+    let advance = 5 * scale + scale; // glyph width + inter-char gap
+    if advance == 0 {
+        return 0;
+    }
+    // n glyphs occupy `n*5*scale + (n-1)*scale = n*advance - scale` pixels,
+    // so n <= (max_width + scale) / advance.
+    (max_width.saturating_add(scale) / advance) as usize
+}
+
+/// Append a single character to a colour-run list, merging into the last
+/// run when the colour matches.  Produces a compact run list suitable for
+/// [`draw_colored_text`].
+fn push_colored(runs: &mut Vec<ColoredRun>, ch: char, color: Rgba<u8>) {
+    if let Some(last) = runs.last_mut() {
+        if last.color == color {
+            last.text.push(ch);
+            return;
+        }
+    }
+    runs.push(ColoredRun {
+        text: ch.to_string(),
+        color,
+    });
+}
+
+/// Word-wrap a coloured run list to `max_chars` glyphs per line, preserving
+/// the per-character colours.  Wrapping happens at spaces when possible, or
+/// as a hard break when a single word is wider than the available width
+/// (which can happen for long hyphenless names).
+///
+/// Inter-word spaces consumed by line breaks are dropped — each returned
+/// line's runs contain only the characters that will actually be drawn.
+fn wrap_colored(runs: &[ColoredRun], max_chars: usize) -> Vec<Vec<ColoredRun>> {
+    if max_chars == 0 {
+        return vec![Vec::new()];
+    }
+
+    // Flatten to (char, color) pairs so splitting and slicing preserves
+    // colour at per-character granularity.
+    let mut pairs: Vec<(char, Rgba<u8>)> = Vec::new();
+    for run in runs {
+        for ch in run.text.chars() {
+            pairs.push((ch, run.color));
+        }
+    }
+
+    // Split into words (spaces are boundaries and discarded — the packer
+    // re-inserts them where it decides to keep words on the same line).
+    let mut words: Vec<Vec<(char, Rgba<u8>)>> = Vec::new();
+    let mut word: Vec<(char, Rgba<u8>)> = Vec::new();
+    for pair in pairs {
+        if pair.0 == ' ' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(pair);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    // Greedy line packing.
+    let mut lines: Vec<Vec<(char, Rgba<u8>)>> = vec![Vec::new()];
+    for word in words {
+        // Hard-break words that are individually wider than the column.
+        // We keep a rotating buffer of leftover characters until exhausted.
+        if word.len() > max_chars {
+            // Flush the current line if it has content before hard-wrapping.
+            if !lines.last().unwrap().is_empty() {
+                lines.push(Vec::new());
+            }
+            let mut remaining = word;
+            while remaining.len() > max_chars {
+                let tail = remaining.split_off(max_chars);
+                if let Some(last) = lines.last_mut() {
+                    last.extend(remaining);
+                }
+                lines.push(Vec::new());
+                remaining = tail;
+            }
+            if let Some(last) = lines.last_mut() {
+                last.extend(remaining);
+            }
+            continue;
+        }
+
+        let current = lines.last_mut().unwrap();
+        // `would_len` accounts for the single space that rejoins words on
+        // the same line.
+        let would_len = if current.is_empty() {
+            word.len()
+        } else {
+            current.len() + 1 + word.len()
+        };
+
+        if would_len <= max_chars {
+            if !current.is_empty() {
+                // Space colour is irrelevant — blank glyph renders nothing.
+                current.push((' ', LORE_DEFAULT));
+            }
+            current.extend(word);
+        } else {
+            lines.push(word);
+        }
+    }
+
+    // Collapse back to compact ColoredRun lists.
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut out: Vec<ColoredRun> = Vec::new();
+            for (ch, col) in line {
+                push_colored(&mut out, ch, col);
+            }
+            out
+        })
+        .collect()
 }
 
 // ── Item description DTO ──────────────────────────────────────────────────
@@ -331,7 +457,14 @@ pub struct RenderableItem {
 // ── Public renderer ───────────────────────────────────────────────────────
 
 const CARD_W: u32 = 420;
-const CARD_H: u32 = 440;
+/// Minimum rendered height — keeps "short lore" cards looking consistent
+/// with the earlier fixed-height cards.  The renderer grows past this to
+/// fit longer lore rather than clipping or ellipsising.
+const MIN_CARD_H: u32 = 440;
+/// Upper bound on card height.  Very long lore (e.g. pet descriptions with
+/// every single bonus spelled out) could otherwise push past Discord's
+/// attachment sizing comfort zone — a 420×1400 PNG is still only ~80 KB.
+const MAX_CARD_H: u32 = 1400;
 const PADDING: u32 = 18;
 const ICON_SIZE: u32 = 96;
 
@@ -342,28 +475,84 @@ const FOOTER_SCALE: u32 = 2;
 /// Produce a PNG `Vec<u8>` for the given item.  Never fails: if something
 /// goes wrong during rendering (e.g. a decode error on the icon) we fall back
 /// to a plain card with a placeholder icon.
+///
+/// The card height is chosen dynamically so that all lore wraps naturally
+/// onto additional lines instead of being truncated with an ellipsis.
 pub fn render_item_png(item: &RenderableItem) -> Vec<u8> {
-    let mut img: RgbaImage = ImageBuffer::from_pixel(CARD_W, CARD_H, BG);
+    // ── Layout metrics ────────────────────────────────────────────────
+    // Derived here rather than as constants so future tweaks (e.g. bigger
+    // fonts) recompute the offsets consistently.
+    let max_w = CARD_W - 2 * PADDING;
+    let icon_x = (CARD_W - ICON_SIZE) / 2;
+    let icon_y = PADDING + 40;
+    let lore_start_y = icon_y + ICON_SIZE + 18;
+    let lore_line_h = 7 * LORE_SCALE + LORE_SCALE; // glyph height + gap
+    let footer_line_h = 7 * FOOTER_SCALE + FOOTER_SCALE;
+
+    // ── Pre-compute wrapped lore ──────────────────────────────────────
+    // Wrap each raw lore line into one-or-more display lines so we know
+    // exactly how tall the card needs to be before allocating the image.
+    let max_chars = chars_per_line(max_w, LORE_SCALE);
+    let mut wrapped_lore: Vec<Vec<ColoredRun>> = Vec::new();
+    for raw in &item.lore {
+        let runs = parse_mc_string(raw, LORE_DEFAULT);
+        let wrapped = wrap_colored(&runs, max_chars);
+        // `wrap_colored` always returns at least one (possibly empty) line,
+        // which naturally preserves blank spacer lines in MC lore (e.g. a
+        // `§7` code alone produces a visible gap between sections).
+        wrapped_lore.extend(wrapped);
+    }
+
+    // Cap the wrapped-lore count so a pathological item description can't
+    // produce a card taller than Discord will happily embed.  Anything past
+    // the cap becomes a single trailing "…" line so the user knows the
+    // output was truncated rather than silently dropped.
+    let max_lore_lines = ((MAX_CARD_H
+        .saturating_sub(lore_start_y + footer_line_h + 12 + PADDING))
+        / lore_line_h) as usize;
+    let truncated_lore = wrapped_lore.len() > max_lore_lines;
+    if truncated_lore {
+        wrapped_lore.truncate(max_lore_lines.saturating_sub(1));
+        wrapped_lore.push(vec![ColoredRun {
+            text: "…".to_string(),
+            color: LORE_DEFAULT,
+        }]);
+    }
+
+    // ── Decide final card height ─────────────────────────────────────
+    let lore_total_h = wrapped_lore.len() as u32 * lore_line_h;
+    let footer_block = if item.footer.is_some() {
+        footer_line_h + 12
+    } else {
+        0
+    };
+    let needed_h = lore_start_y + lore_total_h + footer_block + PADDING;
+    let card_h = needed_h.clamp(MIN_CARD_H, MAX_CARD_H);
+
+    let mut img: RgbaImage = ImageBuffer::from_pixel(CARD_W, card_h, BG);
 
     // Double border (outer thin + inner thicker) to echo the MC tooltip.
-    draw_rect_outline(&mut img, 0, 0, CARD_W, CARD_H, 2, BORDER_OUTER);
-    draw_rect_outline(&mut img, 3, 3, CARD_W - 6, CARD_H - 6, 1, BORDER_INNER);
+    draw_rect_outline(&mut img, 0, 0, CARD_W, card_h, 2, BORDER_OUTER);
+    draw_rect_outline(&mut img, 3, 3, CARD_W - 6, card_h - 6, 1, BORDER_INNER);
 
-    // Title — colour-aware, truncated to fit.
+    // Title — colour-aware, truncated to fit (titles remain single-line).
     let title_runs = parse_mc_string(&item.title, TITLE_DEFAULT);
     let title_plain = title_runs.iter().map(|r| r.text.clone()).collect::<String>();
-    let title_fit = truncate_to_width(&title_plain, CARD_W - 2 * PADDING, TITLE_SCALE);
-    // Re-derive runs for the truncated string by mapping characters back to
-    // their original colour positions.
+    let title_fit = truncate_to_width(&title_plain, max_w, TITLE_SCALE);
     let title_runs_fit = reapply_colors(&title_runs, &title_fit);
     let title_w = text_width(&title_fit, TITLE_SCALE);
     let title_x = (CARD_W - title_w) / 2;
     draw_colored_text(&mut img, &title_runs_fit, title_x, PADDING + 4, TITLE_SCALE);
 
     // Icon block.
-    let icon_x = (CARD_W - ICON_SIZE) / 2;
-    let icon_y = PADDING + 40;
-    fill_rect(&mut img, icon_x - 4, icon_y - 4, ICON_SIZE + 8, ICON_SIZE + 8, ICON_BG);
+    fill_rect(
+        &mut img,
+        icon_x - 4,
+        icon_y - 4,
+        ICON_SIZE + 8,
+        ICON_SIZE + 8,
+        ICON_BG,
+    );
     draw_rect_outline(
         &mut img,
         icon_x - 4,
@@ -386,7 +575,6 @@ pub fn render_item_png(item: &RenderableItem) -> Vec<u8> {
                 let fx = icon_x + dx;
                 let fy = icon_y + dy;
                 if fx < img.width() && fy < img.height() && px.0[3] > 0 {
-                    // Alpha-composite against the icon background for nicer edges.
                     blend_pixel(&mut img, fx, fy, *px);
                 }
             }
@@ -408,29 +596,15 @@ pub fn render_item_png(item: &RenderableItem) -> Vec<u8> {
         draw_text(&mut img, &count_str, cx + 4, cy + 3, LORE_SCALE, COUNT_FG);
     }
 
-    // Lore lines.
-    let lore_start_y = icon_y + ICON_SIZE + 18;
-    let line_height = 7 * LORE_SCALE + LORE_SCALE; // glyph height + gap
+    // Lore lines — already wrapped above.  Each entry is one display row.
     let mut cy = lore_start_y;
-    let max_w = CARD_W - 2 * PADDING;
-    let footer_reserved = if item.footer.is_some() {
-        line_height + 8
-    } else {
-        0
-    };
-    for raw in &item.lore {
-        if cy + line_height + footer_reserved >= CARD_H - PADDING {
-            break;
-        }
-        let runs = parse_mc_string(raw, LORE_DEFAULT);
-        let plain: String = runs.iter().map(|r| r.text.clone()).collect();
-        let fit = truncate_to_width(&plain, max_w, LORE_SCALE);
-        let runs_fit = reapply_colors(&runs, &fit);
-        draw_colored_text(&mut img, &runs_fit, PADDING, cy, LORE_SCALE);
-        cy += line_height;
+    for line_runs in &wrapped_lore {
+        draw_colored_text(&mut img, line_runs, PADDING, cy, LORE_SCALE);
+        cy += lore_line_h;
     }
 
-    // Footer line at the bottom (price / auction info).
+    // Footer line at the bottom (price / auction info).  Uses `card_h` so
+    // the footer stays pinned to the bottom regardless of dynamic height.
     if let Some(footer) = &item.footer {
         let runs = parse_mc_string(footer, Rgba([255, 170, 0, 255]));
         let plain: String = runs.iter().map(|r| r.text.clone()).collect();
@@ -438,7 +612,7 @@ pub fn render_item_png(item: &RenderableItem) -> Vec<u8> {
         let runs_fit = reapply_colors(&runs, &fit);
         let fw = text_width(&fit, FOOTER_SCALE);
         let fx = (CARD_W - fw) / 2;
-        let fy = CARD_H - PADDING - (7 * FOOTER_SCALE);
+        let fy = card_h - PADDING - (7 * FOOTER_SCALE);
         draw_colored_text(&mut img, &runs_fit, fx, fy, FOOTER_SCALE);
     }
 
@@ -527,6 +701,37 @@ mod tests {
     fn strips_color_codes() {
         assert_eq!(strip_mc_codes("§6Gold §7Gray"), "Gold Gray");
         assert_eq!(strip_mc_codes("no codes"), "no codes");
+    }
+
+    #[test]
+    fn wraps_long_lore_onto_multiple_lines() {
+        // A long single-line description that the old implementation would
+        // have truncated to "…".  After wrapping we expect multiple lines
+        // with no trailing ellipsis.
+        let runs = parse_mc_string(
+            "§7A very long lore line that clearly exceeds the normal card \
+             width and should wrap onto multiple lines without ellipsis",
+            LORE_DEFAULT,
+        );
+        let lines = wrap_colored(&runs, 30);
+        assert!(
+            lines.len() > 1,
+            "expected long lore to wrap onto multiple lines, got {}",
+            lines.len()
+        );
+        for line in &lines {
+            let plain: String = line.iter().map(|r| r.text.clone()).collect();
+            assert!(
+                plain.chars().count() <= 30,
+                "wrapped line should not exceed the char budget: {:?}",
+                plain
+            );
+            assert!(
+                !plain.ends_with("..."),
+                "word-wrapped lines must not include the truncation marker: {:?}",
+                plain
+            );
+        }
     }
 
     #[test]
