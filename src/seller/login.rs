@@ -120,54 +120,162 @@ pub struct LoginResult {
     pub display_name: String,
 }
 
+/// Environment variable users can set to point us at an exact browser
+/// executable when auto-detection fails — useful for portable installs,
+/// non-standard VPS setups, or Windows Store editions of Edge that live
+/// under `C:\Program Files\WindowsApps\…` and aren't in the usual paths.
+const BROWSER_ENV_VAR: &str = "TWM_SELLER_BROWSER";
+
+/// Human-readable fallback message appended to browser-launch errors.
+/// Surfaced verbatim in the Seller tab so users don't have to guess what
+/// to try next.
+fn browser_not_found_hint() -> String {
+    format!(
+        "No Chromium-based browser could be located automatically. \
+         Install Google Chrome or Microsoft Edge, \
+         or set the {BROWSER_ENV_VAR} environment variable to the full path \
+         of an existing browser executable (for example \
+         'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'). \
+         Alternatively you can skip this step entirely by pasting your Discord \
+         token into the field above — the browser login is just a convenience."
+    )
+}
+
+/// Query the OS's "where" / "which" command for a named executable.
+/// Returns the first hit if any.  We keep this as a short, blocking call
+/// (it completes in tens of ms) so it's fine to invoke from async code.
+fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let tool = "where";
+    #[cfg(not(windows))]
+    let tool = "which";
+
+    let output = std::process::Command::new(tool).arg(name).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let p = PathBuf::from(line.trim());
+        if !p.as_os_str().is_empty() && p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Locate the best Chromium-based browser on the current OS.  We prefer
 /// Edge on Windows because it's always installed; otherwise fall back to
-/// Chrome.  Returning `None` lets chromiumoxide do its own detection.
-#[cfg(windows)]
+/// Chrome/Brave/Chromium.  Returning `None` lets chromiumoxide do its own
+/// detection — but in practice this function succeeds on every normal
+/// install, so that fallback is only for truly exotic setups.
 fn find_browser_executable() -> Option<PathBuf> {
+    // 1. Explicit override wins over everything else.
+    if let Ok(raw) = std::env::var(BROWSER_ENV_VAR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 2. Hardcoded install paths, OS-specific.
+    for p in hardcoded_browser_paths() {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 3. Ask the OS to resolve each known executable name via PATH.  Edge
+    //    registers itself under the "App Paths" registry key on Windows
+    //    which `where.exe` honours, so this picks up per-user installs,
+    //    portable installs, and custom directories alike.
+    #[cfg(windows)]
+    let names: &[&str] = &[
+        "msedge.exe",
+        "chrome.exe",
+        "brave.exe",
+        "chromium.exe",
+    ];
+    #[cfg(target_os = "macos")]
+    let names: &[&str] = &[
+        "Google Chrome",
+        "Microsoft Edge",
+        "Brave Browser",
+        "Chromium",
+        "google-chrome",
+        "chromium",
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let names: &[&str] = &[
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+        "brave-browser",
+    ];
+
+    for name in names {
+        if let Some(p) = resolve_on_path(name) {
+            return Some(p);
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn hardcoded_browser_paths() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![
         PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
         PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
         PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
         PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
         PathBuf::from(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+        PathBuf::from(
+            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+        ),
+        PathBuf::from(r"C:\Program Files\Chromium\Application\chrome.exe"),
     ];
     if let Some(local) = dirs::data_local_dir() {
         candidates.push(local.join("Microsoft/Edge/Application/msedge.exe"));
         candidates.push(local.join("Google/Chrome/Application/chrome.exe"));
         candidates.push(local.join("BraveSoftware/Brave-Browser/Application/brave.exe"));
+        candidates.push(local.join("Chromium/Application/chrome.exe"));
     }
-    candidates.into_iter().find(|p| p.exists())
+    if let Some(roam) = dirs::data_dir() {
+        candidates.push(roam.join("Microsoft/Edge/Application/msedge.exe"));
+    }
+    candidates
 }
 
 #[cfg(target_os = "macos")]
-fn find_browser_executable() -> Option<PathBuf> {
-    let candidates = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ];
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+fn hardcoded_browser_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+        PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+    ]
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn find_browser_executable() -> Option<PathBuf> {
-    let candidates = [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/microsoft-edge",
-        "/usr/bin/brave-browser",
-    ];
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+fn hardcoded_browser_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/usr/bin/google-chrome"),
+        PathBuf::from("/usr/bin/google-chrome-stable"),
+        PathBuf::from("/usr/bin/chromium"),
+        PathBuf::from("/usr/bin/chromium-browser"),
+        PathBuf::from("/usr/bin/microsoft-edge"),
+        PathBuf::from("/usr/bin/microsoft-edge-stable"),
+        PathBuf::from("/usr/bin/brave-browser"),
+        PathBuf::from("/snap/bin/chromium"),
+        PathBuf::from("/snap/bin/brave"),
+    ]
 }
 
 /// Spawn a visible browser window, let the user log in, and return the
@@ -194,14 +302,11 @@ pub async fn extract_token_via_login() -> Result<LoginResult, String> {
 
     let config = builder
         .build()
-        .map_err(|e| format!("failed to configure browser: {e}"))?;
+        .map_err(|e| format!("{e}. {}", browser_not_found_hint()))?;
 
-    let (mut browser, mut handler) = Browser::launch(config).await.map_err(|e| {
-        format!(
-            "could not launch browser: {e}. \
-             Make sure Google Chrome, Microsoft Edge, or another Chromium-based browser is installed."
-        )
-    })?;
+    let (mut browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|e| format!("could not launch browser: {e}. {}", browser_not_found_hint()))?;
 
     // chromiumoxide requires us to continuously drive the CDP handler; if
     // the task stops polling, the websocket stalls and every request hangs.
