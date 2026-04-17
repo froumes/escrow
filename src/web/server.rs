@@ -181,6 +181,11 @@ struct CancelBzOrderPayload {
 }
 
 #[derive(Deserialize)]
+struct BuyAuctionPayload {
+    auction_id: String,
+}
+
+#[derive(Deserialize)]
 struct LoginPayload {
     password: String,
 }
@@ -336,6 +341,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
         .route("/api/cancel_auction", axum::routing::post(cancel_auction))
+        .route("/api/buy_auction", axum::routing::post(buy_auction))
         .route("/api/claim_purchases", axum::routing::post(claim_purchases))
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
@@ -792,6 +798,83 @@ async fn cancel_auction(
     );
 
     (StatusCode::OK, "Cancel auction command queued")
+}
+
+/// Queue a purchase of a specific auction by UUID.
+///
+/// Accepts flexible input: raw UUID (with or without dashes), a full
+/// `/viewauction <uuid>` paste, or the UUID surrounded by whitespace.  The
+/// input is normalized to a dash-less lowercase 32-char hex string before the
+/// `PurchaseAuction` command is enqueued, so the existing purchase flow (send
+/// `/viewauction`, wait for slot 31, click buy, confirm) does the rest.
+async fn buy_auction(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<BuyAuctionPayload>,
+) -> impl IntoResponse {
+    let uuid = match normalize_auction_uuid(&payload.auction_id) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid auction ID — expected a 32-character hex UUID".to_string(),
+            );
+        }
+    };
+
+    info!("[WebGUI] Buy auction requested for UUID {}", uuid);
+
+    let msg = format!("[TWM Web] Buying auction {}...", uuid);
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
+
+    // Synthetic flip carrying just the UUID.  The PurchaseAuction handler only
+    // requires a non-empty UUID; price fields are logged but never validated,
+    // so zero values are safe here.
+    let flip = crate::types::Flip {
+        item_name: format!("Web Buy {}", &uuid[..8]),
+        starting_bid: 0,
+        target: 0,
+        finder: None,
+        profit_perc: None,
+        purchase_at_ms: None,
+        uuid: Some(uuid),
+    };
+
+    s.command_queue.enqueue(
+        CommandType::PurchaseAuction { flip },
+        CommandPriority::Critical,
+        false,
+    );
+
+    (StatusCode::OK, "Buy auction command queued".to_string())
+}
+
+/// Normalize an auction ID input from the web panel into a 32-char lowercase
+/// hex string.  Accepts inputs such as:
+/// - `c6b7e9e2c1f74eb7a59b0e9f5c1d2e3a`
+/// - `C6B7E9E2-C1F7-4EB7-A59B-0E9F5C1D2E3A`
+/// - `/viewauction c6b7e9e2-c1f7-4eb7-a59b-0e9f5c1d2e3a`
+/// Returns `None` if the resulting string is not exactly 32 hex characters.
+fn normalize_auction_uuid(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    // Strip a leading `/viewauction` (case-insensitive) so users can paste the
+    // full command they would otherwise type in-game.
+    let without_cmd = trimmed
+        .strip_prefix("/viewauction ")
+        .or_else(|| trimmed.strip_prefix("/VIEWAUCTION "))
+        .or_else(|| trimmed.strip_prefix("/Viewauction "))
+        .unwrap_or(trimmed)
+        .trim();
+    let cleaned: String = without_cmd
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.len() == 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(cleaned)
+    } else {
+        None
+    }
 }
 
 async fn claim_purchases(
@@ -1469,6 +1552,32 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn normalize_auction_uuid_accepts_common_formats() {
+        let dashless = "c6b7e9e2c1f74eb7a59b0e9f5c1d2e3a";
+        assert_eq!(
+            normalize_auction_uuid(dashless).as_deref(),
+            Some(dashless)
+        );
+        assert_eq!(
+            normalize_auction_uuid("C6B7E9E2-C1F7-4EB7-A59B-0E9F5C1D2E3A").as_deref(),
+            Some(dashless)
+        );
+        assert_eq!(
+            normalize_auction_uuid("  /viewauction c6b7e9e2-c1f7-4eb7-a59b-0e9f5c1d2e3a  ")
+                .as_deref(),
+            Some(dashless)
+        );
+    }
+
+    #[test]
+    fn normalize_auction_uuid_rejects_bad_input() {
+        assert!(normalize_auction_uuid("").is_none());
+        assert!(normalize_auction_uuid("not-a-uuid").is_none());
+        assert!(normalize_auction_uuid("c6b7e9e2c1f74eb7a59b0e9f5c1d2e3").is_none()); // 31 chars
+        assert!(normalize_auction_uuid("g6b7e9e2c1f74eb7a59b0e9f5c1d2e3a").is_none()); // non-hex
+    }
 
     #[test]
     fn derive_tag_from_item_name() {

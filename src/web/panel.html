@@ -455,6 +455,31 @@ img{display:block;max-width:100%}
     gap:10px;
     margin-top:20px;
 }
+.buyAuctionRow{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-top:12px;
+    align-items:stretch;
+}
+.buyAuctionInput{
+    flex:1 1 320px;
+    min-width:0;
+    padding:12px 14px;
+    border:1px solid var(--line);
+    border-radius:14px;
+    background:var(--surface-soft);
+    color:var(--text);
+    outline:none;
+    font-family:inherit;
+}
+.buyAuctionInput::placeholder{opacity:.65}
+.buyAuctionInput:focus{border-color:var(--focus-ring)}
+.buyAuctionError{
+    margin-top:8px;
+    color:var(--red-2);
+    font-size:.9em;
+}
 .heroMeta{
     margin-top:20px;
     display:flex;
@@ -1482,6 +1507,7 @@ const API = {
     claimBz: "/api/claim_bz_orders",
     cancelAllBz: "/api/cancel_all_bz_orders",
     cancelAuction: "/api/cancel_auction",
+    buyAuction: "/api/buy_auction",
     cancelBz: "/api/cancel_bz_order",
     chatSend: "/api/chat/send",
     logsLatest: "/api/logs/latest",
@@ -2471,6 +2497,8 @@ function App() {
     const [savedConfigText, setSavedConfigText] = useState("");
     const [configMsg, setConfigMsg] = useState("");
     const [chatInput, setChatInput] = useState("");
+    const [buyAuctionId, setBuyAuctionId] = useState("");
+    const [buyAuctionError, setBuyAuctionError] = useState("");
     const [chat, setChat] = useState([]);
     const [chatConnected, setChatConnected] = useState(false);
     const [chatFilter, setChatFilter] = useState("");
@@ -2692,6 +2720,33 @@ function App() {
             }
         }
     }, [configText, flash, handleUnauthorized, refreshCore]);
+
+    const submitBuyAuction = useCallback(async () => {
+        const raw = buyAuctionId.trim();
+        if (!raw) {
+            setBuyAuctionError("Enter an auction ID first");
+            return;
+        }
+        try {
+            await req(API.buyAuction, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ auction_id: raw })
+            });
+            setBuyAuctionId("");
+            setBuyAuctionError("");
+            flash("Buy auction queued");
+            await refreshEverything();
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+                return;
+            }
+            const msg = error.message || "Failed to queue buy";
+            setBuyAuctionError(msg);
+            flash(msg);
+        }
+    }, [buyAuctionId, flash, handleUnauthorized, refreshEverything]);
 
     const sendChat = useCallback(async () => {
         if (!chatInput.trim()) return;
@@ -3084,6 +3139,25 @@ function App() {
                                     <${Button} kind="secondary" onClick=${() => post(API.claimBz, null, "Claim bazaar orders queued")}>Claim Filled BZ</${Button}>
                                     <${Button} kind="danger" onClick=${() => post(API.cancelAllBz, null, "Cancel all bazaar orders queued")}>Cancel All BZ</${Button}>
                                 </div>
+                                <div className="buyAuctionRow">
+                                    <input
+                                        className="buyAuctionInput"
+                                        type="text"
+                                        value=${buyAuctionId}
+                                        placeholder="Auction ID — paste UUID or /viewauction <id>"
+                                        spellcheck="false"
+                                        autoComplete="off"
+                                        onInput=${(event) => { setBuyAuctionId(event.target.value); if (buyAuctionError) setBuyAuctionError(""); }}
+                                        onKeyDown=${(event) => {
+                                            if (event.key === "Enter") {
+                                                event.preventDefault();
+                                                submitBuyAuction();
+                                            }
+                                        }}
+                                    />
+                                    <${Button} kind="primary" onClick=${submitBuyAuction}>Buy Auction</${Button}>
+                                </div>
+                                ${buyAuctionError ? html`<div className="buyAuctionError">${buyAuctionError}</div>` : null}
                                 <div className="heroMeta">
                                     <span className=${cls("pill", status.enable_ah_flips ? "tone-green" : "tone-red")}>AH ${status.enable_ah_flips ? "enabled" : "disabled"}</span>
                                     <span className=${cls("pill", status.enable_bazaar_flips ? "tone-green" : "tone-red")}>BZ ${status.enable_bazaar_flips ? "enabled" : "disabled"}</span>
