@@ -1685,6 +1685,7 @@ const API = {
     sellerStop: "/api/seller/stop",
     sellerValidateToken: "/api/seller/validate_token",
     sellerValidateChannel: "/api/seller/validate_channel",
+    sellerLogin: "/api/seller/login",
     sellerPreview: "/api/seller/preview",
     sellerAvailable: "/api/seller/available_items",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
@@ -2696,6 +2697,7 @@ function App() {
     const [sellerDraftChannels, setSellerDraftChannels] = useState([]);
     const [sellerDraftSelected, setSellerDraftSelected] = useState([]);
     const [sellerTokenValidation, setSellerTokenValidation] = useState({ state: "idle", message: "" });
+    const [sellerLoginState, setSellerLoginState] = useState({ state: "idle", message: "" });
     const [sellerError, setSellerError] = useState("");
     const [sellerPreviewUrl, setSellerPreviewUrl] = useState("");
     const [sellerPreviewKey, setSellerPreviewKey] = useState("");
@@ -3035,6 +3037,48 @@ function App() {
             setSellerTokenValidation({ state: "error", message: error.message || "Token rejected" });
         }
     }, [handleUnauthorized, sellerDraftToken]);
+
+    // Spawn a visible browser window on the bot host and wait for the user
+    // to sign in to Discord.  The server blocks for up to 5 minutes while
+    // this runs, so we use a very long client-side timeout and surface a
+    // clear busy state.  On success we fill the token field, refresh the
+    // on-disk config (the backend persists the new token), and mark the
+    // validation indicator as green.
+    const loginSellerViaBrowser = useCallback(async () => {
+        setSellerLoginState({
+            state: "loading",
+            message: "Opening browser… log in to Discord in the new window."
+        });
+        setSellerTokenValidation({ state: "idle", message: "" });
+        try {
+            const res = await req(API.sellerLogin, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: "{}",
+                // The backend blocks until the user finishes logging in or the
+                // 5-minute timeout elapses; pick a slightly larger window so
+                // the fetch never races the server.
+                signal: AbortSignal.timeout(360_000)
+            });
+            setSellerLoginState({
+                state: "ok",
+                message: `Signed in as ${res.username}`
+            });
+            setSellerTokenValidation({
+                state: "ok",
+                message: `Logged in as ${res.username}`
+            });
+            // Clear the local draft so the field shows the stored masked
+            // token rather than a stale paste, and reload config from disk.
+            setSellerDraftToken("");
+            await refreshSellerConfig();
+            flash(`Seller signed in as ${res.username}`);
+        } catch (error) {
+            if (error && error.status === 401) { handleUnauthorized(); return; }
+            const msg = (error && error.message) || "Login failed";
+            setSellerLoginState({ state: "error", message: msg });
+        }
+    }, [flash, handleUnauthorized, refreshSellerConfig]);
 
     const toggleSellerSelection = useCallback((sel) => {
         setSellerDraftSelected((prev) => {
@@ -3998,12 +4042,29 @@ function App() {
                                                 onInput=${(e) => { setSellerDraftToken(e.target.value); setSellerTokenValidation({ state: "idle", message: "" }); }}
                                                 spellcheck="false"
                                                 autoComplete="off"
+                                                disabled=${sellerLoginState.state === "loading"}
                                             />
-                                            <${Button} kind="ghost" onClick=${validateSellerToken}>Validate</${Button}>
+                                            <${Button}
+                                                kind="ghost"
+                                                onClick=${validateSellerToken}
+                                                disabled=${sellerLoginState.state === "loading"}
+                                            >Validate</${Button}>
+                                            <${Button}
+                                                kind="primary"
+                                                onClick=${loginSellerViaBrowser}
+                                                disabled=${sellerLoginState.state === "loading"}
+                                                title="Open a browser window, sign in to Discord, and capture the token automatically"
+                                            >${sellerLoginState.state === "loading" ? "Waiting for login…" : "Login via Browser"}</${Button}>
                                         </div>
+                                        ${sellerLoginState.state !== "idle"
+                                            ? html`<div className=${cls("sellerHint", sellerLoginState.state === "ok" ? "tone-green" : sellerLoginState.state === "error" ? "tone-red" : "tone-blue")}>${sellerLoginState.message}</div>`
+                                            : null}
                                         ${sellerTokenValidation.state !== "idle"
                                             ? html`<div className=${cls("sellerHint", sellerTokenValidation.state === "ok" ? "tone-green" : sellerTokenValidation.state === "error" ? "tone-red" : "")}>${sellerTokenValidation.message}</div>`
-                                            : sellerConfig.has_token ? html`<div className="sellerHint tone-blue">Token on file: ${sellerConfig.token}. Leave blank to reuse.</div>` : null}
+                                            : sellerConfig.has_token && sellerLoginState.state === "idle" ? html`<div className="sellerHint tone-blue">Token on file: ${sellerConfig.token}. Leave blank to reuse.</div>` : null}
+                                        <div className="sellerHint">
+                                            Tip: "Login via Browser" opens a Chromium window on the machine running the bot — finish the Discord login there and the token is captured automatically.
+                                        </div>
                                     </div>
 
                                     <div className="sellerField">

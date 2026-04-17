@@ -364,6 +364,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/seller/stop", axum::routing::post(stop_seller))
         .route("/api/seller/validate_token", axum::routing::post(seller_validate_token))
         .route("/api/seller/validate_channel", axum::routing::post(seller_validate_channel))
+        .route("/api/seller/login", axum::routing::post(seller_login))
         .route("/api/seller/preview", axum::routing::post(seller_preview))
         .route("/api/seller/available_items", get(seller_available_items))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
@@ -1571,6 +1572,7 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
 //   • POST /api/seller/stop                → signal all tasks to stop
 //   • POST /api/seller/validate_token      → { token } → { ok, username }
 //   • POST /api/seller/validate_channel    → { token, channel_id } → { ok, name }
+//   • POST /api/seller/login               → open browser, capture user token
 //   • GET  /api/seller/available_items     → inventory + own-auctions snapshot
 //   • POST /api/seller/preview             → render a single selection to PNG
 
@@ -1731,6 +1733,73 @@ async fn seller_validate_channel(
     }
     match crate::seller::discord::validate_channel(&token, &payload.channel_id).await {
         Ok(name) => Json(serde_json::json!({"ok": true, "name": name})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// Guard so only one browser login flow can be in flight at a time.  A
+/// second concurrent click would otherwise spawn a second headless browser
+/// and interfere with the first window's token capture.
+static LOGIN_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// POST /api/seller/login
+///
+/// Launches a visible browser window pointed at Discord's login page and
+/// waits up to 5 minutes for the user to sign in.  On success the captured
+/// token is written through to `twm_seller.json` (so subsequent page loads
+/// already have it set) and returned to the caller.
+///
+/// This endpoint blocks for the entire login duration — the frontend must
+/// show a clear "logging in…" state and not fire other requests against it
+/// during that window.
+async fn seller_login(State(s): State<WebSharedState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+
+    if LOGIN_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "another browser login is already in progress"
+            })),
+        )
+            .into_response();
+    }
+
+    // Scope-guard so the flag always clears, even on panic/early-return.
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            LOGIN_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = Guard;
+
+    match crate::seller::login::extract_token_via_login().await {
+        Ok(result) => {
+            // Persist the freshly captured token so reloading the panel or
+            // restarting the bot keeps the login — matches the legacy tool's
+            // behaviour of writing straight to config.json.
+            let mut cfg = SellerConfig::load_from(&s.seller_config_path).unwrap_or_default();
+            cfg.token = result.token.clone();
+            if let Err(e) = cfg.save_to(&s.seller_config_path) {
+                tracing::warn!(target: "seller", "failed to persist captured token: {e}");
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "username": result.display_name,
+                "token_mask": mask_token(&result.token),
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"ok": false, "error": e})),
