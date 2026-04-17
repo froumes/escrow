@@ -243,21 +243,31 @@ pub async fn send_webhook_item_purchased(
     finder: Option<&str>,
     webhook_url: &str,
 ) {
-    let payload = build_purchase_embed(
-        "✅ Flip Purchased",
-        0x2ecc71u32,
-        ingame_name,
-        item_name,
+    let fields = build_purchase_fields(
         price,
         target,
         profit,
-        purse,
         buy_speed_ms,
         ping_ms,
         estimated_server_ack_ms,
-        auction_uuid,
         finder,
+        auction_uuid,
     );
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🛒 Item Purchased Successfully",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0x00ff00,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("TWM • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
     post_embed(webhook_url, payload).await;
 }
 
@@ -725,21 +735,31 @@ pub async fn send_webhook_legendary_flip(
     discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let payload = build_purchase_embed(
-        "🌟 Legendary Flip",
-        0xFFD700u32,
-        ingame_name,
-        item_name,
+    let fields = build_purchase_fields(
         price,
         target,
         Some(profit),
-        purse,
         buy_speed_ms,
         ping_ms,
         estimated_server_ack_ms,
-        auction_uuid,
         finder,
+        auction_uuid,
     );
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🌟 Legendary Flip!",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0xFFD700u32,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("TWM • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
     let ping = discord_id.map(|id| format!("<@{}>", id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
@@ -761,21 +781,31 @@ pub async fn send_webhook_divine_flip(
     discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let payload = build_purchase_embed(
-        "💎 Divine Flip",
-        0x00FFFFu32,
-        ingame_name,
-        item_name,
+    let fields = build_purchase_fields(
         price,
         target,
         Some(profit),
-        purse,
         buy_speed_ms,
         ping_ms,
         estimated_server_ack_ms,
-        auction_uuid,
         finder,
+        auction_uuid,
     );
+    let safe_item = sanitize_item_name(item_name);
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "💎 Divine Flip!",
+            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
+            "color": 0x00FFFFu32,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "footer": {
+                "text": format!("TWM • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
     let ping = discord_id.map(|id| format!("<@{}>", id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
@@ -869,67 +899,6 @@ pub async fn send_webhook_bazaar_flip_channel(
     post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
 }
 
-fn humanize_finder_name(finder: &str) -> String {
-    finder
-        .split('_')
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn build_purchase_embed(
-    title: &str,
-    color: u32,
-    ingame_name: &str,
-    item_name: &str,
-    price: u64,
-    target: Option<u64>,
-    profit: Option<i64>,
-    purse: Option<u64>,
-    buy_speed_ms: Option<u64>,
-    ping_ms: Option<u64>,
-    estimated_server_ack_ms: Option<u64>,
-    auction_uuid: Option<&str>,
-    finder: Option<&str>,
-) -> serde_json::Value {
-    let fields = build_purchase_fields(
-        price,
-        target,
-        profit,
-        buy_speed_ms,
-        ping_ms,
-        estimated_server_ack_ms,
-        finder,
-        auction_uuid,
-    );
-    let safe_item = sanitize_item_name(item_name);
-    serde_json::json!({
-        "embeds": [{
-            "title": title,
-            "description": format!("**{}**\nConfirmed purchase <t:{}:R>.", item_name, now_unix()),
-            "color": color,
-            "author": {
-                "name": "TWM Purchase Feed",
-                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
-            },
-            "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
-            "footer": {
-                "text": format!("{}{}", ingame_name,
-                    purse.map(|p| format!(" • Purse {}", format_purse(p))).unwrap_or_default()),
-                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
-            },
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        }]
-    })
-}
-
 /// Build embed fields for purchase-style webhooks (purchase price, target, profit/ROI, buy speed, finder, auction link).
 fn build_purchase_fields(
     price: u64,
@@ -943,54 +912,74 @@ fn build_purchase_fields(
 ) -> Vec<serde_json::Value> {
     let mut fields = vec![
         serde_json::json!({
-            "name": "Purchase",
-            "value": format!("**{}** coins", format_number(price as f64)),
+            "name": "💰 Purchase Price",
+            "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
             "inline": true
         }),
     ];
     if let Some(t) = target {
         fields.push(serde_json::json!({
-            "name": "Target",
-            "value": format!("**{}** coins", format_number(t as f64)),
+            "name": "🎯 Target Price",
+            "value": format!("```fix\n{} coins\n```", format_number(t as f64)),
             "inline": true
         }));
     }
     if let Some(p) = profit {
-        let sign = if p >= 0 { "+" } else { "-" };
-        let abs_profit = if p >= 0 { p as f64 } else { (-p) as f64 };
-        let roi_str = if price > 0 {
-            format!("\nROI **{:.1}%**", (p as f64 / price as f64) * 100.0)
+        let sign = if p >= 0 { "+" } else { "" };
+        let roi_str = if let Some(t) = target {
+            if t > 0 && price > 0 {
+                format!(" ({:.1}%)", (p as f64 / price as f64) * 100.0)
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
         fields.push(serde_json::json!({
-            "name": "Expected Profit",
-            "value": format!("**{}{}** coins{}", sign, format_number(abs_profit), roi_str),
+            "name": "📈 Expected Profit",
+            "value": format!("```diff\n{}{} coins{}\n```", sign, format_number(p as f64), roi_str),
             "inline": true
         }));
     }
-    let mut latency_lines = Vec::new();
     if let Some(ms) = buy_speed_ms {
-        latency_lines.push(format!("Buy speed **{}ms**", ms));
+        fields.push(serde_json::json!({
+            "name": "⚡ Buy Speed",
+            "value": format!("```\n{}ms\n```", ms),
+            "inline": true
+        }));
     }
     if let Some(ms) = estimated_server_ack_ms {
-        latency_lines.push(format!("Server ack **{}ms**", ms));
+        fields.push(serde_json::json!({
+            "name": "🛰️ Est. Server Ack",
+            "value": format!("```\n{}ms\n```", ms),
+            "inline": true
+        }));
     }
     if let Some(ms) = ping_ms {
-        latency_lines.push(format!("Ping **{}ms**", ms));
-    }
-    if !latency_lines.is_empty() {
         fields.push(serde_json::json!({
-            "name": "Latency",
-            "value": latency_lines.join("\n"),
+            "name": "📶 Ping",
+            "value": format!("```\n{}ms\n```", ms),
             "inline": true
         }));
     }
     if let Some(f) = finder {
         if !f.is_empty() {
+            // Convert COFL snake_case finder names to readable form
+            // e.g. "SNIPER_MEDIAN" → "Sniper Median"
+            let readable = f
+                .split('_')
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             fields.push(serde_json::json!({
-                "name": "Finder",
-                "value": humanize_finder_name(f),
+                "name": "🔍 Finder",
+                "value": format!("```\n{}\n```", readable),
                 "inline": true
             }));
         }
@@ -998,8 +987,8 @@ fn build_purchase_fields(
     if let Some(uuid) = auction_uuid {
         if !uuid.is_empty() {
             fields.push(serde_json::json!({
-                "name": "Auction",
-                "value": format!("[Open on Coflnet](https://sky.coflnet.com/auction/{}?refId=9KKPN9)", uuid),
+                "name": "🔗 Auction Link",
+                "value": format!("[View on Coflnet](https://sky.coflnet.com/auction/{}?refId=9KKPN9)", uuid),
                 "inline": false
             }));
         }
