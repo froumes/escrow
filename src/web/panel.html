@@ -531,9 +531,68 @@ img{display:block;max-width:100%}
     background:var(--surface-soft);
     font-size:.92em;
 }
-.sellerChannelRow{display:flex;gap:8px;align-items:center}
+.sellerChannelRow{display:flex;gap:8px;align-items:flex-start}
 .sellerChannelRow .sellerInput{flex:1 1 auto}
+.sellerChannelInputCell{flex:1 1 auto;display:flex;flex-direction:column;gap:4px;min-width:0}
+.sellerChannelInputCell .sellerInput{width:100%}
+.sellerChannelHint{
+    font-size:.78em;
+    color:var(--accent);
+    padding:0 2px;
+    letter-spacing:.02em;
+}
 .sellerCooldown{width:100px;flex:0 0 auto!important;text-align:center}
+.sellerPresets{
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+    padding:10px 12px;
+    border:1px dashed var(--line);
+    border-radius:10px;
+    background:var(--surface-soft);
+}
+.sellerPresetsLabel{
+    font-size:.78em;
+    font-weight:600;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:var(--muted);
+}
+.sellerPresetChips{display:flex;flex-wrap:wrap;gap:6px}
+.sellerPresetChip{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:5px 10px;
+    border-radius:999px;
+    background:var(--surface);
+    border:1px solid var(--line);
+    color:var(--fg);
+    font-size:.85em;
+    cursor:pointer;
+    transition:background .12s ease, border-color .12s ease, color .12s ease;
+}
+.sellerPresetChip:hover{border-color:color-mix(in srgb, var(--accent) 60%, var(--line))}
+.sellerPresetChip.isActive{
+    background:color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color:color-mix(in srgb, var(--accent) 65%, transparent);
+    color:var(--accent);
+}
+.sellerPresetDot{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:16px;
+    height:16px;
+    border-radius:50%;
+    background:color-mix(in srgb, var(--accent) 35%, transparent);
+    color:#fff;
+    font-size:.75em;
+    font-weight:700;
+    line-height:1;
+}
+.sellerPresetChip.isActive .sellerPresetDot{background:var(--accent);color:var(--bg)}
+.sellerPresetName{white-space:nowrap}
 .sellerChipRow{display:flex;flex-wrap:wrap;gap:8px}
 .sellerChip{
     display:inline-flex;
@@ -1704,6 +1763,18 @@ const TAB_DEFS = [
     ["seller", "Seller"],
     ["config", "Config"],
     ["chat", "Chat"]
+];
+
+// Commonly-used Skyblock-Z trade channels surfaced as one-click presets in
+// the Seller tab.  Listed here (rather than being truly hardcoded into the
+// saved config) so users can toggle each on/off instead of copying IDs —
+// selections are still written through to their own config exactly like a
+// manually-typed channel.
+const SELLER_CHANNEL_PRESETS = [
+    { id: "641480093360848906", label: "SBZ · Trading Offers", cooldown_seconds: 1800 },
+    { id: "877295310496493638", label: "SBZ · Lowball", cooldown_seconds: 1800 },
+    { id: "873078118678679552", label: "SBZ · Garden & Farm Trading", cooldown_seconds: 1800 },
+    { id: "866757991280672778", label: "SBZ · Collectors", cooldown_seconds: 1800 }
 ];
 
 function cls(...parts) {
@@ -3100,6 +3171,20 @@ function App() {
         setSellerDraftChannels((prev) => prev.filter((_, i) => i !== idx));
     }, []);
 
+    // Toggle a preset channel on/off in the draft list.  If the preset is
+    // already present (by ID match), remove it.  Otherwise append it with
+    // the preset's default cooldown — user can still tweak the cooldown
+    // afterwards like any manually-added channel.
+    const toggleSellerPreset = useCallback((preset) => {
+        setSellerDraftChannels((prev) => {
+            const idx = prev.findIndex((c) => (c.channel_id || "").trim() === preset.id);
+            if (idx !== -1) {
+                return prev.filter((_, i) => i !== idx);
+            }
+            return [...prev, { channel_id: preset.id, cooldown_seconds: preset.cooldown_seconds }];
+        });
+    }, []);
+
     const startSeller = useCallback(async () => {
         setSellerError("");
         const payload = {
@@ -4083,28 +4168,54 @@ function App() {
                                             <label>Channels</label>
                                             <${Button} kind="ghost" onClick=${addSellerChannel}>+ Add Channel</${Button}>
                                         </div>
+                                        <div className="sellerPresets">
+                                            <div className="sellerPresetsLabel">Quick-add presets</div>
+                                            <div className="sellerPresetChips">
+                                                ${SELLER_CHANNEL_PRESETS.map((preset) => {
+                                                    const active = sellerDraftChannels.some((c) => (c.channel_id || "").trim() === preset.id);
+                                                    return html`
+                                                        <button
+                                                            type="button"
+                                                            key=${preset.id}
+                                                            className=${cls("sellerPresetChip", active && "isActive")}
+                                                            onClick=${() => toggleSellerPreset(preset)}
+                                                            title=${`Channel ID: ${preset.id} · default cooldown ${preset.cooldown_seconds}s`}
+                                                        >
+                                                            <span className="sellerPresetDot">${active ? "✓" : "+"}</span>
+                                                            <span className="sellerPresetName">${preset.label}</span>
+                                                        </button>
+                                                    `;
+                                                })}
+                                            </div>
+                                        </div>
                                         ${sellerDraftChannels.length === 0
-                                            ? html`<div className="sellerEmpty">No channels yet — add at least one Discord channel ID to begin posting.</div>`
-                                            : sellerDraftChannels.map((ch, idx) => html`
-                                                <div className="sellerChannelRow" key=${idx}>
-                                                    <input
-                                                        className="sellerInput"
-                                                        type="text"
-                                                        placeholder="Channel ID"
-                                                        value=${ch.channel_id}
-                                                        onInput=${(e) => setSellerDraftChannels((prev) => prev.map((c, i) => i === idx ? { ...c, channel_id: e.target.value } : c))}
-                                                    />
-                                                    <input
-                                                        className="sellerInput sellerCooldown"
-                                                        type="number"
-                                                        min="5"
-                                                        step="1"
-                                                        value=${ch.cooldown_seconds}
-                                                        onInput=${(e) => setSellerDraftChannels((prev) => prev.map((c, i) => i === idx ? { ...c, cooldown_seconds: Number(e.target.value) } : c))}
-                                                    />
-                                                    <${Button} kind="danger" onClick=${() => removeSellerChannel(idx)}>Remove</${Button}>
-                                                </div>
-                                            `)}
+                                            ? html`<div className="sellerEmpty">No channels yet — tap a preset above or add a custom channel ID.</div>`
+                                            : sellerDraftChannels.map((ch, idx) => {
+                                                const preset = SELLER_CHANNEL_PRESETS.find((p) => p.id === (ch.channel_id || "").trim());
+                                                return html`
+                                                    <div className="sellerChannelRow" key=${idx}>
+                                                        <div className="sellerChannelInputCell">
+                                                            <input
+                                                                className="sellerInput"
+                                                                type="text"
+                                                                placeholder="Channel ID"
+                                                                value=${ch.channel_id}
+                                                                onInput=${(e) => setSellerDraftChannels((prev) => prev.map((c, i) => i === idx ? { ...c, channel_id: e.target.value } : c))}
+                                                            />
+                                                            ${preset ? html`<div className="sellerChannelHint">${preset.label}</div>` : null}
+                                                        </div>
+                                                        <input
+                                                            className="sellerInput sellerCooldown"
+                                                            type="number"
+                                                            min="5"
+                                                            step="1"
+                                                            value=${ch.cooldown_seconds}
+                                                            onInput=${(e) => setSellerDraftChannels((prev) => prev.map((c, i) => i === idx ? { ...c, cooldown_seconds: Number(e.target.value) } : c))}
+                                                        />
+                                                        <${Button} kind="danger" onClick=${() => removeSellerChannel(idx)}>Remove</${Button}>
+                                                    </div>
+                                                `;
+                                            })}
                                     </div>
                                 </div>
 
