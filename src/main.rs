@@ -721,9 +721,32 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("profit_history.json"));
     let profit_tracker = Arc::new(twm::profit::ProfitTracker::load_or_new(profit_tracker_path));
 
-    // Recent realized AH flips for the flip-history panel.
-    let flip_history: Arc<Mutex<VecDeque<FlipHistoryEntry>>> =
-        Arc::new(VecDeque::new().into());
+    // Recent realized AH flips for the flip-history panel.  Persisted so
+    // a flip whose purchase was in one session and sale in another (or one
+    // whose lifecycle straddles a restart in any way) still appears in the
+    // panel after the bot relaunches.
+    let flip_history_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("flip_history.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("flip_history.json"));
+    let flip_history_writer: AsyncJsonWriter<Vec<FlipHistoryEntry>> = AsyncJsonWriter::new(
+        flip_history_path.clone(),
+        Duration::from_millis(JSON_PERSIST_DEBOUNCE_MS),
+    );
+    let flip_history: Arc<Mutex<VecDeque<FlipHistoryEntry>>> = {
+        let loaded: Vec<FlipHistoryEntry> = std::fs::read_to_string(&flip_history_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        if !loaded.is_empty() {
+            info!(
+                "Loaded {} persisted flip history entries from {}",
+                loaded.len(),
+                flip_history_path.display()
+            );
+        }
+        Arc::new(Mutex::new(VecDeque::from(loaded)))
+    };
 
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(twm::bazaar_tracker::BazaarOrderTracker::new());
@@ -859,6 +882,7 @@ async fn main() -> Result<()> {
     let enable_ah_flips_events = enable_ah_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
     let flip_history_events = flip_history.clone();
+    let flip_history_writer_events = flip_history_writer.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
     let ah_purchase_ledger_events = ah_purchase_ledger.clone();
     let ah_purchase_ledger_writer_events = ah_purchase_ledger_writer.clone();
@@ -1294,6 +1318,11 @@ async fn main() -> Result<()> {
                             while history.len() > MAX_FLIP_HISTORY {
                                 history.pop_back();
                             }
+                            // Persist after every change so the panel survives a
+                            // restart with the full set of realised flips intact.
+                            let snapshot: Vec<FlipHistoryEntry> =
+                                history.iter().cloned().collect();
+                            flip_history_writer_events.schedule(snapshot);
                         }
                     }
                     // Print colorful sold announcement

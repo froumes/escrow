@@ -27,7 +27,12 @@ use crate::types::{CommandPriority, CommandType};
 use crate::websocket::CoflWebSocket;
 
 /// A single realized AH flip used for the flip-history panel.
-#[derive(Clone, Serialize)]
+///
+/// Persisted to `flip_history.json` so the panel reflects every realised
+/// flip across restarts — the in-memory ring would otherwise discard any
+/// flip that was completed in a prior session, including flips whose
+/// purchase happened in one session and sale in another.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FlipHistoryEntry {
     pub sold_at_unix: u64,
     pub item_name: String,
