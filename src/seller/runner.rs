@@ -22,6 +22,41 @@ use super::discord::{send_message, validate_channel, validate_token, AttachmentP
 use super::render::{render_item_png, strip_mc_codes, RenderableItem};
 use crate::bot::BotClient;
 
+/// Outcome of a per-send availability check for a rendered item.
+#[derive(Copy, Clone, Debug)]
+enum Presence {
+    /// Still looks like the same item the user picked — include it.
+    Present,
+    /// Item is gone (sold, claimed, expired, or slot cleared).  The
+    /// included reason is logged once on the first drop detection.
+    Gone(&'static str),
+}
+
+/// Snapshot captured at render time that lets us re-identify an item
+/// against the live inventory / auction caches on every send.
+#[derive(Clone, Debug)]
+struct ItemIdentity {
+    /// Display name with `§`-codes stripped so log lines are human-readable
+    /// and tag-less items (vanilla Minecraft blocks, enchanted books without
+    /// a Hypixel ID, …) can still be matched by name.
+    plain_title: String,
+    /// Hypixel item id (`HYPERION`, `PET_MAMMOTH`, …) if available.  This is
+    /// the strongest identity signal — two Hyperions look the same in a slot
+    /// but never swap silently for a different tag.
+    tag: Option<String>,
+}
+
+/// A single rendered attachment plus the metadata needed to decide whether
+/// it should still be included in the next Discord message.  Shared across
+/// every per-channel sender task via [`Arc`] so that the first task to
+/// notice an item has been sold records the drop exactly once.
+struct RenderedItem {
+    selected: SelectedItem,
+    identity: ItemIdentity,
+    attachment: AttachmentPng,
+    dropped: AtomicBool,
+}
+
 const MAX_LOG_ENTRIES: usize = 120;
 const ICON_FETCH_TIMEOUT_SECS: u64 = 10;
 
@@ -221,7 +256,7 @@ impl SellerRunner {
         }
 
         // Resolve each selected item through the live bot caches.
-        let attachments = match resolve_and_render(&self.bot_client, &req.selected_items).await {
+        let rendered = match resolve_and_render(&self.bot_client, &req.selected_items).await {
             Ok(list) => list,
             Err(e) => {
                 self.push_log(LogLevel::Error, format!("Render failed: {e}"));
@@ -230,14 +265,16 @@ impl SellerRunner {
             }
         };
 
-        if attachments.is_empty() && req.selected_items.is_empty() {
+        let had_selected_items = !req.selected_items.is_empty();
+
+        if rendered.is_empty() && !had_selected_items {
             // Running without attachments is allowed — just a recurring text
             // message.  That matches how the Python tool behaved.
             self.push_log(
                 LogLevel::Info,
                 "No items selected — sending text-only messages.",
             );
-        } else if attachments.is_empty() {
+        } else if rendered.is_empty() {
             self.push_log(
                 LogLevel::Error,
                 "All selected items failed to resolve — aborting.",
@@ -247,9 +284,15 @@ impl SellerRunner {
         } else {
             self.push_log(
                 LogLevel::Info,
-                format!("Rendered {} item attachment(s).", attachments.len()),
+                format!("Rendered {} item attachment(s).", rendered.len()),
             );
         }
+
+        // Wrap each rendered item in an Arc so every per-channel sender
+        // shares the same `dropped` flag.  First task to notice a sold /
+        // missing item flips the flag; the others silently skip the log.
+        let items: Arc<Vec<Arc<RenderedItem>>> =
+            Arc::new(rendered.into_iter().map(Arc::new).collect());
 
         // Install a broadcast channel the per-channel tasks listen to for
         // cooperative cancellation.  Each task re-checks this flag on every
@@ -272,7 +315,7 @@ impl SellerRunner {
             let runner = self.clone();
             let token_c = token.clone();
             let message_c = message.clone();
-            let atts_c = attachments.clone();
+            let items_c = Arc::clone(&items);
             let mut stop_rx_c = stop_rx.clone();
             let handle = tokio::spawn(async move {
                 runner
@@ -281,7 +324,8 @@ impl SellerRunner {
                         ch.channel_id,
                         label,
                         message_c,
-                        atts_c,
+                        items_c,
+                        had_selected_items,
                         ch.cooldown_seconds,
                         &mut stop_rx_c,
                     )
@@ -294,13 +338,15 @@ impl SellerRunner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn sender_loop(
         &self,
         token: String,
         channel_id: String,
         label: String,
         message: String,
-        attachments: Vec<AttachmentPng>,
+        items: Arc<Vec<Arc<RenderedItem>>>,
+        had_selected_items: bool,
         cooldown_seconds: u64,
         stop_rx: &mut watch::Receiver<bool>,
     ) {
@@ -313,6 +359,26 @@ impl SellerRunner {
             if should_stop {
                 break;
             }
+
+            // Re-check availability against the live caches before every
+            // send so sold / claimed / moved items silently drop out of the
+            // message instead of being re-posted forever.
+            let attachments = self.current_attachments(&items);
+
+            if had_selected_items && attachments.is_empty() {
+                // Every item the user picked has been sold or is otherwise
+                // gone — there's nothing left to advertise.  Stop the whole
+                // runner so other channels follow suit and the UI flips back
+                // to the idle state.
+                self.push_log(
+                    LogLevel::Info,
+                    "All selected items are sold or unavailable — stopping.",
+                );
+                let me = self.clone();
+                tokio::spawn(async move { me.stop().await });
+                return;
+            }
+
             let send_result = send_message(&token, &channel_id, &message, &attachments).await;
             let n = {
                 let mut counts = self.inner.sent_counts.lock();
@@ -321,7 +387,10 @@ impl SellerRunner {
                 *entry
             };
             match send_result {
-                Ok(()) => self.push_log(LogLevel::Success, format!("{short}  #{n} sent")),
+                Ok(()) => self.push_log(
+                    LogLevel::Success,
+                    format!("{short}  #{n} sent ({} item(s))", attachments.len()),
+                ),
                 Err(e) => self.push_log(LogLevel::Error, format!("{short}  #{n} FAILED — {e}")),
             }
 
@@ -341,17 +410,64 @@ impl SellerRunner {
             }
         }
     }
+
+    /// Build the attachment list for the next message by walking the shared
+    /// rendered-item list and keeping only those that still match a live
+    /// item in the bot's caches.  The first task to observe an item
+    /// transitioning `Present → Gone` logs a single removal line; every
+    /// other task sees `dropped` already set and silently skips it.
+    fn current_attachments(&self, items: &[Arc<RenderedItem>]) -> Vec<AttachmentPng> {
+        let inv_json = self.bot_client.get_cached_inventory_json();
+        let auctions_json = self.bot_client.get_cached_my_auctions_json();
+
+        let inv_slots: Vec<serde_json::Value> = inv_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("slots").cloned())
+            .and_then(|s| s.as_array().cloned())
+            .unwrap_or_default();
+        let auctions: Vec<serde_json::Value> = auctions_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if item.dropped.load(Ordering::SeqCst) {
+                continue;
+            }
+            match check_presence(&item.selected, &item.identity, &inv_slots, &auctions) {
+                Presence::Present => out.push(item.attachment.clone()),
+                Presence::Gone(reason) => {
+                    if item
+                        .dropped
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        self.push_log(
+                            LogLevel::Warn,
+                            format!("Removed \"{}\" — {reason}", item.identity.plain_title),
+                        );
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 // ── Item resolution + rendering ───────────────────────────────────────────
 
 /// Walk the selected-item list and render each into a PNG attachment.  Items
 /// that can't be resolved (e.g. stale slot, expired auction) are skipped with
-/// a log entry rather than failing the whole run.
+/// a log entry rather than failing the whole run.  The returned list pairs
+/// each attachment with enough identity metadata for the sender loop to
+/// keep re-checking availability on every send.
 async fn resolve_and_render(
     bot_client: &BotClient,
     selected: &[SelectedItem],
-) -> Result<Vec<AttachmentPng>, String> {
+) -> Result<Vec<RenderedItem>, String> {
     let inv_json = bot_client.get_cached_inventory_json();
     let my_auctions_json = bot_client.get_cached_my_auctions_json();
 
@@ -373,11 +489,11 @@ async fn resolve_and_render(
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
-    let mut out: Vec<AttachmentPng> = Vec::with_capacity(selected.len());
+    let mut out: Vec<RenderedItem> = Vec::with_capacity(selected.len());
     let mut icon_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
 
     for (idx, sel) in selected.iter().enumerate() {
-        let renderable = match sel {
+        let resolved = match sel {
             SelectedItem::Inventory { slot } => {
                 resolve_inventory(&inv_slots, *slot, &http, &mut icon_cache).await
             }
@@ -385,13 +501,18 @@ async fn resolve_and_render(
                 resolve_auction(&auctions_arr, uuid, &http, &mut icon_cache).await
             }
         };
-        match renderable {
-            Some(item) => {
+        match resolved {
+            Some((item, identity)) => {
                 let png = render_item_png(&item);
                 let safe = sanitize_filename(&item.title);
-                out.push(AttachmentPng {
-                    filename: format!("{:02}_{safe}.png", idx + 1),
-                    bytes: png,
+                out.push(RenderedItem {
+                    selected: sel.clone(),
+                    identity,
+                    attachment: AttachmentPng {
+                        filename: format!("{:02}_{safe}.png", idx + 1),
+                        bytes: png,
+                    },
+                    dropped: AtomicBool::new(false),
                 });
             }
             None => {
@@ -403,12 +524,138 @@ async fn resolve_and_render(
     Ok(out)
 }
 
+/// Decide whether a previously-rendered item should still appear in the
+/// next outbound Discord message.
+fn check_presence(
+    selected: &SelectedItem,
+    identity: &ItemIdentity,
+    inv_slots: &[serde_json::Value],
+    auctions: &[serde_json::Value],
+) -> Presence {
+    match selected {
+        SelectedItem::Inventory { slot } => check_inventory_presence(*slot, identity, inv_slots),
+        SelectedItem::Auction { uuid } => check_auction_presence(uuid, identity, auctions),
+    }
+}
+
+fn check_inventory_presence(
+    slot: u32,
+    identity: &ItemIdentity,
+    inv_slots: &[serde_json::Value],
+) -> Presence {
+    // If the bot hasn't re-cached inventory yet (e.g. just reconnected) we
+    // intentionally assume the item is still present.  The alternative is
+    // silently dropping every item on every reconnect, which is worse than
+    // occasionally sending a stale image.
+    if inv_slots.is_empty() {
+        return Presence::Present;
+    }
+    let Some(entry) = inv_slots.get(slot as usize) else {
+        return Presence::Gone("slot out of range");
+    };
+    if entry.is_null() {
+        return Presence::Gone("slot is empty");
+    }
+    let current_tag = entry
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let current_name_plain = entry
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(strip_mc_codes)
+        .or_else(|| {
+            entry
+                .get("displayNameColored")
+                .and_then(|v| v.as_str())
+                .map(strip_mc_codes)
+        })
+        .unwrap_or_default();
+
+    // Prefer the Hypixel tag as the identity key — it's unique per item
+    // kind and stable even if Hypixel changes the display name formatting.
+    match (identity.tag.as_deref(), current_tag.as_deref()) {
+        (Some(want), Some(got)) if want == got => Presence::Present,
+        (Some(_), Some(_)) => Presence::Gone("slot holds a different item"),
+        _ if !identity.plain_title.is_empty()
+            && current_name_plain == identity.plain_title =>
+        {
+            Presence::Present
+        }
+        _ => Presence::Gone("slot holds a different item"),
+    }
+}
+
+fn check_auction_presence(
+    identifier: &str,
+    identity: &ItemIdentity,
+    auctions: &[serde_json::Value],
+) -> Presence {
+    // Empty cache = "Manage Auctions" window not yet opened this session.
+    // Treat that as "still listed" so we don't spuriously remove items
+    // right after restart / reconnect.
+    if auctions.is_empty() {
+        return Presence::Present;
+    }
+
+    let status_of = |v: &serde_json::Value| -> Option<String> {
+        v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string())
+    };
+
+    let found = if let Some(idx_str) = identifier.strip_prefix("idx:") {
+        // `idx:N` is fragile across window re-opens because positions can
+        // shift.  Fall back to matching by identity (tag + plain title)
+        // whenever the positional lookup fails or returns a different item.
+        let positional = idx_str
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| auctions.get(idx));
+        positional
+            .filter(|v| auction_matches_identity(v, identity))
+            .or_else(|| auctions.iter().find(|v| auction_matches_identity(v, identity)))
+    } else {
+        let normalized = identifier.replace('-', "").to_lowercase();
+        auctions.iter().find(|a| {
+            a.get("uuid")
+                .and_then(|v| v.as_str())
+                .map(|u| u.replace('-', "").to_lowercase() == normalized)
+                .unwrap_or(false)
+        })
+    };
+
+    let Some(entry) = found else {
+        // No matching auction anywhere in the current cache — the user
+        // either claimed the payout or cancelled the listing.
+        return Presence::Gone("sold or claimed");
+    };
+
+    match status_of(entry).as_deref() {
+        Some("sold") => Presence::Gone("sold"),
+        Some("expired") => Presence::Gone("expired"),
+        _ => Presence::Present,
+    }
+}
+
+fn auction_matches_identity(entry: &serde_json::Value, identity: &ItemIdentity) -> bool {
+    let entry_tag = entry.get("tag").and_then(|v| v.as_str());
+    if let (Some(want), Some(got)) = (identity.tag.as_deref(), entry_tag) {
+        return want == got;
+    }
+    let entry_name = entry
+        .get("item_name")
+        .or_else(|| entry.get("itemName"))
+        .and_then(|v| v.as_str())
+        .map(strip_mc_codes)
+        .unwrap_or_default();
+    !identity.plain_title.is_empty() && entry_name == identity.plain_title
+}
+
 async fn resolve_inventory(
     inv_slots: &[serde_json::Value],
     slot: u32,
     http: &reqwest::Client,
     cache: &mut HashMap<String, Option<Vec<u8>>>,
-) -> Option<RenderableItem> {
+) -> Option<(RenderableItem, ItemIdentity)> {
     let entry = inv_slots.get(slot as usize)?;
     if entry.is_null() {
         return None;
@@ -435,13 +682,20 @@ async fn resolve_inventory(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let icon_png = fetch_icon(http, tag.as_deref(), cache).await;
-    Some(RenderableItem {
-        title,
-        lore,
-        count,
-        icon_png,
-        footer: None,
-    })
+    let identity = ItemIdentity {
+        plain_title: strip_mc_codes(&title),
+        tag: tag.clone(),
+    };
+    Some((
+        RenderableItem {
+            title,
+            lore,
+            count,
+            icon_png,
+            footer: None,
+        },
+        identity,
+    ))
 }
 
 async fn resolve_auction(
@@ -449,7 +703,7 @@ async fn resolve_auction(
     identifier: &str,
     http: &reqwest::Client,
     cache: &mut HashMap<String, Option<Vec<u8>>>,
-) -> Option<RenderableItem> {
+) -> Option<(RenderableItem, ItemIdentity)> {
     // Support both real UUIDs (returned by the Hypixel API path) and the
     // synthetic `idx:N` form the panel falls back to when `/api/auctions`
     // came from the in-game GUI cache (no UUID available there).
@@ -496,13 +750,20 @@ async fn resolve_auction(
         .map(|s| s.to_string());
 
     let icon_png = fetch_icon(http, tag.as_deref(), cache).await;
-    Some(RenderableItem {
-        title,
-        lore,
-        count: 1,
-        icon_png,
-        footer: None,
-    })
+    let identity = ItemIdentity {
+        plain_title: strip_mc_codes(&title),
+        tag: tag.clone(),
+    };
+    Some((
+        RenderableItem {
+            title,
+            lore,
+            count: 1,
+            icon_png,
+            footer: None,
+        },
+        identity,
+    ))
 }
 
 async fn fetch_icon(
@@ -553,10 +814,123 @@ fn sanitize_filename(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sanitize_filename_keeps_ascii_alphanum() {
         assert_eq!(sanitize_filename("§6Hyperion ✦"), "Hyperion_");
         assert_eq!(sanitize_filename(""), "item");
+    }
+
+    fn identity(title: &str, tag: Option<&str>) -> ItemIdentity {
+        ItemIdentity {
+            plain_title: title.to_string(),
+            tag: tag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn inventory_presence_empty_cache_is_optimistic() {
+        // Before the bot has cached any inventory we must not spuriously
+        // drop every item — otherwise a reconnect would wipe the message.
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_inventory_presence(9, &id, &[]),
+            Presence::Present
+        ));
+    }
+
+    #[test]
+    fn inventory_presence_detects_swapped_slot() {
+        let slots = vec![
+            serde_json::Value::Null, // slot 0 intentionally empty
+            json!({ "displayName": "Dirt", "tag": "DIRT" }),
+        ];
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_inventory_presence(1, &id, &slots),
+            Presence::Gone(_)
+        ));
+    }
+
+    #[test]
+    fn inventory_presence_matches_by_tag() {
+        let slots = vec![json!({
+            "displayName": "§6Hyperion",
+            "tag": "HYPERION",
+        })];
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_inventory_presence(0, &id, &slots),
+            Presence::Present
+        ));
+    }
+
+    #[test]
+    fn auction_presence_empty_cache_is_optimistic() {
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_auction_presence("abc", &id, &[]),
+            Presence::Present
+        ));
+    }
+
+    #[test]
+    fn auction_presence_flags_sold() {
+        let auctions = vec![json!({
+            "item_name": "Hyperion",
+            "tag": "HYPERION",
+            "status": "sold",
+        })];
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_auction_presence("idx:0", &id, &auctions),
+            Presence::Gone("sold")
+        ));
+    }
+
+    #[test]
+    fn auction_presence_flags_expired() {
+        let auctions = vec![json!({
+            "item_name": "Hyperion",
+            "tag": "HYPERION",
+            "status": "expired",
+        })];
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_auction_presence("idx:0", &id, &auctions),
+            Presence::Gone("expired")
+        ));
+    }
+
+    #[test]
+    fn auction_presence_flags_missing_as_claimed() {
+        // User claimed the payout → auction is no longer in the cache at all.
+        let auctions = vec![json!({
+            "item_name": "Terminator",
+            "tag": "TERMINATOR",
+            "status": "active",
+        })];
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_auction_presence("idx:5", &id, &auctions),
+            Presence::Gone("sold or claimed")
+        ));
+    }
+
+    #[test]
+    fn auction_presence_finds_active_by_identity_even_if_idx_shifted() {
+        // Position changed (was idx:2, now idx:0) because another listing
+        // ahead of it expired.  We should still find it by tag + name.
+        let auctions = vec![json!({
+            "item_name": "Hyperion",
+            "tag": "HYPERION",
+            "status": "active",
+        })];
+        let id = identity("Hyperion", Some("HYPERION"));
+        assert!(matches!(
+            check_auction_presence("idx:2", &id, &auctions),
+            Presence::Present
+        ));
     }
 }
