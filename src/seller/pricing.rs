@@ -151,6 +151,92 @@ pub fn prune_expired_cache() {
     map.retain(|_, v| v.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS));
 }
 
+/// Is `tag` a Hypixel SkyBlock cosmetic-skin item?
+///
+/// Skin items are fungible — two copies of "WISE_DRAGON_SKIN" are
+/// indistinguishable in-game and should always be priced the same on
+/// the auction house.  Every official skin tag I'm aware of follows the
+/// same naming convention: either it starts with `SKIN_`, or it has
+/// `_SKIN` as a discrete underscore-delimited word.  We match exactly
+/// that pattern so non-skin tags that merely *contain* the letters
+/// "skin" (e.g. `PUMPKIN_SKINNED`, `SKINNY_BLOCK`) don't false-positive.
+pub fn is_skin_tag(tag: &str) -> bool {
+    let upper = tag.to_uppercase();
+    if upper.starts_with("SKIN_") {
+        return true;
+    }
+    if let Some(idx) = upper.find("_SKIN") {
+        // Accept "_SKIN" only when it stands alone — at the end of the
+        // tag, or followed by another underscore-delimited word.
+        let after = &upper[idx + "_SKIN".len()..];
+        if after.is_empty() || after.starts_with('_') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Source label for a resolved asking price; surfaced to the panel UI
+/// via the `source` field on `/api/seller/price_estimate` responses.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PriceSource {
+    /// Coflnet recent-sales median for the item tag.
+    CoflnetMedian,
+    /// The user's own active BIN listing price.
+    BinListing,
+    /// The user's own active starting-bid price.
+    AuctionListing,
+}
+
+impl PriceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PriceSource::CoflnetMedian => "coflnet_median",
+            PriceSource::BinListing => "bin_listing",
+            PriceSource::AuctionListing => "auction_listing",
+        }
+    }
+}
+
+/// Resolve the canonical asking price for an inventory item.  Inventory
+/// has no listing yet, so we always go to Coflnet.
+pub async fn resolve_inventory_price(tag: &str) -> Result<Option<(u64, PriceSource)>, String> {
+    let p = fetch_coflnet_median_price(tag).await?;
+    Ok(p.map(|price| (price, PriceSource::CoflnetMedian)))
+}
+
+/// Resolve the canonical asking price for an active-auction item.
+///
+/// For skin items we deliberately ignore the user's listing price and
+/// fall back to the Coflnet median: skins are interchangeable, and
+/// duplicate listings should never appear at different prices in the
+/// outgoing message.  For non-skin items the user's listing is what
+/// they're actually asking, so we keep that.
+pub async fn resolve_auction_price(
+    tag: Option<&str>,
+    listing_price: Option<u64>,
+    bin: bool,
+) -> Result<Option<(u64, PriceSource)>, String> {
+    if let Some(t) = tag {
+        if is_skin_tag(t) {
+            if let Some(price) = fetch_coflnet_median_price(t).await? {
+                return Ok(Some((price, PriceSource::CoflnetMedian)));
+            }
+            // Coflnet had no data for this skin — fall through to the
+            // listing price below so the user still sees *something*.
+        }
+    }
+    let listing = listing_price.filter(|p| *p > 0);
+    Ok(listing.map(|price| {
+        let source = if bin {
+            PriceSource::BinListing
+        } else {
+            PriceSource::AuctionListing
+        };
+        (price, source)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +264,56 @@ mod tests {
     #[test]
     fn extract_price_rounds_floats() {
         assert_eq!(extract_price(&json!({ "median": 1234.7 })), Some(1235));
+    }
+
+    #[test]
+    fn skin_tag_detection_covers_known_patterns() {
+        assert!(is_skin_tag("WISE_DRAGON_SKIN"));
+        assert!(is_skin_tag("BEE_DRAGON_PET_SKIN"));
+        assert!(is_skin_tag("WARDEN_HELMET_SKIN_NICOLE"));
+        assert!(is_skin_tag("SKIN_HYPERION_GOLDEN"));
+        assert!(is_skin_tag("hyperion_skin_blue")); // case-insensitive
+    }
+
+    #[test]
+    fn skin_tag_detection_avoids_false_positives() {
+        assert!(!is_skin_tag("HYPERION"));
+        assert!(!is_skin_tag("NECRON_HANDLE"));
+        assert!(!is_skin_tag("SKINNY_BLOCK")); // contains SKIN but not as a token
+        assert!(!is_skin_tag("PUMPKIN_SKINNED")); // ditto
+    }
+
+    #[test]
+    fn price_source_string_labels_round_trip() {
+        assert_eq!(PriceSource::CoflnetMedian.as_str(), "coflnet_median");
+        assert_eq!(PriceSource::BinListing.as_str(), "bin_listing");
+        assert_eq!(PriceSource::AuctionListing.as_str(), "auction_listing");
+    }
+
+    #[tokio::test]
+    async fn auction_price_uses_listing_for_non_skin() {
+        // Non-skin tag: the user's listing wins, no Coflnet hit needed.
+        let (price, src) = resolve_auction_price(Some("HYPERION"), Some(1_000_000), true)
+            .await
+            .expect("must succeed")
+            .expect("must produce a price");
+        assert_eq!(price, 1_000_000);
+        assert_eq!(src, PriceSource::BinListing);
+    }
+
+    #[tokio::test]
+    async fn auction_price_falls_back_to_listing_when_no_tag() {
+        let (price, src) = resolve_auction_price(None, Some(42_000), false)
+            .await
+            .expect("must succeed")
+            .expect("must produce a price");
+        assert_eq!(price, 42_000);
+        assert_eq!(src, PriceSource::AuctionListing);
+    }
+
+    #[tokio::test]
+    async fn auction_price_returns_none_when_listing_is_zero_and_no_tag() {
+        let resolved = resolve_auction_price(None, Some(0), true).await.unwrap();
+        assert!(resolved.is_none());
     }
 }

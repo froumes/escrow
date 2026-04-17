@@ -3194,17 +3194,20 @@ function App() {
     }, []);
 
     // Fetch the asking-price estimate for a single selection.  Auctions
-    // answer immediately from the cached available-items list; inventory
-    // items hit /api/seller/price_estimate which round-trips to Coflnet
-    // for a recent-sales median.
+    // normally answer immediately from the cached available-items list,
+    // but skin items always fall through to the backend so the Coflnet
+    // override applies — that way two copies of the same skin always show
+    // the same price in the chip row regardless of how the user listed
+    // each individual copy on the auction house.
     const fetchSellerPrice = useCallback(async (sel) => {
         const key = sellerSelKey(sel);
         if (sel.kind === "auction") {
             const cached = sellerAvailable.auctions.find((it) => it.id === sel.uuid);
-            if (cached && cached.suggested_price > 0) {
+            const isSkin = cached?.tag ? /(?:_SKIN|^SKIN_)/i.test(cached.tag) : false;
+            if (cached && cached.suggested_price > 0 && !isSkin) {
                 setSellerPrices((prev) => ({
                     ...prev,
-                    [key]: { state: "ok", price: cached.suggested_price, source: "listing" }
+                    [key]: { state: "ok", price: cached.suggested_price, source: cached.bin ? "bin_listing" : "auction_listing" }
                 }));
                 return;
             }
@@ -4358,9 +4361,14 @@ function App() {
                                                                 priceBtnTitle = "Looking up Coflnet price…";
                                                             } else if (priceState?.state === "ok") {
                                                                 priceBtnContent = html`<span>$${coins(priceState.price)}</span>`;
-                                                                priceBtnTitle = priceState.source === "coflnet_median"
-                                                                    ? `Coflnet median estimate · click to remove from message`
-                                                                    : `Listing price · click to remove from message`;
+                                                                const sourceLabel = priceState.source === "coflnet_median"
+                                                                    ? "Coflnet median estimate (skin item — shared across copies)"
+                                                                    : priceState.source === "bin_listing"
+                                                                        ? "Your BIN listing price"
+                                                                        : priceState.source === "auction_listing"
+                                                                            ? "Your auction starting bid"
+                                                                            : "Listing price";
+                                                                priceBtnTitle = `${sourceLabel} · click to remove from message`;
                                                             } else if (priceState?.state === "error") {
                                                                 priceBtnContent = html`<span>$?</span>`;
                                                                 priceBtnTitle = priceState.error || "Price unavailable";

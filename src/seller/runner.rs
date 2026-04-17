@@ -571,11 +571,12 @@ async fn resolve_and_render(
             }
         };
         match resolved {
-            Some((item, identity, listing_price)) => {
+            Some((item, identity, listing_price, bin)) => {
                 let png = render_item_png(&item);
                 let safe = sanitize_filename(&item.title);
                 let asking_price = if sel.include_price() {
-                    resolve_asking_price(sel, listing_price, identity.tag.as_deref()).await
+                    resolve_asking_price(sel, listing_price, identity.tag.as_deref(), bin)
+                        .await
                 } else {
                     None
                 };
@@ -599,22 +600,38 @@ async fn resolve_and_render(
     Ok(out)
 }
 
-/// Resolve the "asking price" for a selected item:
-/// - **Auctions** use the listing price (BIN or starting bid) we already
-///   pulled out of the cached "My Auctions" snapshot.
-/// - **Inventory** items have no listing yet, so we ask Coflnet for the
-///   recent-sales median — which is what their UI calls the price estimate.
+/// Resolve the "asking price" for a selected item.
+///
+/// - **Auctions** normally use the listing price (BIN or starting bid)
+///   we pulled out of the cached "My Auctions" snapshot, EXCEPT for
+///   cosmetic-skin items where two copies are interchangeable — those
+///   always fall back to the Coflnet median so the user can't end up
+///   advertising the same skin at two different prices in a single
+///   message.
+/// - **Inventory** items have no listing yet, so we always ask Coflnet
+///   for the recent-sales median (their UI's "price estimate").
 async fn resolve_asking_price(
     sel: &SelectedItem,
     listing_price: Option<u64>,
     tag: Option<&str>,
+    bin: bool,
 ) -> Option<u64> {
     match sel {
-        SelectedItem::Auction { .. } => listing_price,
+        SelectedItem::Auction { .. } => {
+            match super::pricing::resolve_auction_price(tag, listing_price, bin).await {
+                Ok(Some((price, _src))) => Some(price),
+                Ok(None) => None,
+                Err(e) => {
+                    debug!("[Seller] auction price lookup for {tag:?} failed: {e}");
+                    listing_price
+                }
+            }
+        }
         SelectedItem::Inventory { .. } => {
             let tag = tag?;
-            match super::pricing::fetch_coflnet_median_price(tag).await {
-                Ok(p) => p,
+            match super::pricing::resolve_inventory_price(tag).await {
+                Ok(Some((price, _src))) => Some(price),
+                Ok(None) => None,
                 Err(e) => {
                     debug!("[Seller] coflnet price lookup for {tag} failed: {e}");
                     None
@@ -757,7 +774,7 @@ async fn resolve_inventory(
     slot: u32,
     http: &reqwest::Client,
     cache: &mut HashMap<String, Option<Vec<u8>>>,
-) -> Option<(RenderableItem, ItemIdentity, Option<u64>)> {
+) -> Option<(RenderableItem, ItemIdentity, Option<u64>, bool)> {
     let entry = inv_slots.get(slot as usize)?;
     if entry.is_null() {
         return None;
@@ -800,6 +817,8 @@ async fn resolve_inventory(
         // Inventory items have no listing — the asking price is computed
         // later from Coflnet only if the user opts in.
         None,
+        // BIN flag is meaningless for inventory; default to false.
+        false,
     ))
 }
 
@@ -808,7 +827,7 @@ async fn resolve_auction(
     identifier: &str,
     http: &reqwest::Client,
     cache: &mut HashMap<String, Option<Vec<u8>>>,
-) -> Option<(RenderableItem, ItemIdentity, Option<u64>)> {
+) -> Option<(RenderableItem, ItemIdentity, Option<u64>, bool)> {
     // Support both real UUIDs (returned by the Hypixel API path) and the
     // synthetic `idx:N` form the panel falls back to when `/api/auctions`
     // came from the in-game GUI cache (no UUID available there).
@@ -864,6 +883,10 @@ async fn resolve_auction(
         .and_then(|v| v.as_i64())
         .filter(|p| *p > 0)
         .map(|p| p as u64);
+    let bin = found
+        .get("bin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Some((
         RenderableItem {
             title,
@@ -874,6 +897,7 @@ async fn resolve_auction(
         },
         identity,
         listing_price,
+        bin,
     ))
 }
 

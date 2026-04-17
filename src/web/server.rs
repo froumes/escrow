@@ -2040,6 +2040,8 @@ async fn seller_price_estimate(
     State(s): State<WebSharedState>,
     Json(req): Json<SellerPriceEstimateReq>,
 ) -> impl IntoResponse {
+    use crate::seller::pricing;
+
     match req {
         SellerPriceEstimateReq::Auction { uuid } => {
             let cached = s.bot_client.get_cached_my_auctions_json();
@@ -2058,26 +2060,38 @@ async fn seller_price_estimate(
                         .unwrap_or(false)
                 })
             };
-            match found {
-                Some(entry) => {
-                    let price = entry
-                        .get("starting_bid")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        .max(0) as u64;
-                    let bin = entry
-                        .get("bin")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "price": price,
-                        "source": if bin { "bin_listing" } else { "auction_listing" },
-                    }))
-                }
-                None => Json(serde_json::json!({
+            let Some(entry) = found else {
+                return Json(serde_json::json!({
                     "ok": false,
                     "error": "auction not found in current cache",
+                }));
+            };
+            let listing_price = entry
+                .get("starting_bid")
+                .and_then(|v| v.as_i64())
+                .filter(|p| *p > 0)
+                .map(|p| p as u64);
+            let bin = entry.get("bin").and_then(|v| v.as_bool()).unwrap_or(false);
+            let tag = entry
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Skin items take the Coflnet median override here too — see
+            // pricing::resolve_auction_price for rationale.
+            match pricing::resolve_auction_price(tag.as_deref(), listing_price, bin).await {
+                Ok(Some((price, src))) => Json(serde_json::json!({
+                    "ok": true,
+                    "price": price,
+                    "source": src.as_str(),
+                    "is_skin": tag.as_deref().map(pricing::is_skin_tag).unwrap_or(false),
+                })),
+                Ok(None) => Json(serde_json::json!({
+                    "ok": false,
+                    "error": "no listing price and Coflnet has no data for this tag",
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("Coflnet lookup failed: {e}"),
                 })),
             }
         }
@@ -2102,12 +2116,13 @@ async fn seller_price_estimate(
                     "error": "inventory slot is empty or has no SkyBlock tag",
                 }));
             };
-            match crate::seller::pricing::fetch_coflnet_median_price(&tag).await {
-                Ok(Some(price)) => Json(serde_json::json!({
+            match pricing::resolve_inventory_price(&tag).await {
+                Ok(Some((price, src))) => Json(serde_json::json!({
                     "ok": true,
                     "price": price,
-                    "source": "coflnet_median",
+                    "source": src.as_str(),
                     "tag": tag,
+                    "is_skin": pricing::is_skin_tag(&tag),
                 })),
                 Ok(None) => Json(serde_json::json!({
                     "ok": false,
