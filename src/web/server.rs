@@ -367,6 +367,10 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/seller/login", axum::routing::post(seller_login))
         .route("/api/seller/preview", axum::routing::post(seller_preview))
         .route("/api/seller/available_items", get(seller_available_items))
+        .route(
+            "/api/seller/price_estimate",
+            axum::routing::post(seller_price_estimate),
+        )
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -1843,7 +1847,7 @@ async fn render_single_preview(
     let auctions_json = s.bot_client.get_cached_my_auctions_json();
 
     let item: RenderableItem = match sel {
-        SelectedItem::Inventory { slot } => {
+        SelectedItem::Inventory { slot, .. } => {
             let v: serde_json::Value = serde_json::from_str(&inv_json?).ok()?;
             let slots = v.get("slots")?.as_array()?;
             let entry = slots.get(*slot as usize)?;
@@ -1852,7 +1856,7 @@ async fn render_single_preview(
             }
             build_inventory_renderable(entry).await
         }
-        SelectedItem::Auction { uuid } => {
+        SelectedItem::Auction { uuid, .. } => {
             let arr: Vec<serde_json::Value> =
                 serde_json::from_str(&auctions_json?).ok()?;
             let found = if let Some(idx_str) = uuid.strip_prefix("idx:") {
@@ -1961,9 +1965,17 @@ async fn seller_available_items(State(s): State<WebSharedState>) -> impl IntoRes
                         continue;
                     }
                     let slot = entry.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // Forward every field the existing `getTooltipData()`
+                    // helper on the panel knows how to consume so the tile
+                    // can pop the same Minecraft hover card the inventory
+                    // and auctions tabs already use.
                     inventory.push(serde_json::json!({
                         "slot": slot,
                         "display_name": entry.get("displayNameColored").or_else(|| entry.get("displayName")).cloned(),
+                        "displayName": entry.get("displayName").cloned(),
+                        "displayNameColored": entry.get("displayNameColored").cloned(),
+                        "name": entry.get("name").cloned(),
+                        "lore": entry.get("lore").cloned().unwrap_or(serde_json::json!([])),
                         "tag": entry.get("tag").cloned(),
                         "count": entry.get("count").cloned().unwrap_or(serde_json::json!(1)),
                     }));
@@ -1985,12 +1997,23 @@ async fn seller_available_items(State(s): State<WebSharedState>) -> impl IntoRes
                     .filter(|u| !u.is_empty())
                     .map(String::from)
                     .unwrap_or_else(|| format!("idx:{idx}"));
+                let starting_bid = a
+                    .get("starting_bid")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 auctions.push(serde_json::json!({
                     "id": uuid,
                     "display_name": a.get("item_name_colored").or_else(|| a.get("item_name")).cloned(),
+                    "item_name": a.get("item_name").cloned(),
+                    "displayNameColored": a.get("item_name_colored").cloned(),
+                    "lore": a.get("lore").cloned().unwrap_or(serde_json::json!([])),
                     "tag": a.get("tag").cloned(),
                     "bin": a.get("bin").cloned().unwrap_or(serde_json::json!(false)),
-                    "starting_bid": a.get("starting_bid").cloned().unwrap_or(serde_json::json!(0)),
+                    "starting_bid": starting_bid,
+                    // Auctions know what they cost — the listing price.
+                    // Inventory items have to be priced separately via
+                    // /api/seller/price_estimate (lazy Coflnet lookup).
+                    "suggested_price": starting_bid,
                     "time_remaining_seconds": a.get("time_remaining_seconds").cloned().unwrap_or(serde_json::json!(0)),
                 }));
             }
@@ -2001,6 +2024,102 @@ async fn seller_available_items(State(s): State<WebSharedState>) -> impl IntoRes
         "inventory": inventory,
         "auctions": auctions,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SellerPriceEstimateReq {
+    Inventory { slot: u32 },
+    Auction { uuid: String },
+}
+
+/// Resolve the asking price for a single selected item.  Auctions answer
+/// from the cached "My Auctions" snapshot (the listing price the user
+/// already chose).  Inventory items hit Coflnet for a price estimate.
+async fn seller_price_estimate(
+    State(s): State<WebSharedState>,
+    Json(req): Json<SellerPriceEstimateReq>,
+) -> impl IntoResponse {
+    match req {
+        SellerPriceEstimateReq::Auction { uuid } => {
+            let cached = s.bot_client.get_cached_my_auctions_json();
+            let arr: Vec<serde_json::Value> = cached
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            let found = if let Some(idx_str) = uuid.strip_prefix("idx:") {
+                idx_str.parse::<usize>().ok().and_then(|i| arr.get(i).cloned())
+            } else {
+                let normalized = uuid.replace('-', "").to_lowercase();
+                arr.into_iter().find(|a| {
+                    a.get("uuid")
+                        .and_then(|v| v.as_str())
+                        .map(|u| u.replace('-', "").to_lowercase() == normalized)
+                        .unwrap_or(false)
+                })
+            };
+            match found {
+                Some(entry) => {
+                    let price = entry
+                        .get("starting_bid")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        .max(0) as u64;
+                    let bin = entry
+                        .get("bin")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "price": price,
+                        "source": if bin { "bin_listing" } else { "auction_listing" },
+                    }))
+                }
+                None => Json(serde_json::json!({
+                    "ok": false,
+                    "error": "auction not found in current cache",
+                })),
+            }
+        }
+        SellerPriceEstimateReq::Inventory { slot } => {
+            let cached = s.bot_client.get_cached_inventory_json();
+            let tag = cached
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|v| v.get("slots").cloned())
+                .and_then(|s| s.as_array().cloned())
+                .and_then(|slots| slots.get(slot as usize).cloned())
+                .filter(|entry| !entry.is_null())
+                .and_then(|entry| {
+                    entry
+                        .get("tag")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+            let Some(tag) = tag else {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "error": "inventory slot is empty or has no SkyBlock tag",
+                }));
+            };
+            match crate::seller::pricing::fetch_coflnet_median_price(&tag).await {
+                Ok(Some(price)) => Json(serde_json::json!({
+                    "ok": true,
+                    "price": price,
+                    "source": "coflnet_median",
+                    "tag": tag,
+                })),
+                Ok(None) => Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("Coflnet has no price data for {tag}"),
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("Coflnet lookup failed: {e}"),
+                })),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@
 pub mod config;
 pub mod discord;
 pub mod login;
+pub mod pricing;
 pub mod render;
 pub mod runner;
 

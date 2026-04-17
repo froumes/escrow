@@ -611,6 +611,25 @@ img{display:block;max-width:100%}
     text-overflow:ellipsis;
     white-space:nowrap;
 }
+.sellerChipPrice{
+    border:1px solid var(--line);
+    background:transparent;
+    color:var(--muted);
+    border-radius:6px;
+    padding:1px 6px;
+    font-size:.78em;
+    line-height:1.4;
+    cursor:pointer;
+    transition:all .15s ease;
+    white-space:nowrap;
+}
+.sellerChipPrice:hover{border-color:var(--accent);color:var(--accent)}
+.sellerChipPrice.isActive{
+    background:color-mix(in srgb, var(--accent) 18%, transparent);
+    border-color:var(--accent);
+    color:var(--accent);
+    font-weight:600;
+}
 .sellerChipAction,.sellerChipRemove{
     background:transparent;
     border:none;
@@ -1747,6 +1766,7 @@ const API = {
     sellerLogin: "/api/seller/login",
     sellerPreview: "/api/seller/preview",
     sellerAvailable: "/api/seller/available_items",
+    sellerPriceEstimate: "/api/seller/price_estimate",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -2773,6 +2793,11 @@ function App() {
     const [sellerError, setSellerError] = useState("");
     const [sellerPreviewUrl, setSellerPreviewUrl] = useState("");
     const [sellerPreviewKey, setSellerPreviewKey] = useState("");
+    // Per-item cached asking-price lookup, keyed by `inv:<slot>` / `auc:<id>`.
+    // Each value is `{ state: "loading"|"ok"|"error"|"none", price?, error? }`.
+    // Auctions resolve instantly from sellerAvailable; inventory items are
+    // fetched on demand the first time their price toggle flips on.
+    const [sellerPrices, setSellerPrices] = useState({});
     const [chat, setChat] = useState([]);
     const [chatConnected, setChatConnected] = useState(false);
     const [chatFilter, setChatFilter] = useState("");
@@ -3164,6 +3189,79 @@ function App() {
         });
     }, []);
 
+    const sellerSelKey = useCallback((sel) => {
+        return sel.kind === "inventory" ? `inv:${sel.slot}` : `auc:${sel.uuid}`;
+    }, []);
+
+    // Fetch the asking-price estimate for a single selection.  Auctions
+    // answer immediately from the cached available-items list; inventory
+    // items hit /api/seller/price_estimate which round-trips to Coflnet
+    // for a recent-sales median.
+    const fetchSellerPrice = useCallback(async (sel) => {
+        const key = sellerSelKey(sel);
+        if (sel.kind === "auction") {
+            const cached = sellerAvailable.auctions.find((it) => it.id === sel.uuid);
+            if (cached && cached.suggested_price > 0) {
+                setSellerPrices((prev) => ({
+                    ...prev,
+                    [key]: { state: "ok", price: cached.suggested_price, source: "listing" }
+                }));
+                return;
+            }
+        }
+        setSellerPrices((prev) => ({ ...prev, [key]: { state: "loading" } }));
+        try {
+            const body = sel.kind === "inventory"
+                ? { kind: "inventory", slot: sel.slot }
+                : { kind: "auction", uuid: sel.uuid };
+            const resp = await fetch(API.sellerPriceEstimate, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+                credentials: "same-origin"
+            });
+            if (resp.status === 401) { handleUnauthorized(); return; }
+            const data = await resp.json();
+            if (data.ok && data.price > 0) {
+                setSellerPrices((prev) => ({
+                    ...prev,
+                    [key]: { state: "ok", price: data.price, source: data.source }
+                }));
+            } else {
+                setSellerPrices((prev) => ({
+                    ...prev,
+                    [key]: { state: "error", error: data.error || "no price data" }
+                }));
+            }
+        } catch (error) {
+            setSellerPrices((prev) => ({
+                ...prev,
+                [key]: { state: "error", error: error.message || "lookup failed" }
+            }));
+        }
+    }, [handleUnauthorized, sellerAvailable.auctions, sellerSelKey]);
+
+    // Flip the per-item "include asking price" flag.  When turning the
+    // toggle on for the first time we kick off a price fetch so the chip
+    // can immediately display the resolved number.
+    const toggleSellerItemPrice = useCallback((idx) => {
+        setSellerDraftSelected((prev) => {
+            if (idx < 0 || idx >= prev.length) return prev;
+            const next = prev.slice();
+            const cur = next[idx];
+            const turningOn = !cur.include_price;
+            next[idx] = { ...cur, include_price: turningOn };
+            if (turningOn) {
+                const key = sellerSelKey(cur);
+                const cached = sellerPrices[key];
+                if (!cached || cached.state === "error") {
+                    fetchSellerPrice(cur);
+                }
+            }
+            return next;
+        });
+    }, [fetchSellerPrice, sellerPrices, sellerSelKey]);
+
     const addSellerChannel = useCallback(() => {
         setSellerDraftChannels((prev) => [...prev, { channel_id: "", cooldown_seconds: 60 }]);
     }, []);
@@ -3370,6 +3468,21 @@ function App() {
         }, 4000);
         return () => window.clearInterval(interval);
     }, [needsAuth, activeTab, sellerConfigLoaded, refreshSellerConfig, refreshSellerAvailable, refreshSellerStatus]);
+
+    // Whenever the selected-item list changes (config load, manual edit),
+    // hydrate the local price cache for every item with the asking-price
+    // toggle on.  Auctions resolve from the available-items list synchronously,
+    // inventory items kick off a Coflnet round-trip.
+    useEffect(() => {
+        if (activeTab !== "seller") return;
+        for (const sel of sellerDraftSelected) {
+            if (!sel.include_price) continue;
+            const key = sellerSelKey(sel);
+            const cached = sellerPrices[key];
+            if (cached && (cached.state === "ok" || cached.state === "loading")) continue;
+            fetchSellerPrice(sel);
+        }
+    }, [activeTab, sellerDraftSelected, sellerPrices, sellerSelKey, fetchSellerPrice]);
 
     useEffect(() => {
         if (!Object.keys(status || {}).length) return;
@@ -4231,14 +4344,39 @@ function App() {
                                             : html`
                                                 <div className="sellerChipRow">
                                                     ${sellerDraftSelected.map((sel, idx) => {
-                                                        const key = sel.kind === "inventory" ? `inv:${sel.slot}` : `auc:${sel.uuid}`;
+                                                        const key = sellerSelKey(sel);
                                                         const label = sel.kind === "inventory" ? `Inventory slot ${sel.slot}` : `Auction ${String(sel.uuid).slice(0, 12)}`;
                                                         const tagPreview = sel.kind === "inventory"
                                                             ? (sellerAvailable.inventory.find((it) => it.slot === sel.slot)?.display_name || label)
                                                             : (sellerAvailable.auctions.find((it) => it.id === sel.uuid)?.display_name || label);
+                                                        const priceState = sellerPrices[key];
+                                                        let priceBtnContent = "$";
+                                                        let priceBtnTitle = "Include asking price in the message";
+                                                        if (sel.include_price) {
+                                                            if (priceState?.state === "loading") {
+                                                                priceBtnContent = html`<span>$…</span>`;
+                                                                priceBtnTitle = "Looking up Coflnet price…";
+                                                            } else if (priceState?.state === "ok") {
+                                                                priceBtnContent = html`<span>$${coins(priceState.price)}</span>`;
+                                                                priceBtnTitle = priceState.source === "coflnet_median"
+                                                                    ? `Coflnet median estimate · click to remove from message`
+                                                                    : `Listing price · click to remove from message`;
+                                                            } else if (priceState?.state === "error") {
+                                                                priceBtnContent = html`<span>$?</span>`;
+                                                                priceBtnTitle = priceState.error || "Price unavailable";
+                                                            } else {
+                                                                priceBtnContent = "$";
+                                                            }
+                                                        }
                                                         return html`
                                                             <div className="sellerChip" key=${key}>
                                                                 <span className="sellerChipLabel">${stripMc(tagPreview)}</span>
+                                                                <button
+                                                                    type="button"
+                                                                    className=${cls("sellerChipPrice", sel.include_price && "isActive")}
+                                                                    onClick=${() => toggleSellerItemPrice(idx)}
+                                                                    title=${priceBtnTitle}
+                                                                >${priceBtnContent}</button>
                                                                 <button type="button" className="sellerChipAction" onClick=${() => previewSellerItem(sel)} title="Preview">&#128065;</button>
                                                                 <button type="button" className="sellerChipRemove" onClick=${() => setSellerDraftSelected((prev) => prev.filter((_, i) => i !== idx))}>×</button>
                                                             </div>
@@ -4261,15 +4399,23 @@ function App() {
                                             : html`
                                                 <div className="sellerItemGrid">
                                                     ${sellerAvailable.inventory.map((it) => {
-                                                        const sel = { kind: "inventory", slot: it.slot };
+                                                        const sel = { kind: "inventory", slot: it.slot, include_price: false };
                                                         const key = `inv:${it.slot}`;
                                                         const picked = sellerDraftSelected.some((s) => s.kind === "inventory" && s.slot === it.slot);
+                                                        const tooltip = getTooltipData(it);
                                                         return html`
-                                                            <button key=${key} type="button" className=${cls("sellerItemTile", picked && "picked")} onClick=${() => toggleSellerSelection(sel)}>
+                                                            <${TooltipAnchor}
+                                                                key=${key}
+                                                                as="button"
+                                                                type="button"
+                                                                tooltip=${tooltip}
+                                                                className=${cls("sellerItemTile", picked && "picked")}
+                                                                onClick=${() => toggleSellerSelection(sel)}
+                                                            >
                                                                 ${it.tag ? html`<img src=${`https://sky.coflnet.com/static/icon/${it.tag}`} alt="" />` : html`<div className="sellerItemIconFallback">?</div>`}
                                                                 <span className="sellerItemName">${stripMc(it.display_name || "")}</span>
                                                                 <span className="sellerItemMeta">Slot ${it.slot}${it.count > 1 ? ` · x${it.count}` : ""}</span>
-                                                            </button>
+                                                            </${TooltipAnchor}>
                                                         `;
                                                     })}
                                                 </div>
@@ -4283,15 +4429,23 @@ function App() {
                                             : html`
                                                 <div className="sellerItemGrid">
                                                     ${sellerAvailable.auctions.map((it) => {
-                                                        const sel = { kind: "auction", uuid: it.id };
+                                                        const sel = { kind: "auction", uuid: it.id, include_price: false };
                                                         const key = `auc:${it.id}`;
                                                         const picked = sellerDraftSelected.some((s) => s.kind === "auction" && s.uuid === it.id);
+                                                        const tooltip = getTooltipData(it);
                                                         return html`
-                                                            <button key=${key} type="button" className=${cls("sellerItemTile", picked && "picked")} onClick=${() => toggleSellerSelection(sel)}>
+                                                            <${TooltipAnchor}
+                                                                key=${key}
+                                                                as="button"
+                                                                type="button"
+                                                                tooltip=${tooltip}
+                                                                className=${cls("sellerItemTile", picked && "picked")}
+                                                                onClick=${() => toggleSellerSelection(sel)}
+                                                            >
                                                                 ${it.tag ? html`<img src=${`https://sky.coflnet.com/static/icon/${it.tag}`} alt="" />` : html`<div className="sellerItemIconFallback">?</div>`}
                                                                 <span className="sellerItemName">${stripMc(it.display_name || "")}</span>
                                                                 <span className="sellerItemMeta">${it.bin ? "BIN" : "Bid"} · ${coins(it.starting_bid || 0)}</span>
-                                                            </button>
+                                                            </${TooltipAnchor}>
                                                         `;
                                                     })}
                                                 </div>

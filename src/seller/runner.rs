@@ -54,6 +54,10 @@ struct RenderedItem {
     selected: SelectedItem,
     identity: ItemIdentity,
     attachment: AttachmentPng,
+    /// Asking price (in coins) the user wants broadcast for this item, if
+    /// they enabled the per-item price toggle and we were able to resolve
+    /// a number (BIN listing for auctions, Coflnet median for inventory).
+    asking_price: Option<u64>,
     dropped: AtomicBool,
 }
 
@@ -363,7 +367,7 @@ impl SellerRunner {
             // Re-check availability against the live caches before every
             // send so sold / claimed / moved items silently drop out of the
             // message instead of being re-posted forever.
-            let attachments = self.current_attachments(&items);
+            let (attachments, prices) = self.current_attachments(&items);
 
             if had_selected_items && attachments.is_empty() {
                 // Every item the user picked has been sold or is otherwise
@@ -379,7 +383,13 @@ impl SellerRunner {
                 return;
             }
 
-            let send_result = send_message(&token, &channel_id, &message, &attachments).await;
+            // Append the per-item asking-price block to the user's message
+            // for any surviving item whose price toggle was on.  Done at
+            // send time (not start time) so dropped items vanish from the
+            // list automatically.
+            let body = build_message_with_prices(&message, &prices);
+
+            let send_result = send_message(&token, &channel_id, &body, &attachments).await;
             let n = {
                 let mut counts = self.inner.sent_counts.lock();
                 let entry = counts.entry(channel_id.clone()).or_insert(0);
@@ -411,12 +421,16 @@ impl SellerRunner {
         }
     }
 
-    /// Build the attachment list for the next message by walking the shared
-    /// rendered-item list and keeping only those that still match a live
-    /// item in the bot's caches.  The first task to observe an item
-    /// transitioning `Present → Gone` logs a single removal line; every
-    /// other task sees `dropped` already set and silently skips it.
-    fn current_attachments(&self, items: &[Arc<RenderedItem>]) -> Vec<AttachmentPng> {
+    /// Build the attachment list and per-item price list for the next
+    /// message by walking the shared rendered-item list and keeping only
+    /// those that still match a live item in the bot's caches.  The first
+    /// task to observe an item transitioning `Present → Gone` logs a single
+    /// removal line; every other task sees `dropped` already set and
+    /// silently skips it.
+    fn current_attachments(
+        &self,
+        items: &[Arc<RenderedItem>],
+    ) -> (Vec<AttachmentPng>, Vec<(String, u64)>) {
         let inv_json = self.bot_client.get_cached_inventory_json();
         let auctions_json = self.bot_client.get_cached_my_auctions_json();
 
@@ -432,13 +446,21 @@ impl SellerRunner {
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
 
-        let mut out = Vec::with_capacity(items.len());
+        let mut attachments = Vec::with_capacity(items.len());
+        let mut prices: Vec<(String, u64)> = Vec::new();
         for item in items {
             if item.dropped.load(Ordering::SeqCst) {
                 continue;
             }
             match check_presence(&item.selected, &item.identity, &inv_slots, &auctions) {
-                Presence::Present => out.push(item.attachment.clone()),
+                Presence::Present => {
+                    attachments.push(item.attachment.clone());
+                    if item.selected.include_price() {
+                        if let Some(price) = item.asking_price {
+                            prices.push((item.identity.plain_title.clone(), price));
+                        }
+                    }
+                }
                 Presence::Gone(reason) => {
                     if item
                         .dropped
@@ -453,7 +475,50 @@ impl SellerRunner {
                 }
             }
         }
-        out
+        (attachments, prices)
+    }
+}
+
+/// Append an "Asking prices" block to the user's message body for every
+/// surviving item that opted in.  Designed to render cleanly in Discord
+/// without overflowing 2000 characters even with the maximum 10 items.
+fn build_message_with_prices(message: &str, prices: &[(String, u64)]) -> String {
+    if prices.is_empty() {
+        return message.to_string();
+    }
+    let mut out = message.trim_end_matches('\n').to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str("**Asking prices:**\n");
+    for (name, price) in prices {
+        out.push_str("• ");
+        out.push_str(name.trim());
+        out.push_str(": ");
+        out.push_str(&format_coins_short(*price));
+        out.push('\n');
+    }
+    // Drop the trailing newline so Discord doesn't render an empty line
+    // at the end of the message.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Format a coin amount as `1.23B` / `45.6M` / `789K`, rounding to two
+/// decimal places for B/M and one for K.  Matches the convention the
+/// auctions page already uses on the panel.
+fn format_coins_short(coins: u64) -> String {
+    let n = coins as f64;
+    if coins >= 1_000_000_000 {
+        format!("{:.2}B", n / 1_000_000_000.0)
+    } else if coins >= 1_000_000 {
+        format!("{:.2}M", n / 1_000_000.0)
+    } else if coins >= 1_000 {
+        format!("{:.1}K", n / 1_000.0)
+    } else {
+        coins.to_string()
     }
 }
 
@@ -489,22 +554,31 @@ async fn resolve_and_render(
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
+    // Drop expired entries from the in-process price cache so a long-lived
+    // TWM instance doesn't keep stale numbers around indefinitely.
+    super::pricing::prune_expired_cache();
+
     let mut out: Vec<RenderedItem> = Vec::with_capacity(selected.len());
     let mut icon_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
 
     for (idx, sel) in selected.iter().enumerate() {
         let resolved = match sel {
-            SelectedItem::Inventory { slot } => {
+            SelectedItem::Inventory { slot, .. } => {
                 resolve_inventory(&inv_slots, *slot, &http, &mut icon_cache).await
             }
-            SelectedItem::Auction { uuid } => {
+            SelectedItem::Auction { uuid, .. } => {
                 resolve_auction(&auctions_arr, uuid, &http, &mut icon_cache).await
             }
         };
         match resolved {
-            Some((item, identity)) => {
+            Some((item, identity, listing_price)) => {
                 let png = render_item_png(&item);
                 let safe = sanitize_filename(&item.title);
+                let asking_price = if sel.include_price() {
+                    resolve_asking_price(sel, listing_price, identity.tag.as_deref()).await
+                } else {
+                    None
+                };
                 out.push(RenderedItem {
                     selected: sel.clone(),
                     identity,
@@ -512,6 +586,7 @@ async fn resolve_and_render(
                         filename: format!("{:02}_{safe}.png", idx + 1),
                         bytes: png,
                     },
+                    asking_price,
                     dropped: AtomicBool::new(false),
                 });
             }
@@ -524,6 +599,31 @@ async fn resolve_and_render(
     Ok(out)
 }
 
+/// Resolve the "asking price" for a selected item:
+/// - **Auctions** use the listing price (BIN or starting bid) we already
+///   pulled out of the cached "My Auctions" snapshot.
+/// - **Inventory** items have no listing yet, so we ask Coflnet for the
+///   recent-sales median — which is what their UI calls the price estimate.
+async fn resolve_asking_price(
+    sel: &SelectedItem,
+    listing_price: Option<u64>,
+    tag: Option<&str>,
+) -> Option<u64> {
+    match sel {
+        SelectedItem::Auction { .. } => listing_price,
+        SelectedItem::Inventory { .. } => {
+            let tag = tag?;
+            match super::pricing::fetch_coflnet_median_price(tag).await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("[Seller] coflnet price lookup for {tag} failed: {e}");
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Decide whether a previously-rendered item should still appear in the
 /// next outbound Discord message.
 fn check_presence(
@@ -533,8 +633,10 @@ fn check_presence(
     auctions: &[serde_json::Value],
 ) -> Presence {
     match selected {
-        SelectedItem::Inventory { slot } => check_inventory_presence(*slot, identity, inv_slots),
-        SelectedItem::Auction { uuid } => check_auction_presence(uuid, identity, auctions),
+        SelectedItem::Inventory { slot, .. } => {
+            check_inventory_presence(*slot, identity, inv_slots)
+        }
+        SelectedItem::Auction { uuid, .. } => check_auction_presence(uuid, identity, auctions),
     }
 }
 
@@ -655,7 +757,7 @@ async fn resolve_inventory(
     slot: u32,
     http: &reqwest::Client,
     cache: &mut HashMap<String, Option<Vec<u8>>>,
-) -> Option<(RenderableItem, ItemIdentity)> {
+) -> Option<(RenderableItem, ItemIdentity, Option<u64>)> {
     let entry = inv_slots.get(slot as usize)?;
     if entry.is_null() {
         return None;
@@ -695,6 +797,9 @@ async fn resolve_inventory(
             footer: None,
         },
         identity,
+        // Inventory items have no listing — the asking price is computed
+        // later from Coflnet only if the user opts in.
+        None,
     ))
 }
 
@@ -703,7 +808,7 @@ async fn resolve_auction(
     identifier: &str,
     http: &reqwest::Client,
     cache: &mut HashMap<String, Option<Vec<u8>>>,
-) -> Option<(RenderableItem, ItemIdentity)> {
+) -> Option<(RenderableItem, ItemIdentity, Option<u64>)> {
     // Support both real UUIDs (returned by the Hypixel API path) and the
     // synthetic `idx:N` form the panel falls back to when `/api/auctions`
     // came from the in-game GUI cache (no UUID available there).
@@ -754,6 +859,11 @@ async fn resolve_auction(
         plain_title: strip_mc_codes(&title),
         tag: tag.clone(),
     };
+    let listing_price = found
+        .get("starting_bid")
+        .and_then(|v| v.as_i64())
+        .filter(|p| *p > 0)
+        .map(|p| p as u64);
     Some((
         RenderableItem {
             title,
@@ -763,6 +873,7 @@ async fn resolve_auction(
             footer: None,
         },
         identity,
+        listing_price,
     ))
 }
 
@@ -916,6 +1027,43 @@ mod tests {
             check_auction_presence("idx:5", &id, &auctions),
             Presence::Gone("sold or claimed")
         ));
+    }
+
+    #[test]
+    fn build_message_with_prices_no_prices_passes_message_through() {
+        assert_eq!(build_message_with_prices("hello world", &[]), "hello world");
+        assert_eq!(build_message_with_prices("", &[]), "");
+    }
+
+    #[test]
+    fn build_message_with_prices_appends_block() {
+        let prices = vec![
+            ("Hyperion".to_string(), 850_000_000),
+            ("Terminator".to_string(), 25_000_000),
+        ];
+        let out = build_message_with_prices("Taking offers!", &prices);
+        assert!(out.starts_with("Taking offers!"));
+        assert!(out.contains("**Asking prices:**"));
+        assert!(out.contains("• Hyperion: 850.00M"));
+        assert!(out.contains("• Terminator: 25.00M"));
+        assert!(!out.ends_with('\n'), "should not end with trailing newline");
+    }
+
+    #[test]
+    fn build_message_with_prices_handles_empty_user_message() {
+        let prices = vec![("Hyperion".to_string(), 850_000_000)];
+        let out = build_message_with_prices("", &prices);
+        assert!(out.starts_with("**Asking prices:**"));
+        assert!(out.contains("Hyperion: 850.00M"));
+    }
+
+    #[test]
+    fn format_coins_short_uses_b_m_k_suffixes() {
+        assert_eq!(format_coins_short(0), "0");
+        assert_eq!(format_coins_short(500), "500");
+        assert_eq!(format_coins_short(2_500), "2.5K");
+        assert_eq!(format_coins_short(1_500_000), "1.50M");
+        assert_eq!(format_coins_short(2_300_000_000), "2.30B");
     }
 
     #[test]

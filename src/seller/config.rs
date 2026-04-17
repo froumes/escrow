@@ -25,15 +25,36 @@ pub const MAX_SELECTED_ITEMS: usize = 10;
 ///
 /// We keep these opaque (inventory slot or auction UUID) instead of snapshots
 /// so that the rendered image always reflects the live state of the item when
-/// the Discord message is sent.
+/// the Discord message is sent.  The `include_price` flag — defaulted to false
+/// for backward compatibility with existing config files — controls whether
+/// the runner appends an "asking price" line for that item in the outgoing
+/// Discord message.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SelectedItem {
     /// Item in the player's inventory, addressed by the mineflayer slot id
     /// (9..=44 — hotbar + main inventory).
-    Inventory { slot: u32 },
+    Inventory {
+        slot: u32,
+        #[serde(default)]
+        include_price: bool,
+    },
     /// Active auction-house listing, addressed by auction UUID.
-    Auction { uuid: String },
+    Auction {
+        uuid: String,
+        #[serde(default)]
+        include_price: bool,
+    },
+}
+
+impl SelectedItem {
+    /// Whether the user has opted into broadcasting this item's asking price.
+    pub fn include_price(&self) -> bool {
+        match self {
+            SelectedItem::Inventory { include_price, .. }
+            | SelectedItem::Auction { include_price, .. } => *include_price,
+        }
+    }
 }
 
 /// A Discord channel the sender posts into, with its own cooldown.
@@ -182,12 +203,24 @@ mod tests {
     fn sanitized_truncates_selected_items_to_discord_limit() {
         let cfg = SellerConfig {
             selected_items: (0..20)
-                .map(|i| SelectedItem::Inventory { slot: 9 + i })
+                .map(|i| SelectedItem::Inventory {
+                    slot: 9 + i,
+                    include_price: false,
+                })
                 .collect(),
             ..SellerConfig::default()
         }
         .sanitized();
         assert_eq!(cfg.selected_items.len(), MAX_SELECTED_ITEMS);
+    }
+
+    #[test]
+    fn legacy_selected_item_without_include_price_deserialises() {
+        let raw = r#"[{"kind":"inventory","slot":12},{"kind":"auction","uuid":"abc"}]"#;
+        let parsed: Vec<SelectedItem> = serde_json::from_str(raw).expect("decode");
+        assert_eq!(parsed.len(), 2);
+        assert!(!parsed[0].include_price());
+        assert!(!parsed[1].include_price());
     }
 
     #[test]
