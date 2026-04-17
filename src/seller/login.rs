@@ -132,12 +132,14 @@ const BROWSER_ENV_VAR: &str = "TWM_SELLER_BROWSER";
 fn browser_not_found_hint() -> String {
     format!(
         "No Chromium-based browser could be located automatically. \
-         Install Google Chrome or Microsoft Edge, \
-         or set the {BROWSER_ENV_VAR} environment variable to the full path \
-         of an existing browser executable (for example \
-         'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'). \
-         Alternatively you can skip this step entirely by pasting your Discord \
-         token into the field above — the browser login is just a convenience."
+         If you already have Chrome or Edge installed, find the full path \
+         to chrome.exe (open Chrome, go to chrome://version, and copy the \
+         'Executable Path' line) and set the {BROWSER_ENV_VAR} environment \
+         variable to that path before restarting TWM — for example \
+         'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'. \
+         Otherwise install Google Chrome or Microsoft Edge. \
+         You can also skip the browser login entirely by pasting your Discord \
+         token into the field above; browser login is only a convenience."
     )
 }
 
@@ -161,6 +163,67 @@ fn resolve_on_path(name: &str) -> Option<PathBuf> {
             return Some(p);
         }
     }
+    None
+}
+
+/// On Windows, look up the canonical executable path registered under
+/// `App Paths` — this is how the OS itself resolves `chrome.exe` when
+/// you paste it into Start > Run, and it's populated by every Chromium
+/// installer regardless of whether it's a per-user (HKCU) or per-machine
+/// (HKLM) install.  Unlike `where.exe`, App Paths does NOT require the
+/// executable's directory to be in the `PATH` environment variable — which
+/// is important because Chrome does not add itself to `PATH`.
+#[cfg(windows)]
+fn find_browser_via_registry() -> Option<PathBuf> {
+    // Ordered Edge → Chrome → Brave → Chromium to mirror our launch
+    // preference (Edge is usually lightest-weight on Windows).
+    let targets: &[(&str, &str)] = &[
+        ("HKLM", "msedge.exe"),
+        ("HKCU", "msedge.exe"),
+        ("HKLM", "chrome.exe"),
+        ("HKCU", "chrome.exe"),
+        ("HKLM", "brave.exe"),
+        ("HKCU", "brave.exe"),
+        ("HKLM", "chromium.exe"),
+        ("HKCU", "chromium.exe"),
+    ];
+    for (hive, name) in targets {
+        let key = format!(
+            r"{hive}\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}"
+        );
+        let Ok(output) = std::process::Command::new("reg")
+            .args(["query", &key, "/ve"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Each line looks roughly like:
+        //     (Default)    REG_SZ    C:\Program Files\Google\Chrome\Application\chrome.exe
+        // We split on the type marker so paths with embedded spaces
+        // survive intact.
+        for line in stdout.lines() {
+            if let Some(idx) = line.find("REG_SZ") {
+                let path_str = line[idx + "REG_SZ".len()..].trim();
+                // Registry values are sometimes wrapped in quotes; strip them.
+                let path_str = path_str.trim_matches('"');
+                if !path_str.is_empty() {
+                    let p = PathBuf::from(path_str);
+                    if p.exists() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn find_browser_via_registry() -> Option<PathBuf> {
     None
 }
 
@@ -188,10 +251,19 @@ fn find_browser_executable() -> Option<PathBuf> {
         }
     }
 
-    // 3. Ask the OS to resolve each known executable name via PATH.  Edge
-    //    registers itself under the "App Paths" registry key on Windows
-    //    which `where.exe` honours, so this picks up per-user installs,
-    //    portable installs, and custom directories alike.
+    // 3. Windows "App Paths" registry.  This is the canonical source of
+    //    truth for installed Chromium browsers on Windows — `where.exe`
+    //    only searches `PATH`, and Chrome specifically does NOT add its
+    //    install directory to `PATH`, so without this step a completely
+    //    standard Chrome install is invisible to us.  No-op on Unix.
+    if let Some(p) = find_browser_via_registry() {
+        return Some(p);
+    }
+
+    // 4. Ask the OS to resolve each known executable name via PATH.  Edge
+    //    *does* put its directory on `PATH` on recent Windows builds, and
+    //    every major Linux distribution ships Chromium/Chrome as a PATH
+    //    entry, so this catches anything the previous steps missed.
     #[cfg(windows)]
     let names: &[&str] = &[
         "msedge.exe",
@@ -235,6 +307,10 @@ fn hardcoded_browser_paths() -> Vec<PathBuf> {
         PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
         PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
         PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        PathBuf::from(r"C:\Program Files\Google\Chrome Beta\Application\chrome.exe"),
+        PathBuf::from(r"C:\Program Files (x86)\Google\Chrome Beta\Application\chrome.exe"),
+        PathBuf::from(r"C:\Program Files\Google\Chrome Dev\Application\chrome.exe"),
+        PathBuf::from(r"C:\Program Files (x86)\Google\Chrome Dev\Application\chrome.exe"),
         PathBuf::from(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
         PathBuf::from(
             r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -244,6 +320,10 @@ fn hardcoded_browser_paths() -> Vec<PathBuf> {
     if let Some(local) = dirs::data_local_dir() {
         candidates.push(local.join("Microsoft/Edge/Application/msedge.exe"));
         candidates.push(local.join("Google/Chrome/Application/chrome.exe"));
+        candidates.push(local.join("Google/Chrome Beta/Application/chrome.exe"));
+        candidates.push(local.join("Google/Chrome Dev/Application/chrome.exe"));
+        // Chrome Canary only ever installs per-user under "Chrome SxS".
+        candidates.push(local.join("Google/Chrome SxS/Application/chrome.exe"));
         candidates.push(local.join("BraveSoftware/Brave-Browser/Application/brave.exe"));
         candidates.push(local.join("Chromium/Application/chrome.exe"));
     }
