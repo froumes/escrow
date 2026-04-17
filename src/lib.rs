@@ -12,6 +12,7 @@ pub mod inventory;
 pub mod logging;
 pub mod persistence;
 pub mod profit;
+pub mod seller;
 pub mod state;
 pub mod types;
 pub mod utils;

@@ -89,6 +89,10 @@ pub struct WebSharedState {
     pub flip_history: Arc<Mutex<VecDeque<FlipHistoryEntry>>>,
     /// Config loader for persisting changes to config.toml.
     pub config_loader: Arc<crate::config::ConfigLoader>,
+    /// Background Discord auto-sender driving the "Seller" tab.
+    pub seller_runner: crate::seller::SellerRunner,
+    /// On-disk path for the Seller config JSON (sibling of `config.toml`).
+    pub seller_config_path: std::path::PathBuf,
 }
 
 /// Ordered set-like storage for active web sessions.
@@ -354,6 +358,14 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
         .route("/api/flip-history", get(get_flip_history))
+        .route("/api/seller/config", get(get_seller_config).post(save_seller_config))
+        .route("/api/seller/status", get(get_seller_status))
+        .route("/api/seller/start", axum::routing::post(start_seller))
+        .route("/api/seller/stop", axum::routing::post(stop_seller))
+        .route("/api/seller/validate_token", axum::routing::post(seller_validate_token))
+        .route("/api/seller/validate_channel", axum::routing::post(seller_validate_channel))
+        .route("/api/seller/preview", axum::routing::post(seller_preview))
+        .route("/api/seller/available_items", get(seller_available_items))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -1545,6 +1557,400 @@ async fn handle_chat_ws(mut socket: WebSocket, state: WebSharedState) {
         }
     }
     debug!("[WebGUI] WebSocket client disconnected");
+}
+
+// ── Seller tab handlers ──────────────────────────────────────────────────
+//
+// The Seller tab owns a recurring Discord sender that posts rendered item
+// "screenshot" cards to one or more channels at configurable cooldowns.
+// Panel flow:
+//   • GET  /api/seller/config              → persisted settings (token masked)
+//   • POST /api/seller/config              → save settings (accepts raw token)
+//   • GET  /api/seller/status              → running state + logs + counters
+//   • POST /api/seller/start               → validate + render + spawn tasks
+//   • POST /api/seller/stop                → signal all tasks to stop
+//   • POST /api/seller/validate_token      → { token } → { ok, username }
+//   • POST /api/seller/validate_channel    → { token, channel_id } → { ok, name }
+//   • GET  /api/seller/available_items     → inventory + own-auctions snapshot
+//   • POST /api/seller/preview             → render a single selection to PNG
+
+use crate::seller::{
+    mask_token, SelectedItem, SellerChannel, SellerConfig, StartRequest,
+};
+
+#[derive(Deserialize)]
+struct SaveSellerConfigPayload {
+    /// Token from the UI.  Empty string or the masked placeholder keeps the
+    /// existing on-disk token so the panel never has to re-prompt for it.
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    selected_items: Vec<SelectedItem>,
+    #[serde(default)]
+    channels: Vec<SellerChannel>,
+}
+
+async fn get_seller_config(State(s): State<WebSharedState>) -> impl IntoResponse {
+    let cfg = SellerConfig::load_from(&s.seller_config_path).unwrap_or_default();
+    Json(serde_json::json!({
+        "token": mask_token(&cfg.token),
+        "has_token": !cfg.token.is_empty(),
+        "message": cfg.message,
+        "selected_items": cfg.selected_items,
+        "channels": cfg.channels,
+    }))
+}
+
+async fn save_seller_config(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<SaveSellerConfigPayload>,
+) -> impl IntoResponse {
+    let existing = SellerConfig::load_from(&s.seller_config_path).unwrap_or_default();
+
+    // Preserve the on-disk token when the panel sends back the masked form
+    // (or nothing at all) — the browser never receives the raw secret, so it
+    // can't resubmit it without the user re-typing.
+    let new_token = payload.token.trim();
+    let token = if new_token.is_empty() || new_token == mask_token(&existing.token) {
+        existing.token.clone()
+    } else {
+        new_token.to_string()
+    };
+
+    let cfg = SellerConfig {
+        token,
+        message: payload.message,
+        selected_items: payload.selected_items,
+        channels: payload.channels,
+    }
+    .sanitized();
+
+    if let Err(e) = cfg.save_to(&s.seller_config_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+async fn get_seller_status(State(s): State<WebSharedState>) -> impl IntoResponse {
+    Json(s.seller_runner.status())
+}
+
+async fn start_seller(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<SaveSellerConfigPayload>,
+) -> impl IntoResponse {
+    // Reuse save_seller_config's token-preservation logic so starting never
+    // requires the panel to re-send the secret.  We persist the submitted
+    // config before starting so a crash mid-run doesn't lose the user's
+    // latest selections.
+    let existing = SellerConfig::load_from(&s.seller_config_path).unwrap_or_default();
+    let new_token = payload.token.trim();
+    let token = if new_token.is_empty() || new_token == mask_token(&existing.token) {
+        existing.token.clone()
+    } else {
+        new_token.to_string()
+    };
+    let cfg = SellerConfig {
+        token: token.clone(),
+        message: payload.message.clone(),
+        selected_items: payload.selected_items.clone(),
+        channels: payload.channels.clone(),
+    }
+    .sanitized();
+    let _ = cfg.save_to(&s.seller_config_path);
+
+    let req = StartRequest {
+        token,
+        message: cfg.message,
+        channels: cfg.channels,
+        selected_items: cfg.selected_items,
+    };
+    match s.seller_runner.start(req).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn stop_seller(State(s): State<WebSharedState>) -> impl IntoResponse {
+    s.seller_runner.stop().await;
+    Json(serde_json::json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+struct TokenPayload {
+    token: String,
+}
+
+async fn seller_validate_token(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<TokenPayload>,
+) -> impl IntoResponse {
+    // Accept either a raw token or the masked placeholder — in the latter
+    // case, fall back to the token stored on disk so users can re-validate
+    // without re-typing their secret.
+    let mut token = payload.token.trim().to_string();
+    let existing = SellerConfig::load_from(&s.seller_config_path).unwrap_or_default();
+    if token.is_empty() || token == mask_token(&existing.token) {
+        token = existing.token;
+    }
+    match crate::seller::discord::validate_token(&token).await {
+        Ok(name) => Json(serde_json::json!({"ok": true, "username": name})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChannelValidatePayload {
+    #[serde(default)]
+    token: String,
+    channel_id: String,
+}
+
+async fn seller_validate_channel(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<ChannelValidatePayload>,
+) -> impl IntoResponse {
+    let mut token = payload.token.trim().to_string();
+    let existing = SellerConfig::load_from(&s.seller_config_path).unwrap_or_default();
+    if token.is_empty() || token == mask_token(&existing.token) {
+        token = existing.token;
+    }
+    match crate::seller::discord::validate_channel(&token, &payload.channel_id).await {
+        Ok(name) => Json(serde_json::json!({"ok": true, "name": name})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewPayload {
+    item: SelectedItem,
+}
+
+async fn seller_preview(
+    State(s): State<WebSharedState>,
+    Json(payload): Json<PreviewPayload>,
+) -> impl IntoResponse {
+    // We reuse the runner's render helper but it's not pub — instead, build
+    // a minimal RenderableItem here so the preview avoids hitting Discord.
+    let png = match render_single_preview(&s, &payload.item).await {
+        Some(bytes) => bytes,
+        None => return (StatusCode::NOT_FOUND, "Item could not be resolved").into_response(),
+    };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        png,
+    )
+        .into_response()
+}
+
+async fn render_single_preview(
+    s: &WebSharedState,
+    sel: &SelectedItem,
+) -> Option<Vec<u8>> {
+    use crate::seller::render::{render_item_png, RenderableItem};
+
+    let inv_json = s.bot_client.get_cached_inventory_json();
+    let auctions_json = s.bot_client.get_cached_my_auctions_json();
+
+    let item: RenderableItem = match sel {
+        SelectedItem::Inventory { slot } => {
+            let v: serde_json::Value = serde_json::from_str(&inv_json?).ok()?;
+            let slots = v.get("slots")?.as_array()?;
+            let entry = slots.get(*slot as usize)?;
+            if entry.is_null() {
+                return None;
+            }
+            build_inventory_renderable(entry).await
+        }
+        SelectedItem::Auction { uuid } => {
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_str(&auctions_json?).ok()?;
+            let found = if let Some(idx_str) = uuid.strip_prefix("idx:") {
+                let idx: usize = idx_str.parse().ok()?;
+                arr.get(idx)?.clone()
+            } else {
+                let normalized = uuid.replace('-', "").to_lowercase();
+                arr.iter()
+                    .find(|a| {
+                        a.get("uuid")
+                            .and_then(|v| v.as_str())
+                            .map(|u| u.replace('-', "").to_lowercase() == normalized)
+                            .unwrap_or(false)
+                    })?
+                    .clone()
+            };
+            build_auction_renderable(&found).await
+        }
+    };
+    Some(render_item_png(&item))
+}
+
+async fn fetch_icon_bytes(tag: Option<&str>) -> Option<Vec<u8>> {
+    let tag = tag?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let url = format!("https://sky.coflnet.com/static/icon/{tag}");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.bytes().await.ok().map(|b| b.to_vec())
+}
+
+async fn build_inventory_renderable(
+    entry: &serde_json::Value,
+) -> crate::seller::render::RenderableItem {
+    let title = entry
+        .get("displayNameColored")
+        .and_then(|v| v.as_str())
+        .or_else(|| entry.get("displayName").and_then(|v| v.as_str()))
+        .or_else(|| entry.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("Item")
+        .to_string();
+    let lore: Vec<String> = entry
+        .get("lore")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let count = entry.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+    let tag = entry.get("tag").and_then(|v| v.as_str());
+    let icon_png = fetch_icon_bytes(tag).await;
+    crate::seller::render::RenderableItem {
+        title,
+        lore,
+        count,
+        icon_png,
+        footer: None,
+    }
+}
+
+async fn build_auction_renderable(
+    entry: &serde_json::Value,
+) -> crate::seller::render::RenderableItem {
+    let title = entry
+        .get("item_name_colored")
+        .or_else(|| entry.get("item_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Auction")
+        .to_string();
+    let lore: Vec<String> = entry
+        .get("lore")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let tag = entry.get("tag").and_then(|v| v.as_str());
+    let price = entry
+        .get("starting_bid")
+        .or_else(|| entry.get("highest_bid"))
+        .and_then(|v| v.as_i64());
+    let bin = entry.get("bin").and_then(|v| v.as_bool()).unwrap_or(false);
+    let footer = price.map(|p| {
+        let label = if bin { "BIN" } else { "Bid" };
+        format!("§e{label}: {}", fmt_thousands(p))
+    });
+    let icon_png = fetch_icon_bytes(tag).await;
+    crate::seller::render::RenderableItem {
+        title,
+        lore,
+        count: 1,
+        icon_png,
+        footer,
+    }
+}
+
+fn fmt_thousands(n: i64) -> String {
+    let neg = n < 0;
+    let mag = n.unsigned_abs().to_string();
+    let bytes = mag.as_bytes();
+    let mut out = String::with_capacity(mag.len() + mag.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    if neg { format!("-{out}") } else { out }
+}
+
+/// Lightweight summary of everything the panel can select from — inventory
+/// slots plus the player's own active auctions.  The panel renders these as
+/// selectable tiles without needing extra API calls.
+async fn seller_available_items(State(s): State<WebSharedState>) -> impl IntoResponse {
+    let mut inventory: Vec<serde_json::Value> = Vec::new();
+    if let Some(raw) = s.bot_client.get_cached_inventory_json() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(slots) = v.get("slots").and_then(|v| v.as_array()) {
+                for entry in slots {
+                    if entry.is_null() {
+                        continue;
+                    }
+                    let slot = entry.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
+                    inventory.push(serde_json::json!({
+                        "slot": slot,
+                        "display_name": entry.get("displayNameColored").or_else(|| entry.get("displayName")).cloned(),
+                        "tag": entry.get("tag").cloned(),
+                        "count": entry.get("count").cloned().unwrap_or(serde_json::json!(1)),
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut auctions: Vec<serde_json::Value> = Vec::new();
+    if let Some(raw) = s.bot_client.get_cached_my_auctions_json() {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+            for (idx, a) in arr.iter().enumerate() {
+                if a.get("status").and_then(|v| v.as_str()) != Some("active") {
+                    continue;
+                }
+                let uuid = a
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .filter(|u| !u.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("idx:{idx}"));
+                auctions.push(serde_json::json!({
+                    "id": uuid,
+                    "display_name": a.get("item_name_colored").or_else(|| a.get("item_name")).cloned(),
+                    "tag": a.get("tag").cloned(),
+                    "bin": a.get("bin").cloned().unwrap_or(serde_json::json!(false)),
+                    "starting_bid": a.get("starting_bid").cloned().unwrap_or(serde_json::json!(0)),
+                    "time_remaining_seconds": a.get("time_remaining_seconds").cloned().unwrap_or(serde_json::json!(0)),
+                }));
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "inventory": inventory,
+        "auctions": auctions,
+    }))
 }
 
 #[cfg(test)]

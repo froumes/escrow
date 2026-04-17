@@ -728,6 +728,11 @@ async fn main() -> Result<()> {
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(twm::bazaar_tracker::BazaarOrderTracker::new());
 
+    // Background Discord auto-sender for the Seller tab.  One instance for
+    // the process — state lives in `SellerRunner` (start/stop, logs, counts).
+    let seller_runner = twm::seller::SellerRunner::new(bot_client.clone());
+    let seller_config_path = twm::seller::SellerConfig::default_path();
+
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
     {
@@ -759,6 +764,8 @@ async fn main() -> Result<()> {
             bazaar_tracker: bazaar_tracker.clone(),
             flip_history: flip_history.clone(),
             config_loader: config_loader.clone(),
+            seller_runner: seller_runner.clone(),
+            seller_config_path: seller_config_path.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {

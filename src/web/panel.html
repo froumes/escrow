@@ -480,6 +480,174 @@ img{display:block;max-width:100%}
     color:var(--red-2);
     font-size:.9em;
 }
+.sellerGrid{
+    display:grid;
+    grid-template-columns:minmax(320px,1fr) minmax(320px,1.2fr);
+    gap:28px;
+    margin-top:18px;
+}
+@media (max-width:960px){
+    .sellerGrid{grid-template-columns:1fr}
+}
+.sellerColumn{display:flex;flex-direction:column;gap:18px}
+.sellerField{display:flex;flex-direction:column;gap:8px}
+.sellerField > label{font-weight:600;font-size:.85em;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.sellerFieldHeader{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.sellerInput{
+    padding:10px 12px;
+    border-radius:10px;
+    border:1px solid var(--line);
+    background:var(--surface-soft);
+    color:var(--text);
+    font:inherit;
+    outline:none;
+    transition:border-color .15s ease;
+}
+.sellerInput:focus{border-color:var(--focus-ring)}
+.sellerInput::placeholder{opacity:.6}
+.sellerTextarea{
+    padding:12px 14px;
+    border-radius:12px;
+    border:1px solid var(--line);
+    background:var(--surface-soft);
+    color:var(--text);
+    font:inherit;
+    resize:vertical;
+    min-height:90px;
+    outline:none;
+}
+.sellerTextarea:focus{border-color:var(--focus-ring)}
+.sellerTokenRow{display:flex;gap:8px;align-items:center}
+.sellerTokenRow .sellerInput{flex:1 1 auto}
+.sellerHint{font-size:.82em;color:var(--muted);padding:4px 2px}
+.sellerHint.tone-green{color:var(--green-2)}
+.sellerHint.tone-red{color:var(--red-2)}
+.sellerHint.tone-blue{color:var(--accent)}
+.sellerEmpty{
+    padding:14px;
+    border:1px dashed var(--line);
+    border-radius:12px;
+    color:var(--muted);
+    background:var(--surface-soft);
+    font-size:.92em;
+}
+.sellerChannelRow{display:flex;gap:8px;align-items:center}
+.sellerChannelRow .sellerInput{flex:1 1 auto}
+.sellerCooldown{width:100px;flex:0 0 auto!important;text-align:center}
+.sellerChipRow{display:flex;flex-wrap:wrap;gap:8px}
+.sellerChip{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    padding:6px 10px;
+    border-radius:999px;
+    background:var(--surface-soft);
+    border:1px solid var(--line);
+    font-size:.9em;
+    max-width:100%;
+}
+.sellerChipLabel{
+    max-width:180px;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+}
+.sellerChipAction,.sellerChipRemove{
+    background:transparent;
+    border:none;
+    color:var(--muted);
+    cursor:pointer;
+    padding:0 2px;
+    font-size:1em;
+}
+.sellerChipRemove{color:var(--red-2);font-weight:700}
+.sellerChipAction:hover{color:var(--accent)}
+.sellerItemGrid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(120px,1fr));
+    gap:10px;
+    max-height:320px;
+    overflow-y:auto;
+    padding:4px;
+}
+.sellerItemTile{
+    position:relative;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:6px;
+    padding:10px 8px;
+    background:var(--surface-soft);
+    border:1px solid var(--line);
+    border-radius:12px;
+    cursor:pointer;
+    color:var(--text);
+    text-align:center;
+    transition:transform .1s ease,border-color .15s ease,background .15s ease;
+    font:inherit;
+}
+.sellerItemTile:hover{border-color:var(--focus-ring);transform:translateY(-1px)}
+.sellerItemTile.picked{border-color:var(--green-2);background:rgba(34,197,94,.08)}
+.sellerItemTile img{width:48px;height:48px;image-rendering:pixelated}
+.sellerItemIconFallback{
+    width:48px;height:48px;
+    display:flex;align-items:center;justify-content:center;
+    background:var(--line);
+    border-radius:8px;
+    font-weight:700;color:var(--muted);
+}
+.sellerItemName{
+    font-size:.82em;
+    line-height:1.1;
+    max-height:2.4em;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
+}
+.sellerItemMeta{font-size:.72em;color:var(--muted)}
+.sellerPreviewBox{
+    margin-top:10px;
+    padding:10px;
+    background:var(--surface-soft);
+    border:1px solid var(--line);
+    border-radius:12px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:8px;
+}
+.sellerPreviewImg{max-width:100%;max-height:260px;image-rendering:pixelated;border-radius:8px}
+.sellerStatusCard{
+    margin-top:22px;
+    padding:16px 18px;
+    border:1px solid var(--line);
+    border-radius:14px;
+    background:var(--surface-soft);
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+}
+.sellerCountRow{display:flex;flex-wrap:wrap;gap:6px}
+.sellerLogBox{
+    max-height:220px;
+    overflow-y:auto;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+    font-size:.85em;
+    border-radius:8px;
+    background:rgba(0,0,0,.25);
+    padding:8px 10px;
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+}
+.sellerLogLine{display:flex;gap:10px;color:var(--text)}
+.sellerLogLine.tone-success{color:var(--green-2)}
+.sellerLogLine.tone-warn{color:#f59e0b}
+.sellerLogLine.tone-error{color:var(--red-2)}
+.sellerLogTs{color:var(--muted);flex:0 0 auto;min-width:72px}
+.sellerLogMsg{flex:1 1 auto;word-break:break-word}
 .heroMeta{
     margin-top:20px;
     display:flex;
@@ -1511,6 +1679,14 @@ const API = {
     cancelBz: "/api/cancel_bz_order",
     chatSend: "/api/chat/send",
     logsLatest: "/api/logs/latest",
+    sellerConfig: "/api/seller/config",
+    sellerStatus: "/api/seller/status",
+    sellerStart: "/api/seller/start",
+    sellerStop: "/api/seller/stop",
+    sellerValidateToken: "/api/seller/validate_token",
+    sellerValidateChannel: "/api/seller/validate_channel",
+    sellerPreview: "/api/seller/preview",
+    sellerAvailable: "/api/seller/available_items",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -1524,6 +1700,7 @@ const TAB_DEFS = [
     ["inventory", "Inventory"],
     ["market", "Market"],
     ["queue", "Queue"],
+    ["seller", "Seller"],
     ["config", "Config"],
     ["chat", "Chat"]
 ];
@@ -2499,6 +2676,29 @@ function App() {
     const [chatInput, setChatInput] = useState("");
     const [buyAuctionId, setBuyAuctionId] = useState("");
     const [buyAuctionError, setBuyAuctionError] = useState("");
+    const [sellerConfig, setSellerConfig] = useState({
+        token: "",
+        has_token: false,
+        message: "",
+        selected_items: [],
+        channels: []
+    });
+    const [sellerConfigLoaded, setSellerConfigLoaded] = useState(false);
+    const [sellerStatus, setSellerStatus] = useState({
+        running: false,
+        sent_counts: {},
+        active_channels: [],
+        logs: []
+    });
+    const [sellerAvailable, setSellerAvailable] = useState({ inventory: [], auctions: [] });
+    const [sellerDraftMessage, setSellerDraftMessage] = useState("");
+    const [sellerDraftToken, setSellerDraftToken] = useState("");
+    const [sellerDraftChannels, setSellerDraftChannels] = useState([]);
+    const [sellerDraftSelected, setSellerDraftSelected] = useState([]);
+    const [sellerTokenValidation, setSellerTokenValidation] = useState({ state: "idle", message: "" });
+    const [sellerError, setSellerError] = useState("");
+    const [sellerPreviewUrl, setSellerPreviewUrl] = useState("");
+    const [sellerPreviewKey, setSellerPreviewKey] = useState("");
     const [chat, setChat] = useState([]);
     const [chatConnected, setChatConnected] = useState(false);
     const [chatFilter, setChatFilter] = useState("");
@@ -2748,6 +2948,174 @@ function App() {
         }
     }, [buyAuctionId, flash, handleUnauthorized, refreshEverything]);
 
+    const refreshSellerConfig = useCallback(async () => {
+        try {
+            const cfg = await req(API.sellerConfig);
+            setSellerConfig(cfg);
+            setSellerDraftMessage(cfg.message || "");
+            setSellerDraftChannels(Array.isArray(cfg.channels) ? cfg.channels.map((c) => ({
+                channel_id: c.channel_id || "",
+                cooldown_seconds: c.cooldown_seconds ?? 60
+            })) : []);
+            setSellerDraftSelected(Array.isArray(cfg.selected_items) ? cfg.selected_items.slice(0, 10) : []);
+            setSellerDraftToken(cfg.token || "");
+            setSellerConfigLoaded(true);
+        } catch (error) {
+            if (error.status === 401) handleUnauthorized();
+        }
+    }, [handleUnauthorized]);
+
+    const refreshSellerStatus = useCallback(async () => {
+        try {
+            const s = await req(API.sellerStatus);
+            setSellerStatus(s);
+        } catch (error) {
+            if (error.status === 401) handleUnauthorized();
+        }
+    }, [handleUnauthorized]);
+
+    const refreshSellerAvailable = useCallback(async () => {
+        try {
+            const data = await req(API.sellerAvailable);
+            setSellerAvailable({
+                inventory: Array.isArray(data.inventory) ? data.inventory : [],
+                auctions: Array.isArray(data.auctions) ? data.auctions : []
+            });
+        } catch (error) {
+            if (error.status === 401) handleUnauthorized();
+        }
+    }, [handleUnauthorized]);
+
+    const persistSellerConfig = useCallback(async (next) => {
+        try {
+            await req(API.sellerConfig, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(next)
+            });
+            return true;
+        } catch (error) {
+            if (error.status === 401) { handleUnauthorized(); return false; }
+            setSellerError(error.message || "Failed to save Seller config");
+            flash(error.message || "Failed to save Seller config");
+            return false;
+        }
+    }, [flash, handleUnauthorized]);
+
+    const saveSellerConfig = useCallback(async () => {
+        const payload = {
+            token: sellerDraftToken,
+            message: sellerDraftMessage,
+            selected_items: sellerDraftSelected,
+            channels: sellerDraftChannels
+                .filter((c) => (c.channel_id || "").trim())
+                .map((c) => ({
+                    channel_id: (c.channel_id || "").trim(),
+                    cooldown_seconds: Math.max(5, Number(c.cooldown_seconds) || 60)
+                }))
+        };
+        if (await persistSellerConfig(payload)) {
+            setSellerError("");
+            flash("Seller config saved");
+            await refreshSellerConfig();
+        }
+    }, [flash, persistSellerConfig, refreshSellerConfig, sellerDraftChannels, sellerDraftMessage, sellerDraftSelected, sellerDraftToken]);
+
+    const validateSellerToken = useCallback(async () => {
+        setSellerTokenValidation({ state: "loading", message: "Validating..." });
+        try {
+            const res = await req(API.sellerValidateToken, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ token: sellerDraftToken })
+            });
+            setSellerTokenValidation({ state: "ok", message: `Logged in as ${res.username}` });
+        } catch (error) {
+            if (error.status === 401) { handleUnauthorized(); return; }
+            setSellerTokenValidation({ state: "error", message: error.message || "Token rejected" });
+        }
+    }, [handleUnauthorized, sellerDraftToken]);
+
+    const toggleSellerSelection = useCallback((sel) => {
+        setSellerDraftSelected((prev) => {
+            const keyOf = (item) => item.kind === "inventory" ? `inv:${item.slot}` : `auc:${item.uuid}`;
+            const k = keyOf(sel);
+            if (prev.some((s) => keyOf(s) === k)) {
+                return prev.filter((s) => keyOf(s) !== k);
+            }
+            if (prev.length >= 10) return prev;
+            return [...prev, sel];
+        });
+    }, []);
+
+    const addSellerChannel = useCallback(() => {
+        setSellerDraftChannels((prev) => [...prev, { channel_id: "", cooldown_seconds: 60 }]);
+    }, []);
+
+    const removeSellerChannel = useCallback((idx) => {
+        setSellerDraftChannels((prev) => prev.filter((_, i) => i !== idx));
+    }, []);
+
+    const startSeller = useCallback(async () => {
+        setSellerError("");
+        const payload = {
+            token: sellerDraftToken,
+            message: sellerDraftMessage,
+            selected_items: sellerDraftSelected,
+            channels: sellerDraftChannels
+                .filter((c) => (c.channel_id || "").trim())
+                .map((c) => ({
+                    channel_id: (c.channel_id || "").trim(),
+                    cooldown_seconds: Math.max(5, Number(c.cooldown_seconds) || 60)
+                }))
+        };
+        try {
+            await req(API.sellerStart, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            flash("Seller started");
+            await Promise.all([refreshSellerStatus(), refreshSellerConfig()]);
+        } catch (error) {
+            if (error.status === 401) { handleUnauthorized(); return; }
+            setSellerError(error.message || "Failed to start Seller");
+            flash(error.message || "Failed to start Seller");
+        }
+    }, [flash, handleUnauthorized, refreshSellerConfig, refreshSellerStatus, sellerDraftChannels, sellerDraftMessage, sellerDraftSelected, sellerDraftToken]);
+
+    const stopSeller = useCallback(async () => {
+        try {
+            await req(API.sellerStop, { method: "POST" });
+            flash("Seller stopped");
+            await refreshSellerStatus();
+        } catch (error) {
+            if (error.status === 401) { handleUnauthorized(); return; }
+            flash(error.message || "Failed to stop Seller");
+        }
+    }, [flash, handleUnauthorized, refreshSellerStatus]);
+
+    const previewSellerItem = useCallback(async (sel) => {
+        const key = sel.kind === "inventory" ? `inv:${sel.slot}` : `auc:${sel.uuid}`;
+        try {
+            const resp = await fetch(API.sellerPreview, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ item: sel }),
+                credentials: "same-origin"
+            });
+            if (resp.status === 401) { handleUnauthorized(); return; }
+            if (!resp.ok) { flash("Preview unavailable"); return; }
+            const blob = await resp.blob();
+            if (sellerPreviewUrl) URL.revokeObjectURL(sellerPreviewUrl);
+            const url = URL.createObjectURL(blob);
+            setSellerPreviewUrl(url);
+            setSellerPreviewKey(key);
+        } catch (error) {
+            flash(error.message || "Preview failed");
+        }
+    }, [flash, handleUnauthorized, sellerPreviewUrl]);
+
     const sendChat = useCallback(async () => {
         if (!chatInput.trim()) return;
         try {
@@ -2860,6 +3228,18 @@ function App() {
             loadConfig();
         }
     }, [activeTab, configText, loadConfig]);
+
+    useEffect(() => {
+        if (needsAuth || activeTab !== "seller") return undefined;
+        if (!sellerConfigLoaded) refreshSellerConfig();
+        refreshSellerAvailable();
+        refreshSellerStatus();
+        const interval = window.setInterval(() => {
+            refreshSellerStatus();
+            refreshSellerAvailable();
+        }, 4000);
+        return () => window.clearInterval(interval);
+    }, [needsAuth, activeTab, sellerConfigLoaded, refreshSellerConfig, refreshSellerAvailable, refreshSellerStatus]);
 
     useEffect(() => {
         if (!Object.keys(status || {}).length) return;
@@ -3580,6 +3960,199 @@ function App() {
 
                 ${renderedTab === "queue" ? html`
                     <${QueueCard} status=${status} queue=${queue} />
+                ` : null}
+
+                ${renderedTab === "seller" ? html`
+                    <${Panel}>
+                        <div className="cardBody">
+                            <div className="sectionTitle">
+                                <div>
+                                    <span className="eyebrow">Seller</span>
+                                    <h2 className="panelTitle">Auto-post item screenshots to Discord</h2>
+                                    <p>Pick up to 10 items from your inventory or active auctions, set a message, and the bot will render per-item cards and re-post on a cooldown.</p>
+                                </div>
+                                <div className="configTools">
+                                    <span className=${cls("pill", sellerStatus.running ? "tone-green" : "tone-red")}>
+                                        ${sellerStatus.running ? "Running" : "Stopped"}
+                                    </span>
+                                    ${sellerStatus.running
+                                        ? html`<${Button} kind="danger" onClick=${stopSeller}>Stop</${Button}>`
+                                        : html`<${Button} kind="success" onClick=${startSeller}>Start</${Button}>`
+                                    }
+                                    <${Button} kind="secondary" onClick=${saveSellerConfig}>Save Settings</${Button}>
+                                </div>
+                            </div>
+
+                            ${sellerError ? html`<div className="configMsg">${sellerError}</div>` : null}
+
+                            <div className="sellerGrid">
+                                <div className="sellerColumn">
+                                    <div className="sellerField">
+                                        <label>Discord Token</label>
+                                        <div className="sellerTokenRow">
+                                            <input
+                                                className="sellerInput"
+                                                type="password"
+                                                placeholder=${sellerConfig.has_token ? sellerConfig.token : "Paste your Discord user token"}
+                                                value=${sellerDraftToken}
+                                                onInput=${(e) => { setSellerDraftToken(e.target.value); setSellerTokenValidation({ state: "idle", message: "" }); }}
+                                                spellcheck="false"
+                                                autoComplete="off"
+                                            />
+                                            <${Button} kind="ghost" onClick=${validateSellerToken}>Validate</${Button}>
+                                        </div>
+                                        ${sellerTokenValidation.state !== "idle"
+                                            ? html`<div className=${cls("sellerHint", sellerTokenValidation.state === "ok" ? "tone-green" : sellerTokenValidation.state === "error" ? "tone-red" : "")}>${sellerTokenValidation.message}</div>`
+                                            : sellerConfig.has_token ? html`<div className="sellerHint tone-blue">Token on file: ${sellerConfig.token}. Leave blank to reuse.</div>` : null}
+                                    </div>
+
+                                    <div className="sellerField">
+                                        <label>Message</label>
+                                        <textarea
+                                            className="sellerTextarea"
+                                            placeholder="Message body posted alongside the item screenshots"
+                                            value=${sellerDraftMessage}
+                                            onInput=${(e) => setSellerDraftMessage(e.target.value)}
+                                            rows="4"
+                                        ></textarea>
+                                    </div>
+
+                                    <div className="sellerField">
+                                        <div className="sellerFieldHeader">
+                                            <label>Channels</label>
+                                            <${Button} kind="ghost" onClick=${addSellerChannel}>+ Add Channel</${Button}>
+                                        </div>
+                                        ${sellerDraftChannels.length === 0
+                                            ? html`<div className="sellerEmpty">No channels yet — add at least one Discord channel ID to begin posting.</div>`
+                                            : sellerDraftChannels.map((ch, idx) => html`
+                                                <div className="sellerChannelRow" key=${idx}>
+                                                    <input
+                                                        className="sellerInput"
+                                                        type="text"
+                                                        placeholder="Channel ID"
+                                                        value=${ch.channel_id}
+                                                        onInput=${(e) => setSellerDraftChannels((prev) => prev.map((c, i) => i === idx ? { ...c, channel_id: e.target.value } : c))}
+                                                    />
+                                                    <input
+                                                        className="sellerInput sellerCooldown"
+                                                        type="number"
+                                                        min="5"
+                                                        step="1"
+                                                        value=${ch.cooldown_seconds}
+                                                        onInput=${(e) => setSellerDraftChannels((prev) => prev.map((c, i) => i === idx ? { ...c, cooldown_seconds: Number(e.target.value) } : c))}
+                                                    />
+                                                    <${Button} kind="danger" onClick=${() => removeSellerChannel(idx)}>Remove</${Button}>
+                                                </div>
+                                            `)}
+                                    </div>
+                                </div>
+
+                                <div className="sellerColumn">
+                                    <div className="sellerField">
+                                        <div className="sellerFieldHeader">
+                                            <label>Selected Items (${sellerDraftSelected.length} / 10)</label>
+                                            ${sellerDraftSelected.length > 0 ? html`<${Button} kind="ghost" onClick=${() => setSellerDraftSelected([])}>Clear</${Button}>` : null}
+                                        </div>
+                                        ${sellerDraftSelected.length === 0
+                                            ? html`<div className="sellerEmpty">Click an inventory slot or auction below to add it. Up to 10 items per message.</div>`
+                                            : html`
+                                                <div className="sellerChipRow">
+                                                    ${sellerDraftSelected.map((sel, idx) => {
+                                                        const key = sel.kind === "inventory" ? `inv:${sel.slot}` : `auc:${sel.uuid}`;
+                                                        const label = sel.kind === "inventory" ? `Inventory slot ${sel.slot}` : `Auction ${String(sel.uuid).slice(0, 12)}`;
+                                                        const tagPreview = sel.kind === "inventory"
+                                                            ? (sellerAvailable.inventory.find((it) => it.slot === sel.slot)?.display_name || label)
+                                                            : (sellerAvailable.auctions.find((it) => it.id === sel.uuid)?.display_name || label);
+                                                        return html`
+                                                            <div className="sellerChip" key=${key}>
+                                                                <span className="sellerChipLabel">${stripMc(tagPreview)}</span>
+                                                                <button type="button" className="sellerChipAction" onClick=${() => previewSellerItem(sel)} title="Preview">&#128065;</button>
+                                                                <button type="button" className="sellerChipRemove" onClick=${() => setSellerDraftSelected((prev) => prev.filter((_, i) => i !== idx))}>×</button>
+                                                            </div>
+                                                        `;
+                                                    })}
+                                                </div>
+                                            `}
+                                        ${sellerPreviewUrl ? html`
+                                            <div className="sellerPreviewBox">
+                                                <img className="sellerPreviewImg" src=${sellerPreviewUrl} alt="Item preview" />
+                                                <button type="button" className="sellerChipRemove" onClick=${() => { URL.revokeObjectURL(sellerPreviewUrl); setSellerPreviewUrl(""); setSellerPreviewKey(""); }}>Close</button>
+                                            </div>
+                                        ` : null}
+                                    </div>
+
+                                    <div className="sellerField">
+                                        <label>Inventory</label>
+                                        ${sellerAvailable.inventory.length === 0
+                                            ? html`<div className="sellerEmpty">No inventory cached yet. The bot populates this once you're in-game.</div>`
+                                            : html`
+                                                <div className="sellerItemGrid">
+                                                    ${sellerAvailable.inventory.map((it) => {
+                                                        const sel = { kind: "inventory", slot: it.slot };
+                                                        const key = `inv:${it.slot}`;
+                                                        const picked = sellerDraftSelected.some((s) => s.kind === "inventory" && s.slot === it.slot);
+                                                        return html`
+                                                            <button key=${key} type="button" className=${cls("sellerItemTile", picked && "picked")} onClick=${() => toggleSellerSelection(sel)}>
+                                                                ${it.tag ? html`<img src=${`https://sky.coflnet.com/static/icon/${it.tag}`} alt="" />` : html`<div className="sellerItemIconFallback">?</div>`}
+                                                                <span className="sellerItemName">${stripMc(it.display_name || "")}</span>
+                                                                <span className="sellerItemMeta">Slot ${it.slot}${it.count > 1 ? ` · x${it.count}` : ""}</span>
+                                                            </button>
+                                                        `;
+                                                    })}
+                                                </div>
+                                            `}
+                                    </div>
+
+                                    <div className="sellerField">
+                                        <label>Your Active Auctions</label>
+                                        ${sellerAvailable.auctions.length === 0
+                                            ? html`<div className="sellerEmpty">No active auctions cached. Open /ah &rarr; Manage Auctions in-game to populate.</div>`
+                                            : html`
+                                                <div className="sellerItemGrid">
+                                                    ${sellerAvailable.auctions.map((it) => {
+                                                        const sel = { kind: "auction", uuid: it.id };
+                                                        const key = `auc:${it.id}`;
+                                                        const picked = sellerDraftSelected.some((s) => s.kind === "auction" && s.uuid === it.id);
+                                                        return html`
+                                                            <button key=${key} type="button" className=${cls("sellerItemTile", picked && "picked")} onClick=${() => toggleSellerSelection(sel)}>
+                                                                ${it.tag ? html`<img src=${`https://sky.coflnet.com/static/icon/${it.tag}`} alt="" />` : html`<div className="sellerItemIconFallback">?</div>`}
+                                                                <span className="sellerItemName">${stripMc(it.display_name || "")}</span>
+                                                                <span className="sellerItemMeta">${it.bin ? "BIN" : "Bid"} · ${coins(it.starting_bid || 0)}</span>
+                                                            </button>
+                                                        `;
+                                                    })}
+                                                </div>
+                                            `}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="sellerStatusCard">
+                                <div className="sectionTitle">
+                                    <div>
+                                        <span className="eyebrow">Activity</span>
+                                        <h3 className="panelTitle">${sellerStatus.running ? `Posting to ${sellerStatus.active_channels.length} channel(s)` : "Not running"}</h3>
+                                    </div>
+                                    ${sellerStatus.running && Object.keys(sellerStatus.sent_counts || {}).length > 0 ? html`
+                                        <div className="sellerCountRow">
+                                            ${Object.entries(sellerStatus.sent_counts).map(([id, n]) => html`
+                                                <span className="pill">${id}: ${n}</span>
+                                            `)}
+                                        </div>
+                                    ` : null}
+                                </div>
+                                <div className="sellerLogBox">
+                                    ${(sellerStatus.logs || []).slice().reverse().map((log, i) => html`
+                                        <div key=${i} className=${cls("sellerLogLine", `tone-${log.level}`)}>
+                                            <span className="sellerLogTs">${new Date(log.ts).toLocaleTimeString()}</span>
+                                            <span className="sellerLogMsg">${log.message}</span>
+                                        </div>
+                                    `)}
+                                    ${(sellerStatus.logs || []).length === 0 ? html`<div className="sellerEmpty">No activity yet.</div>` : null}
+                                </div>
+                            </div>
+                        </div>
+                    </${Panel}>
                 ` : null}
 
                 ${renderedTab === "config" ? html`
