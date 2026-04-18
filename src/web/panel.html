@@ -1447,16 +1447,30 @@ tbody tr.selected{background:var(--surface-soft-hover)}
     z-index:120;
     padding:18px;
     display:flex;
+    flex-direction:column;
     align-items:center;
-    justify-content:center;
+    justify-content:flex-start;
     background:rgba(6,9,10,.76);
     backdrop-filter:blur(18px);
+    /* Scroll the overlay itself when its contents exceed the viewport
+       (e.g. on mobile where both panels stack vertically and the soft
+       keyboard further shrinks the available space).  Without this,
+       `align-items:center` clips the top of the content and the
+       password field becomes unreachable. */
+    overflow-y:auto;
+    overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch;
 }
 .overlayGrid{
     width:min(1180px,100%);
     display:grid;
     grid-template-columns:.92fr 1.08fr;
     gap:18px;
+    /* Combined with `flex-direction:column` on `.overlay`, auto vertical
+       margins center the grid when there's free space and collapse when
+       the content is taller than the viewport — letting the overlay
+       scroll naturally without ever hiding the top of the form. */
+    margin:auto 0;
 }
 .loginPanel{padding:22px}
 .loginPanel h2{font-size:clamp(1.8rem,3vw,2.8rem)}
@@ -1769,6 +1783,20 @@ tbody tr.selected{background:var(--surface-soft-hover)}
     .toolbar .themeToggle,
     .toolbar .themeSelect{width:auto}
     .loginActions .button{width:auto}
+    /* Tighten the overlay padding so the form gets as much space as
+       possible above the soft keyboard. */
+    .overlay{padding:10px}
+    .overlayGrid{gap:12px}
+    /* Drop the secondary "Public Snapshot" panel on phones — the login
+       form is the only thing the user can act on at this point, and the
+       second panel doubles the overlay's height which is what made the
+       password field scroll out of reach in the first place. */
+    .overlayGrid > :nth-child(2){display:none}
+    /* iOS Safari auto-zooms any input whose computed font-size is below
+       16px and refuses to scroll back, leaving the form offset to the
+       upper-left.  Forcing 16px here keeps the viewport stable when the
+       password field gains focus. */
+    .loginField{font-size:16px}
 }
 </style>
 </head>
