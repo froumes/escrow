@@ -3162,12 +3162,21 @@ function App() {
                 handleUnauthorized();
                 return;
             }
-            if (error.status === 404) {
-                flash("No share link configured — set share_public_url or web_share_token in config");
-                setShareLink(null);
-                return;
-            }
-            flash(error.message || "Failed to fetch share link");
+            // The share-link endpoint returns structured JSON like
+            // `{"error": "..."}` for the configuration footguns it catches
+            // (numeric-IP `share_public_url`, push-without-public-url, etc.).
+            // Surface that text directly so users see exactly what to fix
+            // instead of a generic "Failed to fetch share link".
+            let detail = "";
+            try {
+                const parsed = JSON.parse(error.message || "");
+                if (parsed && typeof parsed.error === "string") {
+                    detail = parsed.error;
+                }
+            } catch (_e) { /* not JSON, fall through */ }
+            if (!detail) detail = error.message || "Failed to fetch share link";
+            setShareLink(null);
+            flash(detail);
         } finally {
             setShareLinkLoading(false);
         }

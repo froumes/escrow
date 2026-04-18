@@ -78,6 +78,12 @@ pub struct WebSharedState {
     /// domain backed by an outbound `share_push_url`) instead of exposing
     /// the bot's host directly.
     pub share_public_url: Option<String>,
+    /// Mirror of `config.share_push_url`.  Used by the share-link endpoint
+    /// to detect the "operator opted into the remote-push flow" state so
+    /// the panel can refuse the local `/share/{token}` fallback (which
+    /// would expose the bot's host) and prompt them to set
+    /// `share_public_url` instead.
+    pub share_push_url: Option<String>,
     /// Active web sessions with deterministic FIFO eviction at capacity.
     pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -1814,12 +1820,61 @@ struct ShareLinkResponse {
     kind: &'static str,
 }
 
+/// Parsed host portion of a URL (no scheme, no port, no path) lower-cased.
+/// Returns `None` when the URL is malformed enough that we can't extract a
+/// host — callers should refuse to hand the URL out in that case.
+fn extract_url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let authority = authority.split('@').next_back()?;
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next()?.to_string()
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| authority.to_string())
+    };
+    let host = host.trim().to_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Returns `true` when `host` is a bare numeric address (IPv4 or IPv6) or a
+/// loopback name — i.e. a host that exposes the bot's network location to
+/// anyone who opens the URL.  Operators using the remote-push flow want to
+/// hide their VPS, so the share endpoint refuses to hand out URLs whose
+/// host matches this predicate.
+fn host_exposes_bot_network(host: &str) -> bool {
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok()
+        || host.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        return true;
+    }
+    false
+}
+
 /// GET /api/share/link — auth-gated helper for the panel's "Share Stats"
-/// button.  Returns the pre-configured `share_public_url` if set; otherwise
-/// falls back to a locally-derived `http(s)://<host>/share/<token>` URL when
-/// `web_share_token` is configured.  Returns 404 when neither is set so the
-/// frontend can show a clear "configure a token first" message without
-/// leaking whether sharing exists at all.
+/// button.  Decides which URL to hand out with these rules, in order:
+///
+///   1. If `share_public_url` is set:
+///        a. Reject when its host is a numeric IP / `localhost` — that
+///           defeats the purpose of having a remote URL.
+///        b. Otherwise return it as `kind: "remote"`.
+///   2. Else if `share_push_url` is set (operator opted into the
+///      remote-push flow but forgot to configure the public URL): refuse
+///      with a 409 explaining what to set.  Falling back to the local
+///      `/share/{token}` link here would silently expose the bot's host.
+///   3. Else if `web_share_token` is set: build
+///      `http(s)://<host>/share/<token>` from the request headers and
+///      return it as `kind: "local"`.
+///   4. Else: 404 (nothing configured).
 ///
 /// Lives behind the same auth gate as the rest of `/api/*` so anonymous
 /// callers can't enumerate whether sharing is configured.
@@ -1827,7 +1882,33 @@ async fn get_share_link(
     State(s): State<WebSharedState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Some(remote) = s.share_public_url.as_deref().filter(|u| !u.is_empty()) {
+    let public_url = s.share_public_url.as_deref().filter(|u| !u.is_empty());
+    let push_url = s.share_push_url.as_deref().filter(|u| !u.is_empty());
+    let token = s.web_share_token.as_deref().filter(|t| !t.is_empty());
+
+    if let Some(remote) = public_url {
+        let Some(host) = extract_url_host(remote) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "share_public_url is malformed ('{remote}') — expected something like https://yourdomain.tld/twm?t=<viewer_token>"
+                    )
+                })),
+            )
+                .into_response();
+        };
+        if host_exposes_bot_network(&host) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "share_public_url points at '{host}', which exposes this bot's host. Set share_public_url to your remote site's URL (e.g. https://yourdomain.tld/twm?t=<viewer_token>)."
+                    )
+                })),
+            )
+                .into_response();
+        }
         return Json(ShareLinkResponse {
             url: remote.to_string(),
             kind: "remote",
@@ -1835,7 +1916,17 @@ async fn get_share_link(
         .into_response();
     }
 
-    let Some(token) = s.web_share_token.as_deref().filter(|t| !t.is_empty()) else {
+    if push_url.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "share_push_url is configured but share_public_url is not — set share_public_url to the URL viewers should open (e.g. https://yourdomain.tld/twm?t=<viewer_token>) so the bot's host stays hidden"
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(token) = token else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -2564,6 +2655,44 @@ mod tests {
         assert!(entries[0].bin);
         assert!(entries[0].tag.is_some());
         assert_eq!(entries[0].tag.as_deref(), Some("DIAMOND_SWORD"));
+    }
+
+    #[test]
+    fn extract_url_host_handles_common_shapes() {
+        assert_eq!(
+            extract_url_host("https://austinxyz.lol/twm?t=abc").as_deref(),
+            Some("austinxyz.lol")
+        );
+        assert_eq!(
+            extract_url_host("http://130.51.22.60:8080/share/test1").as_deref(),
+            Some("130.51.22.60")
+        );
+        assert_eq!(
+            extract_url_host("http://[::1]:8080/share/x").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(
+            extract_url_host("https://user:pw@example.com/path").as_deref(),
+            Some("example.com")
+        );
+        // No scheme prefix is treated as host-only — still extracts a host.
+        assert_eq!(
+            extract_url_host("austinxyz.lol/twm").as_deref(),
+            Some("austinxyz.lol")
+        );
+        assert_eq!(extract_url_host("").as_deref(), None);
+    }
+
+    #[test]
+    fn host_exposes_bot_network_flags_ips_and_localhost() {
+        assert!(host_exposes_bot_network("localhost"));
+        assert!(host_exposes_bot_network("dev.localhost"));
+        assert!(host_exposes_bot_network("127.0.0.1"));
+        assert!(host_exposes_bot_network("130.51.22.60"));
+        assert!(host_exposes_bot_network("::1"));
+        assert!(host_exposes_bot_network("2001:db8::1"));
+        assert!(!host_exposes_bot_network("austinxyz.lol"));
+        assert!(!host_exposes_bot_network("twm.example.com"));
     }
 
     #[test]
