@@ -72,6 +72,12 @@ pub struct WebSharedState {
     /// Optional unguessable token enabling the read-only public stats page at
     /// `/share/{token}`.  `None` (or empty) disables the route entirely.
     pub web_share_token: Option<String>,
+    /// Pre-formed public URL handed out by the panel's "Share Stats" button.
+    /// When set, takes precedence over the locally-derived `/share/{token}`
+    /// URL so operators can point viewers at a remote site (e.g. their own
+    /// domain backed by an outbound `share_push_url`) instead of exposing
+    /// the bot's host directly.
+    pub share_public_url: Option<String>,
     /// Active web sessions with deterministic FIFO eviction at capacity.
     pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -321,7 +327,13 @@ async fn check_auth(
     // The public stats share page enforces its own token check inside the
     // handler.  Bypass the password gate so anyone with the share URL can view
     // it even when the panel is otherwise password-protected.
-    if path.starts_with("/share/") || path.starts_with("/api/share/") {
+    //
+    // `/api/share/link` is the panel's own "give me the share URL" helper and
+    // must stay behind the password gate so anonymous callers can't fish for
+    // a configured viewer token.
+    if path.starts_with("/share/")
+        || (path.starts_with("/api/share/") && path != "/api/share/link")
+    {
         return next.run(req).await;
     }
 
@@ -350,6 +362,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/og-image.png", get(get_og_image))
         .route("/share/{token}", get(get_share_page))
         .route("/api/share/{token}/stats", get(get_share_stats))
+        .route("/api/share/link", get(get_share_link))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -1789,6 +1802,73 @@ async fn get_share_stats(
         return StatusCode::NOT_FOUND.into_response();
     }
     Json(build_public_share_stats(&s)).into_response()
+}
+
+/// Where the configured share link points: either a remote URL the operator
+/// pre-set (e.g. their own domain) or the bot's own `/share/{token}` page.
+#[derive(Serialize)]
+struct ShareLinkResponse {
+    url: String,
+    /// `"remote"` when sourced from `share_public_url`, `"local"` when
+    /// derived from `web_share_token` + the request's Host header.
+    kind: &'static str,
+}
+
+/// GET /api/share/link — auth-gated helper for the panel's "Share Stats"
+/// button.  Returns the pre-configured `share_public_url` if set; otherwise
+/// falls back to a locally-derived `http(s)://<host>/share/<token>` URL when
+/// `web_share_token` is configured.  Returns 404 when neither is set so the
+/// frontend can show a clear "configure a token first" message without
+/// leaking whether sharing exists at all.
+///
+/// Lives behind the same auth gate as the rest of `/api/*` so anonymous
+/// callers can't enumerate whether sharing is configured.
+async fn get_share_link(
+    State(s): State<WebSharedState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(remote) = s.share_public_url.as_deref().filter(|u| !u.is_empty()) {
+        return Json(ShareLinkResponse {
+            url: remote.to_string(),
+            kind: "remote",
+        })
+        .into_response();
+    }
+
+    let Some(token) = s.web_share_token.as_deref().filter(|t| !t.is_empty()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no share link configured — set share_public_url or web_share_token"
+            })),
+        )
+            .into_response();
+    };
+
+    // Prefer the proxy-supplied scheme when present (the bot is normally
+    // accessed directly over HTTP, but operators sometimes front it with
+    // Caddy/Nginx/Cloudflare for HTTPS).  Fall back to http otherwise so
+    // the link is always copy-pasteable even without a proxy.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http".to_string());
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "localhost".to_string());
+
+    Json(ShareLinkResponse {
+        url: format!("{scheme}://{host}/share/{token}"),
+        kind: "local",
+    })
+    .into_response()
 }
 
 async fn chat_ws_handler(

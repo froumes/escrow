@@ -107,6 +107,13 @@ Useful settings include:
   profit charts, recent realized flips, and active-auction / bazaar-order
   counts — but cannot see the IGN, chat, config, or send commands. Leave empty
   to disable. Rotate by changing the value and reloading config.
+- `share_public_url`
+  Pre-formed URL the panel's "Share Stats" button copies to your clipboard.
+  Set this to whatever link you want viewers to open — typically the page on
+  your remote site that pairs with `share_push_url`, e.g.
+  `https://yourdomain.tld/twm?t=<viewer_token>`. When unset, the button falls
+  back to the local `http://<this-host>/share/<web_share_token>` URL (which
+  requires `web_share_token` to be set and exposes this bot's host).
 - `enable_bazaar_flips`
   Enables or disables Bazaar flipping logic at startup.
 - `fastbuy`

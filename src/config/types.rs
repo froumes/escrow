@@ -231,6 +231,19 @@ pub struct Config {
     #[serde(default = "default_share_push_interval_seconds")]
     pub share_push_interval_seconds: u64,
 
+    /// Pre-formed public URL handed out by the "Share Stats" button in the
+    /// web panel.  Set this to whatever link a viewer should open — typically
+    /// the page on the remote site that pairs with `share_push_url`, e.g.
+    /// `https://austinxyz.lol/twm?t=<viewer_token>`.
+    ///
+    /// When this is empty the panel falls back to the local
+    /// `http://<host>/share/<web_share_token>` URL (only useful if you don't
+    /// mind exposing the bot's host directly).  When neither this nor
+    /// `web_share_token` is set, the Share button reports that no link is
+    /// configured.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub share_public_url: Option<String>,
+
     /// Hypixel API key for fetching active auctions. Obtain one from https://developer.hypixel.net/
     /// Leave empty to use the Coflnet API as a fallback.
     #[serde(default, with = "opt_string_as_empty")]
@@ -389,6 +402,7 @@ impl Default for Config {
             share_push_url: None,
             share_push_secret: None,
             share_push_interval_seconds: default_share_push_interval_seconds(),
+            share_public_url: None,
             hypixel_api_key: None,
             share_legendary_flips: true,
             anonymize_webhook_name: false,

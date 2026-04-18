@@ -775,6 +775,7 @@ async fn main() -> Result<()> {
             web_gui_password: config.web_gui_password.clone(),
             web_gui_cookie_secure: config.web_gui_cookie_secure,
             web_share_token: config.web_share_token.clone(),
+            share_public_url: config.share_public_url.clone(),
             valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 twm::web::SessionStore::new(),
             )),

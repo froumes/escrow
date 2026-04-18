@@ -480,6 +480,55 @@ img{display:block;max-width:100%}
     color:var(--red-2);
     font-size:.9em;
 }
+.shareLinkReveal{
+    display:flex;
+    flex-wrap:wrap;
+    gap:12px 14px;
+    align-items:center;
+    margin:14px 0 4px;
+    padding:14px 16px;
+    border:1px solid var(--line);
+    border-radius:16px;
+    background:var(--surface-soft);
+}
+.shareLinkLabel{
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+    flex:0 1 auto;
+    min-width:160px;
+}
+.shareLinkHint{
+    font-size:.78em;
+    color:var(--muted);
+    line-height:1.35;
+}
+.shareLinkHint code{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:var(--surface);
+    padding:1px 6px;
+    border-radius:6px;
+    border:1px solid var(--line);
+}
+.shareLinkInput{
+    flex:1 1 320px;
+    min-width:0;
+    padding:10px 12px;
+    border:1px solid var(--line);
+    border-radius:12px;
+    background:var(--surface);
+    color:var(--text);
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:.92em;
+    outline:none;
+}
+.shareLinkInput:focus{border-color:var(--focus-ring)}
+.shareLinkActions{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    align-items:center;
+}
 .sellerGrid{
     display:grid;
     grid-template-columns:minmax(320px,1fr) minmax(320px,1.2fr);
@@ -1767,6 +1816,7 @@ const API = {
     sellerPreview: "/api/seller/preview",
     sellerAvailable: "/api/seller/available_items",
     sellerPriceEstimate: "/api/seller/price_estimate",
+    shareLink: "/api/share/link",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -2769,6 +2819,11 @@ function App() {
     const [chatInput, setChatInput] = useState("");
     const [buyAuctionId, setBuyAuctionId] = useState("");
     const [buyAuctionError, setBuyAuctionError] = useState("");
+    // `null` while hidden; `{ url, kind, copyState }` when the panel reveal is open.
+    // `kind` is `"remote"` (operator-supplied URL) or `"local"` (derived /share/{token}).
+    // `copyState` is `"idle" | "copied" | "failed"` and resets on subsequent clicks.
+    const [shareLink, setShareLink] = useState(null);
+    const [shareLinkLoading, setShareLinkLoading] = useState(false);
     const [sellerConfig, setSellerConfig] = useState({
         token: "",
         has_token: false,
@@ -3046,6 +3101,81 @@ function App() {
             flash(msg);
         }
     }, [buyAuctionId, flash, handleUnauthorized, refreshEverything]);
+
+    // Click handler for the topbar "Share Stats" button.  Asks the bot which
+    // URL it would currently hand out (remote `share_public_url` if set,
+    // otherwise the locally-derived `/share/{token}`), then opens the inline
+    // reveal and tries to copy to the clipboard.  Repeated clicks while open
+    // re-trigger the copy without re-fetching.
+    const fetchShareLink = useCallback(async () => {
+        if (shareLinkLoading) return;
+        setShareLinkLoading(true);
+        try {
+            const resp = await req(API.shareLink);
+            const next = { url: resp.url, kind: resp.kind, copyState: "idle" };
+            setShareLink(next);
+            // Fire-and-forget clipboard write so the user gets a one-click
+            // copy on first open.  Some browsers reject this without a
+            // direct user gesture chain; fall back silently in that case
+            // and let the explicit Copy button in the reveal take over.
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(next.url);
+                    setShareLink((prev) => prev ? { ...prev, copyState: "copied" } : prev);
+                    flash("Share link copied to clipboard");
+                } else {
+                    flash("Share link ready — use the Copy button");
+                }
+            } catch (_e) {
+                flash("Share link ready — use the Copy button");
+            }
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+                return;
+            }
+            if (error.status === 404) {
+                flash("No share link configured — set share_public_url or web_share_token in config");
+                setShareLink(null);
+                return;
+            }
+            flash(error.message || "Failed to fetch share link");
+        } finally {
+            setShareLinkLoading(false);
+        }
+    }, [flash, handleUnauthorized, shareLinkLoading]);
+
+    const copyShareLink = useCallback(async () => {
+        if (!shareLink) return;
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(shareLink.url);
+                setShareLink((prev) => prev ? { ...prev, copyState: "copied" } : prev);
+                flash("Share link copied to clipboard");
+            } else {
+                // Legacy fallback: select-and-execCommand via a temp textarea
+                // so this works on plain http://<vps>:<port> without HTTPS.
+                const ta = document.createElement("textarea");
+                ta.value = shareLink.url;
+                ta.style.position = "fixed";
+                ta.style.opacity = "0";
+                document.body.appendChild(ta);
+                ta.select();
+                const ok = document.execCommand("copy");
+                document.body.removeChild(ta);
+                if (ok) {
+                    setShareLink((prev) => prev ? { ...prev, copyState: "copied" } : prev);
+                    flash("Share link copied to clipboard");
+                } else {
+                    setShareLink((prev) => prev ? { ...prev, copyState: "failed" } : prev);
+                    flash("Could not copy — select the link manually");
+                }
+            }
+        } catch (_e) {
+            setShareLink((prev) => prev ? { ...prev, copyState: "failed" } : prev);
+            flash("Could not copy — select the link manually");
+        }
+    }, [shareLink, flash]);
 
     const refreshSellerConfig = useCallback(async () => {
         try {
@@ -3727,6 +3857,7 @@ function App() {
                     <div className="toolbar">
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
+                        <${Button} kind="primary" size="small" onClick=${fetchShareLink} disabled=${shareLinkLoading} title="Copy a public read-only stats link to share">${shareLinkLoading ? "Loading…" : "Share Stats"}</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
                         <span className="themeSelectWrap">
                             <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">
@@ -3736,6 +3867,31 @@ function App() {
                         <button type="button" className="themeToggle" onClick=${toggleNotifSound} title=${notifSoundEnabled ? "Mute flip notifications" : "Unmute flip notifications"} aria-pressed=${String(notifSoundEnabled)}>${notifSoundEnabled ? "\u{1F514}" : "\u{1F515}"}</button>
                     </div>
                 </div>
+
+                ${shareLink ? html`
+                    <div className="shareLinkReveal">
+                        <div className="shareLinkLabel">
+                            <span className="eyebrow">${shareLink.kind === "remote" ? "Public stats link" : "Local stats link (this host)"}</span>
+                            ${shareLink.kind === "local" ? html`<span className="shareLinkHint">Exposes this bot's host. Configure <code>share_public_url</code> in config to use a remote URL instead.</span>` : null}
+                        </div>
+                        <input
+                            className="shareLinkInput"
+                            type="text"
+                            readOnly
+                            value=${shareLink.url}
+                            spellcheck="false"
+                            onFocus=${(e) => e.target.select()}
+                            onClick=${(e) => e.target.select()}
+                        />
+                        <div className="shareLinkActions">
+                            <${Button} kind=${shareLink.copyState === "copied" ? "success" : "primary"} size="small" onClick=${copyShareLink}>
+                                ${shareLink.copyState === "copied" ? "Copied" : "Copy"}
+                            </${Button}>
+                            <a className="button secondary small" href=${shareLink.url} target="_blank" rel="noreferrer">Open</a>
+                            <${Button} kind="ghost" size="small" onClick=${() => setShareLink(null)}>Close</${Button}>
+                        </div>
+                    </div>
+                ` : null}
 
                 <div className="tabbar">
                     ${TAB_DEFS.map(([key, label]) => html`
