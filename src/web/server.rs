@@ -7,7 +7,7 @@ use std::sync::{
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Request, State, WebSocketUpgrade,
+        Path, Request, State, WebSocketUpgrade,
     },
     http::StatusCode,
     middleware::Next,
@@ -69,6 +69,9 @@ pub struct WebSharedState {
     pub web_gui_password: Option<String>,
     /// Whether auth session cookies should include the `Secure` attribute.
     pub web_gui_cookie_secure: bool,
+    /// Optional unguessable token enabling the read-only public stats page at
+    /// `/share/{token}`.  `None` (or empty) disables the route entirely.
+    pub web_share_token: Option<String>,
     /// Active web sessions with deterministic FIFO eviction at capacity.
     pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -315,6 +318,13 @@ async fn check_auth(
         return next.run(req).await;
     }
 
+    // The public stats share page enforces its own token check inside the
+    // handler.  Bypass the password gate so anyone with the share URL can view
+    // it even when the panel is otherwise password-protected.
+    if path.starts_with("/share/") || path.starts_with("/api/share/") {
+        return next.run(req).await;
+    }
+
     if has_valid_auth_session(&req, &s.valid_sessions) {
         return next.run(req).await;
     }
@@ -338,6 +348,8 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/login", axum::routing::post(login))
         .route("/api/profit/public", get(get_profit_public))
         .route("/api/og-image.png", get(get_og_image))
+        .route("/share/{token}", get(get_share_page))
+        .route("/api/share/{token}/stats", get(get_share_stats))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -1534,6 +1546,249 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
         ],
         png,
     )
+}
+
+// ── Public share page ────────────────────────────────────────
+//
+// `web_share_token` in config.toml gates a read-only stats dashboard at
+// `GET /share/{token}`.  The dashboard fetches its data from
+// `GET /api/share/{token}/stats`, both protected by constant-time token
+// comparison so the page is impossible to brute-force or time-attack.
+//
+// Unset (or empty) token in config → both routes return 404 (route disabled,
+// no leaked information about whether sharing exists).
+//
+// The payload is intentionally anonymized:
+//   • no IGN, no Minecraft UUID, no Discord ID, no auction UUIDs
+//   • no chat, no inventory, no command/queue access, no config
+//   • only profit charts, profit/hour, uptime, recent realized flips
+//     (item name + prices + duration), and counts of active auctions /
+//     bazaar orders
+//
+// This means handing the URL to anyone reveals "how the bot is doing" without
+// exposing any control surface or account-identifying data.
+
+const SHARE_PAGE_HTML: &str = include_str!("share.html");
+
+/// Constant-time string comparison so a bad token can't be detected via
+/// response-time differences.  The expected value comes from the config
+/// share token; the supplied value comes from the URL.
+fn share_token_matches(expected: &str, supplied: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let a = expected.as_bytes();
+    let b = supplied.as_bytes();
+    let len_eq = a.len() == b.len();
+    let mut diff: u8 = if len_eq { 0 } else { 1 };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let ai = *a.get(i).unwrap_or(&0);
+        let bi = *b.get(i).unwrap_or(&0);
+        diff |= ai ^ bi;
+    }
+    len_eq && diff == 0
+}
+
+/// Returns `true` when the supplied token matches the configured share token
+/// (and sharing is enabled at all).
+fn share_token_authorized(state: &WebSharedState, supplied: &str) -> bool {
+    match state.web_share_token.as_deref() {
+        Some(expected) if !expected.is_empty() => share_token_matches(expected, supplied),
+        _ => false,
+    }
+}
+
+async fn get_share_page(
+    State(s): State<WebSharedState>,
+    Path(token): Path<String>,
+) -> Response {
+    if !share_token_authorized(&s, &token) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(SHARE_PAGE_HTML).into_response()
+}
+
+/// Anonymized realized AH flip used by the public share page.
+/// Drops `auction_uuid` so consumers can't link flips back to specific
+/// listings on Hypixel.
+#[derive(Serialize)]
+pub struct PublicFlipEntry {
+    pub sold_at_unix: u64,
+    pub item_name: String,
+    pub buy_price: i64,
+    pub sell_price: i64,
+    pub profit: i64,
+    pub time_to_sell_secs: u64,
+}
+
+/// Anonymized active auction shown on the share page.
+/// Drops UUIDs and end timestamps so the dashboard is purely informational.
+#[derive(Serialize)]
+pub struct PublicActiveAuction {
+    pub item_name: String,
+    pub starting_bid: i64,
+    pub highest_bid: i64,
+    pub bin: bool,
+    pub time_remaining_seconds: i64,
+}
+
+/// Anonymized active bazaar order shown on the share page.
+#[derive(Serialize)]
+pub struct PublicBazaarOrder {
+    pub item_name: String,
+    pub amount: u64,
+    pub price_per_unit: f64,
+    pub is_buy_order: bool,
+    pub status: String,
+    pub placed_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct PublicShareStats {
+    /// Cumulative AH profit points: `(unix_seconds, cumulative_coins)`.
+    pub all_time_ah_points: Vec<(u64, i64)>,
+    /// Cumulative BZ profit points: `(unix_seconds, cumulative_coins)`.
+    pub all_time_bz_points: Vec<(u64, i64)>,
+    pub all_time_ah_total: i64,
+    pub all_time_bz_total: i64,
+    pub all_time_total: i64,
+    /// Session-only series (resets at process start) for the live "today" chart.
+    pub session_ah_points: Vec<(u64, i64)>,
+    pub session_bz_points: Vec<(u64, i64)>,
+    pub session_ah_total: i64,
+    pub session_bz_total: i64,
+    pub session_total: i64,
+    pub session_per_hour: f64,
+    pub session_uptime_seconds: u64,
+    pub session_started_at_unix: u64,
+    /// Last ~200 realized AH flips (most recent first).
+    pub recent_flips: Vec<PublicFlipEntry>,
+    /// Counts only — full lists are intentionally excluded for the share view
+    /// to keep the payload tiny and the strategy mostly opaque.
+    pub active_auctions_count: usize,
+    pub active_bazaar_orders_count: usize,
+    /// Anonymized current AH listings (no UUIDs, no end timestamp).
+    pub active_auctions: Vec<PublicActiveAuction>,
+    /// Anonymized current Bazaar orders.
+    pub active_bazaar_orders: Vec<PublicBazaarOrder>,
+    /// Server clock at response time — clients use this instead of `Date.now()`
+    /// so chart x-axes stay correct even when the viewer's clock is skewed.
+    pub now_unix: u64,
+}
+
+/// Build the anonymized snapshot used by both `/api/share/{token}/stats` and
+/// the outbound `share_push_url` pusher.  Pulled out into a helper so the two
+/// callers can never drift apart in shape or anonymization rules.
+pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
+    let snapshot = s.profit_tracker.snapshot();
+    let session_total = snapshot.session_ah_total + snapshot.session_bz_total;
+    let all_time_total = snapshot.all_time_ah_total + snapshot.all_time_bz_total;
+    let uptime = s.started_at.elapsed().as_secs();
+    let hours = uptime as f64 / 3600.0;
+    let per_hour = if hours > 0.0 { session_total as f64 / hours } else { 0.0 };
+
+    // Most-recent-first window of realized flips.  The on-disk ring already
+    // bounds this; we cap again here to keep the share payload small even if
+    // an operator bumps the ring size in a future change.
+    const MAX_FLIPS: usize = 200;
+    let recent_flips: Vec<PublicFlipEntry> = s
+        .flip_history
+        .lock()
+        .map(|h| {
+            h.iter()
+                .rev()
+                .take(MAX_FLIPS)
+                .map(|f| PublicFlipEntry {
+                    sold_at_unix: f.sold_at_unix,
+                    item_name: f.item_name.clone(),
+                    buy_price: f.buy_price,
+                    sell_price: f.sell_price,
+                    profit: f.profit,
+                    time_to_sell_secs: f.time_to_sell_secs,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Active auctions: prefer the in-memory cache populated by the in-game
+    // GUI parser (no external API hit) so the share page stays responsive
+    // even when Hypixel/Coflnet is rate-limiting.
+    let active_auctions: Vec<PublicActiveAuction> = s
+        .bot_client
+        .get_cached_my_auctions_json()
+        .and_then(|j| serde_json::from_str::<Vec<serde_json::Value>>(&j).ok())
+        .map(|arr| {
+            arr.into_iter()
+                .filter(|a| a.get("status").and_then(|v| v.as_str()).unwrap_or("") == "active")
+                .map(|a| PublicActiveAuction {
+                    item_name: a
+                        .get("item_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown")
+                        .to_string(),
+                    starting_bid: a.get("starting_bid").and_then(|v| v.as_i64()).unwrap_or(0),
+                    highest_bid: a.get("highest_bid").and_then(|v| v.as_i64()).unwrap_or(0),
+                    bin: a.get("bin").and_then(|v| v.as_bool()).unwrap_or(false),
+                    time_remaining_seconds: a
+                        .get("time_remaining_seconds")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let active_bazaar_orders: Vec<PublicBazaarOrder> = s
+        .bazaar_tracker
+        .get_orders()
+        .into_iter()
+        .map(|o| PublicBazaarOrder {
+            item_name: o.item_name,
+            amount: o.amount,
+            price_per_unit: o.price_per_unit,
+            is_buy_order: o.is_buy_order,
+            status: o.status,
+            placed_at: o.placed_at,
+        })
+        .collect();
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    PublicShareStats {
+        all_time_ah_points: snapshot.all_time_ah_points,
+        all_time_bz_points: snapshot.all_time_bz_points,
+        all_time_ah_total: snapshot.all_time_ah_total,
+        all_time_bz_total: snapshot.all_time_bz_total,
+        all_time_total,
+        session_ah_points: snapshot.session_ah_points,
+        session_bz_points: snapshot.session_bz_points,
+        session_ah_total: snapshot.session_ah_total,
+        session_bz_total: snapshot.session_bz_total,
+        session_total,
+        session_per_hour: per_hour,
+        session_uptime_seconds: uptime,
+        session_started_at_unix: snapshot.session_started_at_unix,
+        active_auctions_count: active_auctions.len(),
+        active_bazaar_orders_count: active_bazaar_orders.len(),
+        recent_flips,
+        active_auctions,
+        active_bazaar_orders,
+        now_unix,
+    }
+}
+
+async fn get_share_stats(
+    State(s): State<WebSharedState>,
+    Path(token): Path<String>,
+) -> Response {
+    if !share_token_authorized(&s, &token) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(build_public_share_stats(&s)).into_response()
 }
 
 async fn chat_ws_handler(

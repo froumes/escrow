@@ -194,6 +194,43 @@ pub struct Config {
     #[serde(default)]
     pub web_gui_cookie_secure: bool,
 
+    /// Optional unguessable token that enables a read-only public stats page at
+    /// `GET /share/{token}`.  Anyone with this exact URL can see anonymized
+    /// profit charts, recent realized flips, and counts of active auctions /
+    /// bazaar orders — but cannot see the IGN, send commands, change config,
+    /// view chat, or otherwise interact with the bot.
+    ///
+    /// Leave empty to disable the share page entirely (every `/share/*` request
+    /// returns 404).  Rotate by replacing the value and reloading config.
+    /// Recommended length: 32+ random characters (e.g. `openssl rand -hex 32`).
+    #[serde(default, with = "opt_string_as_empty")]
+    pub web_share_token: Option<String>,
+
+    /// Optional outbound URL the bot pushes anonymized stats snapshots to on
+    /// a fixed interval.  Pair this with a remote site (e.g. a Cloudflare
+    /// Pages Function) so viewers see your stats via that site's domain
+    /// instead of your VPS IP — the bot is purely an HTTP client and never
+    /// needs an inbound port to be public.
+    ///
+    /// Example: `https://austinxyz.lol/api/twm/push`
+    /// Leave empty to disable pushing entirely.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub share_push_url: Option<String>,
+
+    /// Shared secret used to HMAC-SHA256 sign the body of each push.  The
+    /// receiving endpoint must verify with the same secret.  Leave empty
+    /// (or set `share_push_url` empty) to disable pushing.
+    /// Recommended length: 32+ random characters (e.g. `openssl rand -hex 32`).
+    #[serde(default, with = "opt_string_as_empty")]
+    pub share_push_secret: Option<String>,
+
+    /// How often to push a snapshot, in seconds.  Defaults to 30s — fast
+    /// enough that the public page feels live but slow enough to stay well
+    /// under any reasonable rate limit on the receiving side.
+    /// Minimum honored value is 5 seconds.
+    #[serde(default = "default_share_push_interval_seconds")]
+    pub share_push_interval_seconds: u64,
+
     /// Hypixel API key for fetching active auctions. Obtain one from https://developer.hypixel.net/
     /// Leave empty to use the Coflnet API as a fallback.
     #[serde(default, with = "opt_string_as_empty")]
@@ -310,6 +347,10 @@ fn default_humanization_max_break_minutes() -> u64 {
     10
 }
 
+fn default_share_push_interval_seconds() -> u64 {
+    30
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -344,6 +385,10 @@ impl Default for Config {
             discord_id: None,
             web_gui_password: None,
             web_gui_cookie_secure: false,
+            web_share_token: None,
+            share_push_url: None,
+            share_push_secret: None,
+            share_push_interval_seconds: default_share_push_interval_seconds(),
             hypixel_api_key: None,
             share_legendary_flips: true,
             anonymize_webhook_name: false,

@@ -101,6 +101,12 @@ Useful settings include:
   Password-protect the web panel.
 - `web_gui_cookie_secure`
   Adds `Secure` to the web panel session cookie. Enable for HTTPS/reverse-proxy deployments.
+- `web_share_token`
+  Optional unguessable token (32+ random chars) that enables a read-only public
+  stats page at `GET /share/<token>`. Anyone with the link can see anonymized
+  profit charts, recent realized flips, and active-auction / bazaar-order
+  counts — but cannot see the IGN, chat, config, or send commands. Leave empty
+  to disable. Rotate by changing the value and reloading config.
 - `enable_bazaar_flips`
   Enables or disables Bazaar flipping logic at startup.
 - `fastbuy`

@@ -64,6 +64,12 @@ tower-http = { version = "0.6", features = ["cors"] }
 # OG image generation for link embeds
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# HMAC-SHA256 for the optional outbound share-push (signs each pushed
+# snapshot so the receiving site can verify the bot is the only sender).
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
 # Headless browser automation for the Seller tab's "Login via Browser" flow.
 # Drives a visible Chromium-based browser (Chrome/Edge/Brave) over CDP to
 # intercept the user's Discord token the same way the legacy Python tool did.

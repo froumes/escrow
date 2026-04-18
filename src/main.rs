@@ -774,6 +774,7 @@ async fn main() -> Result<()> {
             chat_tx: chat_tx.clone(),
             web_gui_password: config.web_gui_password.clone(),
             web_gui_cookie_secure: config.web_gui_cookie_secure,
+            web_share_token: config.web_share_token.clone(),
             valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 twm::web::SessionStore::new(),
             )),
@@ -791,9 +792,23 @@ async fn main() -> Result<()> {
             seller_config_path: seller_config_path.clone(),
         };
         let web_port = config.web_gui_port;
+        let pusher_state = web_state.clone();
         tokio::spawn(async move {
             start_web_server(web_state, web_port).await;
         });
+
+        // Optional outbound stats pusher.  When `share_push_url` and
+        // `share_push_secret` are both set, snapshots of the same anonymized
+        // public-stats payload are POSTed to that URL on a fixed cadence so
+        // a remote site (Cloudflare Pages, etc.) can serve them publicly
+        // without ever exposing this VPS's IP.
+        if let Some(pusher_cfg) = twm::share_pusher::SharePusherConfig::from_parts(
+            config.share_push_url.clone(),
+            config.share_push_secret.clone(),
+            config.share_push_interval_seconds,
+        ) {
+            twm::share_pusher::spawn(pusher_state, pusher_cfg);
+        }
     }
 
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL

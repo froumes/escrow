@@ -13,6 +13,7 @@ pub mod logging;
 pub mod persistence;
 pub mod profit;
 pub mod seller;
+pub mod share_pusher;
 pub mod state;
 pub mod types;
 pub mod utils;
