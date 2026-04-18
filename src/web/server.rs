@@ -7,7 +7,7 @@ use std::sync::{
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Path, Request, State, WebSocketUpgrade,
+        Request, State, WebSocketUpgrade,
     },
     http::StatusCode,
     middleware::Next,
@@ -69,21 +69,18 @@ pub struct WebSharedState {
     pub web_gui_password: Option<String>,
     /// Whether auth session cookies should include the `Secure` attribute.
     pub web_gui_cookie_secure: bool,
-    /// Optional unguessable token enabling the read-only public stats page at
-    /// `/share/{token}`.  `None` (or empty) disables the route entirely.
-    pub web_share_token: Option<String>,
-    /// Pre-formed public URL handed out by the panel's "Share Stats" button.
-    /// When set, takes precedence over the locally-derived `/share/{token}`
-    /// URL so operators can point viewers at a remote site (e.g. their own
-    /// domain backed by an outbound `share_push_url`) instead of exposing
-    /// the bot's host directly.
-    pub share_public_url: Option<String>,
-    /// Mirror of `config.share_push_url`.  Used by the share-link endpoint
-    /// to detect the "operator opted into the remote-push flow" state so
-    /// the panel can refuse the local `/share/{token}` fallback (which
-    /// would expose the bot's host) and prompt them to set
-    /// `share_public_url` instead.
-    pub share_push_url: Option<String>,
+    /// Base URL of the remote site that hosts the public stats viewer
+    /// (e.g. `https://austinxyz.lol`).  Used when the panel auto-generates
+    /// a fresh share state.
+    pub share_remote_base_url: String,
+    /// On-disk location of `share_state.json` — written the first time the
+    /// operator clicks "Share Stats" and read on every subsequent startup.
+    pub share_state_path: std::path::PathBuf,
+    /// The bot's persisted share credentials (`slot_id` + `push_secret`),
+    /// or `None` until the operator triggers auto-setup.  Wrapped in
+    /// `RwLock` so the share-pusher can read it on its tick loop while the
+    /// auto-setup endpoint installs new state without blocking pushes.
+    pub share_state: Arc<tokio::sync::RwLock<Option<crate::share_state::ShareState>>>,
     /// Active web sessions with deterministic FIFO eviction at capacity.
     pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -330,18 +327,10 @@ async fn check_auth(
         return next.run(req).await;
     }
 
-    // The public stats share page enforces its own token check inside the
-    // handler.  Bypass the password gate so anyone with the share URL can view
-    // it even when the panel is otherwise password-protected.
-    //
-    // `/api/share/link` is the panel's own "give me the share URL" helper and
-    // must stay behind the password gate so anonymous callers can't fish for
-    // a configured viewer token.
-    if path.starts_with("/share/")
-        || (path.starts_with("/api/share/") && path != "/api/share/link")
-    {
-        return next.run(req).await;
-    }
+    // `/api/share/auto-setup` must stay behind the password gate so anonymous
+    // callers can't trigger fresh `slot_id`/`push_secret` generation against a
+    // running bot.  No other `/share*` routes are exposed by the bot anymore;
+    // the public viewer lives on the remote site (e.g. austinxyz.lol).
 
     if has_valid_auth_session(&req, &s.valid_sessions) {
         return next.run(req).await;
@@ -366,9 +355,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/login", axum::routing::post(login))
         .route("/api/profit/public", get(get_profit_public))
         .route("/api/og-image.png", get(get_og_image))
-        .route("/share/{token}", get(get_share_page))
-        .route("/api/share/{token}/stats", get(get_share_stats))
-        .route("/api/share/link", get(get_share_link))
+        .route("/api/share/auto-setup", axum::routing::post(auto_setup_share))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -1567,17 +1554,15 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
     )
 }
 
-// ── Public share page ────────────────────────────────────────
+// ── Public share snapshot ────────────────────────────────────
 //
-// `web_share_token` in config.toml gates a read-only stats dashboard at
-// `GET /share/{token}`.  The dashboard fetches its data from
-// `GET /api/share/{token}/stats`, both protected by constant-time token
-// comparison so the page is impossible to brute-force or time-attack.
+// The bot itself no longer serves the public stats page — that lives on the
+// remote site (e.g. austinxyz.lol) and is fed by `share_pusher.rs`, which
+// POSTs anonymized snapshots to a Cloudflare Pages Function on a fixed
+// interval.  The structs below define the wire shape; `build_public_share_stats`
+// produces the snapshot from the live in-process state.
 //
-// Unset (or empty) token in config → both routes return 404 (route disabled,
-// no leaked information about whether sharing exists).
-//
-// The payload is intentionally anonymized:
+// Anonymization rules:
 //   • no IGN, no Minecraft UUID, no Discord ID, no auction UUIDs
 //   • no chat, no inventory, no command/queue access, no config
 //   • only profit charts, profit/hour, uptime, recent realized flips
@@ -1586,47 +1571,6 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
 //
 // This means handing the URL to anyone reveals "how the bot is doing" without
 // exposing any control surface or account-identifying data.
-
-const SHARE_PAGE_HTML: &str = include_str!("share.html");
-
-/// Constant-time string comparison so a bad token can't be detected via
-/// response-time differences.  The expected value comes from the config
-/// share token; the supplied value comes from the URL.
-fn share_token_matches(expected: &str, supplied: &str) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    let a = expected.as_bytes();
-    let b = supplied.as_bytes();
-    let len_eq = a.len() == b.len();
-    let mut diff: u8 = if len_eq { 0 } else { 1 };
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let ai = *a.get(i).unwrap_or(&0);
-        let bi = *b.get(i).unwrap_or(&0);
-        diff |= ai ^ bi;
-    }
-    len_eq && diff == 0
-}
-
-/// Returns `true` when the supplied token matches the configured share token
-/// (and sharing is enabled at all).
-fn share_token_authorized(state: &WebSharedState, supplied: &str) -> bool {
-    match state.web_share_token.as_deref() {
-        Some(expected) if !expected.is_empty() => share_token_matches(expected, supplied),
-        _ => false,
-    }
-}
-
-async fn get_share_page(
-    State(s): State<WebSharedState>,
-    Path(token): Path<String>,
-) -> Response {
-    if !share_token_authorized(&s, &token) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    Html(SHARE_PAGE_HTML).into_response()
-}
 
 /// Anonymized realized AH flip used by the public share page.
 /// Drops `auction_uuid` so consumers can't link flips back to specific
@@ -1696,9 +1640,9 @@ pub struct PublicShareStats {
     pub now_unix: u64,
 }
 
-/// Build the anonymized snapshot used by both `/api/share/{token}/stats` and
-/// the outbound `share_push_url` pusher.  Pulled out into a helper so the two
-/// callers can never drift apart in shape or anonymization rules.
+/// Build the anonymized snapshot used by the outbound share pusher.  Lives
+/// here (rather than in `share_pusher.rs`) so the wire shape stays adjacent
+/// to the `Public*` structs that define it.
 pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
     let snapshot = s.profit_tracker.snapshot();
     let session_total = snapshot.session_ah_total + snapshot.session_bz_total;
@@ -1800,166 +1744,77 @@ pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
     }
 }
 
-async fn get_share_stats(
-    State(s): State<WebSharedState>,
-    Path(token): Path<String>,
-) -> Response {
-    if !share_token_authorized(&s, &token) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    Json(build_public_share_stats(&s)).into_response()
-}
-
-/// Where the configured share link points: either a remote URL the operator
-/// pre-set (e.g. their own domain) or the bot's own `/share/{token}` page.
+/// Response shape for `POST /api/share/auto-setup`.  `created` is `true`
+/// only when this call was the one that actually generated fresh
+/// credentials, so the panel can show "link created!" toast vs.
+/// "here's your link" on subsequent clicks.
 #[derive(Serialize)]
-struct ShareLinkResponse {
+struct AutoSetupResponse {
     url: String,
-    /// `"remote"` when sourced from `share_public_url`, `"local"` when
-    /// derived from `web_share_token` + the request's Host header.
-    kind: &'static str,
+    slot_id: String,
+    created: bool,
 }
 
-/// Parsed host portion of a URL (no scheme, no port, no path) lower-cased.
-/// Returns `None` when the URL is malformed enough that we can't extract a
-/// host — callers should refuse to hand the URL out in that case.
-fn extract_url_host(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = after_scheme.split(['/', '?', '#']).next()?;
-    let authority = authority.split('@').next_back()?;
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        stripped.split(']').next()?.to_string()
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_else(|| authority.to_string())
-    };
-    let host = host.trim().to_lowercase();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
-}
-
-/// Returns `true` when `host` is a bare numeric address (IPv4 or IPv6) or a
-/// loopback name — i.e. a host that exposes the bot's network location to
-/// anyone who opens the URL.  Operators using the remote-push flow want to
-/// hide their VPS, so the share endpoint refuses to hand out URLs whose
-/// host matches this predicate.
-fn host_exposes_bot_network(host: &str) -> bool {
-    if host == "localhost" || host.ends_with(".localhost") {
-        return true;
-    }
-    if host.parse::<std::net::Ipv4Addr>().is_ok()
-        || host.parse::<std::net::Ipv6Addr>().is_ok()
+/// `POST /api/share/auto-setup` — single endpoint backing the panel's
+/// "Share Stats" button.  Idempotent: the first call generates a fresh
+/// `slot_id` + `push_secret`, persists them to `share_state.json`, and
+/// returns the viewer URL; subsequent calls simply return the same URL.
+///
+/// The push loop in `share_pusher::spawn` polls `WebSharedState.share_state`
+/// continuously, so freshly generated state takes effect on the next push
+/// tick without restarting the bot.  No restart, no config edit, no env
+/// vars — just one click.
+async fn auto_setup_share(State(s): State<WebSharedState>) -> Response {
     {
-        return true;
-    }
-    false
-}
-
-/// GET /api/share/link — auth-gated helper for the panel's "Share Stats"
-/// button.  Decides which URL to hand out with these rules, in order:
-///
-///   1. If `share_public_url` is set:
-///        a. Reject when its host is a numeric IP / `localhost` — that
-///           defeats the purpose of having a remote URL.
-///        b. Otherwise return it as `kind: "remote"`.
-///   2. Else if `share_push_url` is set (operator opted into the
-///      remote-push flow but forgot to configure the public URL): refuse
-///      with a 409 explaining what to set.  Falling back to the local
-///      `/share/{token}` link here would silently expose the bot's host.
-///   3. Else if `web_share_token` is set: build
-///      `http(s)://<host>/share/<token>` from the request headers and
-///      return it as `kind: "local"`.
-///   4. Else: 404 (nothing configured).
-///
-/// Lives behind the same auth gate as the rest of `/api/*` so anonymous
-/// callers can't enumerate whether sharing is configured.
-async fn get_share_link(
-    State(s): State<WebSharedState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    let public_url = s.share_public_url.as_deref().filter(|u| !u.is_empty());
-    let push_url = s.share_push_url.as_deref().filter(|u| !u.is_empty());
-    let token = s.web_share_token.as_deref().filter(|t| !t.is_empty());
-
-    if let Some(remote) = public_url {
-        let Some(host) = extract_url_host(remote) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "share_public_url is malformed ('{remote}') — expected something like https://yourdomain.tld/twm?t=<viewer_token>"
-                    )
-                })),
-            )
-                .into_response();
-        };
-        if host_exposes_bot_network(&host) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "share_public_url points at '{host}', which exposes this bot's host. Set share_public_url to your remote site's URL (e.g. https://yourdomain.tld/twm?t=<viewer_token>)."
-                    )
-                })),
-            )
-                .into_response();
+        let guard = s.share_state.read().await;
+        if let Some(existing) = guard.as_ref() {
+            return Json(AutoSetupResponse {
+                url: existing.viewer_url(),
+                slot_id: existing.slot_id.clone(),
+                created: false,
+            })
+            .into_response();
         }
-        return Json(ShareLinkResponse {
-            url: remote.to_string(),
-            kind: "remote",
+    }
+
+    // Re-acquire as a writer.  If a concurrent caller raced us into this
+    // branch and won, prefer their state so two near-simultaneous clicks
+    // don't both write competing `share_state.json` files.
+    let mut guard = s.share_state.write().await;
+    if let Some(existing) = guard.as_ref() {
+        return Json(AutoSetupResponse {
+            url: existing.viewer_url(),
+            slot_id: existing.slot_id.clone(),
+            created: false,
         })
         .into_response();
     }
 
-    if push_url.is_some() {
+    let fresh = crate::share_state::ShareState::generate(&s.share_remote_base_url);
+    if let Err(e) = fresh.save_to(&s.share_state_path) {
+        warn!(
+            "[Share] failed to persist share_state.json at {}: {e}",
+            s.share_state_path.display()
+        );
         return (
-            StatusCode::CONFLICT,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": "share_push_url is configured but share_public_url is not — set share_public_url to the URL viewers should open (e.g. https://yourdomain.tld/twm?t=<viewer_token>) so the bot's host stays hidden"
+                "error": format!("could not write share_state.json: {e}")
             })),
         )
             .into_response();
     }
 
-    let Some(token) = token else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "no share link configured — set share_public_url or web_share_token"
-            })),
-        )
-            .into_response();
+    let response = AutoSetupResponse {
+        url: fresh.viewer_url(),
+        slot_id: fresh.slot_id.clone(),
+        created: true,
     };
-
-    // Prefer the proxy-supplied scheme when present (the bot is normally
-    // accessed directly over HTTP, but operators sometimes front it with
-    // Caddy/Nginx/Cloudflare for HTTPS).  Fall back to http otherwise so
-    // the link is always copy-pasteable even without a proxy.
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "http".to_string());
-
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "localhost".to_string());
-
-    Json(ShareLinkResponse {
-        url: format!("{scheme}://{host}/share/{token}"),
-        kind: "local",
-    })
-    .into_response()
+    *guard = Some(fresh);
+    info!(
+        "[Share] auto-setup complete — slot_id ready, pusher will start on next tick"
+    );
+    Json(response).into_response()
 }
 
 async fn chat_ws_handler(
@@ -2655,44 +2510,6 @@ mod tests {
         assert!(entries[0].bin);
         assert!(entries[0].tag.is_some());
         assert_eq!(entries[0].tag.as_deref(), Some("DIAMOND_SWORD"));
-    }
-
-    #[test]
-    fn extract_url_host_handles_common_shapes() {
-        assert_eq!(
-            extract_url_host("https://austinxyz.lol/twm?t=abc").as_deref(),
-            Some("austinxyz.lol")
-        );
-        assert_eq!(
-            extract_url_host("http://130.51.22.60:8080/share/test1").as_deref(),
-            Some("130.51.22.60")
-        );
-        assert_eq!(
-            extract_url_host("http://[::1]:8080/share/x").as_deref(),
-            Some("::1")
-        );
-        assert_eq!(
-            extract_url_host("https://user:pw@example.com/path").as_deref(),
-            Some("example.com")
-        );
-        // No scheme prefix is treated as host-only — still extracts a host.
-        assert_eq!(
-            extract_url_host("austinxyz.lol/twm").as_deref(),
-            Some("austinxyz.lol")
-        );
-        assert_eq!(extract_url_host("").as_deref(), None);
-    }
-
-    #[test]
-    fn host_exposes_bot_network_flags_ips_and_localhost() {
-        assert!(host_exposes_bot_network("localhost"));
-        assert!(host_exposes_bot_network("dev.localhost"));
-        assert!(host_exposes_bot_network("127.0.0.1"));
-        assert!(host_exposes_bot_network("130.51.22.60"));
-        assert!(host_exposes_bot_network("::1"));
-        assert!(host_exposes_bot_network("2001:db8::1"));
-        assert!(!host_exposes_bot_network("austinxyz.lol"));
-        assert!(!host_exposes_bot_network("twm.example.com"));
     }
 
     #[test]

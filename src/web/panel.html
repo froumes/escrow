@@ -1844,7 +1844,7 @@ const API = {
     sellerPreview: "/api/seller/preview",
     sellerAvailable: "/api/seller/available_items",
     sellerPriceEstimate: "/api/seller/price_estimate",
-    shareLink: "/api/share/link",
+    shareAutoSetup: "/api/share/auto-setup",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -3130,17 +3130,17 @@ function App() {
         }
     }, [buyAuctionId, flash, handleUnauthorized, refreshEverything]);
 
-    // Click handler for the topbar "Share Stats" button.  Asks the bot which
-    // URL it would currently hand out (remote `share_public_url` if set,
-    // otherwise the locally-derived `/share/{token}`), then opens the inline
-    // reveal and tries to copy to the clipboard.  Repeated clicks while open
-    // re-trigger the copy without re-fetching.
+    // Click handler for the topbar "Share Stats" button.  POSTs to the
+    // auto-setup endpoint, which generates `slot_id` + `push_secret` on the
+    // very first call and stores them in `share_state.json`; subsequent
+    // calls just return the same URL.  Either way we open the inline
+    // reveal and try to copy to the clipboard.
     const fetchShareLink = useCallback(async () => {
         if (shareLinkLoading) return;
         setShareLinkLoading(true);
         try {
-            const resp = await req(API.shareLink);
-            const next = { url: resp.url, kind: resp.kind, copyState: "idle" };
+            const resp = await req(API.shareAutoSetup, { method: "POST" });
+            const next = { url: resp.url, copyState: "idle", created: !!resp.created };
             setShareLink(next);
             // Fire-and-forget clipboard write so the user gets a one-click
             // copy on first open.  Some browsers reject this without a
@@ -3150,7 +3150,7 @@ function App() {
                 if (navigator.clipboard && window.isSecureContext) {
                     await navigator.clipboard.writeText(next.url);
                     setShareLink((prev) => prev ? { ...prev, copyState: "copied" } : prev);
-                    flash("Share link copied to clipboard");
+                    flash(next.created ? "Share link created and copied" : "Share link copied to clipboard");
                 } else {
                     flash("Share link ready — use the Copy button");
                 }
@@ -3162,11 +3162,9 @@ function App() {
                 handleUnauthorized();
                 return;
             }
-            // The share-link endpoint returns structured JSON like
-            // `{"error": "..."}` for the configuration footguns it catches
-            // (numeric-IP `share_public_url`, push-without-public-url, etc.).
-            // Surface that text directly so users see exactly what to fix
-            // instead of a generic "Failed to fetch share link".
+            // The endpoint returns `{"error": "..."}` for I/O failures.
+            // Surface the message directly so the user sees exactly what
+            // went wrong instead of a generic "failed".
             let detail = "";
             try {
                 const parsed = JSON.parse(error.message || "");
@@ -3174,7 +3172,7 @@ function App() {
                     detail = parsed.error;
                 }
             } catch (_e) { /* not JSON, fall through */ }
-            if (!detail) detail = error.message || "Failed to fetch share link";
+            if (!detail) detail = error.message || "Failed to set up share link";
             setShareLink(null);
             flash(detail);
         } finally {
@@ -3908,8 +3906,8 @@ function App() {
                 ${shareLink ? html`
                     <div className="shareLinkReveal">
                         <div className="shareLinkLabel">
-                            <span className="eyebrow">${shareLink.kind === "remote" ? "Public stats link" : "Local stats link (this host)"}</span>
-                            ${shareLink.kind === "local" ? html`<span className="shareLinkHint">Exposes this bot's host. Configure <code>share_public_url</code> in config to use a remote URL instead.</span>` : null}
+                            <span className="eyebrow">Public stats link</span>
+                            <span className="shareLinkHint">Anyone with this link can view your anonymized stats. Your bot's IP stays hidden.</span>
                         </div>
                         <input
                             className="shareLinkInput"

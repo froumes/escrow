@@ -101,19 +101,16 @@ Useful settings include:
   Password-protect the web panel.
 - `web_gui_cookie_secure`
   Adds `Secure` to the web panel session cookie. Enable for HTTPS/reverse-proxy deployments.
-- `web_share_token`
-  Optional unguessable token (32+ random chars) that enables a read-only public
-  stats page at `GET /share/<token>`. Anyone with the link can see anonymized
-  profit charts, recent realized flips, and active-auction / bazaar-order
-  counts — but cannot see the IGN, chat, config, or send commands. Leave empty
-  to disable. Rotate by changing the value and reloading config.
-- `share_public_url`
-  Pre-formed URL the panel's "Share Stats" button copies to your clipboard.
-  Set this to whatever link you want viewers to open — typically the page on
-  your remote site that pairs with `share_push_url`, e.g.
-  `https://yourdomain.tld/twm?t=<viewer_token>`. When unset, the button falls
-  back to the local `http://<this-host>/share/<web_share_token>` URL (which
-  requires `web_share_token` to be set and exposes this bot's host).
+- `share_remote_base_url`
+  Base URL of the remote site that hosts the public stats viewer (defaults to
+  `https://austinxyz.lol`). Click "Share Stats" in the panel to auto-generate
+  an unguessable `slot_id` + `push_secret` (saved to `share_state.json`); the
+  bot then pushes anonymized snapshots to `<base>/api/twm/push/<slot_id>` and
+  hands you a viewer link `<base>/twm?s=<slot_id>`. Anyone with that link can
+  see your stats; nobody learns your bot's IP. Override only if you self-host
+  the receiving Cloudflare Pages site on a different domain.
+- `share_push_interval_seconds`
+  Push cadence in seconds. Default `30`. Minimum honored value is 5.
 - `enable_bazaar_flips`
   Enables or disables Bazaar flipping logic at startup.
 - `fastbuy`

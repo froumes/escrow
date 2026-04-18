@@ -756,6 +756,25 @@ async fn main() -> Result<()> {
     let seller_runner = twm::seller::SellerRunner::new(bot_client.clone());
     let seller_config_path = twm::seller::SellerConfig::default_path();
 
+    // Persistent share-link state.  Loaded on every startup so the public
+    // URL stays stable across restarts; populated for the first time when
+    // the operator clicks "Share Stats" in the panel.  Wrapped in an
+    // RwLock so the panel handler can mutate it (auto-setup) while the
+    // share pusher reads it on its tick loop.
+    let share_state_path = twm::share_state::ShareState::default_path();
+    let initial_share_state = match twm::share_state::ShareState::load_from(&share_state_path) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!(
+                "[Share] could not read {}: {e} — starting without persisted share state",
+                share_state_path.display()
+            );
+            None
+        }
+    };
+    let share_state_handle =
+        std::sync::Arc::new(tokio::sync::RwLock::new(initial_share_state));
+
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
     {
@@ -774,9 +793,9 @@ async fn main() -> Result<()> {
             chat_tx: chat_tx.clone(),
             web_gui_password: config.web_gui_password.clone(),
             web_gui_cookie_secure: config.web_gui_cookie_secure,
-            web_share_token: config.web_share_token.clone(),
-            share_public_url: config.share_public_url.clone(),
-            share_push_url: config.share_push_url.clone(),
+            share_remote_base_url: config.share_remote_base_url.clone(),
+            share_state_path: share_state_path.clone(),
+            share_state: share_state_handle.clone(),
             valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 twm::web::SessionStore::new(),
             )),
@@ -799,18 +818,15 @@ async fn main() -> Result<()> {
             start_web_server(web_state, web_port).await;
         });
 
-        // Optional outbound stats pusher.  When `share_push_url` and
-        // `share_push_secret` are both set, snapshots of the same anonymized
-        // public-stats payload are POSTed to that URL on a fixed cadence so
-        // a remote site (Cloudflare Pages, etc.) can serve them publicly
-        // without ever exposing this VPS's IP.
-        if let Some(pusher_cfg) = twm::share_pusher::SharePusherConfig::from_parts(
-            config.share_push_url.clone(),
-            config.share_push_secret.clone(),
-            config.share_push_interval_seconds,
-        ) {
-            twm::share_pusher::spawn(pusher_state, pusher_cfg);
-        }
+        // Outbound stats pusher.  Always spawned; the loop is a cheap no-op
+        // until the operator clicks "Share Stats" in the panel for the
+        // first time, which populates `share_state` and starts the pushes.
+        // Anonymized snapshots are POSTed to the remote site so viewers
+        // see stats via that origin and the bot's IP stays hidden.
+        twm::share_pusher::spawn(
+            pusher_state,
+            twm::share_pusher::SharePusherConfig::new(config.share_push_interval_seconds),
+        );
     }
 
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
