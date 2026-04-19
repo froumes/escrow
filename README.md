@@ -109,6 +109,17 @@ Useful settings include:
   hands you a viewer link `<base>/twm?s=<slot_id>`. Anyone with that link can
   see your stats; nobody learns your bot's IP. Override only if you self-host
   the receiving Cloudflare Pages site on a different domain.
+
+  **Pretty URLs via Discord OAuth:** after clicking Share Stats, click
+  "Link Discord" in the same toolbar. That opens a short-lived, HMAC-signed
+  Discord OAuth flow; once you authorise, the remote writes a vanity
+  mapping and redirects you to `<base>/twm/<your-discord-username>`. The
+  slot id is still accepted as `<base>/twm?s=<slot_id>`, so both URLs work
+  for the same slot. Requires the remote operator to have set
+  `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `DISCORD_REDIRECT_URI`
+  in Cloudflare Pages (see `austinxyz.lol/wrangler.toml.example`).
+  Pre-Pomelo accounts (those still carrying a `#1234` discriminator) are
+  rejected with a "please migrate your Discord account" page.
 - `share_push_interval_seconds`
   Push cadence in seconds. Default `30`. Minimum honored value is 5.
 - `enable_bazaar_flips`

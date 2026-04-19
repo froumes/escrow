@@ -1845,6 +1845,7 @@ const API = {
     sellerAvailable: "/api/seller/available_items",
     sellerPriceEstimate: "/api/seller/price_estimate",
     shareAutoSetup: "/api/share/auto-setup",
+    shareDiscordLinkUrl: "/api/share/discord-link-url",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -2852,6 +2853,7 @@ function App() {
     // `copyState` is `"idle" | "copied" | "failed"` and resets on subsequent clicks.
     const [shareLink, setShareLink] = useState(null);
     const [shareLinkLoading, setShareLinkLoading] = useState(false);
+    const [discordLinkLoading, setDiscordLinkLoading] = useState(false);
     const [sellerConfig, setSellerConfig] = useState({
         token: "",
         has_token: false,
@@ -3179,6 +3181,50 @@ function App() {
             setShareLinkLoading(false);
         }
     }, [flash, handleUnauthorized, shareLinkLoading]);
+
+    // Click handler for the "Link Discord" button.  Asks the bot to mint
+    // an HMAC-signed `/auth/discord/start?slot=&ts=&sig=` URL (valid for
+    // 5 minutes on the remote side), then opens it in a new tab so the
+    // user can authorize via Discord OAuth.  After Discord bounces back
+    // to the callback, the remote writes the vanity mapping in KV and
+    // redirects to `/twm/<username>` — the user sees their new pretty
+    // URL in the address bar.
+    const linkDiscord = useCallback(async () => {
+        if (discordLinkLoading) return;
+        setDiscordLinkLoading(true);
+        try {
+            const resp = await req(API.shareDiscordLinkUrl, { method: "POST" });
+            if (!resp || typeof resp.url !== "string" || !resp.url) {
+                flash("Bot did not return a link URL");
+                return;
+            }
+            const opened = window.open(resp.url, "_blank", "noopener,noreferrer");
+            if (!opened) {
+                // Popup blocker tripped; fall back to same-tab navigation
+                // so the user still gets there.  This loses the panel state
+                // but that's preferable to a silent no-op.
+                window.location.href = resp.url;
+                return;
+            }
+            flash("Discord login opened in a new tab — finish there, then your vanity URL will be ready");
+        } catch (error) {
+            if (error.status === 401) {
+                handleUnauthorized();
+                return;
+            }
+            let detail = "";
+            try {
+                const parsed = JSON.parse(error.message || "");
+                if (parsed && typeof parsed.error === "string") {
+                    detail = parsed.error;
+                }
+            } catch (_e) { /* not JSON */ }
+            if (!detail) detail = error.message || "Failed to create Discord-link URL";
+            flash(detail);
+        } finally {
+            setDiscordLinkLoading(false);
+        }
+    }, [discordLinkLoading, flash, handleUnauthorized]);
 
     const copyShareLink = useCallback(async () => {
         if (!shareLink) return;
@@ -3893,6 +3939,7 @@ function App() {
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="primary" size="small" onClick=${fetchShareLink} disabled=${shareLinkLoading} title="Copy a public read-only stats link to share">${shareLinkLoading ? "Loading…" : "Share Stats"}</${Button}>
+                        <${Button} kind="secondary" size="small" onClick=${linkDiscord} disabled=${discordLinkLoading} title="Open Discord OAuth to claim a vanity URL like /twm/<your-discord-name>">${discordLinkLoading ? "Loading…" : "Link Discord"}</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
                         <span className="themeSelectWrap">
                             <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">

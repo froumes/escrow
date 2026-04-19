@@ -356,6 +356,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/profit/public", get(get_profit_public))
         .route("/api/og-image.png", get(get_og_image))
         .route("/api/share/auto-setup", axum::routing::post(auto_setup_share))
+        .route("/api/share/discord-link-url", axum::routing::post(discord_link_url))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -1651,16 +1652,18 @@ pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { session_total as f64 / hours } else { 0.0 };
 
-    // Most-recent-first window of realized flips.  The on-disk ring already
-    // bounds this; we cap again here to keep the share payload small even if
-    // an operator bumps the ring size in a future change.
+    // Most-recent-first window of realized flips.  `flip_history` is a
+    // VecDeque populated with `push_front` on every realized sale, so its
+    // front-to-back order is already newest→oldest — iterating with plain
+    // `.iter()` preserves that ordering for the public payload.  The ring
+    // is already bounded on the bot, but we cap again here to keep the
+    // share payload small if an operator bumps the ring size later.
     const MAX_FLIPS: usize = 200;
     let recent_flips: Vec<PublicFlipEntry> = s
         .flip_history
         .lock()
         .map(|h| {
             h.iter()
-                .rev()
                 .take(MAX_FLIPS)
                 .map(|f| PublicFlipEntry {
                     sold_at_unix: f.sold_at_unix,
@@ -1755,6 +1758,33 @@ struct AutoSetupResponse {
     created: bool,
 }
 
+/// Response shape for `POST /api/share/discord-link-url`.  Carries a
+/// ready-to-open URL that the panel pops in a new tab so the operator
+/// can authorize their Discord account against the current slot.
+#[derive(Serialize)]
+struct DiscordLinkUrlResponse {
+    url: String,
+    /// Timestamp embedded in the URL, surfaced back to the UI so it can
+    /// show "link valid for 5 minutes" or similar without re-parsing.
+    ts: u64,
+}
+
+/// Compute `HMAC-SHA256(push_secret, "<slot_id>:<ts>")` and return it
+/// hex-encoded.  This is the same primitive the Cloudflare
+/// `/auth/discord/start` function recomputes against the stored
+/// push_secret — if they match, the click came from the bot operator.
+fn sign_discord_link(push_secret: &str, slot_id: &str, ts: u64) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(push_secret.as_bytes())
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(slot_id.as_bytes());
+    mac.update(b":");
+    mac.update(ts.to_string().as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    hex::encode(bytes)
+}
+
 /// `POST /api/share/auto-setup` — single endpoint backing the panel's
 /// "Share Stats" button.  Idempotent: the first call generates a fresh
 /// `slot_id` + `push_secret`, persists them to `share_state.json`, and
@@ -1815,6 +1845,56 @@ async fn auto_setup_share(State(s): State<WebSharedState>) -> Response {
         "[Share] auto-setup complete — slot_id ready, pusher will start on next tick"
     );
     Json(response).into_response()
+}
+
+/// `POST /api/share/discord-link-url` — generate a short-lived, signed
+/// URL that takes the operator through Discord OAuth and attaches their
+/// Discord account to the current share slot, producing a vanity URL
+/// like `https://austinxyz.lol/twm/<username>`.
+///
+/// The URL is signed with `HMAC-SHA256(push_secret, "<slot_id>:<ts>")`
+/// and is valid for 5 minutes on the remote side.  Only the bot and the
+/// remote (which stored `push_secret` on first push) can produce a
+/// matching signature, so an attacker who intercepts or guesses this
+/// URL can't substitute their own slot or Discord account.
+///
+/// Requires `share_state` to be populated — i.e. the operator must
+/// have clicked "Share Stats" at least once so the slot is claimed on
+/// the remote.  Returns 409 otherwise with an actionable error body.
+async fn discord_link_url(State(s): State<WebSharedState>) -> Response {
+    let share = {
+        let guard = s.share_state.read().await;
+        guard.clone()
+    };
+    let share = match share {
+        Some(state) => state,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Click \"Share Stats\" first — no slot has been claimed yet.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sig = sign_discord_link(&share.push_secret, &share.slot_id, ts);
+
+    // urlencoding-free: slot_id is hex, ts is digits, sig is hex — none
+    // need percent-encoding.  Keeping this manual avoids pulling in an
+    // extra crate just for one query string.
+    let url = format!(
+        "{}/auth/discord/start?slot={}&ts={}&sig={}",
+        share.remote_base_url, share.slot_id, ts, sig
+    );
+
+    info!("[Share] issued Discord-link URL for slot {}", share.slot_id);
+    Json(DiscordLinkUrlResponse { url, ts }).into_response()
 }
 
 async fn chat_ws_handler(
