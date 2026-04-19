@@ -108,6 +108,39 @@ pub fn spawn(state: WebSharedState, config: SharePusherConfig) {
     });
 }
 
+/// One-shot wrapper used by `POST /api/share/share-link` to ensure the
+/// Cloudflare KV slot is populated *before* we hand the operator a
+/// signed Discord-link URL.  Without this, the user would have to wait
+/// up to one full push interval (default 30s) after first slot creation
+/// for `/auth/discord/start` to find the slot record.
+///
+/// Returns `Ok(status)` for any HTTP completion (the caller can decide
+/// whether 2xx is required) and `Err(_)` for transport errors.  Builds
+/// its own short-lived client so the public surface stays a single
+/// function call — no shared state to thread through.
+pub async fn push_now(
+    state: &WebSharedState,
+    share: &ShareState,
+) -> Result<reqwest::StatusCode, reqwest::Error> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PUSH_HTTP_TIMEOUT_SECS))
+        .user_agent(concat!("twm-share-pusher/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let snapshot = build_public_share_stats(state);
+    let body = serde_json::to_vec(&snapshot)
+        .expect("PublicShareStats always serializes");
+
+    let resp = client
+        .post(share.push_url())
+        .header("Content-Type", "application/json")
+        .header("X-TWM-Push-Secret", &share.push_secret)
+        .body(body)
+        .send()
+        .await?;
+    Ok(resp.status())
+}
+
 async fn push_once(
     client: &reqwest::Client,
     state: &WebSharedState,

@@ -1846,6 +1846,7 @@ const API = {
     sellerPriceEstimate: "/api/seller/price_estimate",
     shareAutoSetup: "/api/share/auto-setup",
     shareDiscordLinkUrl: "/api/share/discord-link-url",
+    shareLink: "/api/share/share-link",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -2853,7 +2854,6 @@ function App() {
     // `copyState` is `"idle" | "copied" | "failed"` and resets on subsequent clicks.
     const [shareLink, setShareLink] = useState(null);
     const [shareLinkLoading, setShareLinkLoading] = useState(false);
-    const [discordLinkLoading, setDiscordLinkLoading] = useState(false);
     const [sellerConfig, setSellerConfig] = useState({
         token: "",
         has_token: false,
@@ -3137,22 +3137,60 @@ function App() {
     // very first call and stores them in `share_state.json`; subsequent
     // calls just return the same URL.  Either way we open the inline
     // reveal and try to copy to the clipboard.
+    // Click handler for "Share Stats".  Single-button flow that bundles
+    // slot creation + Discord-link enforcement + vanity-URL copy:
+    //
+    //   1. POST `/api/share/share-link`.  The bot ensures it has a slot,
+    //      pushes once if it just minted one, then asks the cloudflare
+    //      side whether the slot is already linked to a Discord vanity.
+    //   2. If linked → response carries `{ url: ".../twm/<vanity>" }`.
+    //      Copy to clipboard and reveal the URL banner.
+    //   3. If not linked → response carries `{ needs_link: true,
+    //      oauth_url }`.  Open the OAuth URL in a new tab and tell the
+    //      user to come back and re-click after authorising — the second
+    //      click short-circuits at step 2.
+    //
+    // The random-token URL (/twm/?s=<slot>) is no longer surfaced to the
+    // operator at all; the only shareable link is the vanity one.
     const fetchShareLink = useCallback(async () => {
         if (shareLinkLoading) return;
         setShareLinkLoading(true);
         try {
-            const resp = await req(API.shareAutoSetup, { method: "POST" });
-            const next = { url: resp.url, copyState: "idle", created: !!resp.created };
+            const resp = await req(API.shareLink, { method: "POST" });
+            if (!resp || typeof resp !== "object") {
+                flash("Bot returned an empty share-link response");
+                return;
+            }
+
+            if (resp.needs_link) {
+                if (typeof resp.oauth_url !== "string" || !resp.oauth_url) {
+                    flash("Bot did not return a Discord-link URL");
+                    return;
+                }
+                // NOTE: window.open with `noopener` is required by spec
+                // to return `null` on success, so we cannot detect
+                // popup-blocker failure here — see the older Link
+                // Discord handler bug for the long version.  Just open
+                // and trust; if the popup is blocked the user can
+                // re-click and the flash tells them what to do.
+                window.open(resp.oauth_url, "_blank", "noopener,noreferrer");
+                setShareLink(null);
+                flash("Discord linking required first — opened login in a new tab. Finish there, then click Share Stats again to get your vanity URL.");
+                return;
+            }
+
+            if (typeof resp.url !== "string" || !resp.url) {
+                flash("Bot returned a linked slot with no URL — please re-click");
+                return;
+            }
+
+            const next = { url: resp.url, copyState: "idle", created: !!resp.created, vanity: resp.vanity || null };
             setShareLink(next);
-            // Fire-and-forget clipboard write so the user gets a one-click
-            // copy on first open.  Some browsers reject this without a
-            // direct user gesture chain; fall back silently in that case
-            // and let the explicit Copy button in the reveal take over.
             try {
                 if (navigator.clipboard && window.isSecureContext) {
                     await navigator.clipboard.writeText(next.url);
                     setShareLink((prev) => prev ? { ...prev, copyState: "copied" } : prev);
-                    flash(next.created ? "Share link created and copied" : "Share link copied to clipboard");
+                    flash(next.created ? `Share link created and copied (/twm/${next.vanity || ""})` : "Share link copied to clipboard");
                 } else {
                     flash("Share link ready — use the Copy button");
                 }
@@ -3164,9 +3202,6 @@ function App() {
                 handleUnauthorized();
                 return;
             }
-            // The endpoint returns `{"error": "..."}` for I/O failures.
-            // Surface the message directly so the user sees exactly what
-            // went wrong instead of a generic "failed".
             let detail = "";
             try {
                 const parsed = JSON.parse(error.message || "");
@@ -3181,49 +3216,6 @@ function App() {
             setShareLinkLoading(false);
         }
     }, [flash, handleUnauthorized, shareLinkLoading]);
-
-    // Click handler for the "Link Discord" button.  Asks the bot to mint
-    // an HMAC-signed `/auth/discord/start?slot=&ts=&sig=` URL (valid for
-    // 5 minutes on the remote side), then opens it in a new tab so the
-    // user can authorize via Discord OAuth.  After Discord bounces back
-    // to the callback, the remote writes the vanity mapping in KV and
-    // redirects to `/twm/<username>` — the user sees their new pretty
-    // URL in the address bar.
-    const linkDiscord = useCallback(async () => {
-        if (discordLinkLoading) return;
-        setDiscordLinkLoading(true);
-        try {
-            const resp = await req(API.shareDiscordLinkUrl, { method: "POST" });
-            if (!resp || typeof resp.url !== "string" || !resp.url) {
-                flash("Bot did not return a link URL");
-                return;
-            }
-            // NOTE: when `noopener`/`noreferrer` is passed, the spec
-            // requires `window.open` to return `null` even on success, so
-            // we cannot use the return value as a popup-blocked signal.
-            // Previously the fallback below ran unconditionally and the
-            // panel ended up navigating the current tab on top of the new
-            // tab the popup actually opened.
-            window.open(resp.url, "_blank", "noopener,noreferrer");
-            flash("Discord login opened in a new tab — finish there, then your vanity URL will be ready. If nothing opened, your browser blocked the popup; re-click the button.");
-        } catch (error) {
-            if (error.status === 401) {
-                handleUnauthorized();
-                return;
-            }
-            let detail = "";
-            try {
-                const parsed = JSON.parse(error.message || "");
-                if (parsed && typeof parsed.error === "string") {
-                    detail = parsed.error;
-                }
-            } catch (_e) { /* not JSON */ }
-            if (!detail) detail = error.message || "Failed to create Discord-link URL";
-            flash(detail);
-        } finally {
-            setDiscordLinkLoading(false);
-        }
-    }, [discordLinkLoading, flash, handleUnauthorized]);
 
     const copyShareLink = useCallback(async () => {
         if (!shareLink) return;
@@ -3937,8 +3929,7 @@ function App() {
                     <div className="toolbar">
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
-                        <${Button} kind="primary" size="small" onClick=${fetchShareLink} disabled=${shareLinkLoading} title="Copy a public read-only stats link to share">${shareLinkLoading ? "Loading…" : "Share Stats"}</${Button}>
-                        <${Button} kind="secondary" size="small" onClick=${linkDiscord} disabled=${discordLinkLoading} title="Open Discord OAuth to claim a vanity URL like /twm/<your-discord-name>">${discordLinkLoading ? "Loading…" : "Link Discord"}</${Button}>
+                        <${Button} kind="primary" size="small" onClick=${fetchShareLink} disabled=${shareLinkLoading} title="Copy your /twm/<discord-name> stats link. First click opens Discord OAuth so the URL stays human-readable; click again afterwards to copy.">${shareLinkLoading ? "Loading…" : "Share Stats"}</${Button}>
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
                         <span className="themeSelectWrap">
                             <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">
