@@ -1847,6 +1847,8 @@ const API = {
     shareAutoSetup: "/api/share/auto-setup",
     shareDiscordLinkUrl: "/api/share/discord-link-url",
     shareLink: "/api/share/share-link",
+    shareStatus: "/api/share/status",
+    shareUnlink: "/api/share/unlink",
     // Migration note: `?token=` URL auth is no longer accepted by the backend.
     // Chat WS auth now relies on the twm_session cookie (login flow) or an
     // Authorization header for non-browser clients.
@@ -2854,6 +2856,15 @@ function App() {
     // `copyState` is `"idle" | "copied" | "failed"` and resets on subsequent clicks.
     const [shareLink, setShareLink] = useState(null);
     const [shareLinkLoading, setShareLinkLoading] = useState(false);
+    // Discord-link status pill state.  Hydrated on mount via /api/share/status
+    // and refreshed after every Share/Unlink action so the pill always
+    // reflects ground truth without polling.  Shape:
+    //   { has_slot: bool, linked: bool, vanity: string|null,
+    //     vanity_url: string|null, error: string|null }
+    // `null` means we haven't checked yet (skeleton render).
+    const [shareStatus, setShareStatus] = useState(null);
+    const [shareStatusLoading, setShareStatusLoading] = useState(false);
+    const [shareUnlinkLoading, setShareUnlinkLoading] = useState(false);
     const [sellerConfig, setSellerConfig] = useState({
         token: "",
         has_token: false,
@@ -3152,6 +3163,77 @@ function App() {
     //
     // The random-token URL (/twm/?s=<slot>) is no longer surfaced to the
     // operator at all; the only shareable link is the vanity one.
+    // Pull current Discord-link status from the bot.  Cheap, side-effect-free,
+    // and explicitly does NOT mint a slot — see `share_status` in server.rs.
+    // Soft-fails: any error just leaves the pill in its previous state so a
+    // transient network hiccup doesn't blank out the UI.
+    const refreshShareStatus = useCallback(async () => {
+        if (shareStatusLoading) return;
+        setShareStatusLoading(true);
+        try {
+            const resp = await req(API.shareStatus);
+            if (resp && typeof resp === "object") {
+                setShareStatus({
+                    has_slot: !!resp.has_slot,
+                    linked: !!resp.linked,
+                    vanity: typeof resp.vanity === "string" ? resp.vanity : null,
+                    vanity_url: typeof resp.vanity_url === "string" ? resp.vanity_url : null,
+                    error: typeof resp.error === "string" ? resp.error : null,
+                });
+            }
+        } catch (error) {
+            if (error && error.status === 401) {
+                handleUnauthorized();
+                return;
+            }
+            // Non-auth errors are non-fatal: keep whatever pill we already
+            // had so the operator isn't left wondering if their link broke.
+        } finally {
+            setShareStatusLoading(false);
+        }
+    }, [handleUnauthorized, shareStatusLoading]);
+
+    // Drop the Discord linkage on the Cloudflare side.  Local share_state
+    // (slot_id + push_secret) is intentionally preserved so re-linking
+    // simply re-binds the same slot to a new Discord account.
+    const unlinkDiscord = useCallback(async () => {
+        if (shareUnlinkLoading) return;
+        if (!shareStatus || !shareStatus.linked) return;
+        const confirmed = window.confirm(
+            `Unlink Discord (@${shareStatus.vanity || "linked"}) from your stats slot?\n\n` +
+            "Anyone who already saved your /twm/<name> URL will get a 'not linked' page until you re-link."
+        );
+        if (!confirmed) return;
+        setShareUnlinkLoading(true);
+        try {
+            const resp = await req(API.shareUnlink, { method: "POST" });
+            if (resp && typeof resp === "object") {
+                if (resp.unlinked) {
+                    flash(`Unlinked @${resp.previous_vanity || shareStatus.vanity || ""} — your stats are no longer reachable via vanity URL.`);
+                } else {
+                    flash("Slot was already unlinked on the remote.");
+                }
+            }
+            // Clear any visible share-link reveal — the URL it points at is dead now.
+            setShareLink(null);
+            await refreshShareStatus();
+        } catch (error) {
+            if (error && error.status === 401) {
+                handleUnauthorized();
+                return;
+            }
+            let detail = "";
+            try {
+                const parsed = JSON.parse(error.message || "");
+                if (parsed && typeof parsed.error === "string") detail = parsed.error;
+            } catch (_e) { /* not JSON */ }
+            if (!detail) detail = (error && error.message) || "Failed to unlink Discord";
+            flash(detail);
+        } finally {
+            setShareUnlinkLoading(false);
+        }
+    }, [shareStatus, shareUnlinkLoading, refreshShareStatus, flash, handleUnauthorized]);
+
     const fetchShareLink = useCallback(async () => {
         if (shareLinkLoading) return;
         setShareLinkLoading(true);
@@ -3186,6 +3268,10 @@ function App() {
 
             const next = { url: resp.url, copyState: "idle", created: !!resp.created, vanity: resp.vanity || null };
             setShareLink(next);
+            // Refresh the pill so it shows "Discord: @vanity (Unlink)"
+            // immediately instead of waiting for the next mount.  Fire and
+            // forget — the share-link reveal renders independently.
+            refreshShareStatus();
             try {
                 if (navigator.clipboard && window.isSecureContext) {
                     await navigator.clipboard.writeText(next.url);
@@ -3215,7 +3301,7 @@ function App() {
         } finally {
             setShareLinkLoading(false);
         }
-    }, [flash, handleUnauthorized, shareLinkLoading]);
+    }, [flash, handleUnauthorized, shareLinkLoading, refreshShareStatus]);
 
     const copyShareLink = useCallback(async () => {
         if (!shareLink) return;
@@ -3604,7 +3690,10 @@ function App() {
             .catch(() => {});
         refreshEverything();
         loadConfig();
-    }, [refreshEverything, loadConfig]);
+        // Hydrate the Discord-link pill on first paint.  No-op when no
+        // share slot exists yet — the pill quietly stays hidden.
+        refreshShareStatus();
+    }, [refreshEverything, loadConfig, refreshShareStatus]);
 
     const updateThemeMeta = useCallback(() => {
         const meta = document.querySelector('meta[name="theme-color"]');
@@ -3930,6 +4019,32 @@ function App() {
                         <span className=${cls("pill", "motion-skeleton", lastRefresh && "is-loaded")}>Updated ${lastRefresh ? new Date(lastRefresh).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "pending"}</span>
                         <${Button} kind="secondary" size="small" onClick=${refreshEverything}>Refresh Now</${Button}>
                         <${Button} kind="primary" size="small" onClick=${fetchShareLink} disabled=${shareLinkLoading} title="Copy your /twm/<discord-name> stats link. First click opens Discord OAuth so the URL stays human-readable; click again afterwards to copy.">${shareLinkLoading ? "Loading…" : "Share Stats"}</${Button}>
+                        ${shareStatus && shareStatus.has_slot && shareStatus.linked ? html`
+                            <span className=${cls("pill", "tone-blue")} title=${shareStatus.vanity_url || ""} style=${{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+                                <span>Discord: <strong>@${shareStatus.vanity}</strong></span>
+                                <button
+                                    type="button"
+                                    onClick=${unlinkDiscord}
+                                    disabled=${shareUnlinkLoading}
+                                    title="Unlink Discord and free the /twm/${shareStatus.vanity} URL"
+                                    style=${{
+                                        background: "transparent",
+                                        border: "1px solid currentColor",
+                                        color: "inherit",
+                                        borderRadius: "999px",
+                                        padding: "0 8px",
+                                        height: "20px",
+                                        fontSize: "0.72rem",
+                                        cursor: shareUnlinkLoading ? "wait" : "pointer",
+                                        opacity: shareUnlinkLoading ? 0.6 : 1,
+                                        lineHeight: 1
+                                    }}>
+                                    ${shareUnlinkLoading ? "…" : "Unlink"}
+                                </button>
+                            </span>
+                        ` : (shareStatus && shareStatus.has_slot && !shareStatus.linked ? html`
+                            <span className="pill" title="Click Share Stats to start Discord OAuth and claim your /twm/<name> URL.">Discord: not linked</span>
+                        ` : null)}
                         <${Button} kind="ghost" size="small" onClick=${() => { window.location.href = API.logsLatest; }}>Download Latest Log</${Button}>
                         <span className="themeSelectWrap">
                             <select className="themeSelect" value=${getThemePreference()} onChange=${(e) => { setThemePreference(e.target.value); setThemeTick(t => t + 1); updateThemeMeta(); }} title="Color theme">

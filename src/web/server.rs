@@ -358,6 +358,8 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/share/auto-setup", axum::routing::post(auto_setup_share))
         .route("/api/share/discord-link-url", axum::routing::post(discord_link_url))
         .route("/api/share/share-link", axum::routing::post(share_link))
+        .route("/api/share/status", axum::routing::get(share_status))
+        .route("/api/share/unlink", axum::routing::post(share_unlink))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -1770,6 +1772,45 @@ struct DiscordLinkUrlResponse {
     ts: u64,
 }
 
+/// Response shape for `GET /api/share/status` — the read-only status
+/// query the panel calls on mount (and after share/unlink actions) to
+/// drive the "Linked as @austin (Unlink)" pill.  Strictly read-only:
+/// never creates a slot, never pushes, never opens an OAuth window.
+///
+/// Three meaningful states:
+///   * `{ has_slot: false, linked: false, vanity: null, slot_id: null }`
+///     — operator hasn't clicked Share Stats yet on this install.
+///   * `{ has_slot: true, linked: false, vanity: null, slot_id: "..." }`
+///     — slot exists but isn't bound to a Discord account.
+///   * `{ has_slot: true, linked: true, vanity: "austin", slot_id: "..." }`
+///     — fully linked; panel shows the vanity URL + Unlink button.
+///
+/// `error` is a soft warning (e.g. "remote unreachable") so the panel
+/// can still render the cached state instead of going to "Failed".
+#[derive(Serialize)]
+struct ShareStatusResponse {
+    has_slot: bool,
+    linked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vanity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vanity_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Response shape for `POST /api/share/unlink` — fired from the Unlink
+/// button.  `unlinked` is `true` only when this call actually removed
+/// KV records; `false` means the slot was already unlinked (no-op).
+#[derive(Serialize)]
+struct ShareUnlinkResponse {
+    unlinked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_vanity: Option<String>,
+}
+
 /// Response shape for `POST /api/share/share-link`.  Single union response
 /// covering both branches of the new flow:
 ///
@@ -2126,6 +2167,158 @@ async fn lookup_vanity(
         Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
         _ => Ok(None),
     }
+}
+
+/// `GET /api/share/status` — read-only status query the panel polls on
+/// mount to render the Discord-link pill.
+///
+/// Crucially this MUST NOT mint a slot; otherwise just opening the
+/// panel would silently claim a public share URL the operator never
+/// asked for.  If `share_state` is absent we short-circuit with
+/// `has_slot: false` and skip the upstream round-trip entirely.
+///
+/// When the slot exists we reuse the same vanity lookup the share-link
+/// flow uses, but soft-fail: a remote outage shows as
+/// `linked: false, error: "..."` instead of returning a non-2xx, so
+/// the panel can still render a usable status pill.
+async fn share_status(State(s): State<WebSharedState>) -> Response {
+    let share_opt = s.share_state.read().await.clone();
+    let Some(share) = share_opt else {
+        return Json(ShareStatusResponse {
+            has_slot: false,
+            linked: false,
+            vanity: None,
+            slot_id: None,
+            vanity_url: None,
+            error: None,
+        })
+        .into_response();
+    };
+
+    match lookup_vanity(&share).await {
+        Ok(Some(vanity)) => {
+            let url = format!("{}/twm/{}", share.remote_base_url, vanity);
+            Json(ShareStatusResponse {
+                has_slot: true,
+                linked: true,
+                vanity: Some(vanity),
+                slot_id: Some(share.slot_id.clone()),
+                vanity_url: Some(url),
+                error: None,
+            })
+            .into_response()
+        }
+        Ok(None) => Json(ShareStatusResponse {
+            has_slot: true,
+            linked: false,
+            vanity: None,
+            slot_id: Some(share.slot_id.clone()),
+            vanity_url: None,
+            error: None,
+        })
+        .into_response(),
+        Err(detail) => Json(ShareStatusResponse {
+            has_slot: true,
+            linked: false,
+            vanity: None,
+            slot_id: Some(share.slot_id.clone()),
+            vanity_url: None,
+            error: Some(detail),
+        })
+        .into_response(),
+    }
+}
+
+/// `POST /api/share/unlink` — remove the Discord linkage for this
+/// install's slot.  Calls the cloudflare DELETE handler with the same
+/// push secret used elsewhere; on success the operator can re-link
+/// to a different Discord account (or just stop publishing the vanity).
+///
+/// The local `share_state` (slot_id, push_secret) is intentionally
+/// preserved so the underlying random-token URL keeps working — only
+/// the human-readable vanity binding is dropped.  Re-linking simply
+/// re-runs OAuth against the same slot.
+async fn share_unlink(State(s): State<WebSharedState>) -> Response {
+    let share_opt = s.share_state.read().await.clone();
+    let Some(share) = share_opt else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "no share slot exists yet — click Share Stats first"
+            })),
+        )
+            .into_response();
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("twm-share-pusher/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("client build: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let url = format!(
+        "{}/api/twm/share/vanity/{}",
+        share.remote_base_url, share.slot_id
+    );
+    let resp = match client
+        .delete(&url)
+        .header("X-TWM-Push-Secret", &share.push_secret)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[Share] unlink request failed: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("request: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        warn!("[Share] unlink returned {} {}", status, body);
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("remote returned {}: {}", status, body)
+            })),
+        )
+            .into_response();
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let unlinked = parsed
+        .get("unlinked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let previous_vanity = parsed
+        .get("previous_vanity")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    info!(
+        "[Share] unlink for slot {} → unlinked={} previous_vanity={:?}",
+        share.slot_id, unlinked, previous_vanity
+    );
+
+    Json(ShareUnlinkResponse {
+        unlinked,
+        previous_vanity,
+    })
+    .into_response()
 }
 
 async fn chat_ws_handler(
