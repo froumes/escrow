@@ -3198,15 +3198,14 @@ function App() {
                 flash("Bot did not return a link URL");
                 return;
             }
-            const opened = window.open(resp.url, "_blank", "noopener,noreferrer");
-            if (!opened) {
-                // Popup blocker tripped; fall back to same-tab navigation
-                // so the user still gets there.  This loses the panel state
-                // but that's preferable to a silent no-op.
-                window.location.href = resp.url;
-                return;
-            }
-            flash("Discord login opened in a new tab — finish there, then your vanity URL will be ready");
+            // NOTE: when `noopener`/`noreferrer` is passed, the spec
+            // requires `window.open` to return `null` even on success, so
+            // we cannot use the return value as a popup-blocked signal.
+            // Previously the fallback below ran unconditionally and the
+            // panel ended up navigating the current tab on top of the new
+            // tab the popup actually opened.
+            window.open(resp.url, "_blank", "noopener,noreferrer");
+            flash("Discord login opened in a new tab — finish there, then your vanity URL will be ready. If nothing opened, your browser blocked the popup; re-click the button.");
         } catch (error) {
             if (error.status === 401) {
                 handleUnauthorized();
