@@ -708,6 +708,7 @@ async fn main() -> Result<()> {
     bot_client.fastbuy = config.fastbuy_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
+    bot_client.bed_grace_timeout_seconds = config.bed_grace_timeout_seconds.clamp(5, 600);
     bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
     bot_client.bazaar_flips_paused = bazaar_flips_paused.clone();
     bot_client.enable_bazaar_flips = enable_bazaar_flips.clone();

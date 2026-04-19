@@ -83,6 +83,21 @@ pub struct Config {
     /// using `bed_spam_click_delay` and this value is ignored.
     #[serde(default = "default_bed_pre_click_ms")]
     pub bed_pre_click_ms: u64,
+
+    /// Maximum seconds the bot will sit in the bed-spam loop before giving up
+    /// when slot 31 never transitions out of "bed".  Real Skyblock grace
+    /// periods finish well under a minute, but lost packets and stalled
+    /// `ContainerSetSlot` updates can keep us watching a stale window.
+    /// Bumping this just trades faster recovery for more chances to win
+    /// long-grace auctions.  Floored at 5 (anything lower is almost
+    /// guaranteed to abandon real wins) and capped at 600 to prevent a
+    /// misconfiguration from stalling the bot for 10+ minutes per stuck
+    /// window.  When freemoney is on and COFL provided a `purchaseAt`,
+    /// the loop keeps running until at least 60s past `purchaseAt`
+    /// regardless of this value, so the bot never gives up *before*
+    /// the predicted unlock instant.  Default: 180 (3 minutes).
+    #[serde(default = "default_bed_grace_timeout_seconds")]
+    pub bed_grace_timeout_seconds: u64,
     
     #[serde(default = "default_bazaar_order_check_interval_seconds")]
     pub bazaar_order_check_interval_seconds: u64,
@@ -286,6 +301,10 @@ fn default_bed_pre_click_ms() -> u64 {
     30
 }
 
+fn default_bed_grace_timeout_seconds() -> u64 {
+    180
+}
+
 fn default_bazaar_order_check_interval_seconds() -> u64 {
     60
 }
@@ -349,6 +368,7 @@ impl Default for Config {
             bed_spam_click_delay: default_bed_spam_click_delay(),
             bed_multiple_clicks_delay: 0,
             bed_pre_click_ms: default_bed_pre_click_ms(),
+            bed_grace_timeout_seconds: default_bed_grace_timeout_seconds(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
             bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
             bazaar_tax_rate: default_bazaar_tax_rate(),
@@ -475,6 +495,19 @@ mod tests {
     fn parses_bed_pre_click_ms() {
         let config: Config = toml::from_str("bed_pre_click_ms = 300").expect("config should parse");
         assert_eq!(config.bed_pre_click_ms, 300);
+    }
+
+    #[test]
+    fn default_bed_grace_timeout_seconds() {
+        let config = Config::default();
+        assert_eq!(config.bed_grace_timeout_seconds, 180);
+    }
+
+    #[test]
+    fn parses_bed_grace_timeout_seconds() {
+        let config: Config =
+            toml::from_str("bed_grace_timeout_seconds = 300").expect("config should parse");
+        assert_eq!(config.bed_grace_timeout_seconds, 300);
     }
 
     #[test]

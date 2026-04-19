@@ -322,6 +322,12 @@ pub struct BotClient {
     insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
+    /// Maximum seconds to wait in the bed-spam loop for slot 31 to transition
+    /// out of "bed" before giving up.  Sourced from the
+    /// `bed_grace_timeout_seconds` config field; clamped to [5, 600] when
+    /// applied so a misconfigured value can't stall the bot indefinitely.
+    /// Default: 180.
+    pub bed_grace_timeout_seconds: u64,
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -481,6 +487,7 @@ impl BotClient {
             bed_spam_click_delay: 100,
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
+            bed_grace_timeout_seconds: 180,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
@@ -596,6 +603,7 @@ impl BotClient {
             cached_empty_player_slots: self.cached_empty_player_slots.clone(),
             insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
+            bed_grace_timeout_seconds: self.bed_grace_timeout_seconds,
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
@@ -1210,6 +1218,10 @@ pub struct BotClientState {
     pub insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
+    /// Maximum seconds to wait in the bed-spam loop for slot 31 to transition
+    /// out of "bed" before giving up.  See the field of the same name on
+    /// `BotClient` for details.  Default: 180.
+    pub bed_grace_timeout_seconds: u64,
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -1339,6 +1351,7 @@ impl Default for BotClientState {
             cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
+            bed_grace_timeout_seconds: 180,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
@@ -3529,11 +3542,42 @@ async fn handle_window_interaction(
                         info!("[AH] Bed detected in slot 31 — starting bed spam at {}ms interval", click_interval_ms);
                     }
 
-                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
+                    // Build a deadline that respects the configured wall-clock
+                    // budget but is *also* at least 60s past any known
+                    // `purchaseAt` from COFL.  We never want to abandon the
+                    // window before the predicted unlock instant has actually
+                    // arrived — historically the hard-coded 70s wall would
+                    // bail on auctions whose grace period was longer than the
+                    // budget, missing wins where slow `ContainerSetSlot`
+                    // updates just hadn't reached us yet.  Capped at 600s so
+                    // a misconfiguration can't strand the bot for >10 min.
+                    let base_timeout_secs = state.bed_grace_timeout_seconds.clamp(5, 600);
+                    let loop_started = tokio::time::Instant::now();
+                    let mut bed_deadline = loop_started + tokio::time::Duration::from_secs(base_timeout_secs);
+                    if let Some(purchase_at_ms) = *state.pending_purchase_at_ms.read() {
+                        if let Ok(now_ms) = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                        {
+                            let extra_ms = purchase_at_ms - now_ms + 60_000;
+                            if extra_ms > 0 {
+                                let purchase_aware = loop_started
+                                    + tokio::time::Duration::from_millis(extra_ms as u64);
+                                if purchase_aware > bed_deadline {
+                                    bed_deadline = purchase_aware;
+                                }
+                            }
+                        }
+                    }
                     let mut failed_clicks: usize = 0;
+                    let mut last_seen_kind: String = "bed".to_string();
                     loop {
                         if tokio::time::Instant::now() >= bed_deadline {
-                            warn!("[AH] Bed timing: grace period did not end — giving up");
+                            let waited_secs = loop_started.elapsed().as_secs();
+                            warn!(
+                                "[AH] Bed timing: grace period did not end after {}s (last_kind={}, failed_clicks={}, budget={}s) — giving up",
+                                waited_secs, last_seen_kind, failed_clicks, base_timeout_secs
+                            );
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
@@ -3548,6 +3592,7 @@ async fn handle_window_interaction(
                                 else { s.kind().to_string().to_lowercase() }
                             }).unwrap_or_else(|| "air".to_string())
                         };
+                        last_seen_kind = current_kind.clone();
 
                         if current_kind == "air" || current_kind.contains("air") {
                             info!("[AH] Bed timing: window closed");
