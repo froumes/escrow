@@ -2775,6 +2775,14 @@ async fn main() -> Result<()> {
     let macro_paused_proc = macro_paused.clone();
     let command_delay_ms = config.command_delay_ms;
     let auction_listing_delay_ms = config.auction_listing_delay_ms;
+    // Must cover the full bed-grace purchase loop (bed_grace_timeout_seconds
+    // plus purchaseAt + 60s extension in client.rs).  The old 10s default
+    // forced Idle mid-purchase and logged "[Queue] ... timed out after 10s"
+    // while the bot was still spamming the bed.
+    let purchase_auction_timeout_secs = config
+        .bed_grace_timeout_seconds
+        .clamp(5, 600)
+        .saturating_add(120);
     let chat_tx_proc = chat_tx.clone();
     let ws_client_proc = ws_client.clone();
     let bot_client_proc_inv = bot_client.clone();
@@ -2966,6 +2974,9 @@ async fn main() -> Result<()> {
                     twm::types::CommandType::BazaarBuyOrder { .. }
                     | twm::types::CommandType::BazaarSellOrder { .. } => 20,
                     twm::types::CommandType::SellToAuction { .. } => 15,
+                    twm::types::CommandType::PurchaseAuction { .. } => {
+                        purchase_auction_timeout_secs
+                    }
                     _ => 10,
                 };
 

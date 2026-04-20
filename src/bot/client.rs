@@ -1785,6 +1785,15 @@ fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
     None
 }
 
+/// Slot 31 kinds that often appear briefly while Hypixel is still syncing
+/// the BIN view — same category as "wait for bed", not a stuck terminal state.
+fn is_bed_grace_transient_slot(kind_lower: &str) -> bool {
+    kind_lower.contains("feather")
+        || kind_lower.contains("glass_pane")
+        || kind_lower.contains("stained_glass")
+        || kind_lower.contains("barrier")
+}
+
 /// Returns true if the item is a claimable (sold/ended/expired) auction slot.
 /// Matches TypeScript ingameMessageHandler claimableIndicators / activeIndicators.
 fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
@@ -3484,7 +3493,9 @@ async fn handle_window_interaction(
 
                     const BED_FREEMONEY_CLICK_INTERVAL_MS: u64 = 20;
                     const BED_WAIT_POLL_MS: u64 = 20;
-                    const MAX_FAILED_CLICKS: usize = 5;
+                    /// Slot 31 can briefly show feather / glass panes while the
+                    /// server catches up — those are NOT terminal failures.
+                    const MAX_FAILED_CLICKS: usize = 15;
                     let click_interval_ms = if state.freemoney {
                         BED_FREEMONEY_CLICK_INTERVAL_MS
                     } else {
@@ -3617,6 +3628,9 @@ async fn handle_window_interaction(
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("bed") {
+                            // Recovered from a transient non-bed frame — don't let
+                            // old glitch counters poison a long grace wait.
+                            failed_clicks = 0;
                             if state.freemoney {
                                 debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
                                 if *state.last_window_id.read() == window_id {
@@ -3625,11 +3639,18 @@ async fn handle_window_interaction(
                             } else {
                                 debug!("[AH] Bed timing: grace period active, waiting for gold_nugget");
                             }
+                        } else if is_bed_grace_transient_slot(&current_kind) {
+                            // Hypixel often flashes feather (loading) or glass panes
+                            // before the bed appears — same semantics as "wait for bed".
+                            debug!(
+                                "[AH] Bed timing: transient slot 31 = {} — waiting (not counting toward cap)",
+                                current_kind
+                            );
                         } else {
                             failed_clicks += 1;
                             debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
-                                warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
+                                warn!("[AH] Bed timing: stopped after {} unexpected slot states (last_kind={})", failed_clicks, last_seen_kind);
                                 state.bed_timing_active.store(false, Ordering::Relaxed);
                                 send_raw_close(bot, window_id, &state.handlers);
                                 *state.bot_state.write() = BotState::Idle;
