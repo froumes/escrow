@@ -125,7 +125,8 @@ Useful settings include:
 - `enable_bazaar_flips`
   Enables or disables Bazaar flipping logic at startup.
 - `fastbuy`
-  Enables the more aggressive fast-buy confirm path. Defaults to enabled.
+  Deprecated compatibility flag for the old predicted confirm pre-click path.
+  Headless buying now uses the safer observer fast path and defaults this off.
 - `freemoney`
   Enables the more aggressive bed/grace-period path.
 - `command_delay_ms`

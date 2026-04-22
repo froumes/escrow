@@ -140,8 +140,8 @@ pub struct Config {
     #[serde(default)]
     pub bed_spam: bool,
 
-    /// Advanced: enable fast-buy skip-click on predicted Confirm Purchase window.
-    /// Defaults to enabled when omitted.
+    /// Deprecated compatibility flag for the old predicted confirm pre-click path.
+    /// Headless purchases now use the safe observer fast path instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fastbuy: Option<bool>,
 
@@ -377,7 +377,7 @@ impl Default for Config {
             enable_ah_flips: true,
             skip_flips_when_inventory_full: false,
             bed_spam: false,
-            fastbuy: Some(true),
+            fastbuy: Some(false),
             freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
@@ -413,7 +413,7 @@ impl Config {
     }
 
     pub fn fastbuy_enabled(&self) -> bool {
-        self.fastbuy.unwrap_or(true)
+        self.fastbuy.unwrap_or(false)
     }
 
     /// Returns the webhook URL only if it is non-empty.
@@ -641,9 +641,9 @@ proxy_credentials = "myuser:mypassword"
     }
 
     #[test]
-    fn fastbuy_defaults_to_true() {
+    fn fastbuy_defaults_to_false() {
         let config = Config::default();
-        assert!(config.fastbuy_enabled());
+        assert!(!config.fastbuy_enabled());
     }
 
     #[test]
@@ -659,9 +659,9 @@ proxy_credentials = "myuser:mypassword"
     }
 
     #[test]
-    fn omitted_fastbuy_now_defaults_to_true() {
+    fn omitted_fastbuy_now_defaults_to_false() {
         let config: Config = toml::from_str("").expect("config should parse");
-        assert!(config.fastbuy_enabled());
+        assert!(!config.fastbuy_enabled());
     }
 
     #[test]
