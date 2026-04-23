@@ -7,7 +7,7 @@ use std::sync::{
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Request, State, WebSocketUpgrade,
+        Path, Request, State, WebSocketUpgrade,
     },
     http::StatusCode,
     middleware::Next,
@@ -69,18 +69,15 @@ pub struct WebSharedState {
     pub web_gui_password: Option<String>,
     /// Whether auth session cookies should include the `Secure` attribute.
     pub web_gui_cookie_secure: bool,
-    /// Base URL of the remote site that hosts the public stats viewer
-    /// (e.g. `https://austinxyz.lol`).  Used when the panel auto-generates
-    /// a fresh share state.
-    pub share_remote_base_url: String,
-    /// On-disk location of `share_state.json` — written the first time the
-    /// operator clicks "Share Stats" and read on every subsequent startup.
-    pub share_state_path: std::path::PathBuf,
-    /// The bot's persisted share credentials (`slot_id` + `push_secret`),
-    /// or `None` until the operator triggers auto-setup.  Wrapped in
-    /// `RwLock` so the share-pusher can read it on its tick loop while the
-    /// auto-setup endpoint installs new state without blocking pushes.
-    pub share_state: Arc<tokio::sync::RwLock<Option<crate::share_state::ShareState>>>,
+    /// Optional unguessable token enabling the read-only public stats page at
+    /// `/share/{token}`.  `None` (or empty) disables the route entirely.
+    pub web_share_token: Option<String>,
+    /// Pre-formed public URL handed out by the panel's "Share Stats" button.
+    /// When set, takes precedence over the locally-derived `/share/{token}`
+    /// URL so operators can point viewers at a remote site (e.g. their own
+    /// domain backed by an outbound `share_push_url`) instead of exposing
+    /// the bot's host directly.
+    pub share_public_url: Option<String>,
     /// Active web sessions with deterministic FIFO eviction at capacity.
     pub valid_sessions: Arc<Mutex<SessionStore>>,
     /// Cached Minecraft UUID for the current account (dashes format).
@@ -327,10 +324,18 @@ async fn check_auth(
         return next.run(req).await;
     }
 
-    // `/api/share/auto-setup` must stay behind the password gate so anonymous
-    // callers can't trigger fresh `slot_id`/`push_secret` generation against a
-    // running bot.  No other `/share*` routes are exposed by the bot anymore;
-    // the public viewer lives on the remote site (e.g. austinxyz.lol).
+    // The public stats share page enforces its own token check inside the
+    // handler.  Bypass the password gate so anyone with the share URL can view
+    // it even when the panel is otherwise password-protected.
+    //
+    // `/api/share/link` is the panel's own "give me the share URL" helper and
+    // must stay behind the password gate so anonymous callers can't fish for
+    // a configured viewer token.
+    if path.starts_with("/share/")
+        || (path.starts_with("/api/share/") && path != "/api/share/link")
+    {
+        return next.run(req).await;
+    }
 
     if has_valid_auth_session(&req, &s.valid_sessions) {
         return next.run(req).await;
@@ -355,11 +360,9 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/login", axum::routing::post(login))
         .route("/api/profit/public", get(get_profit_public))
         .route("/api/og-image.png", get(get_og_image))
-        .route("/api/share/auto-setup", axum::routing::post(auto_setup_share))
-        .route("/api/share/discord-link-url", axum::routing::post(discord_link_url))
-        .route("/api/share/share-link", axum::routing::post(share_link))
-        .route("/api/share/status", axum::routing::get(share_status))
-        .route("/api/share/unlink", axum::routing::post(share_unlink))
+        .route("/share/{token}", get(get_share_page))
+        .route("/api/share/{token}/stats", get(get_share_stats))
+        .route("/api/share/link", get(get_share_link))
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
@@ -1558,15 +1561,17 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
     )
 }
 
-// ── Public share snapshot ────────────────────────────────────
+// ── Public share page ────────────────────────────────────────
 //
-// The bot itself no longer serves the public stats page — that lives on the
-// remote site (e.g. austinxyz.lol) and is fed by `share_pusher.rs`, which
-// POSTs anonymized snapshots to a Cloudflare Pages Function on a fixed
-// interval.  The structs below define the wire shape; `build_public_share_stats`
-// produces the snapshot from the live in-process state.
+// `web_share_token` in config.toml gates a read-only stats dashboard at
+// `GET /share/{token}`.  The dashboard fetches its data from
+// `GET /api/share/{token}/stats`, both protected by constant-time token
+// comparison so the page is impossible to brute-force or time-attack.
 //
-// Anonymization rules:
+// Unset (or empty) token in config → both routes return 404 (route disabled,
+// no leaked information about whether sharing exists).
+//
+// The payload is intentionally anonymized:
 //   • no IGN, no Minecraft UUID, no Discord ID, no auction UUIDs
 //   • no chat, no inventory, no command/queue access, no config
 //   • only profit charts, profit/hour, uptime, recent realized flips
@@ -1575,6 +1580,47 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
 //
 // This means handing the URL to anyone reveals "how the bot is doing" without
 // exposing any control surface or account-identifying data.
+
+const SHARE_PAGE_HTML: &str = include_str!("share.html");
+
+/// Constant-time string comparison so a bad token can't be detected via
+/// response-time differences.  The expected value comes from the config
+/// share token; the supplied value comes from the URL.
+fn share_token_matches(expected: &str, supplied: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let a = expected.as_bytes();
+    let b = supplied.as_bytes();
+    let len_eq = a.len() == b.len();
+    let mut diff: u8 = if len_eq { 0 } else { 1 };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let ai = *a.get(i).unwrap_or(&0);
+        let bi = *b.get(i).unwrap_or(&0);
+        diff |= ai ^ bi;
+    }
+    len_eq && diff == 0
+}
+
+/// Returns `true` when the supplied token matches the configured share token
+/// (and sharing is enabled at all).
+fn share_token_authorized(state: &WebSharedState, supplied: &str) -> bool {
+    match state.web_share_token.as_deref() {
+        Some(expected) if !expected.is_empty() => share_token_matches(expected, supplied),
+        _ => false,
+    }
+}
+
+async fn get_share_page(
+    State(s): State<WebSharedState>,
+    Path(token): Path<String>,
+) -> Response {
+    if !share_token_authorized(&s, &token) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(SHARE_PAGE_HTML).into_response()
+}
 
 /// Anonymized realized AH flip used by the public share page.
 /// Drops `auction_uuid` so consumers can't link flips back to specific
@@ -1644,9 +1690,9 @@ pub struct PublicShareStats {
     pub now_unix: u64,
 }
 
-/// Build the anonymized snapshot used by the outbound share pusher.  Lives
-/// here (rather than in `share_pusher.rs`) so the wire shape stays adjacent
-/// to the `Public*` structs that define it.
+/// Build the anonymized snapshot used by both `/api/share/{token}/stats` and
+/// the outbound `share_push_url` pusher.  Pulled out into a helper so the two
+/// callers can never drift apart in shape or anonymization rules.
 pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
     let snapshot = s.profit_tracker.snapshot();
     let session_total = snapshot.session_ah_total + snapshot.session_bz_total;
@@ -1655,18 +1701,16 @@ pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 { session_total as f64 / hours } else { 0.0 };
 
-    // Most-recent-first window of realized flips.  `flip_history` is a
-    // VecDeque populated with `push_front` on every realized sale, so its
-    // front-to-back order is already newest→oldest — iterating with plain
-    // `.iter()` preserves that ordering for the public payload.  The ring
-    // is already bounded on the bot, but we cap again here to keep the
-    // share payload small if an operator bumps the ring size later.
+    // Most-recent-first window of realized flips.  The on-disk ring already
+    // bounds this; we cap again here to keep the share payload small even if
+    // an operator bumps the ring size in a future change.
     const MAX_FLIPS: usize = 200;
     let recent_flips: Vec<PublicFlipEntry> = s
         .flip_history
         .lock()
         .map(|h| {
             h.iter()
+                .rev()
                 .take(MAX_FLIPS)
                 .map(|f| PublicFlipEntry {
                     sold_at_unix: f.sold_at_unix,
@@ -1750,573 +1794,79 @@ pub fn build_public_share_stats(s: &WebSharedState) -> PublicShareStats {
     }
 }
 
-/// Response shape for `POST /api/share/auto-setup`.  `created` is `true`
-/// only when this call was the one that actually generated fresh
-/// credentials, so the panel can show "link created!" toast vs.
-/// "here's your link" on subsequent clicks.
-#[derive(Serialize)]
-struct AutoSetupResponse {
-    url: String,
-    slot_id: String,
-    created: bool,
+async fn get_share_stats(
+    State(s): State<WebSharedState>,
+    Path(token): Path<String>,
+) -> Response {
+    if !share_token_authorized(&s, &token) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(build_public_share_stats(&s)).into_response()
 }
 
-/// Response shape for `POST /api/share/discord-link-url`.  Carries a
-/// ready-to-open URL that the panel pops in a new tab so the operator
-/// can authorize their Discord account against the current slot.
-#[derive(Serialize)]
-struct DiscordLinkUrlResponse {
-    url: String,
-    /// Timestamp embedded in the URL, surfaced back to the UI so it can
-    /// show "link valid for 5 minutes" or similar without re-parsing.
-    ts: u64,
-}
-
-/// Response shape for `GET /api/share/status` — the read-only status
-/// query the panel calls on mount (and after share/unlink actions) to
-/// drive the "Linked as @austin (Unlink)" pill.  Strictly read-only:
-/// never creates a slot, never pushes, never opens an OAuth window.
-///
-/// Three meaningful states:
-///   * `{ has_slot: false, linked: false, vanity: null, slot_id: null }`
-///     — operator hasn't clicked Share Stats yet on this install.
-///   * `{ has_slot: true, linked: false, vanity: null, slot_id: "..." }`
-///     — slot exists but isn't bound to a Discord account.
-///   * `{ has_slot: true, linked: true, vanity: "austin", slot_id: "..." }`
-///     — fully linked; panel shows the vanity URL + Unlink button.
-///
-/// `error` is a soft warning (e.g. "remote unreachable") so the panel
-/// can still render the cached state instead of going to "Failed".
-#[derive(Serialize)]
-struct ShareStatusResponse {
-    has_slot: bool,
-    linked: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vanity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    slot_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vanity_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// Response shape for `POST /api/share/unlink` — fired from the Unlink
-/// button.  `unlinked` is `true` only when this call actually removed
-/// KV records; `false` means the slot was already unlinked (no-op).
-#[derive(Serialize)]
-struct ShareUnlinkResponse {
-    unlinked: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_vanity: Option<String>,
-}
-
-/// Response shape for `POST /api/share/share-link`.  Single union response
-/// covering both branches of the new flow:
-///
-///   * `{ needs_link: false, url: "https://.../twm/<vanity>", vanity: "austin" }`
-///     — slot is already linked to a Discord account; the panel just
-///     copies the URL and shows the toast.
-///
-///   * `{ needs_link: true, oauth_url: "https://.../auth/discord/start?...",
-///        oauth_ts: <unix> }`
-///     — slot is unlinked; the panel opens `oauth_url` in a new tab and
-///     waits for the user to come back and re-click Share Stats.
-///
-/// `slot_id` and `created` are echoed back in both cases so the panel can
-/// surface "fresh slot just generated" toasts without a second call.
+/// Where the configured share link points: either a remote URL the operator
+/// pre-set (e.g. their own domain) or the bot's own `/share/{token}` page.
 #[derive(Serialize)]
 struct ShareLinkResponse {
-    needs_link: bool,
-    slot_id: String,
-    created: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    vanity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oauth_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oauth_ts: Option<u64>,
+    url: String,
+    /// `"remote"` when sourced from `share_public_url`, `"local"` when
+    /// derived from `web_share_token` + the request's Host header.
+    kind: &'static str,
 }
 
-/// Compute `HMAC-SHA256(push_secret, "<slot_id>:<ts>")` and return it
-/// hex-encoded.  This is the same primitive the Cloudflare
-/// `/auth/discord/start` function recomputes against the stored
-/// push_secret — if they match, the click came from the bot operator.
-fn sign_discord_link(push_secret: &str, slot_id: &str, ts: u64) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(push_secret.as_bytes())
-        .expect("HMAC-SHA256 accepts keys of any length");
-    mac.update(slot_id.as_bytes());
-    mac.update(b":");
-    mac.update(ts.to_string().as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    hex::encode(bytes)
-}
-
-/// `POST /api/share/auto-setup` — single endpoint backing the panel's
-/// "Share Stats" button.  Idempotent: the first call generates a fresh
-/// `slot_id` + `push_secret`, persists them to `share_state.json`, and
-/// returns the viewer URL; subsequent calls simply return the same URL.
+/// GET /api/share/link — auth-gated helper for the panel's "Share Stats"
+/// button.  Returns the pre-configured `share_public_url` if set; otherwise
+/// falls back to a locally-derived `http(s)://<host>/share/<token>` URL when
+/// `web_share_token` is configured.  Returns 404 when neither is set so the
+/// frontend can show a clear "configure a token first" message without
+/// leaking whether sharing exists at all.
 ///
-/// The push loop in `share_pusher::spawn` polls `WebSharedState.share_state`
-/// continuously, so freshly generated state takes effect on the next push
-/// tick without restarting the bot.  No restart, no config edit, no env
-/// vars — just one click.
-async fn auto_setup_share(State(s): State<WebSharedState>) -> Response {
-    {
-        let guard = s.share_state.read().await;
-        if let Some(existing) = guard.as_ref() {
-            return Json(AutoSetupResponse {
-                url: existing.viewer_url(),
-                slot_id: existing.slot_id.clone(),
-                created: false,
-            })
-            .into_response();
-        }
-    }
-
-    // Re-acquire as a writer.  If a concurrent caller raced us into this
-    // branch and won, prefer their state so two near-simultaneous clicks
-    // don't both write competing `share_state.json` files.
-    let mut guard = s.share_state.write().await;
-    if let Some(existing) = guard.as_ref() {
-        return Json(AutoSetupResponse {
-            url: existing.viewer_url(),
-            slot_id: existing.slot_id.clone(),
-            created: false,
+/// Lives behind the same auth gate as the rest of `/api/*` so anonymous
+/// callers can't enumerate whether sharing is configured.
+async fn get_share_link(
+    State(s): State<WebSharedState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(remote) = s.share_public_url.as_deref().filter(|u| !u.is_empty()) {
+        return Json(ShareLinkResponse {
+            url: remote.to_string(),
+            kind: "remote",
         })
         .into_response();
     }
 
-    let fresh = crate::share_state::ShareState::generate(&s.share_remote_base_url);
-    if let Err(e) = fresh.save_to(&s.share_state_path) {
-        warn!(
-            "[Share] failed to persist share_state.json at {}: {e}",
-            s.share_state_path.display()
-        );
+    let Some(token) = s.web_share_token.as_deref().filter(|t| !t.is_empty()) else {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": format!("could not write share_state.json: {e}")
-            })),
-        )
-            .into_response();
-    }
-
-    let response = AutoSetupResponse {
-        url: fresh.viewer_url(),
-        slot_id: fresh.slot_id.clone(),
-        created: true,
-    };
-    *guard = Some(fresh);
-    info!(
-        "[Share] auto-setup complete — slot_id ready, pusher will start on next tick"
-    );
-    Json(response).into_response()
-}
-
-/// `POST /api/share/discord-link-url` — generate a short-lived, signed
-/// URL that takes the operator through Discord OAuth and attaches their
-/// Discord account to the current share slot, producing a vanity URL
-/// like `https://austinxyz.lol/twm/<username>`.
-///
-/// The URL is signed with `HMAC-SHA256(push_secret, "<slot_id>:<ts>")`
-/// and is valid for 5 minutes on the remote side.  Only the bot and the
-/// remote (which stored `push_secret` on first push) can produce a
-/// matching signature, so an attacker who intercepts or guesses this
-/// URL can't substitute their own slot or Discord account.
-///
-/// Requires `share_state` to be populated — i.e. the operator must
-/// have clicked "Share Stats" at least once so the slot is claimed on
-/// the remote.  Returns 409 otherwise with an actionable error body.
-async fn discord_link_url(State(s): State<WebSharedState>) -> Response {
-    let share = {
-        let guard = s.share_state.read().await;
-        guard.clone()
-    };
-    let share = match share {
-        Some(state) => state,
-        None => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "Click \"Share Stats\" first — no slot has been claimed yet.",
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let sig = sign_discord_link(&share.push_secret, &share.slot_id, ts);
-
-    // urlencoding-free: slot_id is hex, ts is digits, sig is hex — none
-    // need percent-encoding.  Keeping this manual avoids pulling in an
-    // extra crate just for one query string.
-    let url = format!(
-        "{}/auth/discord/start?slot={}&ts={}&sig={}",
-        share.remote_base_url, share.slot_id, ts, sig
-    );
-
-    info!("[Share] issued Discord-link URL for slot {}", share.slot_id);
-    Json(DiscordLinkUrlResponse { url, ts }).into_response()
-}
-
-/// `POST /api/share/share-link` — single endpoint backing the new
-/// Share Stats button.  Combines what used to be three sequential
-/// round-trips from the panel (`auto-setup`, lookup-vanity, mint-oauth)
-/// into one call so the button can do the right thing in a single
-/// click and the operator never sees the random-token URL.
-///
-/// Flow:
-///   1. Ensure `share_state` exists, generating + persisting it on the
-///      first call (TOFU mirror of the cloudflare side).
-///   2. If we just created the slot, push immediately so the cloudflare
-///      KV record exists by the time `/auth/discord/start` checks it.
-///      Without this, the OAuth start endpoint would 404 on the very
-///      first link attempt.
-///   3. Ask the cloudflare side for our current vanity (push-secret
-///      auth).  If it returns one → return the pretty viewer URL.
-///   4. Otherwise mint a short-lived signed OAuth-start URL and tell
-///      the panel to open it.  After the user completes Discord,
-///      re-clicking Share Stats short-circuits at step 3.
-///
-/// Errors at every step are surfaced verbatim to the panel so the
-/// operator can see *why* a click didn't behave (unreachable remote,
-/// stale slot, bad secret, etc.).
-async fn share_link(State(s): State<WebSharedState>) -> Response {
-    // ── Step 1: ensure share_state, capturing whether we just minted it ──
-    let (share, created) = match ensure_share_state(&s).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-
-    // ── Step 2: if we just claimed the slot locally, the remote KV is
-    // empty and the OAuth start endpoint will 404 on the signed link.
-    // Fire one synchronous push so the slot exists upstream.  We do NOT
-    // gate the response on push success — if the network is flaky we
-    // still want to let the user retry — but we do log a warning so
-    // diagnosis isn't a mystery.
-    if created {
-        match crate::share_pusher::push_now(&s, &share).await {
-            Ok(status) if status.is_success() => {
-                info!(
-                    "[Share] pushed initial snapshot for fresh slot {} ({})",
-                    share.slot_id, status
-                );
-            }
-            Ok(status) => {
-                warn!(
-                    "[Share] initial push for slot {} returned {} — vanity lookup may 404",
-                    share.slot_id, status
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "[Share] initial push for slot {} failed: {} — vanity lookup may 404",
-                    share.slot_id, e
-                );
-            }
-        }
-    }
-
-    // ── Step 3: ask the remote whether this slot is already linked. ──
-    match lookup_vanity(&share).await {
-        Ok(Some(vanity)) => {
-            let url = format!("{}/twm/{}", share.remote_base_url, vanity);
-            info!(
-                "[Share] slot {} already linked → vanity {}",
-                share.slot_id, vanity
-            );
-            Json(ShareLinkResponse {
-                needs_link: false,
-                slot_id: share.slot_id.clone(),
-                created,
-                url: Some(url),
-                vanity: Some(vanity),
-                oauth_url: None,
-                oauth_ts: None,
-            })
-            .into_response()
-        }
-        Ok(None) => {
-            // ── Step 4: mint OAuth start URL the panel can open. ──
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let sig = sign_discord_link(&share.push_secret, &share.slot_id, ts);
-            let oauth_url = format!(
-                "{}/auth/discord/start?slot={}&ts={}&sig={}",
-                share.remote_base_url, share.slot_id, ts, sig
-            );
-            info!(
-                "[Share] slot {} not yet linked — issuing Discord-link URL",
-                share.slot_id
-            );
-            Json(ShareLinkResponse {
-                needs_link: true,
-                slot_id: share.slot_id.clone(),
-                created,
-                url: None,
-                vanity: None,
-                oauth_url: Some(oauth_url),
-                oauth_ts: Some(ts),
-            })
-            .into_response()
-        }
-        Err(detail) => {
-            warn!("[Share] vanity lookup failed: {}", detail);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("Vanity lookup failed: {}", detail),
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Get-or-create the share state, returning `(share, created)`.  Folded
-/// out of `auto_setup_share` so `share_link` can reuse the exact same
-/// TOFU + persistence logic without duplicating it.
-async fn ensure_share_state(
-    s: &WebSharedState,
-) -> Result<(crate::share_state::ShareState, bool), Response> {
-    {
-        let guard = s.share_state.read().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok((existing.clone(), false));
-        }
-    }
-    let mut guard = s.share_state.write().await;
-    if let Some(existing) = guard.as_ref() {
-        return Ok((existing.clone(), false));
-    }
-    let fresh = crate::share_state::ShareState::generate(&s.share_remote_base_url);
-    if let Err(e) = fresh.save_to(&s.share_state_path) {
-        warn!(
-            "[Share] failed to persist share_state.json at {}: {e}",
-            s.share_state_path.display()
-        );
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("could not write share_state.json: {e}")
-            })),
-        )
-            .into_response());
-    }
-    let cloned = fresh.clone();
-    *guard = Some(fresh);
-    info!(
-        "[Share] auto-setup complete — slot_id ready, pusher will start on next tick"
-    );
-    Ok((cloned, true))
-}
-
-/// Hit the cloudflare-side `/api/twm/share/vanity/<slot>` endpoint with
-/// our push secret and return the linked vanity username (or `None` if
-/// the slot exists but isn't linked yet).  Network/HTTP failures bubble
-/// up as `Err` so the caller can decide how to surface them.
-async fn lookup_vanity(
-    share: &crate::share_state::ShareState,
-) -> Result<Option<String>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("twm-share-pusher/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| format!("client build: {e}"))?;
-
-    let url = format!(
-        "{}/api/twm/share/vanity/{}",
-        share.remote_base_url, share.slot_id
-    );
-    let resp = client
-        .post(&url)
-        .header("X-TWM-Push-Secret", &share.push_secret)
-        .send()
-        .await
-        .map_err(|e| format!("request: {e}"))?;
-
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("read body: {e}"))?;
-
-    if status == StatusCode::NOT_FOUND {
-        // The push hasn't landed in KV yet; surface as "not linked"
-        // rather than an error so the panel just kicks the OAuth flow.
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(format!("remote returned {} {}", status, body));
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("parse json: {e} (body: {body})"))?;
-    match parsed.get("vanity") {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
-        _ => Ok(None),
-    }
-}
-
-/// `GET /api/share/status` — read-only status query the panel polls on
-/// mount to render the Discord-link pill.
-///
-/// Crucially this MUST NOT mint a slot; otherwise just opening the
-/// panel would silently claim a public share URL the operator never
-/// asked for.  If `share_state` is absent we short-circuit with
-/// `has_slot: false` and skip the upstream round-trip entirely.
-///
-/// When the slot exists we reuse the same vanity lookup the share-link
-/// flow uses, but soft-fail: a remote outage shows as
-/// `linked: false, error: "..."` instead of returning a non-2xx, so
-/// the panel can still render a usable status pill.
-async fn share_status(State(s): State<WebSharedState>) -> Response {
-    let share_opt = s.share_state.read().await.clone();
-    let Some(share) = share_opt else {
-        return Json(ShareStatusResponse {
-            has_slot: false,
-            linked: false,
-            vanity: None,
-            slot_id: None,
-            vanity_url: None,
-            error: None,
-        })
-        .into_response();
-    };
-
-    match lookup_vanity(&share).await {
-        Ok(Some(vanity)) => {
-            let url = format!("{}/twm/{}", share.remote_base_url, vanity);
-            Json(ShareStatusResponse {
-                has_slot: true,
-                linked: true,
-                vanity: Some(vanity),
-                slot_id: Some(share.slot_id.clone()),
-                vanity_url: Some(url),
-                error: None,
-            })
-            .into_response()
-        }
-        Ok(None) => Json(ShareStatusResponse {
-            has_slot: true,
-            linked: false,
-            vanity: None,
-            slot_id: Some(share.slot_id.clone()),
-            vanity_url: None,
-            error: None,
-        })
-        .into_response(),
-        Err(detail) => Json(ShareStatusResponse {
-            has_slot: true,
-            linked: false,
-            vanity: None,
-            slot_id: Some(share.slot_id.clone()),
-            vanity_url: None,
-            error: Some(detail),
-        })
-        .into_response(),
-    }
-}
-
-/// `POST /api/share/unlink` — remove the Discord linkage for this
-/// install's slot.  Calls the cloudflare DELETE handler with the same
-/// push secret used elsewhere; on success the operator can re-link
-/// to a different Discord account (or just stop publishing the vanity).
-///
-/// The local `share_state` (slot_id, push_secret) is intentionally
-/// preserved so the underlying random-token URL keeps working — only
-/// the human-readable vanity binding is dropped.  Re-linking simply
-/// re-runs OAuth against the same slot.
-async fn share_unlink(State(s): State<WebSharedState>) -> Response {
-    let share_opt = s.share_state.read().await.clone();
-    let Some(share) = share_opt else {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "no share slot exists yet — click Share Stats first"
+                "error": "no share link configured — set share_public_url or web_share_token"
             })),
         )
             .into_response();
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("twm-share-pusher/", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("client build: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    // Prefer the proxy-supplied scheme when present (the bot is normally
+    // accessed directly over HTTP, but operators sometimes front it with
+    // Caddy/Nginx/Cloudflare for HTTPS).  Fall back to http otherwise so
+    // the link is always copy-pasteable even without a proxy.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http".to_string());
 
-    let url = format!(
-        "{}/api/twm/share/vanity/{}",
-        share.remote_base_url, share.slot_id
-    );
-    let resp = match client
-        .delete(&url)
-        .header("X-TWM-Push-Secret", &share.push_secret)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("[Share] unlink request failed: {e}");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("request: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "localhost".to_string());
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        warn!("[Share] unlink returned {} {}", status, body);
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("remote returned {}: {}", status, body)
-            })),
-        )
-            .into_response();
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    let unlinked = parsed
-        .get("unlinked")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let previous_vanity = parsed
-        .get("previous_vanity")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    info!(
-        "[Share] unlink for slot {} → unlinked={} previous_vanity={:?}",
-        share.slot_id, unlinked, previous_vanity
-    );
-
-    Json(ShareUnlinkResponse {
-        unlinked,
-        previous_vanity,
+    Json(ShareLinkResponse {
+        url: format!("{scheme}://{host}/share/{token}"),
+        kind: "local",
     })
     .into_response()
 }

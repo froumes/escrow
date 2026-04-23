@@ -314,7 +314,7 @@ pub struct BotClient {
     auto_cookie_hours: Arc<RwLock<u64>>,
     /// Hidden config gate for purchaseAt bed timing mode.
     pub freemoney: bool,
-    /// Deprecated compatibility flag for the old predicted confirm pre-click path.
+    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
     pub fastbuy: bool,
     /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
@@ -322,12 +322,6 @@ pub struct BotClient {
     insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
-    /// Maximum seconds to wait in the bed-spam loop for slot 31 to transition
-    /// out of "bed" before giving up.  Sourced from the
-    /// `bed_grace_timeout_seconds` config field; clamped to [5, 600] when
-    /// applied so a misconfigured value can't stall the bot indefinitely.
-    /// Default: 180.
-    pub bed_grace_timeout_seconds: u64,
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -487,7 +481,6 @@ impl BotClient {
             bed_spam_click_delay: 100,
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
-            bed_grace_timeout_seconds: 180,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
@@ -586,14 +579,14 @@ impl BotClient {
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
-            purchase_buy_claim_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            purchase_confirm_claim_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            skip_click_sent: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
             freemoney: self.freemoney,
+            fastbuy: self.fastbuy,
             bed_spam_click_delay: self.bed_spam_click_delay,
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
@@ -603,7 +596,6 @@ impl BotClient {
             cached_empty_player_slots: self.cached_empty_player_slots.clone(),
             insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
-            bed_grace_timeout_seconds: self.bed_grace_timeout_seconds,
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
@@ -1172,14 +1164,9 @@ pub struct BotClientState {
     /// Set to true while the bot is waiting for a bed (grace-period) to expire so
     /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
     pub bed_timing_active: Arc<AtomicBool>,
-    /// Purchase generation that already sent the slot-31 buy click.
-    /// The observer fast path and Event::Packet fallback race through this
-    /// guard so only one path can click the buy button.
-    pub purchase_buy_claim_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Purchase generation that already sent the slot-11 confirm click.
-    /// Confirm clicks are still sent only after the Confirm Purchase window
-    /// has actually opened; this just prevents duplicate first clicks.
-    pub purchase_confirm_claim_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set when a skip-click (pre-click on predicted Confirm Purchase window) is sent.
+    /// The Confirm Purchase handler checks this to avoid sending a duplicate reactive click.
+    pub skip_click_sent: Arc<AtomicBool>,
     /// Notified when ContainerSetSlot / ContainerSetContent arrives so the purchase
     /// handler can react instantly instead of polling every 10ms.
     pub slot_data_notify: Arc<tokio::sync::Notify>,
@@ -1195,6 +1182,8 @@ pub struct BotClientState {
     pub auto_cookie_hours: Arc<RwLock<u64>>,
     /// Hidden config gate for purchaseAt bed timing mode.
     pub freemoney: bool,
+    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
+    pub fastbuy: bool,
     /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
     /// Measured remaining cookie time in seconds (set during CheckingCookie).
@@ -1221,10 +1210,6 @@ pub struct BotClientState {
     pub insta_sell_item: Arc<RwLock<Option<String>>>,
     /// How many ms before bed timer expiry to start pre-clicking (default: 100).
     pub bed_pre_click_ms: u64,
-    /// Maximum seconds to wait in the bed-spam loop for slot 31 to transition
-    /// out of "bed" before giving up.  See the field of the same name on
-    /// `BotClient` for details.  Default: 180.
-    pub bed_grace_timeout_seconds: u64,
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -1337,14 +1322,14 @@ impl Default for BotClientState {
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
-            purchase_buy_claim_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            purchase_confirm_claim_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            skip_click_sent: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
             freemoney: false,
+            fastbuy: false,
             bed_spam_click_delay: 100,
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
@@ -1354,7 +1339,6 @@ impl Default for BotClientState {
             cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
-            bed_grace_timeout_seconds: 180,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
@@ -1786,15 +1770,6 @@ fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
         }
     }
     None
-}
-
-/// Slot 31 kinds that often appear briefly while Hypixel is still syncing
-/// the BIN view — same category as "wait for bed", not a stuck terminal state.
-fn is_bed_grace_transient_slot(kind_lower: &str) -> bool {
-    kind_lower.contains("feather")
-        || kind_lower.contains("glass_pane")
-        || kind_lower.contains("stained_glass")
-        || kind_lower.contains("barrier")
 }
 
 /// Returns true if the item is a claimable (sold/ended/expired) auction slot.
@@ -2278,8 +2253,7 @@ async fn event_handler(
                         send_raw_close(&bot, window_id, &state.handlers);
                     }
                     state.grace_period_spam_active.store(false, Ordering::Relaxed);
-                    state.purchase_buy_claim_generation.store(0, Ordering::Release);
-                    state.purchase_confirm_claim_generation.store(0, Ordering::Release);
+                    state.skip_click_sent.store(false, Ordering::Relaxed);
                     *state.purchase_start_time.write() = None;
                     *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
@@ -3120,7 +3094,7 @@ async fn execute_command(
 
     // Increment the command generation counter so the GUI watchdog knows a new
     // command has started and should not auto-close windows from a previous command.
-    let command_generation = state.command_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.command_generation.fetch_add(1, Ordering::SeqCst);
 
     info!("Executing command: {:?}", command.command_type);
 
@@ -3166,20 +3140,6 @@ async fn execute_command(
             // Clear stale observer data from any previous window so the timing
             // comparison in the OpenScreen handler is accurate for THIS purchase.
             *state.window_open_info.write() = None;
-            *state.pending_purchase_at_ms.write() = flip.purchase_at_ms;
-            state.purchase_buy_claim_generation.store(0, Ordering::Release);
-            state.purchase_confirm_claim_generation.store(0, Ordering::Release);
-
-            // Enter Purchasing and start the observer fast path before
-            // /viewauction is sent, so it can catch the earliest window packet.
-            *state.bot_state.write() = BotState::Purchasing;
-            {
-                let fast_bot = bot.clone();
-                let fast_state = state.clone();
-                tokio::spawn(async move {
-                    purchase_observer_fast_path(fast_bot, fast_state, command_generation).await;
-                });
-            }
 
             // Record buy-speed start time right before sending /viewauction
             // so the measurement covers command-send → coins-in-escrow (the
@@ -3193,6 +3153,10 @@ async fn execute_command(
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
             // local Instant later — and only when the auction turns out to be a
             // bed (grace-period) and freemoney mode is enabled.
+            *state.pending_purchase_at_ms.write() = flip.purchase_at_ms;
+            
+            // Set state to purchasing
+            *state.bot_state.write() = BotState::Purchasing;
         }
         CommandType::BazaarBuyOrder { item_name, item_tag, amount, price_per_unit } => {
             // Abort immediately if at the bazaar order limit — no point opening
@@ -3398,187 +3362,6 @@ async fn execute_command(
     }
 }
 
-// Safe AH purchase fast-path helpers. These preserve the gold_nugget and
-// Confirm Purchase gates while bypassing the slower Event::Packet path.
-fn is_active_purchase_generation(state: &BotClientState, generation: u64) -> bool {
-    generation != 0
-        && state.command_generation.load(Ordering::SeqCst) == generation
-        && *state.bot_state.read() == BotState::Purchasing
-}
-
-fn try_claim_purchase_stage(
-    state: &BotClientState,
-    claim_generation: &std::sync::atomic::AtomicU64,
-    generation: u64,
-    stage: &str,
-) -> bool {
-    if !is_active_purchase_generation(state, generation) {
-        return false;
-    }
-
-    match claim_generation.compare_exchange(0, generation, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => true,
-        Err(existing) if existing == generation => {
-            debug!("[AH FastPath] {} already handled for generation {}", stage, generation);
-            false
-        }
-        Err(existing) => {
-            debug!(
-                "[AH FastPath] {} claim held by generation {}, current generation {}",
-                stage, existing, generation
-            );
-            false
-        }
-    }
-}
-
-fn current_slot_kind(bot: &Client, slot: usize) -> String {
-    let menu = bot.menu();
-    let slots = menu.slots();
-    slots.get(slot).map(|s| {
-        if s.is_empty() { "air".to_string() }
-        else { s.kind().to_string().to_lowercase() }
-    }).unwrap_or_else(|| "air".to_string())
-}
-
-async fn wait_for_slot_kind(
-    bot: &Client,
-    state: &BotClientState,
-    generation: u64,
-    slot: usize,
-    timeout_ms: u64,
-) -> String {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-
-    loop {
-        if !is_active_purchase_generation(state, generation) {
-            return "stale".to_string();
-        }
-
-        let notified = state.slot_data_notify.notified();
-        let kind = current_slot_kind(bot, slot);
-        if kind != "air" || tokio::time::Instant::now() >= deadline {
-            return kind;
-        }
-
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return kind;
-        }
-
-        tokio::select! {
-            _ = notified => {}
-            _ = tokio::time::sleep(deadline - now) => {}
-        }
-    }
-}
-
-async fn wait_for_observed_window<F>(
-    state: &BotClientState,
-    generation: u64,
-    timeout_ms: u64,
-    matches_title: F,
-) -> Option<(u8, String)>
-where
-    F: Fn(&str) -> bool,
-{
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-
-    loop {
-        if !is_active_purchase_generation(state, generation) {
-            return None;
-        }
-
-        let notified = state.window_open_notify.notified();
-        if let Some(info) = state.window_open_info.read().clone() {
-            let parsed_title = state.handlers.parse_window_title(&info.title);
-            if matches_title(&parsed_title) {
-                if let Ok(window_id) = u8::try_from(info.window_id) {
-                    return Some((window_id, parsed_title));
-                }
-            }
-        }
-
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return None;
-        }
-
-        tokio::select! {
-            _ = notified => {}
-            _ = tokio::time::sleep(deadline - now) => return None,
-        }
-    }
-}
-
-async fn purchase_observer_fast_path(bot: Client, state: BotClientState, generation: u64) {
-    let Some((window_id, _title)) = wait_for_observed_window(
-        &state,
-        generation,
-        1_500,
-        |title| title.contains("BIN Auction View") || title.contains("Auction View"),
-    ).await else {
-        return;
-    };
-
-    if let Some(t0) = *state.purchase_start_time.read() {
-        info!(
-            "[Timing] /viewauction -> BIN window observer fast-path: {:.1}ms",
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-
-    let slot_31_kind = wait_for_slot_kind(&bot, &state, generation, 31, 500).await;
-    if let Some(t0) = *state.purchase_start_time.read() {
-        info!(
-            "[Timing] /viewauction -> observer slot 31 ready ({}): {:.1}ms",
-            slot_31_kind,
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-
-    if !slot_31_kind.contains("gold_nugget") {
-        debug!(
-            "[AH FastPath] Slot 31 = {} - leaving this auction to the normal handler",
-            slot_31_kind
-        );
-        return;
-    }
-
-    if !try_claim_purchase_stage(
-        &state,
-        &state.purchase_buy_claim_generation,
-        generation,
-        "buy click",
-    ) {
-        return;
-    }
-
-    info!("[AH FastPath] gold_nugget confirmed by observer - sending buy click");
-    send_raw_click(&bot, window_id, 31);
-
-    let Some((confirm_window_id, _title)) = wait_for_observed_window(
-        &state,
-        generation,
-        1_500,
-        |title| title.contains("Confirm Purchase"),
-    ).await else {
-        return;
-    };
-
-    if !try_claim_purchase_stage(
-        &state,
-        &state.purchase_confirm_claim_generation,
-        generation,
-        "confirm click",
-    ) {
-        return;
-    }
-
-    info!("[AH FastPath] Confirm Purchase observed - clicking confirm");
-    send_raw_click(&bot, confirm_window_id, 11);
-}
-
 /// Handle window interactions based on bot state and window title
 async fn handle_window_interaction(
     bot: &Client,
@@ -3617,11 +3400,11 @@ async fn handle_window_interaction(
                 }
 
                 // ---- Wait for slot 31 before clicking (ANTI-CHEAT GATE) ----
-                // Do NOT click slot 31 until we know what
+                // Do NOT click slot 31 or send skip-click until we know what
                 // item the server placed there.  Clicking on a non-interactive
                 // item (e.g. feather = loading placeholder) is an "impossible
-                // action" that can trigger Hypixel anti-cheat. The buy-click
-                // is sent AFTER gold_nugget is confirmed.
+                // action" that can trigger Hypixel anti-cheat.  The buy-click
+                // and skip-click are sent AFTER gold_nugget is confirmed.
                 //
                 // The PacketAcceleratorPlugin fires slot_data_notify earlier
                 // (during ECS apply_deferred rather than via Event::Packet),
@@ -3633,8 +3416,35 @@ async fn handle_window_interaction(
                 // Wait for ContainerSetContent / ContainerSetSlot to populate
                 // slot 31.  Uses a Notify that fires instantly when the packet
                 // arrives instead of polling every 10ms.
-                let generation = state.command_generation.load(Ordering::SeqCst);
-                let slot_31_kind = wait_for_slot_kind(bot, state, generation, 31, 500).await;
+                let slot_31_kind = {
+                    let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+                    let mut kind;
+                    loop {
+                        // Register the Notify listener BEFORE reading slots.
+                        // notify_waiters() drops the notification when no task
+                        // is waiting, so if ContainerSetContent fires between
+                        // the slot read and the select! below, the notification
+                        // would be lost and we'd stall for the full 500ms
+                        // deadline.  Registering first guarantees we capture it.
+                        let notified = state.slot_data_notify.notified();
+
+                        let menu = bot.menu();
+                        let slots = menu.slots();
+                        kind = slots.get(31).map(|s| {
+                            if s.is_empty() { "air".to_string() }
+                            else { s.kind().to_string().to_lowercase() }
+                        }).unwrap_or_else(|| "air".to_string());
+                        if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
+                            break;
+                        }
+                        let remaining = poll_deadline - tokio::time::Instant::now();
+                        tokio::select! {
+                            _ = notified => {}
+                            _ = tokio::time::sleep(remaining) => {}
+                        }
+                    }
+                    kind
+                };
 
                 // Log when slot 31 data is ready — the delta between this
                 // and the interaction handler start shows how long we waited
@@ -3652,7 +3462,7 @@ async fn handle_window_interaction(
 
                 if slot_31_kind.contains("bed") {
                     // Bed = auction is still in grace period.
-                    // No buy-click was sent (we waited for
+                    // No buy-click or skip-click was sent (we waited for
                     // confirmation first).  The bed-spam loop below
                     // repeatedly clicks slot 31 until the grace period ends
                     // and the item becomes purchasable (gold_nugget appears).
@@ -3661,9 +3471,7 @@ async fn handle_window_interaction(
 
                     const BED_FREEMONEY_CLICK_INTERVAL_MS: u64 = 20;
                     const BED_WAIT_POLL_MS: u64 = 20;
-                    /// Slot 31 can briefly show feather / glass panes while the
-                    /// server catches up — those are NOT terminal failures.
-                    const MAX_FAILED_CLICKS: usize = 15;
+                    const MAX_FAILED_CLICKS: usize = 5;
                     let click_interval_ms = if state.freemoney {
                         BED_FREEMONEY_CLICK_INTERVAL_MS
                     } else {
@@ -3721,42 +3529,11 @@ async fn handle_window_interaction(
                         info!("[AH] Bed detected in slot 31 — starting bed spam at {}ms interval", click_interval_ms);
                     }
 
-                    // Build a deadline that respects the configured wall-clock
-                    // budget but is *also* at least 60s past any known
-                    // `purchaseAt` from COFL.  We never want to abandon the
-                    // window before the predicted unlock instant has actually
-                    // arrived — historically the hard-coded 70s wall would
-                    // bail on auctions whose grace period was longer than the
-                    // budget, missing wins where slow `ContainerSetSlot`
-                    // updates just hadn't reached us yet.  Capped at 600s so
-                    // a misconfiguration can't strand the bot for >10 min.
-                    let base_timeout_secs = state.bed_grace_timeout_seconds.clamp(5, 600);
-                    let loop_started = tokio::time::Instant::now();
-                    let mut bed_deadline = loop_started + tokio::time::Duration::from_secs(base_timeout_secs);
-                    if let Some(purchase_at_ms) = *state.pending_purchase_at_ms.read() {
-                        if let Ok(now_ms) = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                        {
-                            let extra_ms = purchase_at_ms - now_ms + 60_000;
-                            if extra_ms > 0 {
-                                let purchase_aware = loop_started
-                                    + tokio::time::Duration::from_millis(extra_ms as u64);
-                                if purchase_aware > bed_deadline {
-                                    bed_deadline = purchase_aware;
-                                }
-                            }
-                        }
-                    }
+                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
                     let mut failed_clicks: usize = 0;
-                    let mut last_seen_kind: String = "bed".to_string();
                     loop {
                         if tokio::time::Instant::now() >= bed_deadline {
-                            let waited_secs = loop_started.elapsed().as_secs();
-                            warn!(
-                                "[AH] Bed timing: grace period did not end after {}s (last_kind={}, failed_clicks={}, budget={}s) — giving up",
-                                waited_secs, last_seen_kind, failed_clicks, base_timeout_secs
-                            );
+                            warn!("[AH] Bed timing: grace period did not end — giving up");
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
@@ -3771,7 +3548,6 @@ async fn handle_window_interaction(
                                 else { s.kind().to_string().to_lowercase() }
                             }).unwrap_or_else(|| "air".to_string())
                         };
-                        last_seen_kind = current_kind.clone();
 
                         if current_kind == "air" || current_kind.contains("air") {
                             info!("[AH] Bed timing: window closed");
@@ -3796,9 +3572,6 @@ async fn handle_window_interaction(
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("bed") {
-                            // Recovered from a transient non-bed frame — don't let
-                            // old glitch counters poison a long grace wait.
-                            failed_clicks = 0;
                             if state.freemoney {
                                 debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
                                 if *state.last_window_id.read() == window_id {
@@ -3807,18 +3580,11 @@ async fn handle_window_interaction(
                             } else {
                                 debug!("[AH] Bed timing: grace period active, waiting for gold_nugget");
                             }
-                        } else if is_bed_grace_transient_slot(&current_kind) {
-                            // Hypixel often flashes feather (loading) or glass panes
-                            // before the bed appears — same semantics as "wait for bed".
-                            debug!(
-                                "[AH] Bed timing: transient slot 31 = {} — waiting (not counting toward cap)",
-                                current_kind
-                            );
                         } else {
                             failed_clicks += 1;
                             debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
                             if failed_clicks >= MAX_FAILED_CLICKS {
-                                warn!("[AH] Bed timing: stopped after {} unexpected slot states (last_kind={})", failed_clicks, last_seen_kind);
+                                warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
                                 state.bed_timing_active.store(false, Ordering::Relaxed);
                                 send_raw_close(bot, window_id, &state.handlers);
                                 *state.bot_state.write() = BotState::Idle;
@@ -3841,23 +3607,38 @@ async fn handle_window_interaction(
                     // reduces how long we wait to notice these packets, but the
                     // click still occurs after the server has prepared the
                     // window — which is exactly what a fast human player does.
-                    if !try_claim_purchase_stage(
-                        state,
-                        &state.purchase_buy_claim_generation,
-                        generation,
-                        "buy click",
-                    ) {
-                        return;
-                    }
                     if let Some(t0) = *state.purchase_start_time.read() {
                         info!(
                             "[Timing] /viewauction → buy click sent: {:.1}ms",
                             t0.elapsed().as_secs_f64() * 1000.0
                         );
                     }
-                    info!("[AH] gold_nugget confirmed - sending buy click");
+                    if state.fastbuy {
+                        info!("[AH] gold_nugget confirmed — sending buy + skip (fastbuy)");
+                    } else {
+                        info!("[AH] gold_nugget confirmed — sending buy click");
+                    }
                     // Use raw connection to bypass ECS queue for the buy click.
                     send_raw_click(bot, window_id, 31);
+
+                    // Skip-click: only when fastbuy is explicitly enabled,
+                    // pre-click slot 11 on the predicted Confirm Purchase
+                    // window in the same TCP burst as the buy-click.
+                    // When fastbuy is off the Confirm Purchase handler will
+                    // click confirm reactively when the window opens.
+                    if state.fastbuy {
+                        // Redundant second buy click to guard against packet
+                        // loss — only needed when we also send the skip-click,
+                        // because a lost buy-click + queued confirm-click on a
+                        // window that never opens is an impossible action.
+                        send_raw_click(bot, window_id, 31);
+
+                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                        info!("[AH] Fastbuy: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
+                        state.skip_click_sent.store(true, Ordering::Relaxed);
+                        // Use raw connection for the skip-click too.
+                        send_raw_click(bot, next_wid, 11);
+                    }
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
                     // Slot 31 is a non-purchasable item placed by the server:
@@ -3890,8 +3671,6 @@ async fn handle_window_interaction(
                         };
                         warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
                         let _ = state.event_tx.send(BotEvent::ChatMessage(msg.to_string()));
-                        state.purchase_buy_claim_generation.store(0, Ordering::Release);
-                        state.purchase_confirm_claim_generation.store(0, Ordering::Release);
                         *state.purchase_start_time.write() = None;
                         *state.pending_purchase_at_ms.write() = None;
                         send_raw_close(bot, window_id, &state.handlers);
@@ -3909,34 +3688,26 @@ async fn handle_window_interaction(
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                // The observer fast path may already have clicked confirm, but
-                // only after this actual Confirm Purchase window opened. If it
-                // has not, claim and click from the normal Event::Packet path.
-                let generation = state.command_generation.load(Ordering::SeqCst);
-                let confirm_already_sent = state
-                    .purchase_confirm_claim_generation
-                    .load(Ordering::Acquire)
-                    == generation;
-                if confirm_already_sent {
-                    info!("[AH] Confirm click already sent by observer fast path");
-                } else if try_claim_purchase_stage(
-                    state,
-                    &state.purchase_confirm_claim_generation,
-                    generation,
-                    "confirm click",
-                ) {
-                    send_raw_click(bot, window_id, 11);
+                // If a skip-click was already sent for this window, don't fire a
+                // redundant reactive click — the pre-click packet should already be
+                // queued on the server for the same tick.
+                let skip_was_sent = state.skip_click_sent.swap(false, Ordering::Relaxed);
+                if skip_was_sent {
+                    info!("[AH] Skip-click was sent — skipping reactive confirm click");
                 } else {
-                    return;
+                    // No skip-click — click confirm (slot 11) immediately via raw connection.
+                    send_raw_click(bot, window_id, 11);
                 }
 
-                // Safety loop: after the first real confirm-window click, keep
-                // retrying if the window is still open.
+                // When skip-click was sent, the server already has the confirm
+                // click queued from the same TCP burst as the buy-click.  Use
+                // the same retry interval — the safety loop below handles any
+                // cases where the server needs more time.
                 let initial_wait_ms = CONFIRM_PURCHASE_RETRY_MS;
                 tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
-                // Safety retry loop: if the window is still open (click was lost
-                // or the server needs more time), keep retrying.
+                // Safety retry loop: if the window is still open (pre-click failed,
+                // click was lost, or the server needs more time), keep retrying.
                 while state.handlers.current_window_title()
                     .as_deref()
                     .map(|t| t.contains("Confirm Purchase"))
@@ -3947,8 +3718,6 @@ async fn handle_window_interaction(
                 }
 
                 send_raw_close(bot, window_id, &state.handlers);
-                state.purchase_buy_claim_generation.store(0, Ordering::Release);
-                state.purchase_confirm_claim_generation.store(0, Ordering::Release);
                 *state.bot_state.write() = BotState::Idle;
             }
         }

@@ -708,7 +708,6 @@ async fn main() -> Result<()> {
     bot_client.fastbuy = config.fastbuy_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
-    bot_client.bed_grace_timeout_seconds = config.bed_grace_timeout_seconds.clamp(5, 600);
     bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
     bot_client.bazaar_flips_paused = bazaar_flips_paused.clone();
     bot_client.enable_bazaar_flips = enable_bazaar_flips.clone();
@@ -757,25 +756,6 @@ async fn main() -> Result<()> {
     let seller_runner = twm::seller::SellerRunner::new(bot_client.clone());
     let seller_config_path = twm::seller::SellerConfig::default_path();
 
-    // Persistent share-link state.  Loaded on every startup so the public
-    // URL stays stable across restarts; populated for the first time when
-    // the operator clicks "Share Stats" in the panel.  Wrapped in an
-    // RwLock so the panel handler can mutate it (auto-setup) while the
-    // share pusher reads it on its tick loop.
-    let share_state_path = twm::share_state::ShareState::default_path();
-    let initial_share_state = match twm::share_state::ShareState::load_from(&share_state_path) {
-        Ok(state) => state,
-        Err(e) => {
-            tracing::warn!(
-                "[Share] could not read {}: {e} — starting without persisted share state",
-                share_state_path.display()
-            );
-            None
-        }
-    };
-    let share_state_handle =
-        std::sync::Arc::new(tokio::sync::RwLock::new(initial_share_state));
-
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
     {
@@ -794,9 +774,8 @@ async fn main() -> Result<()> {
             chat_tx: chat_tx.clone(),
             web_gui_password: config.web_gui_password.clone(),
             web_gui_cookie_secure: config.web_gui_cookie_secure,
-            share_remote_base_url: config.share_remote_base_url.clone(),
-            share_state_path: share_state_path.clone(),
-            share_state: share_state_handle.clone(),
+            web_share_token: config.web_share_token.clone(),
+            share_public_url: config.share_public_url.clone(),
             valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 twm::web::SessionStore::new(),
             )),
@@ -819,15 +798,18 @@ async fn main() -> Result<()> {
             start_web_server(web_state, web_port).await;
         });
 
-        // Outbound stats pusher.  Always spawned; the loop is a cheap no-op
-        // until the operator clicks "Share Stats" in the panel for the
-        // first time, which populates `share_state` and starts the pushes.
-        // Anonymized snapshots are POSTed to the remote site so viewers
-        // see stats via that origin and the bot's IP stays hidden.
-        twm::share_pusher::spawn(
-            pusher_state,
-            twm::share_pusher::SharePusherConfig::new(config.share_push_interval_seconds),
-        );
+        // Optional outbound stats pusher.  When `share_push_url` and
+        // `share_push_secret` are both set, snapshots of the same anonymized
+        // public-stats payload are POSTed to that URL on a fixed cadence so
+        // a remote site (Cloudflare Pages, etc.) can serve them publicly
+        // without ever exposing this VPS's IP.
+        if let Some(pusher_cfg) = twm::share_pusher::SharePusherConfig::from_parts(
+            config.share_push_url.clone(),
+            config.share_push_secret.clone(),
+            config.share_push_interval_seconds,
+        ) {
+            twm::share_pusher::spawn(pusher_state, pusher_cfg);
+        }
     }
 
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
@@ -2775,14 +2757,6 @@ async fn main() -> Result<()> {
     let macro_paused_proc = macro_paused.clone();
     let command_delay_ms = config.command_delay_ms;
     let auction_listing_delay_ms = config.auction_listing_delay_ms;
-    // Must cover the full bed-grace purchase loop (bed_grace_timeout_seconds
-    // plus purchaseAt + 60s extension in client.rs).  The old 10s default
-    // forced Idle mid-purchase and logged "[Queue] ... timed out after 10s"
-    // while the bot was still spamming the bed.
-    let purchase_auction_timeout_secs = config
-        .bed_grace_timeout_seconds
-        .clamp(5, 600)
-        .saturating_add(120);
     let chat_tx_proc = chat_tx.clone();
     let ws_client_proc = ws_client.clone();
     let bot_client_proc_inv = bot_client.clone();
@@ -2974,9 +2948,6 @@ async fn main() -> Result<()> {
                     twm::types::CommandType::BazaarBuyOrder { .. }
                     | twm::types::CommandType::BazaarSellOrder { .. } => 20,
                     twm::types::CommandType::SellToAuction { .. } => 15,
-                    twm::types::CommandType::PurchaseAuction { .. } => {
-                        purchase_auction_timeout_secs
-                    }
                     _ => 10,
                 };
 

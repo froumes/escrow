@@ -83,21 +83,6 @@ pub struct Config {
     /// using `bed_spam_click_delay` and this value is ignored.
     #[serde(default = "default_bed_pre_click_ms")]
     pub bed_pre_click_ms: u64,
-
-    /// Maximum seconds the bot will sit in the bed-spam loop before giving up
-    /// when slot 31 never transitions out of "bed".  Real Skyblock grace
-    /// periods finish well under a minute, but lost packets and stalled
-    /// `ContainerSetSlot` updates can keep us watching a stale window.
-    /// Bumping this just trades faster recovery for more chances to win
-    /// long-grace auctions.  Floored at 5 (anything lower is almost
-    /// guaranteed to abandon real wins) and capped at 600 to prevent a
-    /// misconfiguration from stalling the bot for 10+ minutes per stuck
-    /// window.  When freemoney is on and COFL provided a `purchaseAt`,
-    /// the loop keeps running until at least 60s past `purchaseAt`
-    /// regardless of this value, so the bot never gives up *before*
-    /// the predicted unlock instant.  Default: 180 (3 minutes).
-    #[serde(default = "default_bed_grace_timeout_seconds")]
-    pub bed_grace_timeout_seconds: u64,
     
     #[serde(default = "default_bazaar_order_check_interval_seconds")]
     pub bazaar_order_check_interval_seconds: u64,
@@ -140,8 +125,8 @@ pub struct Config {
     #[serde(default)]
     pub bed_spam: bool,
 
-    /// Deprecated compatibility flag for the old predicted confirm pre-click path.
-    /// Headless purchases now use the safe observer fast path instead.
+    /// Advanced: enable fast-buy skip-click on predicted Confirm Purchase window.
+    /// Defaults to enabled when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fastbuy: Option<bool>,
 
@@ -209,18 +194,35 @@ pub struct Config {
     #[serde(default)]
     pub web_gui_cookie_secure: bool,
 
-    /// Base URL of the remote site that hosts the public stats viewer and
-    /// accepts pushed snapshots.  When the operator clicks "Share Stats" in
-    /// the panel for the first time, the bot generates an unguessable
-    /// `slot_id` + `push_secret`, saves them to `share_state.json`, and
-    /// starts pushing snapshots to `<base>/api/twm/push/<slot_id>` every
-    /// 30 seconds.  Viewers open `<base>/twm?s=<slot_id>` — the bot's IP
-    /// is never exposed.
+    /// Optional unguessable token that enables a read-only public stats page at
+    /// `GET /share/{token}`.  Anyone with this exact URL can see anonymized
+    /// profit charts, recent realized flips, and counts of active auctions /
+    /// bazaar orders — but cannot see the IGN, send commands, change config,
+    /// view chat, or otherwise interact with the bot.
     ///
-    /// Defaults to `https://austinxyz.lol`.  Override only if you host the
-    /// receiving Cloudflare Pages site on a different domain.
-    #[serde(default = "default_share_remote_base_url")]
-    pub share_remote_base_url: String,
+    /// Leave empty to disable the share page entirely (every `/share/*` request
+    /// returns 404).  Rotate by replacing the value and reloading config.
+    /// Recommended length: 32+ random characters (e.g. `openssl rand -hex 32`).
+    #[serde(default, with = "opt_string_as_empty")]
+    pub web_share_token: Option<String>,
+
+    /// Optional outbound URL the bot pushes anonymized stats snapshots to on
+    /// a fixed interval.  Pair this with a remote site (e.g. a Cloudflare
+    /// Pages Function) so viewers see your stats via that site's domain
+    /// instead of your VPS IP — the bot is purely an HTTP client and never
+    /// needs an inbound port to be public.
+    ///
+    /// Example: `https://austinxyz.lol/api/twm/push`
+    /// Leave empty to disable pushing entirely.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub share_push_url: Option<String>,
+
+    /// Shared secret used to HMAC-SHA256 sign the body of each push.  The
+    /// receiving endpoint must verify with the same secret.  Leave empty
+    /// (or set `share_push_url` empty) to disable pushing.
+    /// Recommended length: 32+ random characters (e.g. `openssl rand -hex 32`).
+    #[serde(default, with = "opt_string_as_empty")]
+    pub share_push_secret: Option<String>,
 
     /// How often to push a snapshot, in seconds.  Defaults to 30s — fast
     /// enough that the public page feels live but slow enough to stay well
@@ -228,6 +230,19 @@ pub struct Config {
     /// Minimum honored value is 5 seconds.
     #[serde(default = "default_share_push_interval_seconds")]
     pub share_push_interval_seconds: u64,
+
+    /// Pre-formed public URL handed out by the "Share Stats" button in the
+    /// web panel.  Set this to whatever link a viewer should open — typically
+    /// the page on the remote site that pairs with `share_push_url`, e.g.
+    /// `https://austinxyz.lol/twm?t=<viewer_token>`.
+    ///
+    /// When this is empty the panel falls back to the local
+    /// `http://<host>/share/<web_share_token>` URL (only useful if you don't
+    /// mind exposing the bot's host directly).  When neither this nor
+    /// `web_share_token` is set, the Share button reports that no link is
+    /// configured.
+    #[serde(default, with = "opt_string_as_empty")]
+    pub share_public_url: Option<String>,
 
     /// Hypixel API key for fetching active auctions. Obtain one from https://developer.hypixel.net/
     /// Leave empty to use the Coflnet API as a fallback.
@@ -301,10 +316,6 @@ fn default_bed_pre_click_ms() -> u64 {
     30
 }
 
-fn default_bed_grace_timeout_seconds() -> u64 {
-    180
-}
-
 fn default_bazaar_order_check_interval_seconds() -> u64 {
     60
 }
@@ -353,10 +364,6 @@ fn default_share_push_interval_seconds() -> u64 {
     30
 }
 
-fn default_share_remote_base_url() -> String {
-    "https://austinxyz.lol".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -368,7 +375,6 @@ impl Default for Config {
             bed_spam_click_delay: default_bed_spam_click_delay(),
             bed_multiple_clicks_delay: 0,
             bed_pre_click_ms: default_bed_pre_click_ms(),
-            bed_grace_timeout_seconds: default_bed_grace_timeout_seconds(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
             bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
             bazaar_tax_rate: default_bazaar_tax_rate(),
@@ -377,7 +383,7 @@ impl Default for Config {
             enable_ah_flips: true,
             skip_flips_when_inventory_full: false,
             bed_spam: false,
-            fastbuy: Some(false),
+            fastbuy: Some(true),
             freemoney: None,
             use_cofl_chat: true,
             auto_cookie: 0,
@@ -392,8 +398,11 @@ impl Default for Config {
             discord_id: None,
             web_gui_password: None,
             web_gui_cookie_secure: false,
-            share_remote_base_url: default_share_remote_base_url(),
+            web_share_token: None,
+            share_push_url: None,
+            share_push_secret: None,
             share_push_interval_seconds: default_share_push_interval_seconds(),
+            share_public_url: None,
             hypixel_api_key: None,
             share_legendary_flips: true,
             anonymize_webhook_name: false,
@@ -413,7 +422,7 @@ impl Config {
     }
 
     pub fn fastbuy_enabled(&self) -> bool {
-        self.fastbuy.unwrap_or(false)
+        self.fastbuy.unwrap_or(true)
     }
 
     /// Returns the webhook URL only if it is non-empty.
@@ -495,19 +504,6 @@ mod tests {
     fn parses_bed_pre_click_ms() {
         let config: Config = toml::from_str("bed_pre_click_ms = 300").expect("config should parse");
         assert_eq!(config.bed_pre_click_ms, 300);
-    }
-
-    #[test]
-    fn default_bed_grace_timeout_seconds() {
-        let config = Config::default();
-        assert_eq!(config.bed_grace_timeout_seconds, 180);
-    }
-
-    #[test]
-    fn parses_bed_grace_timeout_seconds() {
-        let config: Config =
-            toml::from_str("bed_grace_timeout_seconds = 300").expect("config should parse");
-        assert_eq!(config.bed_grace_timeout_seconds, 300);
     }
 
     #[test]
@@ -641,9 +637,9 @@ proxy_credentials = "myuser:mypassword"
     }
 
     #[test]
-    fn fastbuy_defaults_to_false() {
+    fn fastbuy_defaults_to_true() {
         let config = Config::default();
-        assert!(!config.fastbuy_enabled());
+        assert!(config.fastbuy_enabled());
     }
 
     #[test]
@@ -659,9 +655,9 @@ proxy_credentials = "myuser:mypassword"
     }
 
     #[test]
-    fn omitted_fastbuy_now_defaults_to_false() {
+    fn omitted_fastbuy_now_defaults_to_true() {
         let config: Config = toml::from_str("").expect("config should parse");
-        assert!(!config.fastbuy_enabled());
+        assert!(config.fastbuy_enabled());
     }
 
     #[test]
