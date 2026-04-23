@@ -708,6 +708,7 @@ async fn main() -> Result<()> {
     bot_client.fastbuy = config.fastbuy_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
+    bot_client.skip_coop_claims = config.skip_coop_claims;
     bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
     bot_client.bazaar_flips_paused = bazaar_flips_paused.clone();
     bot_client.enable_bazaar_flips = enable_bazaar_flips.clone();
@@ -750,6 +751,7 @@ async fn main() -> Result<()> {
 
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(twm::bazaar_tracker::BazaarOrderTracker::new());
+    bot_client.set_bazaar_tracker(bazaar_tracker.as_ref().clone());
 
     // Background Discord auto-sender for the Seller tab.  One instance for
     // the process — state lives in `SellerRunner` (start/stop, logs, counts).
@@ -3350,7 +3352,9 @@ async fn main() -> Result<()> {
                 sleep(Duration::from_secs(PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS)).await;
                 let bot_state = bot_client_ah_claim.state();
                 let queue_empty = command_queue_ah_claim.is_empty();
-                if should_enqueue_periodic_auction_claim(bot_state, queue_empty) {
+                let coop_safe_ready =
+                    !bot_client_ah_claim.skip_coop_claims || bot_client_ah_claim.has_tracked_auction_listings();
+                if coop_safe_ready && should_enqueue_periodic_auction_claim(bot_state, queue_empty) {
                     debug!(
                         "[ClaimSold] Periodic My Auctions check triggered (every {}s)",
                         PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS
@@ -3414,12 +3418,15 @@ async fn main() -> Result<()> {
                     bot_client_idle.clear_bazaar_at_limit();
                 }
 
-                // Force-claim sold auctions
-                command_queue_idle.enqueue(
-                    CommandType::ClaimSoldItem,
-                    CommandPriority::Normal,
-                    false,
-                );
+                // Force-claim sold auctions, but avoid shared-profile coop claims
+                // when the safeguard is enabled and we have no tracked listings.
+                if !bot_client_idle.skip_coop_claims || bot_client_idle.has_tracked_auction_listings() {
+                    command_queue_idle.enqueue(
+                        CommandType::ClaimSoldItem,
+                        CommandPriority::Normal,
+                        false,
+                    );
+                }
                 // Force-claim purchased items (won bids)
                 if !bot_client_idle.is_inventory_near_full() {
                     command_queue_idle.enqueue(

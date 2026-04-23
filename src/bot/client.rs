@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error, debug, warn};
 
+use crate::bazaar_tracker::BazaarOrderTracker;
 use crate::types::{BotState, QueuedCommand};
 use crate::state::CommandQueue;
 use crate::websocket::CoflWebSocket;
@@ -325,8 +326,14 @@ pub struct BotClient {
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Shared tracker of bazaar orders placed by this bot. Used to avoid
+    /// claiming co-op orders from the shared Manage Orders GUI.
+    bazaar_tracker: Arc<RwLock<Option<BazaarOrderTracker>>>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
+    /// When true, only claim auctions and bazaar orders that the bot can
+    /// attribute to itself. Prevents claiming co-op members' listings/orders.
+    pub skip_coop_claims: bool,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     manage_orders_cancel_open: Arc<AtomicBool>,
     /// Cancel open bazaar orders when they are older than this many minutes per million coins.
@@ -482,7 +489,9 @@ impl BotClient {
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            bazaar_tracker: Arc::new(RwLock::new(None)),
             ingame_name: Arc::new(RwLock::new(String::new())),
+            skip_coop_claims: true,
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
@@ -597,7 +606,9 @@ impl BotClient {
             insta_sell_item: self.insta_sell_item.clone(),
             bed_pre_click_ms: self.bed_pre_click_ms,
             active_auction_listings: self.active_auction_listings.clone(),
+            bazaar_tracker: self.bazaar_tracker.read().clone(),
             ingame_name: self.ingame_name.clone(),
+            skip_coop_claims: self.skip_coop_claims,
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
             bazaar_order_cancel_minutes_per_million: self.bazaar_order_cancel_minutes_per_million,
             managing_order_context: Arc::new(RwLock::new(None)),
@@ -672,6 +683,12 @@ impl BotClient {
     /// Set the AUTO_COOKIE hours threshold. Pass `config.auto_cookie` before calling `connect()`.
     pub fn set_auto_cookie_hours(&self, hours: u64) {
         *self.auto_cookie_hours.write() = hours;
+    }
+
+    /// Share the persisted bazaar tracker with the event handler so claim flows
+    /// can distinguish this bot's orders from co-op members' orders.
+    pub fn set_bazaar_tracker(&self, tracker: BazaarOrderTracker) {
+        *self.bazaar_tracker.write() = Some(tracker);
     }
 
     /// Get the event handlers
@@ -801,6 +818,12 @@ impl BotClient {
     /// My Auctions window yet.
     pub fn get_cached_my_auctions_json(&self) -> Option<String> {
         self.cached_my_auctions_json.read().clone()
+    }
+
+    /// Returns true when at least one auction listed by this bot is still being
+    /// tracked as active for coop-safe claim filtering.
+    pub fn has_tracked_auction_listings(&self) -> bool {
+        !self.active_auction_listings.read().is_empty()
     }
 
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
@@ -1213,8 +1236,14 @@ pub struct BotClientState {
     /// Items the bot has listed on the AH (by lowercase item name).
     /// Used to filter out coop member sales from our own sales.
     pub active_auction_listings: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Shared tracker of bazaar orders placed by this bot. Used to avoid
+    /// claiming co-op orders from the shared Manage Orders GUI.
+    pub bazaar_tracker: Option<BazaarOrderTracker>,
     /// The bot's in-game name, used for coop sale filtering.
     pub ingame_name: Arc<RwLock<String>>,
+    /// When true, only claim auctions and bazaar orders that the bot can
+    /// attribute to itself. Prevents claiming co-op members' listings/orders.
+    pub skip_coop_claims: bool,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     /// When false, it only collects filled orders and leaves open orders untouched.
     pub manage_orders_cancel_open: Arc<AtomicBool>,
@@ -1340,7 +1369,9 @@ impl Default for BotClientState {
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            bazaar_tracker: None,
             ingame_name: Arc::new(RwLock::new(String::new())),
+            skip_coop_claims: true,
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
             bazaar_order_cancel_minutes_per_million: 5,
             managing_order_context: Arc::new(RwLock::new(None)),
@@ -1797,6 +1828,19 @@ fn is_my_auctions_window_title(window_title: &str) -> bool {
     window_title.contains("Manage Auctions") || window_title.contains("My Auctions")
 }
 
+fn tracked_auction_item_key(item_name: &str) -> String {
+    crate::bot::handlers::BotEventHandlers::remove_color_codes(item_name).to_lowercase()
+}
+
+fn auction_slot_matches_tracked_listing(
+    item: &azalea_inventory::ItemStack,
+    tracked_listings: &std::collections::HashSet<String>,
+) -> bool {
+    get_item_display_name_from_slot(item)
+        .map(|name| tracked_listings.contains(&tracked_auction_item_key(&name)))
+        .unwrap_or(false)
+}
+
 /// Calculate the number of "window-content" slots (excluding the 36 player
 /// inventory slots appended at the bottom).  Capped at 54 (max chest size).
 fn window_content_slot_count(total_slots: usize) -> usize {
@@ -2059,6 +2103,55 @@ fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
     None
 }
 
+fn parse_order_total_amount_from_lore(lore: &[String]) -> Option<u64> {
+    if let Some((_, total)) = parse_filled_amount_from_lore(lore) {
+        return Some(total);
+    }
+
+    for line in lore {
+        let clean = remove_mc_colors(line).to_lowercase();
+        if let Some(rest) = clean.strip_prefix("order amount:") {
+            let numeric: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',' || c.is_ascii_whitespace())
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            let numeric = numeric.replace(',', "");
+            if let Ok(total) = numeric.parse::<u64>() {
+                return Some(total);
+            }
+        }
+    }
+
+    None
+}
+
+fn is_owned_bazaar_order(
+    tracker: Option<&BazaarOrderTracker>,
+    order_name: &str,
+    order_identity: &Option<(bool, String)>,
+    is_buy_order: bool,
+    total_amount: Option<u64>,
+) -> bool {
+    let Some(tracker) = tracker else {
+        return false;
+    };
+    let Some(total_amount) = total_amount else {
+        return false;
+    };
+
+    let clean_name = clean_order_item_name(order_name, order_identity)
+        .to_lowercase()
+        .trim()
+        .to_string();
+
+    tracker.get_orders().iter().any(|order| {
+        order.is_buy_order == is_buy_order
+            && order.amount == total_amount
+            && order.item_name.to_lowercase().trim() == clean_name
+    })
+}
+
 /// Returns true when Hypixel chat indicates the purchase flow is terminally invalid
 /// and should be aborted immediately instead of waiting for the GUI watchdog timeout.
 fn is_terminal_purchase_failure_message(message: &str) -> bool {
@@ -2264,12 +2357,6 @@ async fn event_handler(
                 }
             } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
                 // "[Auction] <buyer> bought <item> for <price> coins"
-                // Always claim sold auctions. The active_auction_listings filter was
-                // previously used for coop filtering but it is an in-memory set that
-                // is lost on restart and does not track items listed manually or via
-                // /cofl sell — causing sold auctions like the Hyperion to be silently
-                // skipped. Attempting to claim a coop member's sale is harmless
-                // (the AH UI simply won't show a claim button).
                 if let Some((buyer, item_name, price)) = parse_sold_message(&clean_message) {
                     // Skip if the buyer is our own bot — Hypixel sends "[Auction] OurName
                     // bought X for Y coins" as a purchase notification to the buyer as well.
@@ -2279,9 +2366,15 @@ async fn event_handler(
                     if !own_name.is_empty() && buyer.eq_ignore_ascii_case(&own_name) {
                         debug!("[Auction] Ignoring own purchase notification: \"{}\" bought \"{}\" for {}", buyer, item_name, price);
                     } else {
-                        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
-                        // Housekeeping: remove from active listings if present
-                        state.active_auction_listings.write().remove(&item_key);
+                        let item_key = tracked_auction_item_key(&item_name);
+                        let tracked_listing = state.active_auction_listings.read().contains(&item_key);
+                        if state.skip_coop_claims && !tracked_listing {
+                            info!(
+                                "[Auction] Coop-safe claim guard: ignoring untracked sale notification for \"{}\"",
+                                item_name
+                            );
+                            return Ok(());
+                        }
                         // Try to extract the auction UUID from the JSON representation of the
                         // chat message first — Hypixel embeds "/viewauction <UUID>" in the
                         // clickEvent of the "CLICK" component, which is invisible in plain text
@@ -2292,6 +2385,9 @@ async fn event_handler(
                             .as_deref()
                             .and_then(extract_viewauction_uuid)
                             .or_else(|| extract_viewauction_uuid(&clean_message));
+                        if uuid.is_some() || !state.skip_coop_claims {
+                            state.active_auction_listings.write().remove(&item_key);
+                        }
                         if let Some(ref u) = uuid {
                             info!("[AH] Extracted viewauction UUID for claim: {}", u);
                             let mut sold_queue = state.claim_sold_uuid_queue.write();
@@ -4136,20 +4232,46 @@ async fn handle_window_interaction(
                 // Only scan the window slots (typically 0..27 for a 3-row GUI),
                 // not the player inventory at the bottom, to avoid false matches.
                 let window_slot_count = window_content_slot_count(slots.len());
-                // Look for Claim All first
-                if let Some(i) = find_slot_by_name(&slots, "Claim All") {
-                    info!("[ClaimSold] Clicking Claim All at slot {}", i);
-                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    // Claim All finishes everything — close window and go idle
-                    send_raw_close(bot, window_id, &state.handlers);
-                    state.auction_slot_blocked.store(false, Ordering::Relaxed);
-                    *state.bot_state.write() = BotState::Idle;
-                } else {
+                // Look for Claim All first, but only when coop-safe claim filtering
+                // is disabled. Claim All would also collect co-op members' auctions.
+                if !state.skip_coop_claims {
+                    if let Some(i) = find_slot_by_name(&slots, "Claim All") {
+                        info!("[ClaimSold] Clicking Claim All at slot {}", i);
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                        // Claim All finishes everything — close window and go idle
+                        send_raw_close(bot, window_id, &state.handlers);
+                        state.auction_slot_blocked.store(false, Ordering::Relaxed);
+                        *state.bot_state.write() = BotState::Idle;
+                        return;
+                    }
+                }
+
+                {
                     // Look for first claimable item (only window slots)
                     let mut found = false;
+                    let tracked_listings = state.active_auction_listings.read().clone();
                     for (i, item) in slots.iter().enumerate().take(window_slot_count) {
                         if is_claimable_auction_slot(item) {
+                            if state.skip_coop_claims
+                                && !auction_slot_matches_tracked_listing(item, &tracked_listings)
+                            {
+                                if let Some(name) = get_item_display_name_from_slot(item) {
+                                    debug!(
+                                        "[ClaimSold] Coop-safe claim guard: skipping untracked claimable auction \"{}\"",
+                                        name
+                                    );
+                                }
+                                continue;
+                            }
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
+                            if state.skip_coop_claims {
+                                if let Some(name) = get_item_display_name_from_slot(item) {
+                                    state
+                                        .active_auction_listings
+                                        .write()
+                                        .remove(&tracked_auction_item_key(&name));
+                                }
+                            }
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
                             found = true;
@@ -4629,6 +4751,23 @@ async fn handle_window_interaction(
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&name));
                         let claimable = is_order_claimable_from_lore(&lore);
                         let filled_amount = parse_filled_amount_from_lore(&lore).map(|(f, _)| f);
+                        let total_amount = parse_order_total_amount_from_lore(&lore);
+                        if state.skip_coop_claims
+                            && !is_owned_bazaar_order(
+                                state.bazaar_tracker.as_ref(),
+                                &name,
+                                &identity,
+                                is_buy,
+                                total_amount,
+                            )
+                        {
+                            debug!(
+                                "[ManageOrders] Coop-safe claim guard: skipping untracked {} order \"{}\"",
+                                if is_buy { "BUY" } else { "SELL" },
+                                name
+                            );
+                            continue;
+                        }
                         let order_key = format!("{}::{}", i, name_key);
                         if is_buy {
                             buy_orders.push((i, name, identity, order_key, claimable, filled_amount));
@@ -6950,6 +7089,44 @@ mod tests {
             "Filled: 1,280/2,560 50%".to_string(),
         ];
         assert_eq!(parse_filled_amount_from_lore(&lore), Some((1280, 2560)));
+    }
+
+    #[test]
+    fn test_parse_order_total_amount_from_lore_prefers_total() {
+        let lore = vec![
+            "Order amount: 64x".to_string(),
+            "Filled: 32/64 50%".to_string(),
+        ];
+        assert_eq!(parse_order_total_amount_from_lore(&lore), Some(64));
+    }
+
+    #[test]
+    fn test_is_owned_bazaar_order_matches_tracker_entry() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Enchanted Diamond".into(), 64, 1234.0, true);
+
+        let order_identity = Some((true, "enchanted diamond".to_string()));
+        assert!(is_owned_bazaar_order(
+            Some(&tracker),
+            "BUY Enchanted Diamond",
+            &order_identity,
+            true,
+            Some(64),
+        ));
+        assert!(!is_owned_bazaar_order(
+            Some(&tracker),
+            "BUY Enchanted Diamond",
+            &order_identity,
+            true,
+            Some(32),
+        ));
+        assert!(!is_owned_bazaar_order(
+            Some(&tracker),
+            "SELL Enchanted Diamond",
+            &Some((false, "enchanted diamond".to_string())),
+            false,
+            Some(64),
+        ));
     }
 
     #[test]
