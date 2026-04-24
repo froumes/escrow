@@ -251,9 +251,6 @@ pub enum CommandType {
         message: String,
     },
     ClaimSoldItem,
-    ClaimPurchasedItem,
-    CheckCookie,
-    DiscoverOrders,
     ExecuteOrders,
     SellToAuction {
         item_name: String,
@@ -301,7 +298,6 @@ impl CommandType {
             CommandType::PurchaseAuction { .. } => "purchasing flip",
             CommandType::SendChat { .. } => "chat command",
             CommandType::ClaimSoldItem => "claiming sold item",
-            CommandType::ClaimPurchasedItem => "claiming purchased item",
             CommandType::CheckCookie => "checking cookie",
             CommandType::DiscoverOrders => "discovering orders",
             CommandType::ExecuteOrders => "executing orders",

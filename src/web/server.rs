@@ -376,8 +376,6 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/switch_account", axum::routing::post(switch_account))
         .route("/api/cancel_auction", axum::routing::post(cancel_auction))
         .route("/api/buy_auction", axum::routing::post(buy_auction))
-        .route("/api/claim_purchases", axum::routing::post(claim_purchases))
-        .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
         .route("/api/cancel_bz_order", axum::routing::post(cancel_bz_order))
         .route("/api/cancel_all_bz_orders", axum::routing::post(cancel_all_bz_orders))
@@ -940,42 +938,6 @@ async fn claim_purchases(
     );
 
     (StatusCode::OK, "Claim purchases command queued")
-}
-
-async fn collect_bz_orders(
-    State(s): State<WebSharedState>,
-) -> impl IntoResponse {
-    info!("[WebGUI] Sell inventory instantly on bazaar requested");
-
-    let msg = "[TWM Web] Selling inventory on bazaar...".to_string();
-    print_mc_chat(&msg);
-    let _ = s.chat_tx.send(msg);
-
-    s.command_queue.enqueue(
-        CommandType::SellInventoryBz,
-        CommandPriority::High,
-        false,
-    );
-
-    (StatusCode::OK, "Sell inventory on bazaar command queued")
-}
-
-async fn claim_bz_orders(
-    State(s): State<WebSharedState>,
-) -> impl IntoResponse {
-    info!("[WebGUI] Force claim bazaar orders requested");
-
-    let msg = "[TWM Web] Checking and claiming bazaar orders...".to_string();
-    print_mc_chat(&msg);
-    let _ = s.chat_tx.send(msg);
-
-    s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: false },
-        CommandPriority::High,
-        false,
-    );
-
-    (StatusCode::OK, "Claim bazaar orders command queued")
 }
 
 async fn cancel_bz_order(

@@ -122,12 +122,6 @@ pub struct Config {
     #[serde(default)]
     pub skip_flips_when_inventory_full: bool,
 
-    /// When true, only claim auctions and bazaar orders that this bot can
-    /// attribute to itself. This prevents claiming co-op members' auctions or
-    /// bazaar orders from shared profile GUIs.
-    #[serde(default = "default_true")]
-    pub skip_coop_claims: bool,
-
     #[serde(default)]
     pub bed_spam: bool,
 
@@ -388,7 +382,6 @@ impl Default for Config {
             enable_bazaar_flips: true,
             enable_ah_flips: true,
             skip_flips_when_inventory_full: false,
-            skip_coop_claims: true,
             bed_spam: false,
             fastbuy: Some(true),
             freemoney: None,
@@ -665,18 +658,6 @@ proxy_credentials = "myuser:mypassword"
     fn omitted_fastbuy_now_defaults_to_true() {
         let config: Config = toml::from_str("").expect("config should parse");
         assert!(config.fastbuy_enabled());
-    }
-
-    #[test]
-    fn skip_coop_claims_defaults_to_true() {
-        let config = Config::default();
-        assert!(config.skip_coop_claims);
-    }
-
-    #[test]
-    fn parses_skip_coop_claims_false() {
-        let config: Config = toml::from_str("skip_coop_claims = false").expect("config should parse");
-        assert!(!config.skip_coop_claims);
     }
 
     #[test]
