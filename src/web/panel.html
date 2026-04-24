@@ -1825,10 +1825,6 @@ const API = {
     toggleBazaar: "/api/toggle_bazaar",
     toggleAnon: "/api/toggle_anonymize",
     switchAccount: "/api/switch_account",
-    claimAllAuctions: "/api/claim_all_auctions",
-    claimOwnAuctions: "/api/claim_own_auctions",
-    claimPurchases: "/api/claim_purchases",
-    collectBz: "/api/collect_bz_orders",
     claimBz: "/api/claim_bz_orders",
     cancelAllBz: "/api/cancel_all_bz_orders",
     cancelAuction: "/api/cancel_auction",
@@ -4110,26 +4106,6 @@ function App() {
                                     </div>
 
                                     <div className="actionGrid">
-                                        <div className="actionCard">
-                                            <h3>All Auctions</h3>
-                                            <p>Claim every completed AH listing visible in Manage Auctions, including co-op listings.</p>
-                                            <${Button} kind="secondary" onClick=${() => post(API.claimAllAuctions, null, "Claim all auctions queued")}>Claim All</${Button}>
-                                        </div>
-                                        <div className="actionCard">
-                                            <h3>Own Auctions</h3>
-                                            <p>Claim completed AH listings attributed to this bot account.</p>
-                                            <${Button} kind="secondary" onClick=${() => post(API.claimOwnAuctions, null, "Claim own auctions queued")}>Claim Own</${Button}>
-                                        </div>
-                                        <div className="actionCard">
-                                            <h3>Purchases</h3>
-                                            <p>Claim completed AH purchases without leaving the panel.</p>
-                                            <${Button} kind="secondary" onClick=${() => post(API.claimPurchases, null, "Claim purchases queued")}>Queue Claim</${Button}>
-                                        </div>
-                                        <div className="actionCard">
-                                            <h3>Collect BZ</h3>
-                                            <p>Collect finished Bazaar orders and refresh tracked order state.</p>
-                                            <${Button} kind="secondary" onClick=${() => post(API.collectBz, null, "Collect bazaar orders queued")}>Collect Orders</${Button}>
-                                        </div>
                                         <div className="actionCard">
                                             <h3>Claim Filled BZ</h3>
                                             <p>Claim filled Bazaar orders directly from the maintenance surface.</p>
