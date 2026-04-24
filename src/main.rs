@@ -2804,7 +2804,6 @@ async fn main() -> Result<()> {
                         twm::types::CommandType::CheckCookie
                         | twm::types::CommandType::ManageOrders { .. }
                         | twm::types::CommandType::ClaimSoldItem
-                        | twm::types::CommandType::ClaimSoldAuctions { .. }
                         | twm::types::CommandType::ClaimPurchasedItem
                     );
                     if !is_startup_cmd {
@@ -2860,7 +2859,6 @@ async fn main() -> Result<()> {
                         | twm::types::CommandType::BazaarSellOrder { .. }
                         | twm::types::CommandType::ManageOrders { .. }
                         | twm::types::CommandType::ClaimSoldItem
-                        | twm::types::CommandType::ClaimSoldAuctions { .. }
                         | twm::types::CommandType::SellInventoryBz
                         | twm::types::CommandType::CancelAuction { .. }
                     );
@@ -2954,7 +2952,6 @@ async fn main() -> Result<()> {
                 let timeout_secs: u64 = match cmd.command_type {
                     twm::types::CommandType::ClaimPurchasedItem
                     | twm::types::CommandType::ClaimSoldItem
-                    | twm::types::CommandType::ClaimSoldAuctions { .. }
                     | twm::types::CommandType::CheckCookie => 60,
                     // ManageOrders processes ONE order per cycle with a 10s
                     // internal deadline; keep external timeout just above.

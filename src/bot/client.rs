@@ -561,7 +561,6 @@ impl BotClient {
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
             claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
-            claim_sold_include_coop_override: Arc::new(RwLock::new(None)),
             bazaar_item_name: Arc::new(RwLock::new(String::new())),
             bazaar_amount: Arc::new(RwLock::new(0)),
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
@@ -1115,11 +1114,6 @@ pub struct BotClientState {
     /// Queue of sold-auction UUIDs extracted from chat clickEvent (/viewauction <uuid>).
     /// Keeps claim order stable when multiple auctions sell close together.
     pub claim_sold_uuid_queue: Arc<RwLock<VecDeque<String>>>,
-    /// Per-command override for sold-auction claim filtering.
-    /// `Some(true)` claims all visible sold auctions, including co-op listings.
-    /// `Some(false)` claims only listings tracked as created by this bot.
-    /// `None` uses the configured `skip_coop_claims` behavior.
-    pub claim_sold_include_coop_override: Arc<RwLock<Option<bool>>>,
     // ---- Bazaar order context (set in execute_command, read in window/sign handlers) ----
     /// Item name for current bazaar order
     pub bazaar_item_name: Arc<RwLock<String>>,
@@ -1330,7 +1324,6 @@ impl Default for BotClientState {
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
             claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
-            claim_sold_include_coop_override: Arc::new(RwLock::new(None)),
             bazaar_item_name: Arc::new(RwLock::new(String::new())),
             bazaar_amount: Arc::new(RwLock::new(0)),
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
@@ -3365,7 +3358,6 @@ async fn execute_command(
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
-            *state.claim_sold_include_coop_override.write() = None;
             let uuid = state.claim_sold_uuid_queue.write().pop_front()
                 .or_else(|| state.claim_sold_uuid.write().take());
             if let Some(uuid) = uuid {
@@ -3375,19 +3367,6 @@ async fn execute_command(
                 info!("Claiming sold items via /ah");
                 send_chat_command(bot, "/ah");
             }
-            *state.bot_state.write() = BotState::ClaimingSold;
-        }
-        CommandType::ClaimSoldAuctions { include_coop } => {
-            *state.claiming_purchased.write() = false;
-            *state.claim_sold_include_coop_override.write() = Some(*include_coop);
-            *state.claim_sold_uuid.write() = None;
-            state.claim_sold_uuid_queue.write().clear();
-            if *include_coop {
-                info!("Claiming all sold auctions via /ah");
-            } else {
-                info!("Claiming own sold auctions via /ah");
-            }
-            send_chat_command(bot, "/ah");
             *state.bot_state.write() = BotState::ClaimingSold;
         }
         CommandType::ClaimPurchasedItem => {
@@ -4255,11 +4234,7 @@ async fn handle_window_interaction(
                 let window_slot_count = window_content_slot_count(slots.len());
                 // Look for Claim All first, but only when coop-safe claim filtering
                 // is disabled. Claim All would also collect co-op members' auctions.
-                let claim_all_auctions = state
-                    .claim_sold_include_coop_override
-                    .read()
-                    .unwrap_or(!state.skip_coop_claims);
-                if claim_all_auctions {
+                if !state.skip_coop_claims {
                     if let Some(i) = find_slot_by_name(&slots, "Claim All") {
                         info!("[ClaimSold] Clicking Claim All at slot {}", i);
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
@@ -4277,7 +4252,7 @@ async fn handle_window_interaction(
                     let tracked_listings = state.active_auction_listings.read().clone();
                     for (i, item) in slots.iter().enumerate().take(window_slot_count) {
                         if is_claimable_auction_slot(item) {
-                            if !claim_all_auctions
+                            if state.skip_coop_claims
                                 && !auction_slot_matches_tracked_listing(item, &tracked_listings)
                             {
                                 if let Some(name) = get_item_display_name_from_slot(item) {
@@ -4289,7 +4264,7 @@ async fn handle_window_interaction(
                                 continue;
                             }
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
-                            if !claim_all_auctions {
+                            if state.skip_coop_claims {
                                 if let Some(name) = get_item_display_name_from_slot(item) {
                                     state
                                         .active_auction_listings
