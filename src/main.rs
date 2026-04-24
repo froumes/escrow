@@ -2802,6 +2802,7 @@ async fn main() -> Result<()> {
                         twm::types::CommandType::CheckCookie
                         | twm::types::CommandType::ManageOrders { .. }
                         | twm::types::CommandType::ClaimSoldItem
+                        | twm::types::CommandType::ClaimPurchasedItem
                     );
                     if !is_startup_cmd {
                         debug!("[Queue] Deferring non-startup command during startup: {:?}", cmd.command_type);
@@ -2856,6 +2857,7 @@ async fn main() -> Result<()> {
                         | twm::types::CommandType::BazaarSellOrder { .. }
                         | twm::types::CommandType::ManageOrders { .. }
                         | twm::types::CommandType::ClaimSoldItem
+                        | twm::types::CommandType::SellInventoryBz
                         | twm::types::CommandType::CancelAuction { .. }
                     );
                     if !is_selling_cmd {
@@ -2948,6 +2950,7 @@ async fn main() -> Result<()> {
                 let timeout_secs: u64 = match cmd.command_type {
                     twm::types::CommandType::ClaimPurchasedItem
                     | twm::types::CommandType::ClaimSoldItem
+                    | twm::types::CommandType::CheckCookie => 60,
                     // ManageOrders processes ONE order per cycle with a 10s
                     // internal deadline; keep external timeout just above.
                     twm::types::CommandType::ManageOrders { .. } => 15,

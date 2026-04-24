@@ -552,6 +552,7 @@ impl BotClient {
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
             claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
+            bazaar_item_name: Arc::new(RwLock::new(String::new())),
             bazaar_amount: Arc::new(RwLock::new(0)),
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
             bazaar_is_buy_order: Arc::new(RwLock::new(true)),
@@ -1090,6 +1091,11 @@ pub struct BotClientState {
     /// Queue of sold-auction UUIDs extracted from chat clickEvent (/viewauction <uuid>).
     /// Keeps claim order stable when multiple auctions sell close together.
     pub claim_sold_uuid_queue: Arc<RwLock<VecDeque<String>>>,
+    // ---- Bazaar order context (set in execute_command, read in window/sign handlers) ----
+    /// Item name for current bazaar order
+    pub bazaar_item_name: Arc<RwLock<String>>,
+    /// Amount for current bazaar order
+    pub bazaar_amount: Arc<RwLock<u64>>,
     /// Price per unit for current bazaar order
     pub bazaar_price_per_unit: Arc<RwLock<f64>>,
     /// true = buy order, false = sell offer
@@ -1289,6 +1295,7 @@ impl Default for BotClientState {
             claiming_purchased: Arc::new(RwLock::new(false)),
             claim_sold_uuid: Arc::new(RwLock::new(None)),
             claim_sold_uuid_queue: Arc::new(RwLock::new(VecDeque::new())),
+            bazaar_item_name: Arc::new(RwLock::new(String::new())),
             bazaar_amount: Arc::new(RwLock::new(0)),
             bazaar_price_per_unit: Arc::new(RwLock::new(0.0)),
             bazaar_is_buy_order: Arc::new(RwLock::new(true)),
@@ -3255,6 +3262,7 @@ async fn execute_command(
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
+            let uuid = state.claim_sold_uuid_queue.write().pop_front()
                 .or_else(|| state.claim_sold_uuid.write().take());
             if let Some(uuid) = uuid {
                 info!("Claiming sold item via direct /viewauction {}", uuid);
@@ -3265,6 +3273,19 @@ async fn execute_command(
             }
             *state.bot_state.write() = BotState::ClaimingSold;
         }
+        CommandType::ClaimPurchasedItem => {
+            *state.claiming_purchased.write() = true;
+            *state.claim_sold_uuid.write() = None;
+            state.claim_sold_uuid_queue.write().clear();
+            info!("Claiming purchased item via /ah");
+            send_chat_command(bot, "/ah");
+            *state.bot_state.write() = BotState::ClaimingPurchased;
+        }
+        CommandType::CheckCookie => {
+            let auto_cookie_hours = *state.auto_cookie_hours.read();
+            if auto_cookie_hours == 0 {
+                debug!("[Cookie] AUTO_COOKIE disabled — skipping check");
+                return;
             }
             info!("[Cookie] Checking booster cookie status via /sbmenu...");
             *state.cookie_time_secs.write() = 0;
@@ -4124,6 +4145,10 @@ async fn handle_window_interaction(
                     state.auction_slot_blocked.store(false, Ordering::Relaxed);
                     *state.bot_state.write() = BotState::Idle;
                 } else {
+                    // Look for first claimable item (only window slots)
+                    let mut found = false;
+                    for (i, item) in slots.iter().enumerate().take(window_slot_count) {
+                        if is_claimable_auction_slot(item) {
                             info!("[ClaimSold] Clicking claimable item at slot {}", i);
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
