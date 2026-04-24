@@ -376,6 +376,8 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/switch_account", axum::routing::post(switch_account))
         .route("/api/cancel_auction", axum::routing::post(cancel_auction))
         .route("/api/buy_auction", axum::routing::post(buy_auction))
+        .route("/api/claim_all_auctions", axum::routing::post(claim_all_auctions))
+        .route("/api/claim_own_auctions", axum::routing::post(claim_own_auctions))
         .route("/api/claim_purchases", axum::routing::post(claim_purchases))
         .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
         .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
@@ -940,6 +942,42 @@ async fn claim_purchases(
     );
 
     (StatusCode::OK, "Claim purchases command queued")
+}
+
+async fn claim_all_auctions(
+    State(s): State<WebSharedState>,
+) -> impl IntoResponse {
+    info!("[WebGUI] Claim all sold auctions requested");
+
+    let msg = "[TWM Web] Claiming all sold auctions...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
+
+    s.command_queue.enqueue(
+        CommandType::ClaimSoldAuctions { include_coop: true },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Claim all auctions command queued")
+}
+
+async fn claim_own_auctions(
+    State(s): State<WebSharedState>,
+) -> impl IntoResponse {
+    info!("[WebGUI] Claim own sold auctions requested");
+
+    let msg = "[TWM Web] Claiming own sold auctions...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
+
+    s.command_queue.enqueue(
+        CommandType::ClaimSoldAuctions { include_coop: false },
+        CommandPriority::High,
+        false,
+    );
+
+    (StatusCode::OK, "Claim own auctions command queued")
 }
 
 async fn collect_bz_orders(

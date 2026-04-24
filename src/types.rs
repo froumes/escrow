@@ -251,6 +251,9 @@ pub enum CommandType {
         message: String,
     },
     ClaimSoldItem,
+    ClaimSoldAuctions {
+        include_coop: bool,
+    },
     ClaimPurchasedItem,
     CheckCookie,
     DiscoverOrders,
@@ -301,6 +304,7 @@ impl CommandType {
             CommandType::PurchaseAuction { .. } => "purchasing flip",
             CommandType::SendChat { .. } => "chat command",
             CommandType::ClaimSoldItem => "claiming sold item",
+            CommandType::ClaimSoldAuctions { .. } => "claiming sold auctions",
             CommandType::ClaimPurchasedItem => "claiming purchased item",
             CommandType::CheckCookie => "checking cookie",
             CommandType::DiscoverOrders => "discovering orders",
