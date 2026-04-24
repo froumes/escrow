@@ -406,6 +406,7 @@ pub enum BotEvent {
         item_name: String,
         starting_bid: u64,
         duration_hours: u64,
+        expected_profit: Option<i64>,
     },
     /// A bazaar buy/sell order was fully filled and is ready to collect.
     /// Carries the parsed item name and order type so the tracker can mark
@@ -560,6 +561,7 @@ impl BotClient {
             auction_item_name: Arc::new(RwLock::new(String::new())),
             auction_starting_bid: Arc::new(RwLock::new(0)),
             auction_duration_hours: Arc::new(RwLock::new(24)),
+            auction_expected_profit: Arc::new(RwLock::new(None)),
             auction_item_slot: Arc::new(RwLock::new(None)),
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
@@ -1109,6 +1111,8 @@ pub struct BotClientState {
     pub auction_starting_bid: Arc<RwLock<u64>>,
     /// Duration in hours for current auction
     pub auction_duration_hours: Arc<RwLock<u64>>,
+    /// Expected profit for the current auction listing, if known.
+    pub auction_expected_profit: Arc<RwLock<Option<i64>>>,
     /// Mineflayer inventory slot (9-44) for item to auction
     pub auction_item_slot: Arc<RwLock<Option<u64>>>,
     /// ExtraAttributes.id of item to auction (for identity verification)
@@ -1303,6 +1307,7 @@ impl Default for BotClientState {
             auction_item_name: Arc::new(RwLock::new(String::new())),
             auction_starting_bid: Arc::new(RwLock::new(0)),
             auction_duration_hours: Arc::new(RwLock::new(24)),
+            auction_expected_profit: Arc::new(RwLock::new(None)),
             auction_item_slot: Arc::new(RwLock::new(None)),
             auction_item_id: Arc::new(RwLock::new(None)),
             auction_step: Arc::new(RwLock::new(AuctionStep::Initial)),
@@ -2369,6 +2374,7 @@ async fn event_handler(
                 let item = state.auction_item_name.read().clone();
                 let bid  = *state.auction_starting_bid.read();
                 let dur  = *state.auction_duration_hours.read();
+                let expected_profit = *state.auction_expected_profit.read();
 
                 // Diagnostic safety check: verify the listed item roughly matches what
                 // we intended.  Hypixel includes reforge/star prefixes (e.g. "Withered
@@ -2409,6 +2415,7 @@ async fn event_handler(
                         item_name: item,
                         starting_bid: bid,
                         duration_hours: dur,
+                        expected_profit,
                     });
                 }
             } else if clean_message.contains("This BIN sale is still in its grace period!") {
@@ -3239,12 +3246,23 @@ async fn execute_command(
             // TODO: Implement trade window handling
             warn!("AcceptTrade implementation incomplete - needs trade window handling");
         }
-        CommandType::SellToAuction { item_name, starting_bid, duration_hours, item_slot, item_id } => {
-            info!("Creating auction: {} at {} coins for {} hours", item_name, starting_bid, duration_hours);
+        CommandType::SellToAuction {
+            item_name,
+            starting_bid,
+            duration_hours,
+            expected_profit,
+            item_slot,
+            item_id,
+        } => {
+            info!(
+                "Creating auction: {} at {} coins for {} hours",
+                item_name, starting_bid, duration_hours
+            );
             // Store context for window/sign handlers (matches TypeScript sellHandler.ts)
             *state.auction_item_name.write() = item_name.clone();
             *state.auction_starting_bid.write() = *starting_bid;
             *state.auction_duration_hours.write() = *duration_hours;
+            *state.auction_expected_profit.write() = *expected_profit;
             *state.auction_item_slot.write() = *item_slot;
             *state.auction_item_id.write() = item_id.clone();
             *state.auction_step.write() = AuctionStep::Initial;

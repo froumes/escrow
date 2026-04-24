@@ -1441,7 +1441,12 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                twm::bot::BotEvent::AuctionListed { item_name, starting_bid, duration_hours } => {
+                twm::bot::BotEvent::AuctionListed {
+                    item_name,
+                    starting_bid,
+                    duration_hours,
+                    expected_profit,
+                } => {
                     // Reset the idle-inventory timer so the 30-minute failsafe doesn't fire
                     // while items are being actively listed.
                     *last_auction_listed_at_events.lock().unwrap() = Instant::now();
@@ -1458,7 +1463,7 @@ async fn main() -> Result<()> {
                         let purse = bot_client_clone.get_purse();
                         tokio::spawn(async move {
                             twm::webhook::send_webhook_auction_listed(
-                                &name, &item, starting_bid, duration_hours, purse, &url,
+                                &name, &item, starting_bid, duration_hours, expected_profit, purse, &url,
                             ).await;
                         });
                     }
@@ -2584,10 +2589,27 @@ async fn main() -> Result<()> {
                                         continue;
                                     }
 
+                                    let expected_listing_profit = {
+                                        let key = item_name.to_lowercase();
+                                        match flip_tracker_ws.lock() {
+                                            Ok(tracker) => tracker.get(&key).and_then(|entry| {
+                                                let buy_price = entry.1;
+                                                if buy_price > 0 && price > 0 {
+                                                    let ah_fee = calculate_ah_fee(price);
+                                                    Some(price as i64 - buy_price as i64 - ah_fee as i64)
+                                                } else {
+                                                    None
+                                                }
+                                            }),
+                                            Err(_) => None,
+                                        }
+                                    };
+
                                     let cmd = CommandType::SellToAuction {
                                         item_name,
                                         starting_bid: price,
                                         duration_hours: duration,
+                                        expected_profit: expected_listing_profit,
                                         item_slot,
                                         item_id,
                                     };

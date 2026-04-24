@@ -259,6 +259,8 @@ pub enum CommandType {
         item_name: String,
         starting_bid: u64,
         duration_hours: u64,
+        /// Expected profit after AH fee, if this listing came from a tracked flip.
+        expected_profit: Option<i64>,
         /// Mineflayer inventory slot (9-44) from COFL createAuction message
         item_slot: Option<u64>,
         /// ExtraAttributes.id from COFL for item identity verification

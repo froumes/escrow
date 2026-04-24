@@ -548,21 +548,43 @@ pub async fn send_webhook_auction_listed(
     item_name: &str,
     starting_bid: u64,
     duration_hours: u64,
+    expected_profit: Option<i64>,
     purse: Option<u64>,
     webhook_url: &str,
 ) {
     let safe_item = sanitize_item_name(item_name);
     let expires_unix = now_unix() + duration_hours * 3600;
+    let mut fields = vec![
+        serde_json::json!({
+            "name": "💵 BIN Price",
+            "value": format!("```fix\n{} coins\n```", format_number(starting_bid as f64)),
+            "inline": true
+        }),
+        serde_json::json!({
+            "name": "⏳ Duration",
+            "value": format!("```\n{}h\n```", duration_hours),
+            "inline": true
+        }),
+        serde_json::json!({
+            "name": "📅 Expires",
+            "value": format!("<t:{}:R>", expires_unix),
+            "inline": true
+        }),
+    ];
+    if let Some(p) = expected_profit {
+        let sign = if p >= 0 { "+" } else { "" };
+        fields.push(serde_json::json!({
+            "name": "📈 Expected Profit",
+            "value": format!("```diff\n{}{} coins\n```", sign, format_number(p as f64)),
+            "inline": true
+        }));
+    }
     let payload = serde_json::json!({
         "embeds": [{
             "title": "🏷️ BIN Auction Listed",
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0xe67e22u32,
-            "fields": [
-                {"name": "💵 BIN Price",  "value": format!("```fix\n{} coins\n```", format_number(starting_bid as f64)), "inline": true},
-                {"name": "⏳ Duration",   "value": format!("```\n{}h\n```", duration_hours),                             "inline": true},
-                {"name": "📅 Expires",    "value": format!("<t:{}:R>", expires_unix),                                    "inline": true},
-            ],
+            "fields": fields,
             "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
