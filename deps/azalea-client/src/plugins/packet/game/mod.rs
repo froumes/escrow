@@ -19,7 +19,12 @@ use azalea_protocol::{
 };
 use azalea_registry::builtin::EntityKind;
 use azalea_world::{InstanceContainer, InstanceName, MinecraftEntityId, PartialInstance};
-use bevy_ecs::{prelude::*, system::SystemState};
+use bevy_ecs::{
+    error::{BevyError, ErrorContext, debug as bevy_debug, warn as bevy_warn},
+    prelude::*,
+    system::SystemState,
+    world::error::EntityMutableFetchError,
+};
 pub use events::*;
 use tracing::{debug, error, trace, warn};
 
@@ -39,6 +44,21 @@ use crate::{
     player::{GameProfileComponent, PlayerInfo},
     tick_counter::TicksConnected,
 };
+
+fn handle_relative_entity_update_error(error: BevyError, ctx: ErrorContext) {
+    // Late movement/metadata packets can legitimately arrive after Hypixel has
+    // already despawned the old-world entity during Limbo/lobby/SkyBlock
+    // transfers. Log that race at debug level so the bot keeps running, but
+    // keep warning on any other command-handling failures.
+    if matches!(
+        error.downcast_ref::<EntityMutableFetchError>(),
+        Some(EntityMutableFetchError::NotSpawned(_))
+    ) {
+        bevy_debug(error, ctx);
+    } else {
+        bevy_warn(error, ctx);
+    }
+}
 
 pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundGamePacket) {
     let mut handler = GamePacketHandler { player, ecs };
@@ -691,7 +711,8 @@ impl GamePacketHandler<'_> {
 
             // we use RelativeEntityUpdate because it makes sure changes aren't made
             // multiple times
-            commands.entity(entity).queue(RelativeEntityUpdate::new(
+            commands.entity(entity).queue_handled(
+                RelativeEntityUpdate::new(
                 instance_holder.partial_instance.clone(),
                 move |entity| {
                     let entity_id = entity.id();
@@ -707,7 +728,9 @@ impl GamePacketHandler<'_> {
                         commands_system_state.apply(world);
                     });
                 },
-            ));
+            ),
+                handle_relative_entity_update_error,
+            );
         });
     }
 
@@ -740,13 +763,16 @@ impl GamePacketHandler<'_> {
 
                 let data = KnockbackData::Set(p.delta.to_vec3());
 
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     instance_holder.partial_instance.clone(),
                     move |entity_mut| {
                         entity_mut
                             .world_scope(|world| world.trigger(KnockbackEvent { entity, data }));
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
@@ -802,7 +828,8 @@ impl GamePacketHandler<'_> {
                 let relative = p.relative.clone();
                 let change = p.change.clone();
 
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     instance_holder.partial_instance.clone(),
                     move |entity| {
                         let entity_id = entity.id();
@@ -822,7 +849,9 @@ impl GamePacketHandler<'_> {
                             physics.set_old_pos(old_position);
                         });
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
@@ -849,7 +878,8 @@ impl GamePacketHandler<'_> {
 
                 let new_delta = p.delta.clone();
                 let new_on_ground = p.on_ground;
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     instance_holder.partial_instance.clone(),
                     move |entity_mut| {
                         let mut physics = entity_mut.get_mut::<Physics>().unwrap();
@@ -867,7 +897,9 @@ impl GamePacketHandler<'_> {
                             entity = entity_mut.id()
                         );
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
@@ -899,7 +931,8 @@ impl GamePacketHandler<'_> {
 
                 let new_on_ground = p.on_ground;
 
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     instance_holder.partial_instance.clone(),
                     move |entity_mut| {
                         let mut physics = entity_mut.get_mut::<Physics>().unwrap();
@@ -917,7 +950,9 @@ impl GamePacketHandler<'_> {
                             *look_direction = new_look_direction;
                         }
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
@@ -936,7 +971,8 @@ impl GamePacketHandler<'_> {
                     );
                     let new_on_ground = p.on_ground;
 
-                    commands.entity(entity).queue(RelativeEntityUpdate::new(
+                    commands.entity(entity).queue_handled(
+                        RelativeEntityUpdate::new(
                         instance_holder.partial_instance.clone(),
                         move |entity_mut| {
                             let mut physics = entity_mut.get_mut::<Physics>().unwrap();
@@ -947,7 +983,9 @@ impl GamePacketHandler<'_> {
                                 *look_direction = new_look_direction;
                             }
                         },
-                    ));
+                    ),
+                        handle_relative_entity_update_error,
+                    );
                 } else {
                     warn!(
                         "Got move entity rot packet for unknown entity id {}",
@@ -1127,7 +1165,8 @@ impl GamePacketHandler<'_> {
 
                 let partial_instance = instance_holder.partial_instance.clone();
                 let effect_data = effect_data.clone();
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     partial_instance,
                     move |entity| {
                         if let Some(mut active_effects) = entity.get_mut::<ActiveEffects>() {
@@ -1138,7 +1177,9 @@ impl GamePacketHandler<'_> {
                             entity.insert(active_effects);
                         }
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
@@ -1368,14 +1409,17 @@ impl GamePacketHandler<'_> {
                 };
 
                 let partial_instance = instance_holder.partial_instance.clone();
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     partial_instance,
                     move |entity| {
                         if let Some(mut active_effects) = entity.get_mut::<ActiveEffects>() {
                             active_effects.remove(mob_effect);
                         }
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
@@ -1542,7 +1586,8 @@ impl GamePacketHandler<'_> {
                 let new_on_ground = p.on_ground;
                 let new_look_direction = p.values.look_direction;
 
-                commands.entity(entity).queue(RelativeEntityUpdate::new(
+                commands.entity(entity).queue_handled(
+                    RelativeEntityUpdate::new(
                     instance_holder.partial_instance.clone(),
                     move |entity_mut| {
                         let is_local_entity = entity_mut.get::<LocalEntity>().is_some();
@@ -1563,7 +1608,9 @@ impl GamePacketHandler<'_> {
                         let mut look_direction = entity_mut.get_mut::<LookDirection>().unwrap();
                         *look_direction = new_look_direction;
                     },
-                ));
+                ),
+                    handle_relative_entity_update_error,
+                );
             },
         );
     }
