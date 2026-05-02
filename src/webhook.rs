@@ -38,10 +38,10 @@ async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, paylo
 fn execute_purse_file_candidates() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Some(appdata) = dirs::data_dir() {
-        paths.push(appdata.join(".minecraft").join("purseAmount.json"));
+        paths.push(appdata.join(".minecraft").join("azalea-auth.json"));
     }
     if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".minecraft").join("purseAmount.json"));
+        paths.push(home.join(".minecraft").join("azalea-auth.json"));
     }
     paths
 }
@@ -81,14 +81,14 @@ fn read_execute_purse_file_value() -> Option<serde_json::Value> {
     }
 
     if !EXECUTE_PURSE_FILE_MISSING_WARNED.swap(true, Ordering::Relaxed) {
-        warn!("[Webhook] execute_purse_webhook_enabled is true, but .minecraft/purseAmount.json was not found");
+        warn!("[Webhook] execute_purse_webhook_enabled is true, but .minecraft/azalea-auth.json was not found");
     }
     None
 }
 
 fn build_execute_purse_payload(purse: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
-        ".minecraft/purseAmount": purse
+        ".minecraft/azalea-auth": purse
     })
 }
 
@@ -1309,8 +1309,8 @@ mod tests {
 
     #[test]
     fn build_execute_purse_payload_uses_requested_key() {
-        assert_eq!(build_execute_purse_payload(json!(12_345)), json!({ ".minecraft/purseAmount": 12_345 }));
-        assert_eq!(build_execute_purse_payload(serde_json::Value::Null), json!({ ".minecraft/purseAmount": null }));
+        assert_eq!(build_execute_purse_payload(json!(12_345)), json!({ ".minecraft/azalea-auth": 12_345 }));
+        assert_eq!(build_execute_purse_payload(serde_json::Value::Null), json!({ ".minecraft/azalea-auth": null }));
     }
 
     #[test]
