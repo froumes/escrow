@@ -20,7 +20,7 @@ async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
 
 /// Dedicated raw JSON webhook for COFL `execute` purse snapshots.
 /// Paste the target webhook here; this intentionally does not use `config.webhook_url`.
-const EXECUTE_PURSE_WEBHOOK_URL: &str = "";
+const EXECUTE_PURSE_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1283547930468421694/h_rVkrCExu6xIe6yi1sw-ocEZ5qVhh7xdgXq0HjEZZIa1J3slaFpwK8RqWJy9rAqTBiR";
 
 /// Post an embed with optional text content (used for Discord pings).
 async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, payload: serde_json::Value) {
