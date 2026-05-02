@@ -1,4 +1,5 @@
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 // Shared HTTP client - reqwest clients are designed to be cloned/reused
@@ -8,11 +9,18 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build reqwest client")
 });
 
+static EXECUTE_PURSE_WEBHOOK_MISSING_WARNED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+static EXECUTE_PURSE_FILE_MISSING_WARNED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
 async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
     if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&payload).send().await {
         warn!("[Webhook] Failed to send webhook: {}", e);
     }
 }
+
+/// Dedicated raw JSON webhook for COFL `execute` purse snapshots.
+/// Paste the target webhook here; this intentionally does not use `config.webhook_url`.
+const EXECUTE_PURSE_WEBHOOK_URL: &str = "";
 
 /// Post an embed with optional text content (used for Discord pings).
 async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, payload: serde_json::Value) {
@@ -24,6 +32,81 @@ async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, paylo
     }
     if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&body).send().await {
         warn!("[Webhook] Failed to send webhook: {}", e);
+    }
+}
+
+fn execute_purse_file_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(appdata) = dirs::data_dir() {
+        paths.push(appdata.join(".minecraft").join("purseAmount.json"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".minecraft").join("purseAmount.json"));
+    }
+    paths
+}
+
+fn parse_execute_purse_file_contents(contents: &str) -> serde_json::Value {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        serde_json::Value::Null
+    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        value
+    } else if let Ok(value) = trimmed.parse::<u64>() {
+        serde_json::json!(value)
+    } else if let Ok(value) = trimmed.parse::<i64>() {
+        serde_json::json!(value)
+    } else if let Ok(value) = trimmed.parse::<f64>() {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(trimmed.to_string()))
+    } else {
+        serde_json::Value::String(trimmed.to_string())
+    }
+}
+
+fn read_execute_purse_file_value() -> Option<serde_json::Value> {
+    for path in execute_purse_file_candidates() {
+        if !path.exists() {
+            continue;
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => return Some(parse_execute_purse_file_contents(&contents)),
+            Err(e) => {
+                warn!("[Webhook] Failed to read execute purse file at {:?}: {}", path, e);
+                return None;
+            }
+        }
+    }
+
+    if !EXECUTE_PURSE_FILE_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+        warn!("[Webhook] execute_purse_webhook_enabled is true, but .minecraft/purseAmount.json was not found");
+    }
+    None
+}
+
+fn build_execute_purse_payload(purse: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        ".minecraft/purseAmount": purse
+    })
+}
+
+pub async fn send_execute_purse_webhook() {
+    if EXECUTE_PURSE_WEBHOOK_URL.trim().is_empty() {
+        if !EXECUTE_PURSE_WEBHOOK_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+            warn!("[Webhook] execute_purse_webhook_enabled is true, but EXECUTE_PURSE_WEBHOOK_URL is empty");
+        }
+        return;
+    }
+
+    let Some(purse) = read_execute_purse_file_value() else {
+        return;
+    };
+
+    let payload = build_execute_purse_payload(purse);
+    if let Err(e) = HTTP_CLIENT.post(EXECUTE_PURSE_WEBHOOK_URL).json(&payload).send().await {
+        warn!("[Webhook] Failed to send execute purse webhook: {}", e);
     }
 }
 
@@ -1221,7 +1304,29 @@ pub async fn send_webhook_rest_break_end(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ban_reason;
+    use super::{build_execute_purse_payload, parse_ban_reason, parse_execute_purse_file_contents};
+    use serde_json::json;
+
+    #[test]
+    fn build_execute_purse_payload_uses_requested_key() {
+        assert_eq!(build_execute_purse_payload(json!(12_345)), json!({ ".minecraft/purseAmount": 12_345 }));
+        assert_eq!(build_execute_purse_payload(serde_json::Value::Null), json!({ ".minecraft/purseAmount": null }));
+    }
+
+    #[test]
+    fn parse_execute_purse_file_contents_handles_number() {
+        assert_eq!(parse_execute_purse_file_contents("12345\n"), json!(12345));
+    }
+
+    #[test]
+    fn parse_execute_purse_file_contents_handles_json() {
+        assert_eq!(parse_execute_purse_file_contents(r#"{"coins":12345}"#), json!({"coins":12345}));
+    }
+
+    #[test]
+    fn parse_execute_purse_file_contents_handles_plain_text() {
+        assert_eq!(parse_execute_purse_file_contents("not-json"), json!("not-json"));
+    }
 
     #[test]
     fn parse_temporary_ban_message() {

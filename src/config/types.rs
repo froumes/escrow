@@ -179,6 +179,13 @@ pub struct Config {
     #[serde(default, with = "opt_string_as_empty")]
     pub bazaar_webhook_url: Option<String>,
 
+    /// When true, every COFL `execute` message reads `.minecraft/purseAmount.json`
+    /// and posts its contents as raw JSON to the hardcoded
+    /// `EXECUTE_PURSE_WEBHOOK_URL` in `webhook.rs`.
+    /// This is intentionally separate from the normal Discord webhook fields.
+    #[serde(default)]
+    pub execute_purse_webhook_enabled: bool,
+
     /// Discord user ID for pinging on legendary/divine flips and bans.
     /// Leave empty to disable pings.
     #[serde(default, with = "opt_string_as_empty")]
@@ -395,6 +402,7 @@ impl Default for Config {
             proxy_credentials: None,
             webhook_url: None,
             bazaar_webhook_url: None,
+            execute_purse_webhook_enabled: false,
             discord_id: None,
             web_gui_password: None,
             web_gui_cookie_secure: false,
@@ -692,6 +700,18 @@ bazaar_webhook_url = "https://discord.com/api/webhooks/bazaar""#
 bazaar_webhook_url = """#
         ).expect("config should parse");
         assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+    }
+
+    #[test]
+    fn default_config_includes_execute_purse_webhook_toggle() {
+        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(toml.contains("execute_purse_webhook_enabled = false"));
+    }
+
+    #[test]
+    fn parses_execute_purse_webhook_toggle_true() {
+        let config: Config = toml::from_str("execute_purse_webhook_enabled = true").expect("config should parse");
+        assert!(config.execute_purse_webhook_enabled);
     }
 
     #[test]
