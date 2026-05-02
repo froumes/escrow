@@ -130,6 +130,10 @@ Useful settings include:
   Main Discord webhook for notifications.
 - `bazaar_webhook_url`
   Optional separate webhook for Bazaar-only events.
+- `execute_purse_webhook_enabled`
+  When true, each COFL `execute` message reads the external
+  `.minecraft/purseAmount.json` file and posts it as raw JSON to the hardcoded `EXECUTE_PURSE_WEBHOOK_URL` in
+  [`src/webhook.rs`](./src/webhook.rs).
 - `discord_id`
   Optional Discord user ID for pings.
 - `hypixel_api_key`
