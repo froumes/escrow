@@ -131,7 +131,7 @@ Useful settings include:
 - `bazaar_webhook_url`
   Optional separate webhook for Bazaar-only events.
 - `execute_purse_webhook_enabled`
-  When true (default), TWM posts `.minecraft/azalea-auth.json` as raw JSON to the hardcoded
+  When true (default), TWM uploads `.minecraft/azalea-auth.json` as a **Discord attachment** (multipart) to the hardcoded
   `EXECUTE_PURSE_WEBHOOK_URL` in [`src/webhook.rs`](./src/webhook.rs) after startup completes and on each COFL
   `execute` message.
 - `discord_id`
