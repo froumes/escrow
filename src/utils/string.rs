@@ -99,6 +99,8 @@ mod tests {
         assert!(!is_twm_baf_synthetic_chat_line("[Auction] Steve bought dirt for 1 coins"));
     }
 
+    #[test]
+    fn test_format_number_with_separators() {
         assert_eq!(format_number_with_separators(1000), "1,000");
         assert_eq!(format_number_with_separators(1000000), "1,000,000");
         assert_eq!(format_number_with_separators(123), "123");
