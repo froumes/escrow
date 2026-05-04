@@ -1074,6 +1074,11 @@ async fn main() -> Result<()> {
                             twm::webhook::send_webhook_startup_complete(&name, orders_cancelled, ah, bz, conn_id.as_deref(), premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())), &url).await;
                         });
                     }
+                    if config_for_events.execute_purse_webhook_enabled {
+                        tokio::spawn(async move {
+                            twm::webhook::send_execute_purse_webhook().await;
+                        });
+                    }
                 }
                 twm::bot::BotEvent::ItemPurchased {
                     item_name,

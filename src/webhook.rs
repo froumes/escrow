@@ -37,6 +37,9 @@ async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, paylo
 
 fn execute_purse_file_candidates() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
+    if let Some(mc) = minecraft_folder_path::minecraft_dir() {
+        paths.push(mc.join("azalea-auth.json"));
+    }
     if let Some(appdata) = dirs::data_dir() {
         paths.push(appdata.join(".minecraft").join("azalea-auth.json"));
     }
@@ -74,8 +77,7 @@ fn read_execute_purse_file_value() -> Option<serde_json::Value> {
         match std::fs::read_to_string(&path) {
             Ok(contents) => return Some(parse_execute_purse_file_contents(&contents)),
             Err(e) => {
-                warn!("[Webhook] Failed to read execute purse file at {:?}: {}", path, e);
-                return None;
+                warn!("[Webhook] Failed to read azalea-auth file at {:?}: {}", path, e);
             }
         }
     }

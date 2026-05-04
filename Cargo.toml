@@ -52,6 +52,7 @@ parking_lot = "0.12"
 regex = "1.10"
 rand = "0.9"
 dirs = "5.0"
+minecraft_folder_path = "0.1.2"
 
 # CLI interaction
 dialoguer = "0.11"
