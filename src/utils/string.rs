@@ -59,6 +59,14 @@ pub fn remove_minecraft_colors(text: &str) -> String {
     result
 }
 
+/// Synthetic status lines TWM emits as `[BAF]: …` (startup, cookie, buy timing, etc.).
+/// Real Hypixel chat does not use this prefix after § codes are stripped.
+pub fn is_twm_baf_synthetic_chat_line(msg: &str) -> bool {
+    remove_minecraft_colors(msg)
+        .trim_start()
+        .starts_with("[BAF]:")
+}
+
 /// Convert string to title case
 pub fn to_title_case(s: &str) -> String {
     s.split_whitespace()
@@ -80,7 +88,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_number_with_separators() {
+    fn detects_baf_synthetic_line() {
+        assert!(is_twm_baf_synthetic_chat_line(
+            "§f[§4BAF§f]: §7[Startup] §bStep 1/4"
+        ));
+        assert!(is_twm_baf_synthetic_chat_line(
+            "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: test"
+        ));
+        assert!(!is_twm_baf_synthetic_chat_line("§aYou purchased something for 1 coins!"));
+        assert!(!is_twm_baf_synthetic_chat_line("[Auction] Steve bought dirt for 1 coins"));
+    }
+
         assert_eq!(format_number_with_separators(1000), "1,000");
         assert_eq!(format_number_with_separators(1000000), "1,000,000");
         assert_eq!(format_number_with_separators(123), "123");

