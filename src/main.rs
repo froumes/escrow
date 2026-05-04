@@ -1357,19 +1357,24 @@ async fn main() -> Result<()> {
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    if let Some(webhook_url) = config_for_events.active_webhook_url() {
-                        let url = webhook_url.to_string();
-                        let name = ingame_name_for_events.clone();
-                        let item = item_name.clone();
-                        let b = buyer.clone();
-                        let purse = bot_client_clone.get_purse();
-                        let uuid_str = opt_auction_uuid.clone();
-                        tokio::spawn(async move {
-                            twm::webhook::send_webhook_item_sold(
-                                &name, &item, price, &b, opt_profit, opt_buy_price,
-                                opt_time_secs, purse, uuid_str.as_deref(), &url,
-                            ).await;
-                        });
+                    // Only send sell webhooks when this instance could resolve a
+                    // realized profit from its purchase ledger. This prevents
+                    // duplicate sell notifications when multiple bots are running.
+                    if opt_profit.is_some() {
+                        if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                            let url = webhook_url.to_string();
+                            let name = ingame_name_for_events.clone();
+                            let item = item_name.clone();
+                            let b = buyer.clone();
+                            let purse = bot_client_clone.get_purse();
+                            let uuid_str = opt_auction_uuid.clone();
+                            tokio::spawn(async move {
+                                twm::webhook::send_webhook_item_sold(
+                                    &name, &item, price, &b, opt_profit, opt_buy_price,
+                                    opt_time_secs, purse, uuid_str.as_deref(), &url,
+                                ).await;
+                            });
+                        }
                     }
                     // Query Coflnet for authoritative session profit after each sale.
                     // `/cofl profit <ign> <days>` returns the total AH profit over
