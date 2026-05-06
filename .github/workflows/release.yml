@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  DEFAULT_PUBLIC_RELEASE_REPO: froumes/twm-releases
 
 jobs:
   build:
@@ -44,14 +45,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Validate mirror configuration
-        shell: bash
-        run: |
-          if [[ -z "${{ vars.PUBLIC_RELEASE_REPO }}" ]]; then
-            echo "PUBLIC_RELEASE_REPO GitHub Actions variable is required."
-            exit 1
-          fi
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -62,7 +55,7 @@ jobs:
 
       - name: Build release binaries
         env:
-          TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO }}
+          TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || env.DEFAULT_PUBLIC_RELEASE_REPO }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binaries
@@ -96,16 +89,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     env:
-      PUBLIC_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO }}
+      PUBLIC_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || env.DEFAULT_PUBLIC_RELEASE_REPO }}
 
     steps:
       - name: Validate mirror credentials
         shell: bash
         run: |
-          if [[ -z "$PUBLIC_RELEASE_REPO" ]]; then
-            echo "PUBLIC_RELEASE_REPO GitHub Actions variable is required."
-            exit 1
-          fi
           if [[ -z "${{ secrets.PUBLIC_RELEASES_PAT }}" ]]; then
             echo "PUBLIC_RELEASES_PAT GitHub Actions secret is required."
             exit 1

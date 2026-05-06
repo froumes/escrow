@@ -20,10 +20,14 @@ This repo should already exist before the workflow runs.
 
 In the source repository settings, add:
 
-- Actions variable: `PUBLIC_RELEASE_REPO`
-  For this setup: `froumes/twm-releases`
 - Actions secret: `PUBLIC_RELEASES_PAT`
   Use a fine-grained PAT or app token with `contents:write` access to the public mirror repo
+
+Optional:
+
+- Actions variable: `PUBLIC_RELEASE_REPO`
+  For this setup it can be omitted because the workflow defaults to `froumes/twm-releases`
+  Set it only if you want a different public mirror repo
 
 ## 3. Make the source repo private
 

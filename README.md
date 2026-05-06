@@ -34,13 +34,16 @@ cargo +nightly run --release --bin TWM-loader
 
 ## Release mirror
 
-The release workflow now expects two GitHub Actions settings in the source repo:
+The release workflow now uses `froumes/twm-releases` by default and expects this GitHub Actions secret in the source repo:
+
+- `PUBLIC_RELEASES_PAT`
+  A token with `contents:write` access to the public mirror repo
+
+Optional override:
 
 - `PUBLIC_RELEASE_REPO`
   Format: `owner/repo`
-  Recommended here: `froumes/twm-releases`
-- `PUBLIC_RELEASES_PAT`
-  A token with `contents:write` access to the public mirror repo
+  When unset, CI defaults to `froumes/twm-releases`
 
 At build time, CI injects `TWM_RELEASE_REPO`, so the loader and in-app update checks point to the public releases repo instead of this one.
 
