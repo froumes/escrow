@@ -59,6 +59,8 @@ The built-in panel is still served by the app on `http://localhost:8080` by defa
 
 The GitHub Pages workflow is manual-only now. If you intend this source repo to stay private, also disable GitHub Pages in repository settings so an old public site does not linger.
 
+This repository is intended to trigger release publishing into the public mirror repo rather than act as the public download surface itself.
+
 ## Important license note
 
 `Cargo.toml` currently declares `AGPL-3.0`. If you publicly distribute binaries under AGPL, you still need to make the exact corresponding source for those binaries available with equivalent access. A private source repo plus a public binary-only repo is not sufficient on its own.
