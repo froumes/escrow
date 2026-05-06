@@ -5,6 +5,7 @@ use twm::{
     config::ConfigLoader,
     logging::{init_logger, print_mc_chat},
     persistence::AsyncJsonWriter,
+    release_channel::public_release_repo,
     state::CommandQueue,
     websocket::CoflWebSocket,
     bot::BotClient,
@@ -26,7 +27,6 @@ const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
 /// If no auction has been listed for this many seconds, force a `/cofl sellinventory`
 /// plus claim sold/purchased auctions to unblock stuck inventory.
 const INVENTORY_IDLE_SELLINVENTORY_SECS: u64 = 30 * 60; // 30 minutes
-const GITHUB_REPO: &str = "froumes/escrow";
 
 /// Base delay per consecutive rejoin attempt (seconds).
 const REJOIN_BACKOFF_BASE_SECS: u64 = 60;
@@ -275,6 +275,7 @@ struct GithubRelease {
 /// This avoids false "outdated" warnings when the loader has already updated
 /// the binary to the latest release.
 async fn check_version_outdated() {
+    let github_repo = public_release_repo();
     let client = match reqwest::Client::builder()
         .user_agent("TWM/version-check")
         .timeout(std::time::Duration::from_secs(8))
@@ -283,7 +284,7 @@ async fn check_version_outdated() {
         Ok(c) => c,
         Err(_) => return,
     };
-    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let url = format!("https://api.github.com/repos/{}/releases/latest", github_repo);
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return,

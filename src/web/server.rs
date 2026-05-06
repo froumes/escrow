@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::bot::BotClient;
 use crate::bazaar_tracker::BazaarOrderTracker;
 use crate::logging::print_mc_chat;
+use crate::release_channel::public_release_repo_url;
 use crate::state::CommandQueue;
 use crate::types::{CommandPriority, CommandType};
 use crate::websocket::CoflWebSocket;
@@ -494,7 +495,8 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
     );
 
     let html = include_str!("panel.html")
-        .replacen("<!-- OG_META_TAGS -->", &og_tags, 1);
+        .replacen("<!-- OG_META_TAGS -->", &og_tags, 1)
+        .replace("__PUBLIC_RELEASE_REPO_URL__", &public_release_repo_url());
 
     Html(html)
 }
@@ -1619,7 +1621,8 @@ async fn get_share_page(
     if !share_token_authorized(&s, &token) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Html(SHARE_PAGE_HTML).into_response()
+    Html(SHARE_PAGE_HTML.replace("__PUBLIC_RELEASE_REPO_URL__", &public_release_repo_url()))
+        .into_response()
 }
 
 /// Anonymized realized AH flip used by the public share page.

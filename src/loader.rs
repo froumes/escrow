@@ -11,8 +11,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use twm::release_channel::public_release_repo;
 
-const GITHUB_REPO: &str = "froumes/escrow";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// The asset name for the main binary on the current platform.
@@ -68,6 +68,7 @@ struct GithubAsset {
 }
 
 fn check_and_update() -> anyhow::Result<()> {
+    let github_repo = public_release_repo();
     let exe_path = env::current_exe()?;
     let exe_dir = exe_path
         .parent()
@@ -82,10 +83,10 @@ fn check_and_update() -> anyhow::Result<()> {
         }
     };
 
-    println!("[Loader] Checking for updates on GitHub ({})…", GITHUB_REPO);
+    println!("[Loader] Checking for updates on GitHub ({})…", github_repo);
 
     // Query the latest release from the GitHub API.
-    let url = format!("{}/repos/{}/releases/latest", GITHUB_API_BASE, GITHUB_REPO);
+    let url = format!("{}/repos/{}/releases/latest", GITHUB_API_BASE, github_repo);
     let client = reqwest::blocking::Client::builder()
         .user_agent("TWM-loader/1.0")
         .timeout(std::time::Duration::from_secs(15))

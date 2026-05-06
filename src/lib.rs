@@ -12,6 +12,7 @@ pub mod inventory;
 pub mod logging;
 pub mod persistence;
 pub mod profit;
+pub mod release_channel;
 pub mod seller;
 pub mod share_pusher;
 pub mod state;

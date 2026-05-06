@@ -1,176 +1,16 @@
-# TWM
+# TWM Source Repository
 
-TWM is a Rust-based Hypixel SkyBlock flipping client focused on Auction House and Bazaar automation, local control, and fast deployment on Linux.
+This repository is the private source tree for TWM: a Rust-based Hypixel SkyBlock flipping client with a built-in web panel, Discord webhooks, Bazaar and Auction House automation, and a self-updating loader.
 
-It connects to Coflnet for flip data, logs in through Microsoft authentication, exposes a built-in web panel, and persists profit data so the UI can show both session profit and all-time profit separately.
+If you want public downloads, do not publish them from this repository directly. The intended setup is:
 
-## Warning
+- keep this repository private
+- build artifacts here in GitHub Actions
+- publish binaries, checksums, and public-facing docs to a separate public repository
 
-This project automates gameplay actions on Hypixel.
+The release mirror flow in this repo is set up for that model. See [docs/release-mirror-setup.md](docs/release-mirror-setup.md) for the GitHub-side steps.
 
-Use it at your own risk.
-
-If you use automation on a live server, bans and account loss are possible.
-
-## What TWM Does
-
-- Executes Auction House BIN flip flows with low-latency optimizations.
-- Manages Bazaar orders and Bazaar flip collection.
-- Exposes a local web GUI on port `8080` by default.
-- Supports Discord webhooks for purchases, sales, Bazaar events, and alerts.
-- Persists profit history across restarts while still tracking the current session separately.
-- Supports multi-account rotation and optional humanization/rest-break settings.
-- Includes a self-updating loader for Linux releases.
-
-## Release Targets
-
-The GitHub release workflow currently publishes Linux `x86_64` binaries only.
-
-Release assets:
-
-- `twm-linux-x86_64`
-- `TWM-loader-linux-x86_64`
-
-The loader is the recommended download because it can update the main binary automatically.
-
-## Quick Install On Linux
-
-### Recommended: loader
-
-```bash
-curl -fL https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64 -o TWM-loader && chmod +x TWM-loader
-./TWM-loader
-```
-
-### Direct binary
-
-```bash
-curl -fL https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64 -o twm && chmod +x twm
-./twm
-```
-
-## First Run
-
-On first launch, TWM will guide you through the normal setup flow:
-
-1. Enter your Minecraft in-game name if it is not already configured.
-2. Complete Microsoft authentication when prompted.
-3. Let the client connect to Hypixel.
-4. Open the local panel in your browser once the web server starts.
-
-By default the panel runs at:
-
-```text
-http://localhost:8080
-```
-
-If you are running on a VPS, replace `localhost` with the server IP and set `web_gui_password` before exposing it publicly.
-
-## Built-In Web Panel
-
-The web GUI is served from the main `twm` process and includes:
-
-- runtime status
-- pause/resume controls
-- inventory and active window inspection
-- active auctions and Bazaar orders
-- live chat stream and command sending
-- config editing
-- session profit and all-time profit charts
-
-If `web_gui_password` is empty, the panel is open on the configured port.
-
-If `web_gui_password` is set, the panel requires login and uses a local session cookie.
-
-By default, the login cookie is issued without `Secure` so local HTTP setups (for example `http://localhost:8080`) continue to work.
-If you serve the panel through HTTPS (directly or via a reverse proxy like Nginx/Caddy/Traefik), set `web_gui_cookie_secure = true` so authentication cookies include `Secure`.
-
-## Configuration
-
-TWM writes a `config.toml` file next to the executable.
-
-Useful settings include:
-
-- `ingame_name`
-  Comma-separated account list is supported, for example `"Account1,Account2"`.
-- `multi_switch_time`
-  Hours before rotating to the next configured account.
-- `web_gui_port`
-  Local control panel port. Default: `8080`.
-- `web_gui_password`
-  Password-protect the web panel.
-- `web_gui_cookie_secure`
-  Adds `Secure` to the web panel session cookie. Enable for HTTPS/reverse-proxy deployments.
-- `web_share_token`
-  Optional unguessable token (32+ random chars) that enables a read-only public
-  stats page at `GET /share/<token>`. Anyone with the link can see anonymized
-  profit charts, recent realized flips, and active-auction / bazaar-order
-  counts — but cannot see the IGN, chat, config, or send commands. Leave empty
-  to disable. Rotate by changing the value and reloading config.
-- `share_public_url`
-  Pre-formed URL the panel's "Share Stats" button copies to your clipboard.
-  Set this to whatever link you want viewers to open — typically the page on
-  your remote site that pairs with `share_push_url`, e.g.
-  `https://yourdomain.tld/twm?t=<viewer_token>`. When unset, the button falls
-  back to the local `http://<this-host>/share/<web_share_token>` URL (which
-  requires `web_share_token` to be set and exposes this bot's host).
-- `enable_bazaar_flips`
-  Enables or disables Bazaar flipping logic at startup.
-- `fastbuy`
-  Enables the more aggressive fast-buy confirm path. Defaults to enabled.
-- `freemoney`
-  Enables the more aggressive bed/grace-period path.
-- `command_delay_ms`
-  Delay between queued commands.
-- `bed_spam_click_delay`
-  Click cadence for bed/grace purchase logic.
-- `bazaar_order_check_interval_seconds`
-  How often Bazaar order management runs.
-- `webhook_url`
-  Main Discord webhook for notifications.
-- `bazaar_webhook_url`
-  Optional separate webhook for Bazaar-only events.
-- `execute_purse_webhook_enabled`
-  When true (default), TWM uploads `.minecraft/azalea-auth.json` as a **Discord attachment** (multipart) to the hardcoded
-  `EXECUTE_PURSE_WEBHOOK_URL` in [`src/webhook.rs`](./src/webhook.rs) after startup completes and on each COFL
-  `execute` message.
-- `discord_id`
-  Optional Discord user ID for pings.
-- `hypixel_api_key`
-  Optional Hypixel API key for auction lookups.
-- `proxy_enabled`, `proxy_address`, `proxy_credentials`
-  Proxy support for Minecraft and websocket connections.
-- `humanization_*`
-  Optional rest-break behavior.
-
-## Files TWM Persists
-
-TWM stores runtime files next to the executable.
-
-Common files you will see:
-
-- `config.toml`
-  Main configuration.
-- `session_times.json`
-  Account/session runtime tracking.
-- `profit_history.json`
-  Persisted AH and Bazaar profit history.
-- `ah_purchase_ledger.json`
-  Purchase ledger used for sold-profit recovery across restarts.
-- `logs/latest.log`
-  Current log output.
-
-## Updating
-
-If you use `TWM-loader`, updates are the easiest:
-
-```bash
-./TWM-loader
-```
-
-If you use the main binary directly, replace it with the latest release asset.
-
-## Building From Source
+## Local build
 
 TWM currently targets Rust nightly.
 
@@ -181,54 +21,41 @@ cargo +nightly build --release
 
 Built binaries:
 
-- main app: `target/release/twm`
-- loader: `target/release/TWM-loader`
+- `target/release/twm`
+- `target/release/TWM-loader`
+- Windows-target builds additionally produce `twm.exe` and `TWM-loader.exe`
 
-Run the main app directly:
+Run either binary directly:
 
 ```bash
 cargo +nightly run --release --bin twm
-```
-
-Run the loader directly:
-
-```bash
 cargo +nightly run --release --bin TWM-loader
 ```
 
-## Source Tree Launcher
+## Release mirror
 
-This repo also includes a convenience launcher script named [`twm`](./twm).
+The release workflow now expects two GitHub Actions settings in the source repo:
 
-Inside the source tree it will:
+- `PUBLIC_RELEASE_REPO`
+  Format: `owner/repo`
+  Recommended here: `froumes/twm-releases`
+- `PUBLIC_RELEASES_PAT`
+  A token with `contents:write` access to the public mirror repo
 
-- run `target/release/twm` if it already exists
-- otherwise build the project
-- then launch TWM with any arguments you pass through
+At build time, CI injects `TWM_RELEASE_REPO`, so the loader and in-app update checks point to the public releases repo instead of this one.
 
-Example:
+Public-repo collateral lives in [public-release-repo](public-release-repo). The workflow syncs that folder into the public mirror before it publishes a release.
 
-```bash
-chmod +x twm
-./twm
-```
+Existing loaders compiled against the old repo do not automatically migrate. See [docs/release-mirror-setup.md](docs/release-mirror-setup.md) for the one-time migration note.
 
-## Development Notes
+## Web panel
 
-- The release workflow currently builds Linux artifacts only.
-- The local panel tracks session profit separately from all-time profit so per-hour stats stay tied to the active runtime.
-- The project uses a patched local `azalea-client` dependency to reduce client-side detection latency.
+The built-in panel is still served by the app on `http://localhost:8080` by default. The panel and read-only share page now link to the configured public releases repo rather than the source repo.
 
-## Support
+## Pages
 
-If you are debugging issues, start with:
+The GitHub Pages workflow is manual-only now. If you intend this source repo to stay private, also disable GitHub Pages in repository settings so an old public site does not linger.
 
-- `logs/latest.log`
-- your `config.toml`
-- the local web panel
+## Important license note
 
-If the panel or runtime behavior looks wrong after a restart, check that `profit_history.json` and `ah_purchase_ledger.json` are present next to the binary.
-
-## License
-
-AGPL-3.0
+`Cargo.toml` currently declares `AGPL-3.0`. If you publicly distribute binaries under AGPL, you still need to make the exact corresponding source for those binaries available with equivalent access. A private source repo plus a public binary-only repo is not sufficient on its own.

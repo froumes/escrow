@@ -1,48 +1,56 @@
-name: Build and Release
+name: Build and Publish Releases
 
 on:
   push:
     branches:
       - main
     tags:
-      - 'v*'
-  pull_request:
-    types: [closed]
-    branches:
-      - main
+      - "v*"
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
-  pull-requests: read
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    # Only run on merged PRs or direct pushes to main
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
-          - os: ubuntu-latest
+          - label: linux-x86_64
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: twm
             asset_name: twm-linux-x86_64
             loader_artifact_name: TWM-loader
             loader_asset_name: TWM-loader-linux-x86_64
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: twm.exe
+            asset_name: twm-windows-x86_64.exe
+            loader_artifact_name: TWM-loader.exe
+            loader_asset_name: TWM-loader-windows-x86_64.exe
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Validate mirror configuration
+        shell: bash
+        run: |
+          if [[ -z "${{ vars.PUBLIC_RELEASE_REPO }}" ]]; then
+            echo "PUBLIC_RELEASE_REPO GitHub Actions variable is required."
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -53,43 +61,57 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
+        env:
+          TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binaries (Linux and macOS)
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
+      - name: Strip binaries
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
         run: |
-          PROFILE_DIR="release"
-          strip target/${{ matrix.target }}/${PROFILE_DIR}/${{ matrix.artifact_name }}
-          strip target/${{ matrix.target }}/${PROFILE_DIR}/${{ matrix.loader_artifact_name }}
+          strip "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          strip "target/${{ matrix.target }}/release/${{ matrix.loader_artifact_name }}"
 
       - name: Rename binaries
         shell: bash
         run: |
-          PROFILE_DIR="release"
-          cd target/${{ matrix.target }}/${PROFILE_DIR}
-          mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
-          mv ${{ matrix.loader_artifact_name }} ${{ matrix.loader_asset_name }}
+          cd "target/${{ matrix.target }}/release"
+          mv "${{ matrix.artifact_name }}" "${{ matrix.asset_name }}"
+          mv "${{ matrix.loader_artifact_name }}" "${{ matrix.loader_asset_name }}"
 
       - name: Upload main artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/**/${{ matrix.asset_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
 
       - name: Upload loader artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.loader_asset_name }}
-          path: target/${{ matrix.target }}/**/${{ matrix.loader_asset_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.loader_asset_name }}
 
   release:
-    name: Create Release
+    name: Publish public mirror
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
-    
+    env:
+      PUBLIC_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO }}
+
     steps:
-      - name: Checkout code
+      - name: Validate mirror credentials
+        shell: bash
+        run: |
+          if [[ -z "$PUBLIC_RELEASE_REPO" ]]; then
+            echo "PUBLIC_RELEASE_REPO GitHub Actions variable is required."
+            exit 1
+          fi
+          if [[ -z "${{ secrets.PUBLIC_RELEASES_PAT }}" ]]; then
+            echo "PUBLIC_RELEASES_PAT GitHub Actions secret is required."
+            exit 1
+          fi
+
+      - name: Checkout source repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -99,58 +121,99 @@ jobs:
         with:
           path: ./artifacts
 
-      - name: List artifacts
+      - name: Generate checksums
+        shell: bash
         run: |
-          echo "Downloaded artifacts:"
-          ls -R ./artifacts
+          cd artifacts
+          find . -type f ! -name "SHA256SUMS.txt" -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
 
       - name: Get version
         id: version
+        shell: bash
         run: |
-          # If this is a tag push, use the tag name
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/}
+            VERSION="${GITHUB_REF#refs/tags/}"
           else
-            # Otherwise use the commit SHA
             VERSION="build-$(date +%Y%m%d)-${GITHUB_SHA::7}"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
+      - name: Checkout public mirror repo
+        uses: actions/checkout@v4
         with:
+          repository: ${{ env.PUBLIC_RELEASE_REPO }}
+          token: ${{ secrets.PUBLIC_RELEASES_PAT }}
+          path: public-repo
+          fetch-depth: 0
+
+      - name: Sync public repo collateral
+        shell: bash
+        run: |
+          rsync -a --delete --exclude ".git/" public-release-repo/ public-repo/
+
+          SOURCE_REPO_URL="https://github.com/${GITHUB_REPOSITORY}"
+          PUBLIC_REPO_URL="https://github.com/${PUBLIC_RELEASE_REPO}"
+
+          while IFS= read -r -d '' file; do
+            sed -i \
+              -e "s|__PUBLIC_RELEASE_REPO__|${PUBLIC_RELEASE_REPO}|g" \
+              -e "s|__PUBLIC_RELEASE_REPO_URL__|${PUBLIC_REPO_URL}|g" \
+              -e "s|__SOURCE_REPO__|${GITHUB_REPOSITORY}|g" \
+              -e "s|__SOURCE_REPO_URL__|${SOURCE_REPO_URL}|g" \
+              "$file"
+          done < <(find public-repo -type f -print0)
+
+      - name: Commit public repo collateral
+        shell: bash
+        run: |
+          cd public-repo
+          if git diff --quiet; then
+            echo "No public repo collateral changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "docs: refresh release mirror collateral"
+          git push
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > RELEASE_BODY.md <<EOF
+          ## TWM binaries: ${{ steps.version.outputs.version }}
+
+          Automated release build from source commit \`${{ github.sha }}\`.
+
+          ### Recommended download
+          - \`TWM-loader-windows-x86_64.exe\`
+          - \`TWM-loader-linux-x86_64\`
+
+          The loader checks this repository for updates and keeps the main binary current on startup.
+
+          ### Direct binaries
+          - \`twm-windows-x86_64.exe\`
+          - \`twm-linux-x86_64\`
+
+          ### Integrity
+          Download \`SHA256SUMS.txt\` from this release to verify each asset after download.
+
+          ### Notes
+          - This repository is a public release mirror only.
+          - Source and build configuration live in a separate source repository.
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          repository: ${{ env.PUBLIC_RELEASE_REPO }}
+          token: ${{ secrets.PUBLIC_RELEASES_PAT }}
           tag_name: ${{ steps.version.outputs.version }}
-          name: Release ${{ steps.version.outputs.version }}
-          body: |
-            ## TWM Release ${{ steps.version.outputs.version }}
-            
-            Automated build from commit ${{ github.sha }}
-            
-            ### TWM-loader (Recommended)
-            The loader automatically checks for updates on startup and downloads the latest version.
-            Just run the loader instead of the main binary.
-            
-            - **Linux (x86_64)**: `TWM-loader-linux-x86_64`
-            
-            ### Manual Downloads (main binary)
-            - **Linux (x86_64)**: `twm-linux-x86_64`
-            
-            ### Installation
-            
-            **Linux (using loader):**
-            ```bash
-            chmod +x TWM-loader-linux-x86_64
-            chmod +x twm-linux-x86_64
-            ./TWM-loader-linux-x86_64
-            ```
-            
-            See [README.md](https://github.com/froumes/escrow/blob/main/README.md) for usage instructions.
+          name: TWM ${{ steps.version.outputs.version }}
+          body_path: RELEASE_BODY.md
           files: |
             ./artifacts/**/*
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
