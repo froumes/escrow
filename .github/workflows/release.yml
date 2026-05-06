@@ -16,7 +16,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  DEFAULT_PUBLIC_RELEASE_REPO: froumes/twm-releases
 
 jobs:
   build:
@@ -55,7 +54,7 @@ jobs:
 
       - name: Build release binaries
         env:
-          TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || env.DEFAULT_PUBLIC_RELEASE_REPO }}
+          TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || 'froumes/twm-releases' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binaries
@@ -89,7 +88,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     env:
-      PUBLIC_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || env.DEFAULT_PUBLIC_RELEASE_REPO }}
+      PUBLIC_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || 'froumes/twm-releases' }}
 
     steps:
       - name: Validate mirror credentials
