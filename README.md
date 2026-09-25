@@ -18,6 +18,8 @@ The project pins Rust nightly in `rust-toolchain.toml` and targets Minecraft 26.
 cargo build --release
 ```
 
+Linux release binaries are built in AlmaLinux 9 via `.github/scripts/build-linux-el9.sh` against glibc 2.34 and OpenSSL 3. A local build on a newer distribution may require a newer glibc and may not run on older VPS hosts.
+
 Built binaries:
 
 - `target/release/twm`
