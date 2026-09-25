@@ -45,6 +45,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
+        if: matrix.os == 'windows-latest'
         # rustc builds after 2026-08-18 (incl. current stable) break azalea-core's
         # FixedBitSet<const N> with E0284. Pin the last good nightly (the one that
         # built release build-20260819) until upstream fixes it.
@@ -54,15 +55,27 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build outputs
+        if: matrix.os == 'windows-latest'
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
+        if: matrix.os == 'windows-latest'
         env:
           TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || 'froumes/twm-releases' }}
           BAF_NOTIFY_RELAY_URL: ${{ secrets.BAF_NOTIFY_RELAY_URL }}
           BAF_NOTIFY_SECRET: ${{ secrets.BAF_NOTIFY_SECRET }}
           BAF_BACKEND_TOKEN: ${{ secrets.BAF_BACKEND_TOKEN }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build Linux binaries against glibc 2.34
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          TWM_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || 'froumes/twm-releases' }}
+          BAF_NOTIFY_RELAY_URL: ${{ secrets.BAF_NOTIFY_RELAY_URL }}
+          BAF_NOTIFY_SECRET: ${{ secrets.BAF_NOTIFY_SECRET }}
+          BAF_BACKEND_TOKEN: ${{ secrets.BAF_BACKEND_TOKEN }}
+        run: bash .github/scripts/build-linux-el9.sh
 
       - name: Strip binaries
         if: matrix.os == 'ubuntu-latest'

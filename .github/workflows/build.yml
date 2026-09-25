@@ -19,3 +19,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
         run: cargo check --all-targets
+
+  linux-el9:
+    name: Linux glibc 2.34 build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and check AlmaLinux 9 binaries
+        run: |
+          bash .github/scripts/build-linux-el9.sh
+          test -s target/x86_64-unknown-linux-gnu/release/twm
+          test -s target/x86_64-unknown-linux-gnu/release/TWM-loader
