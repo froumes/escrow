@@ -81,10 +81,7 @@ pub async fn fetch_coflnet_median_price(tag: &str) -> Result<Option<u64>, String
         return Err(format!("Coflnet returned HTTP {}", resp.status()));
     }
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("decode JSON: {e}"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("decode JSON: {e}"))?;
 
     let price = extract_price(&body);
     debug!("[Seller/price] {tag} -> {price:?} (raw={body})");

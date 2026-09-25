@@ -11,7 +11,7 @@ use azalea_protocol::{
         login::{ClientboundLoginPacket, ServerboundHello, ServerboundLoginPacket},
     },
 };
-use azalea_world::Instance;
+use azalea_world::World;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_tasks::{IoTaskPool, Task, futures_lite::future};
@@ -19,10 +19,11 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::events::LocalPlayerEvents;
 use crate::{
-    Account, LocalPlayerBundle,
+    LocalPlayerBundle,
+    account::Account,
     connection::RawConnection,
+    local_player::WorldHolder,
     packet::login::{InLoginState, SendLoginPacketEvent},
 };
 
@@ -51,7 +52,6 @@ impl Plugin for JoinPlugin {
 pub struct StartJoinServerEvent {
     pub account: Account,
     pub connect_opts: ConnectOpts,
-    pub event_sender: Option<mpsc::UnboundedSender<crate::Event>>,
 
     // this is mpsc instead of oneshot so it can be cloned (since it's sent in an event)
     pub start_join_callback_tx: Option<mpsc::UnboundedSender<Entity>>,
@@ -86,7 +86,8 @@ pub struct ConnectOpts {
 #[derive(Message)]
 pub struct ConnectionFailedEvent {
     pub entity: Entity,
-    pub error: ConnectionError,
+    // wrap it in Arc so it can be cloned
+    pub error: Arc<ConnectionError>,
 }
 
 pub fn handle_start_join_server_event(
@@ -96,7 +97,7 @@ pub fn handle_start_join_server_event(
     connection_query: Query<&RawConnection>,
 ) {
     for event in events.read() {
-        let uuid = event.account.uuid_or_offline();
+        let uuid = event.account.uuid();
         let entity = if let Some(entity) = entity_uuid_index.get(&uuid) {
             debug!("Reusing entity {entity:?} for client");
 
@@ -147,12 +148,6 @@ pub fn handle_start_join_server_event(
             // immediately when the connection is created
         ));
 
-        if let Some(event_sender) = &event.event_sender {
-            // this is optional so we don't leak memory in case the user doesn't want to
-            // handle receiving packets
-            entity_mut.insert(LocalPlayerEvents(event_sender.clone()));
-        }
-
         let task_pool = IoTaskPool::get();
         let connect_opts = event.connect_opts.clone();
         let task = task_pool.spawn(async_compat::Compat::new(
@@ -166,10 +161,23 @@ pub fn handle_start_join_server_event(
 async fn create_conn_and_send_intention_packet(
     opts: ConnectOpts,
 ) -> Result<LoginConn, ConnectionError> {
-    let mut conn = if let Some(proxy) = opts.server_proxy {
+    let conn = if let Some(proxy) = opts.server_proxy {
         Connection::new_with_proxy(&opts.address.socket, proxy).await?
     } else {
         Connection::new(&opts.address.socket).await?
+    };
+
+    // Force TCP_NODELAY per the global flag. Upstream's `new_with_proxy` never
+    // sets it, so proxied sockets otherwise keep Nagle's algorithm on and delay
+    // small latency-critical packets. Reunite → set → re-wrap (no cipher or
+    // compression is active at the handshake stage, so wrapping is lossless).
+    let mut conn = match conn.unwrap() {
+        Ok(stream) => {
+            let _ = stream.set_nodelay(crate::TCP_NODELAY.load(std::sync::atomic::Ordering::Relaxed));
+            Connection::wrap(stream)
+        }
+        // Reuniting the two halves of a socket we just split cannot fail.
+        Err(_) => unreachable!("reunite own socket halves"),
     };
 
     conn.write(ServerboundIntention {
@@ -203,7 +211,10 @@ pub fn poll_create_connection_task(
                 Ok(conn) => conn,
                 Err(error) => {
                     warn!("failed to create connection: {error}");
-                    connection_failed_events.write(ConnectionFailedEvent { entity, error });
+                    connection_failed_events.write(ConnectionFailedEvent {
+                        entity,
+                        error: Arc::new(error),
+                    });
                     return;
                 }
             };
@@ -211,12 +222,12 @@ pub fn poll_create_connection_task(
             let (read_conn, write_conn) = conn.into_split();
             let (read_conn, write_conn) = (read_conn.raw, write_conn.raw);
 
-            let instance = Instance::default();
-            let instance_holder = crate::local_player::InstanceHolder::new(
+            let world = World::default();
+            let world_holder = WorldHolder::new(
                 entity,
                 // default to an empty world, it'll be set correctly later when we
                 // get the login packet
-                Arc::new(RwLock::new(instance)),
+                Arc::new(RwLock::new(world)),
             );
 
             entity_mut.insert((
@@ -227,7 +238,7 @@ pub fn poll_create_connection_task(
                         write_conn,
                         ConnectionProtocol::Login,
                     ),
-                    instance_holder,
+                    world_holder,
                     metadata: azalea_entity::metadata::PlayerMetadataBundle::default(),
                 },
                 InLoginState,
@@ -236,8 +247,8 @@ pub fn poll_create_connection_task(
             commands.trigger(SendLoginPacketEvent::new(
                 entity,
                 ServerboundHello {
-                    name: account.username.clone(),
-                    profile_id: account.uuid_or_offline(),
+                    name: account.username().to_owned(),
+                    profile_id: account.uuid(),
                 },
             ));
         }

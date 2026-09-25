@@ -107,10 +107,10 @@ impl SellerConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {}", path.display(), e))?;
-        let cfg: SellerConfig = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let cfg: SellerConfig =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
         Ok(cfg.sanitized())
     }
 
@@ -123,10 +123,9 @@ impl SellerConfig {
             }
         }
         let cleaned = self.clone().sanitized();
-        let raw = serde_json::to_string_pretty(&cleaned)
-            .map_err(|e| format!("serialise: {}", e))?;
-        std::fs::write(path, raw)
-            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+        let raw =
+            serde_json::to_string_pretty(&cleaned).map_err(|e| format!("serialise: {}", e))?;
+        std::fs::write(path, raw).map_err(|e| format!("write {}: {}", path.display(), e))?;
         Ok(())
     }
 
@@ -167,7 +166,14 @@ pub fn mask_token(token: &str) -> String {
         return "•".repeat(token.chars().count().min(8));
     }
     let prefix: String = token.chars().take(4).collect();
-    let suffix: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let suffix: String = token
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{prefix}…{suffix}")
 }
 

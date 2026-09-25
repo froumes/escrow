@@ -37,7 +37,37 @@ impl CommandQueue {
     /// low-priority commands are trimmed — but sell offers, AH listings, and
     /// ManageOrders are never dropped because they represent revenue or are
     /// essential housekeeping.
-    pub fn enqueue(&self, command_type: CommandType, priority: CommandPriority, interruptible: bool) -> Uuid {
+    pub fn enqueue(
+        &self,
+        command_type: CommandType,
+        priority: CommandPriority,
+        interruptible: bool,
+    ) -> Uuid {
+        // `ClaimPurchasedItem` is an argument-free bulk sweep: it opens /ah, walks to
+        // "Your Bids" and hits "Claim All", which drains EVERY pending purchase in one
+        // go.  A second queued copy therefore has nothing left to claim and only
+        // repeats the /ah -> Your Bids window churn.  On 2026-07-28 a redundant copy
+        // fired 13 ms after the first completed, opened a window the server closed
+        // 65 ms later, and clicked into it: Limbo, then a 30-day Watchdog ban
+        // (#01E34397).  Collapse duplicates onto the pending one instead of queueing.
+        // Returning the existing id keeps `await_queued_command` waiting on the real
+        // command rather than an id that was never enqueued.
+        if matches!(command_type, CommandType::ClaimPurchasedItem) {
+            let existing = self
+                .queue
+                .read()
+                .iter()
+                .find(|c| matches!(c.command_type, CommandType::ClaimPurchasedItem))
+                .map(|c| c.id);
+            if let Some(existing_id) = existing {
+                debug!(
+                    "[Queue] Collapsed duplicate ClaimPurchasedItem onto pending {}",
+                    existing_id
+                );
+                return existing_id;
+            }
+        }
+
         let id = Uuid::new_v4();
         let cmd = QueuedCommand {
             id,
@@ -48,13 +78,13 @@ impl CommandQueue {
         };
 
         let mut queue = self.queue.write();
-        
+
         // Find insertion point based on priority
         let pos = queue
             .iter()
             .position(|c| c.priority > priority)
             .unwrap_or(queue.len());
-        
+
         queue.insert(pos, cmd);
 
         // Enforce maximum queue size by removing low-priority droppable
@@ -66,14 +96,18 @@ impl CommandQueue {
                 !matches!(
                     c.command_type,
                     CommandType::BazaarSellOrder { .. }
-                    | CommandType::SellToAuction { .. }
-                    | CommandType::ManageOrders { .. }
-                    | CommandType::PurchaseAuction { .. }
+                        | CommandType::SellToAuction { .. }
+                        | CommandType::ManageOrders { .. }
+                        | CommandType::PurchaseAuction { .. }
                 )
             }) {
                 let dropped = queue.remove(drop_idx).unwrap();
-                info!("[Queue] Trimmed excess command {:?} ({:?}) — queue over {} limit",
-                    dropped.command_type.display_name(), dropped.priority, MAX_QUEUE_SIZE);
+                info!(
+                    "[Queue] Trimmed excess command {:?} ({:?}) — queue over {} limit",
+                    dropped.command_type.display_name(),
+                    dropped.priority,
+                    MAX_QUEUE_SIZE
+                );
             } else {
                 // All commands are essential — allow the queue to exceed the limit.
                 break;
@@ -84,8 +118,11 @@ impl CommandQueue {
 
         // Wake the command processor loop so it picks up the new command immediately.
         self.notify.notify_one();
-        
-        debug!("Enqueued command {:?} with priority {:?} at position {}", id, priority, pos);
+
+        debug!(
+            "Enqueued command {:?} with priority {:?} at position {}",
+            id, priority, pos
+        );
         id
     }
 
@@ -107,7 +144,10 @@ impl CommandQueue {
         let mut queue = self.queue.write();
         if let Some(cmd) = queue.pop_front() {
             *self.current_command.write() = Some(cmd.clone());
-            info!("Starting command {:?} (priority: {:?})", cmd.id, cmd.priority);
+            info!(
+                "Starting command {:?} (priority: {:?})",
+                cmd.id, cmd.priority
+            );
             Some(cmd)
         } else {
             None
@@ -172,7 +212,7 @@ impl CommandQueue {
         let original_len = queue.len();
         queue.retain(|cmd| {
             let age = now.duration_since(cmd.queued_at);
-            
+
             // Only remove stale bazaar commands
             if matches!(
                 cmd.command_type,
@@ -208,7 +248,24 @@ impl CommandQueue {
                 return true;
             }
         }
-        self.queue.read().iter().any(|c| matches!(c.command_type, CommandType::ManageOrders { .. }))
+        self.queue
+            .read()
+            .iter()
+            .any(|c| matches!(c.command_type, CommandType::ManageOrders { .. }))
+    }
+
+    /// Returns true if a ClaimSoldItem command is queued or currently executing.
+    /// Used to coalesce repeated `collectAuctions` signals into a single claim.
+    pub fn has_claim_sold(&self) -> bool {
+        if let Some(ref cur) = *self.current_command.read() {
+            if matches!(cur.command_type, CommandType::ClaimSoldItem) {
+                return true;
+            }
+        }
+        self.queue
+            .read()
+            .iter()
+            .any(|c| matches!(c.command_type, CommandType::ClaimSoldItem))
     }
 
     /// Returns true if a purchase command is queued or currently executing.
@@ -320,6 +377,7 @@ mod tests {
                 profit_perc: None,
                 purchase_at_ms: None,
                 uuid: Some("abc".into()),
+                list_at: None,
             },
         }
     }
@@ -376,7 +434,10 @@ mod tests {
     }
 
     fn dummy_manage_orders() -> CommandType {
-        CommandType::ManageOrders { cancel_open: false }
+        CommandType::ManageOrders {
+            cancel_open: false,
+            target_item: None,
+        }
     }
 
     #[test]

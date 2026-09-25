@@ -13,9 +13,7 @@ pub struct AsyncJsonWriter<T> {
 
 enum WriterMode<T> {
     Sync,
-    Async {
-        tx: mpsc::Sender<T>,
-    },
+    Async { tx: mpsc::Sender<T> },
 }
 
 impl<T> AsyncJsonWriter<T>
@@ -120,11 +118,7 @@ where
                     warn!("[JsonWriter] Failed to write {}: {}", path.display(), e);
                 }
             }
-            Err(e) => warn!(
-                "[JsonWriter] Failed to serialize {}: {}",
-                path.display(),
-                e
-            ),
+            Err(e) => warn!("[JsonWriter] Failed to serialize {}: {}", path.display(), e),
         }
     }
 }

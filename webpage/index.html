@@ -197,6 +197,21 @@
                             <h3>Operational guardrails</h3>
                             <p>Reconnect handling, queueing, watchdog behavior, and persistent order state reduce cleanup work.</p>
                         </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">07</span>
+                            <h3>HTTPS and password protection</h3>
+                            <p>The panel serves HTTPS by default, scopes signed sessions per port, and supports your own certificate and live password changes.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">08</span>
+                            <h3>Seller workspace</h3>
+                            <p>Select inventory or active auctions, preview item cards, and schedule specialized Discord sale posts across multiple channels.</p>
+                        </article>
+                        <article class="feature-card" data-reveal>
+                            <span class="feature-kicker">09</span>
+                            <h3>Shareable read-only stats</h3>
+                            <p>Hand out a token-protected profit dashboard without exposing chat, account identity, inventory controls, or configuration.</p>
+                        </article>
                     </div>
 
                     <div class="detail-grid" data-reveal>
@@ -227,6 +242,16 @@
                                 <li>Anonymize mode and reconnect logic</li>
                             </ul>
                         </div>
+                        <div class="detail-card">
+                            <h3>Secure web controls</h3>
+                            <ul>
+                                <li>HTTPS and password-authenticated sessions</li>
+                                <li>Structured and raw configuration editing</li>
+                                <li>Connect, disconnect, restart, update, and rest-break controls</li>
+                                <li>Read-only stats sharing with separate token authorization</li>
+                            </ul>
+                        </div>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -250,9 +275,9 @@
                         </article>
                         <article class="gallery-card" data-reveal>
                             <div class="gallery-copy">
-                                <span class="mini-label">Auth</span>
-                                <h3>Login screen</h3>
-                                <p>Clean entry point for local access to the panel.</p>
+                                <span class="mini-label">Secure auth</span>
+                                <h3>HTTPS login screen</h3>
+                                <p>Password-protected, port-scoped sessions keep remote panel access separate from public shared stats.</p>
                             </div>
                             <img src="https://github.com/user-attachments/assets/55a28e4b-ec5e-4896-af9b-b62e28190909" alt="TWM login screen" loading="lazy">
                         </article>
@@ -342,8 +367,8 @@
                                 <p>Adjust command pacing, bed interaction timing, and other latency-sensitive values directly in TOML.</p>
                             </article>
                             <article>
-                                <h3>Web and Discord integration</h3>
-                                <p>Set the web panel port and webhook destination without touching application code.</p>
+                                <h3>Web, Seller, and Discord integration</h3>
+                                <p>Set the HTTPS panel password and certificate paths, control stats sharing, and configure webhook or Seller destinations without touching application code.</p>
                             </article>
                         </div>
                     </div>
@@ -367,6 +392,9 @@
 
 <span class="comment"># Web panel</span>
 <span class="key">web_gui_port</span> = <span class="number">8080</span>
+<span class="key">web_gui_password</span> = <span class="string">"use-a-strong-password"</span>
+<span class="key">web_share_token</span> = <span class="string">"separate-read-only-token"</span>
+<span class="comment"># Optional: web_tls_cert_path and web_tls_key_path use your own certificate.</span>
 
 <span class="comment"># Notifications</span>
 <span class="key">webhook_url</span> = <span class="string">"https://discord.com/api/webhooks/..."</span></code></pre>
@@ -414,10 +442,10 @@
                                     <span class="dot green"></span>
                                 </div>
                                 <span class="terminal-title">bash - Linux VPS</span>
-                                <button type="button" class="copy-button" data-copy="wget https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64&#10;chmod +x twm-linux-x86_64&#10;./twm-linux-x86_64">Copy commands</button>
+                                <button type="button" class="copy-button" data-copy="wget https://github.com/froumes/twm-releases/releases/latest/download/twm-linux-x86_64&#10;chmod +x twm-linux-x86_64&#10;./twm-linux-x86_64">Copy commands</button>
                             </div>
                             <div class="terminal-body">
-                                <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/escrow/releases/latest/download/twm-linux-x86_64</p>
+                                <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/twm-releases/releases/latest/download/twm-linux-x86_64</p>
                                 <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x twm-linux-x86_64</p>
                                 <p><span class="prompt">$</span> <span class="cmd">./twm-linux-x86_64</span></p>
                             </div>
@@ -433,10 +461,10 @@
                                     <span class="dot green"></span>
                                 </div>
                                 <span class="terminal-title">bash - Linux VPS loader</span>
-                                <button type="button" class="copy-button" data-copy="wget https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64&#10;chmod +x TWM-loader-linux-x86_64&#10;./TWM-loader-linux-x86_64">Copy commands</button>
+                                <button type="button" class="copy-button" data-copy="wget https://github.com/froumes/twm-releases/releases/latest/download/TWM-loader-linux-x86_64&#10;chmod +x TWM-loader-linux-x86_64&#10;./TWM-loader-linux-x86_64">Copy commands</button>
                             </div>
                             <div class="terminal-body">
-                                <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/escrow/releases/latest/download/TWM-loader-linux-x86_64</p>
+                                <p><span class="prompt">$</span> <span class="cmd">wget</span> https://github.com/froumes/twm-releases/releases/latest/download/TWM-loader-linux-x86_64</p>
                                 <p><span class="prompt">$</span> <span class="cmd">chmod</span> +x TWM-loader-linux-x86_64</p>
                                 <p><span class="prompt">$</span> <span class="cmd">./TWM-loader-linux-x86_64</span></p>
                             </div>
@@ -450,7 +478,7 @@
                             <h3>Use the repo for source and the Discord for feedback loops.</h3>
                         </div>
                         <div class="cta-actions">
-                            <a href="https://github.com/froumes/escrow/releases" class="button button-solid" target="_blank" rel="noopener">View releases</a>
+                            <a href="https://github.com/froumes/twm-releases/releases" class="button button-solid" target="_blank" rel="noopener">View releases</a>
                             <a href="https://discord.gg/42DvX6T9jh" class="button button-ghost" target="_blank" rel="noopener">Join Discord</a>
                         </div>
                     </div>

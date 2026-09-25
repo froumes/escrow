@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::config::{SellerChannel, SelectedItem};
+use super::config::{SelectedItem, SellerChannel};
 use super::discord::{send_message, validate_channel, validate_token, AttachmentPng};
 use super::render::{render_item_png, strip_mc_codes, RenderableItem};
 use crate::bot::BotClient;
@@ -575,8 +575,7 @@ async fn resolve_and_render(
                 let png = render_item_png(&item);
                 let safe = sanitize_filename(&item.title);
                 let asking_price = if sel.include_price() {
-                    resolve_asking_price(sel, listing_price, identity.tag.as_deref(), bin)
-                        .await
+                    resolve_asking_price(sel, listing_price, identity.tag.as_deref(), bin).await
                 } else {
                     None
                 };
@@ -696,9 +695,7 @@ fn check_inventory_presence(
     match (identity.tag.as_deref(), current_tag.as_deref()) {
         (Some(want), Some(got)) if want == got => Presence::Present,
         (Some(_), Some(_)) => Presence::Gone("slot holds a different item"),
-        _ if !identity.plain_title.is_empty()
-            && current_name_plain == identity.plain_title =>
-        {
+        _ if !identity.plain_title.is_empty() && current_name_plain == identity.plain_title => {
             Presence::Present
         }
         _ => Presence::Gone("slot holds a different item"),
@@ -718,7 +715,9 @@ fn check_auction_presence(
     }
 
     let status_of = |v: &serde_json::Value| -> Option<String> {
-        v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string())
+        v.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
     };
 
     let found = if let Some(idx_str) = identifier.strip_prefix("idx:") {
@@ -731,7 +730,11 @@ fn check_auction_presence(
             .and_then(|idx| auctions.get(idx));
         positional
             .filter(|v| auction_matches_identity(v, identity))
-            .or_else(|| auctions.iter().find(|v| auction_matches_identity(v, identity)))
+            .or_else(|| {
+                auctions
+                    .iter()
+                    .find(|v| auction_matches_identity(v, identity))
+            })
     } else {
         let normalized = identifier.replace('-', "").to_lowercase();
         auctions.iter().find(|a| {
@@ -883,10 +886,7 @@ async fn resolve_auction(
         .and_then(|v| v.as_i64())
         .filter(|p| *p > 0)
         .map(|p| p as u64);
-    let bin = found
-        .get("bin")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let bin = found.get("bin").and_then(|v| v.as_bool()).unwrap_or(false);
     Some((
         RenderableItem {
             title,

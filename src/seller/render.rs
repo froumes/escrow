@@ -311,13 +311,7 @@ fn draw_text(img: &mut RgbaImage, text: &str, x: u32, y: u32, scale: u32, color:
     }
 }
 
-fn draw_colored_text(
-    img: &mut RgbaImage,
-    runs: &[ColoredRun],
-    x: u32,
-    y: u32,
-    scale: u32,
-) {
+fn draw_colored_text(img: &mut RgbaImage, runs: &[ColoredRun], x: u32, y: u32, scale: u32) {
     let advance = 5 * scale + scale;
     let mut cx = x;
     for run in runs {
@@ -563,8 +557,7 @@ pub fn render_item_png(item: &RenderableItem) -> Vec<u8> {
     // produce a card taller than Discord will happily embed.  Anything past
     // the cap becomes a single trailing "…" line so the user knows the
     // output was truncated rather than silently dropped.
-    let max_lore_lines = ((MAX_CARD_H
-        .saturating_sub(lore_start_y + footer_line_h + 12 + PADDING))
+    let max_lore_lines = ((MAX_CARD_H.saturating_sub(lore_start_y + footer_line_h + 12 + PADDING))
         / lore_line_h) as usize;
     let truncated_lore = wrapped_lore.len() > max_lore_lines;
     if truncated_lore {
@@ -593,7 +586,10 @@ pub fn render_item_png(item: &RenderableItem) -> Vec<u8> {
 
     // Title — colour-aware, truncated to fit (titles remain single-line).
     let title_runs = parse_mc_string(&item.title, TITLE_DEFAULT);
-    let title_plain = title_runs.iter().map(|r| r.text.clone()).collect::<String>();
+    let title_plain = title_runs
+        .iter()
+        .map(|r| r.text.clone())
+        .collect::<String>();
     let title_fit = truncate_to_width(&title_plain, max_w, TITLE_SCALE);
     let title_runs_fit = reapply_colors(&title_runs, &title_fit);
     let title_w = text_width(&title_fit, TITLE_SCALE);
@@ -737,10 +733,7 @@ fn reapply_colors(runs: &[ColoredRun], target: &str) -> Vec<ColoredRun> {
     // If truncation appended a trailing "..." it won't be covered by any run
     // — draw it in the last-used colour to match the rest of the line.
     if !remaining.is_empty() {
-        let last_color = runs
-            .last()
-            .map(|r| r.color)
-            .unwrap_or(LORE_DEFAULT);
+        let last_color = runs.last().map(|r| r.color).unwrap_or(LORE_DEFAULT);
         out.push(ColoredRun {
             text: remaining,
             color: last_color,
@@ -788,7 +781,10 @@ mod tests {
             assert!(!plain.contains("Seller:"), "line leaked: {plain:?}");
             assert!(!plain.contains("Buy it now"), "line leaked: {plain:?}");
             assert!(!plain.contains("Ends in"), "line leaked: {plain:?}");
-            assert!(!plain.contains("Click to inspect"), "line leaked: {plain:?}");
+            assert!(
+                !plain.contains("Click to inspect"),
+                "line leaked: {plain:?}"
+            );
         }
     }
 
@@ -847,6 +843,9 @@ mod tests {
         };
         let png = render_item_png(&item);
         assert!(png.len() > 100, "png should have meaningful body");
-        assert_eq!(&png[0..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
+        );
     }
 }

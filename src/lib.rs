@@ -1,27 +1,34 @@
 //! TWM (Bazaar Auction Flipper) for Hypixel Skyblock
-//! 
+//!
 //! A high-performance Minecraft bot for automated bazaar and auction house flipping.
 //! Rust port of the original TypeScript implementation using the Azalea framework.
 
+pub mod auction_ownership;
+pub mod backend;
 pub mod bazaar_tracker;
 pub mod bot;
 pub mod config;
 pub mod gui;
 pub mod handlers;
+pub mod hypixel_ping;
 pub mod inventory;
 pub mod logging;
 pub mod persistence;
 pub mod profit;
 pub mod release_channel;
 pub mod seller;
+pub mod session;
 pub mod share_pusher;
 pub mod state;
 pub mod types;
+pub mod updater;
 pub mod utils;
+pub mod visitfriend;
+pub mod vps;
 pub mod web;
-pub mod websocket;
 pub mod webhook;
+pub mod websocket;
 
 pub use bot::{BotClient, BotEvent, BotEventHandlers};
-pub use types::{BotState, CommandPriority, CommandType, Flip, BazaarFlipRecommendation};
+pub use types::{BazaarFlipRecommendation, BotState, CommandPriority, CommandType, Flip};
 pub use web::{start_web_server, WebSharedState};

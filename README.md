@@ -1,8 +1,8 @@
 # TWM Source Repository
 
-This repository is the private source tree for TWM: a Rust-based Hypixel SkyBlock flipping client with a built-in web panel, Discord webhooks, Bazaar and Auction House automation, and a self-updating loader.
+This is the TWM source tree, based on [Frikadellen BAF](https://github.com/TreXito/frikadellen-baf-121): a Rust Hypixel SkyBlock flipping client with Bazaar and Auction House automation, a web panel, Discord integrations, and a self-updating loader.
 
-If you want public downloads, do not publish them from this repository directly. The intended setup is:
+Public downloads are published from a separate repository. The intended setup is:
 
 - keep this repository private
 - build artifacts here in GitHub Actions
@@ -12,11 +12,10 @@ The release mirror flow in this repo is set up for that model. See [docs/release
 
 ## Local build
 
-TWM currently targets Rust nightly.
+The project pins Rust nightly in `rust-toolchain.toml` and targets Minecraft 26.1 (Azalea 0.16).
 
 ```bash
-rustup toolchain install nightly
-cargo +nightly build --release
+cargo build --release
 ```
 
 Built binaries:
@@ -31,6 +30,12 @@ Run either binary directly:
 cargo +nightly run --release --bin twm
 cargo +nightly run --release --bin TWM-loader
 ```
+
+## Combined features
+
+Upstream additions include finder feeds, optional central-backend control, per-account SOCKS5 proxies, safer auction/Bazaar order handling, rest-break recovery, and a password-protected HTTPS control panel. TWM retains its Seller tab, persistent flip history, read-only stats sharing, profit-recovery ledger, and dedicated public release channel. Optional backend and finder integrations require their own configuration.
+
+The Seller browser-login flow captures a Discord user token and stores it locally in plaintext; use it only if you accept that credential risk. Do not expose the local config or Seller API without panel authentication. Anyone with a stats share token can view its read-only data.
 
 ## Release mirror
 
@@ -53,7 +58,7 @@ Existing loaders compiled against the old repo do not automatically migrate. See
 
 ## Web panel
 
-The built-in panel is still served by the app on `http://localhost:8080` by default. The panel and read-only share page now link to the configured public releases repo rather than the source repo.
+The web panel runs on port 8080 by default, serves HTTPS with a password, and includes Seller, account controls, flip history, and optional read-only stats sharing. Preserve an existing `web_gui_password` when migrating; consult the startup log for generated credentials on a fresh installation. The panel and share page link to the configured public releases repository.
 
 ## Pages
 

@@ -5,16 +5,16 @@ use serde::{Deserialize, Serialize};
 pub struct Flip {
     #[serde(rename = "itemName")]
     pub item_name: String,
-    
+
     #[serde(rename = "startingBid")]
     pub starting_bid: u64,
-    
+
     #[serde(rename = "target")]
     pub target: u64,
-    
+
     #[serde(default)]
     pub finder: Option<String>,
-    
+
     #[serde(rename = "profitPerc", default)]
     pub profit_perc: Option<f64>,
 
@@ -26,14 +26,60 @@ pub struct Flip {
         deserialize_with = "deserialize_optional_timestamp_millis"
     )]
     pub purchase_at_ms: Option<i64>,
-    
-    #[serde(default, alias = "auctionUuid", alias = "auction_uuid", alias = "auctionId", alias = "id")]
+
+    #[serde(
+        default,
+        alias = "auctionUuid",
+        alias = "auction_uuid",
+        alias = "auctionId",
+        alias = "id"
+    )]
     pub uuid: Option<String>,
+
+    /// Listing recommendation from the private finder ("this item is really
+    /// worth X") — used to auto-list finder-bought items when COFL doesn't
+    /// list them first. Never present on COFL flips.
+    #[serde(default, rename = "listAt")]
+    pub list_at: Option<u64>,
 }
 
-fn deserialize_optional_timestamp_millis<'de, D>(
-    deserializer: D,
-) -> Result<Option<i64>, D::Error>
+/// Read `purchaseAt` out of a RAW json flip, with the same rules as
+/// [`deserialize_optional_timestamp_millis`].
+///
+/// The finder feed is parsed field-by-field (not via serde) in both
+/// `main.rs`'s FinderWS loop and `websocket/client.rs`, and BOTH hardcoded
+/// `purchase_at_ms: None`. So the finder could send a perfect `purchaseAt` and
+/// the bot would still log "no purchaseAt" and blind-spam the whole grace
+/// window — which is exactly what happened from 2026-07-23 onward.
+pub fn purchase_at_from_json(flip: &serde_json::Value) -> Option<i64> {
+    let v = flip.get("purchaseAt")?;
+    if v.is_null() {
+        return None;
+    }
+    // Below this it is unix SECONDS, above it milliseconds.
+    const MS_CUTOFF: i64 = 1_000_000_000_000;
+    let scale = |i: i64| {
+        if i > MS_CUTOFF {
+            i
+        } else {
+            i.saturating_mul(1000)
+        }
+    };
+    if let Some(i) = v.as_i64() {
+        return Some(scale(i));
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(i) = s.parse::<i64>() {
+            return Some(scale(i));
+        }
+        return chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.timestamp_millis());
+    }
+    None
+}
+
+fn deserialize_optional_timestamp_millis<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -80,19 +126,24 @@ where
 pub struct BazaarFlipRecommendation {
     #[serde(rename = "itemName", alias = "item", alias = "name")]
     pub item_name: String,
-    
+
     #[serde(rename = "itemTag", default)]
     pub item_tag: Option<String>,
-    
+
     #[serde(default)]
     pub amount: u64,
-    
-    #[serde(rename = "pricePerUnit", alias = "price", alias = "unitPrice", deserialize_with = "deserialize_price")]
+
+    #[serde(
+        rename = "pricePerUnit",
+        alias = "price",
+        alias = "unitPrice",
+        deserialize_with = "deserialize_price"
+    )]
     pub price_per_unit: f64,
-    
+
     #[serde(rename = "totalPrice", default)]
     pub total_price: Option<f64>,
-    
+
     #[serde(rename = "isBuyOrder", alias = "isBuy", default)]
     pub is_buy_order: bool,
 
@@ -108,18 +159,26 @@ fn deserialize_price<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Resul
     use serde::de::Error;
     let value = serde_json::Value::deserialize(deserializer)?;
     match value {
-        serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| D::Error::custom("invalid number")),
+        serde_json::Value::Number(n) => {
+            n.as_f64().ok_or_else(|| D::Error::custom("invalid number"))
+        }
         serde_json::Value::String(s) => {
             let clean: String = s.chars().filter(|&c| c != ',').collect();
-            clean.parse::<f64>().map_err(|e| D::Error::custom(format!("invalid price string: {}", e)))
+            clean
+                .parse::<f64>()
+                .map_err(|e| D::Error::custom(format!("invalid price string: {}", e)))
         }
-        other => Err(D::Error::custom(format!("expected number or string for price, got {:?}", other))),
+        other => Err(D::Error::custom(format!(
+            "expected number or string for price, got {:?}",
+            other
+        ))),
     }
 }
 
 impl BazaarFlipRecommendation {
     pub fn calculate_total_price(&self) -> f64 {
-        self.total_price.unwrap_or(self.price_per_unit * self.amount as f64)
+        self.total_price
+            .unwrap_or(self.price_per_unit * self.amount as f64)
     }
 
     /// Returns the effective buy-order flag, preferring `isSell` (negated) when
@@ -203,7 +262,7 @@ pub enum BotState {
 impl BotState {
     /// Returns true if the bot can accept flip/trade commands.
     ///
-/// Matches the TypeScript command-queue safety rule: only "idle"
+    /// Matches the TypeScript command-queue safety rule: only "idle"
     /// style states may accept new commands while GUI workflows are active.
     pub fn allows_commands(&self) -> bool {
         matches!(self, BotState::Idle | BotState::GracePeriod)
@@ -227,6 +286,19 @@ pub struct QueuedCommand {
     pub command_type: CommandType,
     pub queued_at: std::time::Instant,
     pub interruptible: bool,
+}
+
+/// Identifies a specific bazaar order for targeted cancellation.
+///
+/// Used both by the web GUI's per-order cancel button and by COFL's
+/// `cancelOrder` message. `price_per_unit`, when present, disambiguates
+/// between multiple same-side orders for the same item by selecting the one
+/// whose in-game unit price is closest to this value.
+#[derive(Debug, Clone)]
+pub struct BazaarOrderTarget {
+    pub item_name: String,
+    pub is_buy: bool,
+    pub price_per_unit: Option<f64>,
 }
 
 /// Types of commands
@@ -270,8 +342,12 @@ pub enum CommandType {
     /// When `cancel_open` is true (startup), all open orders are cancelled in addition
     /// to collecting filled ones. When false (order-fill triggered), only filled orders
     /// are collected and open orders are left untouched.
+    /// When `target_item` is set, only that specific order is cancelled (used by the
+    /// web GUI's individual cancel button and by COFL's `cancelOrder` message).
     ManageOrders {
         cancel_open: bool,
+        /// When set, only the matching order is cancelled instead of all open orders.
+        target_item: Option<BazaarOrderTarget>,
     },
     // Advanced commands matching TypeScript BAF.ts
     ClickSlot {
@@ -292,6 +368,10 @@ pub enum CommandType {
     /// Sell entire inventory instantly via /bz → "Sell Inventory Now" (slot 47)
     /// → "Selling whole inventory" (slot 11).
     SellInventoryBz,
+    /// Return the bot to its "home" island: the configured friend's island via
+    /// `/visit <friend>` + slot-11 click when `visitfriend` is active, otherwise
+    /// the bot's own island via `/is`.
+    GoToIsland,
 }
 
 impl CommandType {
@@ -314,6 +394,7 @@ impl CommandType {
             CommandType::AcceptTrade { .. } => "accepting trade",
             CommandType::CancelAuction { .. } => "cancelling auction",
             CommandType::SellInventoryBz => "selling inventory via bazaar",
+            CommandType::GoToIsland => "returning to island",
         }
     }
 }
@@ -342,10 +423,49 @@ pub struct ItemStack {
 
 impl ItemStack {
     pub fn skyblock_id(&self) -> Option<String> {
-        self.nbt.as_ref()
+        self.nbt
+            .as_ref()
             .and_then(|nbt| nbt.get("ExtraAttributes"))
             .and_then(|ea| ea.get("id"))
             .and_then(|id| id.as_str())
             .map(|s| s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod purchase_at_json_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Regression: both finder-feed paths built the Flip by hand and hardcoded
+    /// `purchase_at_ms: None`, so a correct `purchaseAt` on the wire was silently
+    /// dropped and the bot blind-spammed the entire 20s grace window.
+    #[test]
+    fn reads_the_field_the_finder_actually_sends() {
+        // The finder sends epoch MILLISECONDS as a JSON integer.
+        let f = json!({"uuid": "u", "purchaseAt": 1_786_555_365_735i64});
+        assert_eq!(purchase_at_from_json(&f), Some(1_786_555_365_735));
+    }
+
+    #[test]
+    fn null_and_absent_both_mean_buy_now() {
+        assert_eq!(purchase_at_from_json(&json!({"uuid": "u"})), None);
+        assert_eq!(
+            purchase_at_from_json(&json!({"uuid": "u", "purchaseAt": serde_json::Value::Null})),
+            None
+        );
+    }
+
+    #[test]
+    fn seconds_and_rfc3339_still_work() {
+        // COFL has sent all three shapes over time.
+        assert_eq!(
+            purchase_at_from_json(&json!({"purchaseAt": 1_786_555_365i64})),
+            Some(1_786_555_365_000)
+        );
+        assert_eq!(
+            purchase_at_from_json(&json!({"purchaseAt": "2026-03-18T12:36:16.208Z"})),
+            Some(1_773_837_376_208)
+        );
     }
 }

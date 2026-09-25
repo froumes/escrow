@@ -3,7 +3,6 @@
 /// Produces a 1200×630 PNG stats card for OpenGraph / Discord embeds.
 /// Uses a built-in 5×7 bitmap font (scaled up) so no external font
 /// files or heavy dependencies are needed — only the `image` crate.
-
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::io::Cursor;
 
@@ -195,6 +194,7 @@ fn draw_rect_outline(
 
 /// Draw a line between two points using Bresenham's algorithm.
 /// `dashed`: if true, alternates 4px on / 4px off.
+#[allow(clippy::too_many_arguments)]
 fn draw_line(
     img: &mut RgbaImage,
     x0: u32,
@@ -216,7 +216,7 @@ fn draw_line(
     let half_t = thickness / 2;
 
     loop {
-        let visible = !dashed || (step / 4) % 2 == 0;
+        let visible = !dashed || (step / 4).is_multiple_of(2);
         if visible {
             for dt in 0..thickness {
                 let py = (cy + dt as i64 - half_t as i64).max(0) as u32;
@@ -430,7 +430,10 @@ pub fn generate_og_image(
             .collect();
 
         // Determine value range across all three series
-        let all_vals = ah_vals.iter().chain(bz_vals.iter()).chain(total_vals.iter());
+        let all_vals = ah_vals
+            .iter()
+            .chain(bz_vals.iter())
+            .chain(total_vals.iter());
         let min_val = *all_vals.clone().min().unwrap_or(&0);
         let max_val = *all_vals.max().unwrap_or(&0);
         let range = (max_val - min_val).max(1) as f64;
@@ -455,8 +458,7 @@ pub fn generate_og_image(
 
         // Draw a zero-line if the range crosses zero
         if min_val < 0 && max_val > 0 {
-            let zero_y_px =
-                (plot_bottom as f64 - ((0 - min_val) as f64 / range) * plot_h) as u32;
+            let zero_y_px = (plot_bottom as f64 - ((0 - min_val) as f64 / range) * plot_h) as u32;
             for px in (plot_left..plot_right).step_by(6) {
                 fill_rect(&mut img, px, zero_y_px, 3, 1, Rgba([50, 55, 90, 255]));
             }

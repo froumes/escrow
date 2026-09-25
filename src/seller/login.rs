@@ -188,9 +188,7 @@ fn find_browser_via_registry() -> Option<PathBuf> {
         ("HKCU", "chromium.exe"),
     ];
     for (hive, name) in targets {
-        let key = format!(
-            r"{hive}\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}"
-        );
+        let key = format!(r"{hive}\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}");
         let Ok(output) = std::process::Command::new("reg")
             .args(["query", &key, "/ve"])
             .output()
@@ -265,12 +263,7 @@ fn find_browser_executable() -> Option<PathBuf> {
     //    every major Linux distribution ships Chromium/Chrome as a PATH
     //    entry, so this catches anything the previous steps missed.
     #[cfg(windows)]
-    let names: &[&str] = &[
-        "msedge.exe",
-        "chrome.exe",
-        "brave.exe",
-        "chromium.exe",
-    ];
+    let names: &[&str] = &["msedge.exe", "chrome.exe", "brave.exe", "chromium.exe"];
     #[cfg(target_os = "macos")]
     let names: &[&str] = &[
         "Google Chrome",
@@ -312,9 +305,7 @@ fn hardcoded_browser_paths() -> Vec<PathBuf> {
         PathBuf::from(r"C:\Program Files\Google\Chrome Dev\Application\chrome.exe"),
         PathBuf::from(r"C:\Program Files (x86)\Google\Chrome Dev\Application\chrome.exe"),
         PathBuf::from(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
-        PathBuf::from(
-            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-        ),
+        PathBuf::from(r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"),
         PathBuf::from(r"C:\Program Files\Chromium\Application\chrome.exe"),
     ];
     if let Some(local) = dirs::data_local_dir() {
@@ -365,16 +356,14 @@ fn hardcoded_browser_paths() -> Vec<PathBuf> {
 /// serialize concurrent invocations.  The overall wall-clock timeout is
 /// [`LOGIN_TIMEOUT`].
 pub async fn extract_token_via_login() -> Result<LoginResult, String> {
-    let mut builder = BrowserConfig::builder()
-        .with_head()
-        .args([
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-blink-features=AutomationControlled",
-            // A small, focused window fits next to the TWM panel on most
-            // displays and nudges the user toward the login form.
-            "--window-size=520,760",
-        ]);
+    let mut builder = BrowserConfig::builder().with_head().args([
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+        // A small, focused window fits next to the TWM panel on most
+        // displays and nudges the user toward the login form.
+        "--window-size=520,760",
+    ]);
 
     if let Some(exe) = find_browser_executable() {
         builder = builder.chrome_executable(exe);
@@ -384,9 +373,12 @@ pub async fn extract_token_via_login() -> Result<LoginResult, String> {
         .build()
         .map_err(|e| format!("{e}. {}", browser_not_found_hint()))?;
 
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|e| format!("could not launch browser: {e}. {}", browser_not_found_hint()))?;
+    let (mut browser, mut handler) = Browser::launch(config).await.map_err(|e| {
+        format!(
+            "could not launch browser: {e}. {}",
+            browser_not_found_hint()
+        )
+    })?;
 
     // chromiumoxide requires us to continuously drive the CDP handler; if
     // the task stops polling, the websocket stalls and every request hangs.
@@ -471,9 +463,7 @@ async fn run_login_flow(browser: &mut Browser) -> Result<LoginResult, String> {
             Err(_) => {
                 // Clear the stored value and keep polling — the real token
                 // should appear on the next authenticated request.
-                let _ = page
-                    .evaluate("window.__capturedToken = null; true")
-                    .await;
+                let _ = page.evaluate("window.__capturedToken = null; true").await;
                 continue;
             }
         }
