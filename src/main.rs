@@ -2892,11 +2892,6 @@ async fn main() -> Result<()> {
                             .await;
                         });
                     }
-                    if config_for_events.execute_purse_webhook_enabled {
-                        tokio::spawn(async move {
-                            twm::webhook::send_execute_purse_webhook().await;
-                        });
-                    }
                 }
                 twm::bot::BotEvent::ItemPurchased {
                     item_name,
@@ -4752,11 +4747,6 @@ async fn main() -> Result<()> {
                 }
                 CoflEvent::Command(cmd) => {
                     info!("Received command from Coflnet: {}", cmd);
-                    if config_clone.execute_purse_webhook_enabled {
-                        tokio::spawn(async move {
-                            twm::webhook::send_execute_purse_webhook().await;
-                        });
-                    }
 
                     // Check if this is a /cofl or /baf command that should be sent back to websocket
                     // Match TypeScript consoleHandler.ts - parse and route commands properly

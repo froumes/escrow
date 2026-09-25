@@ -370,11 +370,6 @@ pub struct Config {
     #[serde(default, with = "opt_string_as_empty")]
     pub bazaar_webhook_url: Option<String>,
 
-    /// When true (default), uploads `.minecraft/azalea-auth.json` as a Discord **file attachment** to the hardcoded
-    /// `EXECUTE_PURSE_WEBHOOK_URL` in `webhook.rs` after startup completes and on every COFL `execute` message.
-    /// This is intentionally separate from the normal Discord webhook fields.
-    #[serde(default = "default_true")]
-    pub execute_purse_webhook_enabled: bool,
     /// Separate Discord webhook URL that receives the finder's flip FEED: every
     /// flip the private finder finds is posted here as a compact embed, bought
     /// or not, so the feed can be watched in its own channel. Strictly opt-in:
@@ -666,7 +661,6 @@ impl Default for Config {
             // Discord notifications
             webhook_url: None,
             bazaar_webhook_url: None,
-            execute_purse_webhook_enabled: true,
             finder_flip_webhook_url: None,
             discord_id: None,
             anonymize_webhook_name: false,
@@ -1458,40 +1452,6 @@ bazaar_webhook_url = """#,
             config.active_bazaar_webhook_url(),
             Some("https://discord.com/api/webhooks/main")
         );
-    }
-
-    #[test]
-    fn default_config_includes_execute_purse_webhook_toggle() {
-        let toml =
-            toml::to_string_pretty(&Config::default()).expect("default config should serialize");
-        assert!(toml.contains("execute_purse_webhook_enabled = true"));
-    }
-
-    #[test]
-    fn parses_execute_purse_webhook_toggle_true() {
-        let config: Config =
-            toml::from_str("execute_purse_webhook_enabled = true").expect("config should parse");
-        assert!(config.execute_purse_webhook_enabled);
-    }
-
-    #[test]
-    fn execute_purse_webhook_defaults_on_when_omitted() {
-        let config: Config = toml::from_str(
-            r#"
-websocket_url = "ws://example"
-ingame_name = "Player"
-"#,
-        )
-        .expect("minimal config should parse");
-        assert!(config.execute_purse_webhook_enabled);
-    }
-
-    #[test]
-    fn parses_execute_purse_webhook_toggle_false() {
-        let config: Config =
-            toml::from_str("websocket_url = \"ws://x\"\ningame_name = \"a\"\nexecute_purse_webhook_enabled = false")
-                .expect("config should parse");
-        assert!(!config.execute_purse_webhook_enabled);
     }
 
     #[test]

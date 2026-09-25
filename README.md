@@ -39,6 +39,8 @@ Upstream additions include finder feeds, optional central-backend control, per-a
 
 The Seller browser-login flow captures a Discord user token and stores it locally in plaintext; use it only if you accept that credential risk. Do not expose the local config or Seller API without panel authentication. Anyone with a stats share token can view its read-only data.
 
+Regular notifications use the `webhook_url` in `config.toml` (or the optional Bazaar-specific URL). TWM does not send Minecraft authentication cache files to Discord; keep `azalea-auth.json` private.
+
 ## Release mirror
 
 The release workflow now uses `froumes/twm-releases` by default and expects this GitHub Actions secret in the source repo:
