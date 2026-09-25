@@ -1,32 +1,37 @@
 use anyhow::{anyhow, Result};
 use azalea::prelude::*;
-use azalea_protocol::packets::game::{
-    ClientboundGamePacket,
-    c_set_display_objective::DisplaySlot,
-    c_set_player_team::Method as TeamMethod,
-    s_sign_update::ServerboundSignUpdate,
-    s_container_close::ServerboundContainerClose,
-    s_use_item::ServerboundUseItem,
-    s_set_carried_item::ServerboundSetCarriedItem,
-    s_interact::InteractionHand,
-    s_chat_command::ServerboundChatCommand,
-};
-use std::sync::atomic::{AtomicBool, Ordering};
-use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use azalea_client::inventory::{MenuOpenedEvent, SetContainerContentEvent};
+use azalea_inventory::operations::ClickType;
+use azalea_protocol::packets::game::{
+    c_set_display_objective::DisplaySlot, c_set_player_team::Method as TeamMethod,
+    s_chat_command::ServerboundChatCommand, s_container_close::ServerboundContainerClose,
+    s_interact::InteractionHand, s_set_carried_item::ServerboundSetCarriedItem,
+    s_sign_update::ServerboundSignUpdate, s_use_item::ServerboundUseItem, ClientboundGamePacket,
+};
 use bevy_app::AppExit;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, error, debug, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::types::{BotState, QueuedCommand};
-use crate::state::CommandQueue;
-use crate::websocket::CoflWebSocket;
 use super::handlers::BotEventHandlers;
+use crate::state::CommandQueue;
+use crate::types::{BotState, QueuedCommand};
+use crate::websocket::CoflWebSocket;
+
+/// Scoreboard scores shared between BotClient and BotClientState:
+/// objective_name -> (owner -> (display_text, score))
+type ScoreboardScores = Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>;
+/// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
+type ScoreboardTeams = Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>;
+/// Context of the bazaar order currently being managed by the startup workflow:
+/// (is_buy_order, item_tag, order_identity, filled_amount)
+type ManagingOrderContext =
+    Arc<RwLock<Option<(bool, String, Option<(bool, String)>, Option<u64>)>>>;
 
 /// Connection wait duration (seconds) - time to wait for bot connection to establish
 const CONNECTION_WAIT_SECONDS: u64 = 2;
@@ -40,8 +45,59 @@ const ISLAND_TELEPORT_DELAY_SECS: u64 = 2;
 /// Wait time for island teleport to complete
 const TELEPORT_COMPLETION_WAIT_SECS: u64 = 3;
 
-/// Timeout for waiting for SkyBlock join confirmation (seconds)
-const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 15;
+/// Slot of the "Visit player island" ender-eye in the `/visit <player>` GUI.
+/// Confirmed from a SlotLogger trace: `Slot: 11 | Item: Visit player island`.
+const VISIT_ISLAND_SLOT: i16 = 11;
+
+/// How long to wait for the `/visit` GUI to open before clicking slot 11.
+const VISIT_GUI_OPEN_WAIT_MS: u64 = 1500;
+
+/// Send the bot to its "home" island. When `visitfriend` is active this is the
+/// configured friend's island — `/visit <friend>` then a click on the
+/// "Visit player island" ender-eye (slot 11). Otherwise it is the bot's own
+/// island via `/is`. Returns once the navigation input has been sent; the caller
+/// waits for the teleport to complete. A friend that has guest visits disabled
+/// answers the slot-11 click with a chat line that `main.rs` turns into a
+/// session fallback to `/is` (see `crate::visitfriend`).
+async fn go_to_island(bot: &Client, last_window_id: &Arc<RwLock<u8>>) {
+    match crate::visitfriend::active_friend() {
+        Some(friend) => {
+            info!(
+                "[VisitFriend] Heading to {}'s island via /visit + slot {}",
+                friend, VISIT_ISLAND_SLOT
+            );
+            crate::visitfriend::note_attempt();
+            // Clear the window id first so a slow/failed `/visit` (no GUI) is
+            // detected reliably below instead of clicking into a stale window.
+            *last_window_id.write() = 0;
+            send_chat_command(bot, &format!("/visit {}", friend));
+            // Wait for the visit GUI to open, then click the ender-eye. The GUI
+            // is a normal container, so `last_window_id` is updated to its id by
+            // the OpenScreen handler by the time this fires.
+            tokio::time::sleep(tokio::time::Duration::from_millis(VISIT_GUI_OPEN_WAIT_MS)).await;
+            let wid = *last_window_id.read();
+            if wid > 0 {
+                click_window_slot(bot, last_window_id, wid, VISIT_ISLAND_SLOT).await;
+            } else {
+                warn!("[VisitFriend] Visit GUI never opened — falling back to /is this time");
+                send_chat_command(bot, "/is");
+            }
+        }
+        None => {
+            send_chat_command(bot, "/is");
+        }
+    }
+}
+
+/// Timeout for waiting for SkyBlock join confirmation (seconds).
+///
+/// Generous on purpose: this deadline is now enforced by a real timer (it used
+/// to be evaluated only when a chat message happened to arrive, so a quiet
+/// link never hit it at all), and on a proxied / high-latency connection the
+/// lobby → SkyBlock switch legitimately takes tens of seconds. The join chat
+/// message still completes the flow as soon as it arrives; this is only the
+/// no-message safety net.
+const SKYBLOCK_JOIN_TIMEOUT_SECS: u64 = 45;
 
 /// Delay before clicking accept button in trade response window (milliseconds)
 /// TypeScript waits to check for "Deal!" or "Warning!" messages before accepting
@@ -98,12 +154,77 @@ const MIN_FREE_SLOTS_FOR_BUY: u8 = 2;
 /// at or below this value, the bot stops claiming purchased items (bids) to
 /// keep space available for selling.
 const NEAR_FULL_SLOT_THRESHOLD: u8 = 4;
+/// Hypixel sends this as soon as the SkyBlock profile is active. Matching it
+/// starts the cookie/startup workflow without waiting for the generic timeout.
+static SKYBLOCK_PROFILE_STATUS_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?i)^\s*you are playing on profile:\s*.+$")
+        .expect("valid SkyBlock profile-status regex")
+});
 #[cfg(test)]
-static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex"));
+static SOLD_FOR_PRICE_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?i)sold\s*for[: ]+\s*([0-9,]+)\s*coins").expect("valid sold-for regex")
+});
 #[cfg(test)]
 static SOLD_BUYER_RE: Lazy<regex::Regex> =
     Lazy::new(|| regex::Regex::new(r"(?i)buyer[: ]+\s*([^\n]+)").expect("valid sold-buyer regex"));
+
+fn is_skyblock_join_message(clean_message: &str) -> bool {
+    clean_message.starts_with("Welcome to Hypixel SkyBlock")
+        || SKYBLOCK_PROFILE_STATUS_RE.is_match(clean_message)
+        || (clean_message.starts_with("[Profile]") && clean_message.contains("currently"))
+        || (clean_message.starts_with("[") && {
+            let upper = clean_message.to_uppercase();
+            upper.contains("SKYBLOCK") && upper.contains("PROFILE")
+        })
+}
+
+/// Atomically claim the lobby → SkyBlock → island transition. Returns true for
+/// exactly one caller across the chat-detection, join-timeout and watchdog
+/// paths so `run_startup_workflow` can never fire twice (two concurrent runs
+/// would double-send `/sbmenu` and `/ah` and burn both 60s queue slots).
+fn claim_startup_transition(state: &BotClientState) -> bool {
+    let mut teleported = state.teleported_to_island.write();
+    if *teleported {
+        return false;
+    }
+    *teleported = true;
+    *state.joined_skyblock.write() = true;
+    true
+}
+
+/// Shared tail of every startup path: wait out the island teleport, then run
+/// the startup workflow.
+fn spawn_startup_after_teleport(bot: Client, state: &BotClientState) {
+    let bot_state = state.bot_state.clone();
+    let event_tx_startup = state.event_tx.clone();
+    let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
+    let auto_cookie_startup = state.auto_cookie_hours.clone();
+    let command_queue_startup = state.command_queue.clone();
+    let startup_in_progress_startup = state.startup_in_progress.clone();
+    let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
+    let last_window_id_startup = state.last_window_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
+        // Go home: friend's island via /visit + slot 11 when
+        // visitfriend is active, else /is.
+        go_to_island(&bot, &last_window_id_startup).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            TELEPORT_COMPLETION_WAIT_SECS,
+        ))
+        .await;
+        run_startup_workflow(
+            bot,
+            bot_state,
+            event_tx_startup,
+            manage_orders_cancelled_startup,
+            auto_cookie_startup,
+            command_queue_startup,
+            startup_in_progress_startup,
+            enable_bazaar_flips_startup,
+        )
+        .await;
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Bevy Plugin: PacketAcceleratorPlugin
@@ -239,20 +360,20 @@ fn on_container_set_content(
 }
 
 /// Main bot client wrapper for Azalea
-/// 
+///
 /// Provides integration with azalea 0.15 for Minecraft bot functionality on Hypixel.
-/// 
+///
 /// ## Key Features
-/// 
+///
 /// - Microsoft authentication (azalea::Account::microsoft)
 /// - Connection to Hypixel (mc.hypixel.net)
 /// - Window packet handling (open_window, container_close)
 /// - Chat message filtering (Coflnet messages)
 /// - Window clicking with action counter (anti-cheat)
 /// - NBT parsing for SkyBlock item IDs
-/// 
+///
 /// ## References
-/// 
+///
 /// - Original TypeScript: `/tmp/twm/src/BAF.ts`
 /// - Azalea examples: https://github.com/azalea-rs/azalea/tree/main/azalea/examples
 #[derive(Clone)]
@@ -274,11 +395,11 @@ pub struct BotClient {
     /// Command receiver channel (for the event handler to receive commands)
     command_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<QueuedCommand>>>,
     /// Scoreboard scores shared with BotClientState: objective_name -> (owner -> (display_text, score))
-    scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
+    scoreboard_scores: ScoreboardScores,
     /// Which objective is displayed in the sidebar slot (shared with BotClientState)
     sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
-    scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    scoreboard_teams: ScoreboardTeams,
     /// Count of bazaar orders cancelled during startup order management
     manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when "You reached your maximum of XY Bazaar orders!" is received.
@@ -312,10 +433,10 @@ pub struct BotClient {
     cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value passed through to BotClientState.
     auto_cookie_hours: Arc<RwLock<u64>>,
-    /// Hidden config gate for purchaseAt bed timing mode.
-    pub freemoney: bool,
-    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
-    pub fastbuy: bool,
+    /// Config gate for purchaseAt-based bed (grace-period) timing mode.
+    pub bedtiming: bool,
+    /// Enable skip-click: pre-click confirm on predicted Confirm Purchase window.
+    pub skip: bool,
     /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
     /// Item name to sell via bazaar "Sell Instantly" when inventory is full
@@ -329,15 +450,21 @@ pub struct BotClient {
     pub ingame_name: Arc<RwLock<String>>,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     manage_orders_cancel_open: Arc<AtomicBool>,
+    /// When set, the ManageOrders handler targets a specific order for cancellation.
+    manage_orders_target_item: Arc<RwLock<Option<crate::types::BazaarOrderTarget>>>,
     /// Cancel open bazaar orders when they are older than this many minutes per million coins.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes_per_million: u64,
     /// Updated whenever the bot opens the Manage/My Auctions GUI.
     cached_my_auctions_json: Arc<RwLock<Option<String>>>,
-    /// Time when /viewauction was sent — start of buy-speed measurement.
+    /// Time when /viewauction was sent. Used for internal timing diagnostics.
     /// Shared with `BotClientState` so the event handler can compute elapsed time
     /// when "Putting coins in escrow" arrives.
     purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Time when the BIN Auction View window opened for the current purchase.
+    /// Buy speed is measured from here (view-open → coins-in-escrow) so it
+    /// reflects the bot's act-on-open speed rather than the /viewauction RTT.
+    bin_view_open_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Shared AH-pause flag so ManageOrders can self-abort when AH flips are incoming.
     pub bazaar_flips_paused: Arc<AtomicBool>,
     /// Buffer of Hypixel chat messages to send as a chatBatch to Coflnet WebSocket.
@@ -362,6 +489,12 @@ pub struct BotClient {
     /// Whether bazaar flips are enabled in the config.  Used by the startup
     /// workflow to decide whether to cancel all open bazaar orders.
     pub enable_bazaar_flips: Arc<AtomicBool>,
+    /// Ensures the dedicated command processor is only spawned once, using the
+    /// first live Azalea `Client` handle delivered to `event_handler`.
+    command_processor_started: Arc<AtomicBool>,
+    /// Set to true to request a clean disconnect from Hypixel.
+    /// The command processor polls this flag and calls `bot.disconnect()` when set.
+    disconnect_requested: Arc<AtomicBool>,
 }
 #[derive(Debug, Clone)]
 pub enum BotEvent {
@@ -391,9 +524,15 @@ pub enum BotEvent {
         buy_speed_ms: Option<u64>,
         ping_ms: Option<u64>,
         estimated_server_ack_ms: Option<u64>,
+        via_bed: Option<bool>,
     },
     /// Item sold on AH
-    ItemSold { item_name: String, price: u64, buyer: String, auction_uuid: Option<String> },
+    ItemSold {
+        item_name: String,
+        price: u64,
+        buyer: String,
+        auction_uuid: Option<String>,
+    },
     /// Bazaar order placed successfully
     BazaarOrderPlaced {
         item_name: String,
@@ -439,11 +578,14 @@ pub enum BotEvent {
         item_name: String,
         starting_bid: u64,
     },
+    /// Listing refused because the resolved slot holds more than one copy while
+    /// the listing price is a per-unit price (see `refuse_stacked_listing`).
+    AuctionRefusedStacked { item_name: String, count: u32 },
     /// Reconciliation snapshot: the set of orders visible in the in-game
-    /// Bazaar Orders window.  Each entry is (item_name, is_buy_order).
+    /// Bazaar Orders window.  Each entry is (item_name, is_buy_order, amount, price_per_unit).
     /// The tracker should remove any orders not in this list.
     BazaarOrdersSnapshot {
-        ingame_orders: Vec<(String, bool)>,
+        ingame_orders: Vec<(String, bool, u64, f64)>,
     },
     /// "You cannot view this auction!" was received — no active booster cookie.
     /// The bot cannot function; the user must manually buy a cookie.
@@ -455,12 +597,15 @@ impl BotClient {
     pub fn new() -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        
+        // One cell, shared with the handlers, so a window close clears it. See
+        // `BotEventHandlers::last_window_id`.
+        let last_window_id = Arc::new(RwLock::new(0u8));
+
         Self {
             state: Arc::new(RwLock::new(BotState::GracePeriod)),
             action_counter: Arc::new(RwLock::new(1)),
-            last_window_id: Arc::new(RwLock::new(0)),
-            handlers: Arc::new(BotEventHandlers::new()),
+            last_window_id: last_window_id.clone(),
+            handlers: Arc::new(BotEventHandlers::with_shared_window_id(last_window_id)),
             event_tx,
             event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
             command_tx,
@@ -477,17 +622,19 @@ impl BotClient {
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
-            freemoney: false,
-            fastbuy: false,
+            bedtiming: false,
+            skip: false,
             bed_spam_click_delay: 100,
             insta_sell_item: Arc::new(RwLock::new(None)),
             bed_pre_click_ms: 100,
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
+            manage_orders_target_item: Arc::new(RwLock::new(None)),
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             purchase_start_time: Arc::new(RwLock::new(None)),
+            bin_view_open_time: Arc::new(RwLock::new(None)),
             bazaar_flips_paused: Arc::new(AtomicBool::new(false)),
             chat_batch_buffer: Arc::new(RwLock::new(Vec::new())),
             cached_window_json: Arc::new(RwLock::new(None)),
@@ -496,48 +643,54 @@ impl BotClient {
             command_queue: Arc::new(RwLock::new(None)),
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
+            command_processor_started: Arc::new(AtomicBool::new(false)),
+            disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Connect to Hypixel with Microsoft authentication
-    /// 
+    ///
     /// Uses azalea 0.15 ClientBuilder API to:
     /// - Authenticate with Microsoft account
     /// - Connect to mc.hypixel.net
     /// - Set up event handlers for chat, window, and inventory events
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `username` - Ingame username for connection
     /// * `ws_client` - Optional WebSocket client for inventory uploads
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```no_run
     /// use twm::bot::BotClient;
-    /// 
+    ///
     /// #[tokio::main]
     /// async fn main() {
     ///     let mut bot = BotClient::new();
     ///     bot.connect("email@example.com".to_string(), None).await.unwrap();
     /// }
     /// ```
-    pub async fn connect(&mut self, username: String, ws_client: Option<CoflWebSocket>) -> Result<()> {
+    pub async fn connect(
+        &mut self,
+        username: String,
+        ws_client: Option<CoflWebSocket>,
+    ) -> Result<()> {
         info!("Connecting to Hypixel as: {}", username);
-        
+
         // Keep state at GracePeriod (matches TypeScript's initial `bot.state = 'gracePeriod'`).
         // GracePeriod allows commands – only the active startup-workflow state (Startup) blocks them.
         // State transitions:  GracePeriod -> Idle  (via Login timeout or chat detection)
         //                      -> Startup           (only if an active startup workflow runs)
         //                      -> Idle              (after startup workflow completes)
-        
+
         // Authenticate with Microsoft
         let account = Account::microsoft(&username)
             .await
             .map_err(|e| anyhow!("Failed to authenticate with Microsoft: {}", e))?;
-        
+
         info!("Microsoft authentication successful");
-        
+
         // Create the handler state
         let handler_state = BotClientState {
             bot_state: self.state.clone(),
@@ -577,23 +730,25 @@ impl BotClient {
             auction_slot_blocked: self.auction_slot_blocked.clone(),
             bazaar_order_rejected: self.bazaar_order_rejected.clone(),
             purchase_start_time: self.purchase_start_time.clone(),
+            bin_view_open_time: self.bin_view_open_time.clone(),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
+            last_buy_via_bed: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
+            fast_buy_clicked: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: self.cached_inventory_json.clone(),
             auto_cookie_hours: self.auto_cookie_hours.clone(),
-            freemoney: self.freemoney,
-            fastbuy: self.fastbuy,
+            bedtiming: self.bedtiming,
+            skip: self.skip,
             bed_spam_click_delay: self.bed_spam_click_delay,
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            command_processor_started: Arc::new(AtomicBool::new(false)),
             inventory_full: self.inventory_full.clone(),
             cached_empty_player_slots: self.cached_empty_player_slots.clone(),
             insta_sell_item: self.insta_sell_item.clone(),
@@ -601,6 +756,7 @@ impl BotClient {
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
+            manage_orders_target_item: self.manage_orders_target_item.clone(),
             bazaar_order_cancel_minutes_per_million: self.bazaar_order_cancel_minutes_per_million,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
@@ -617,45 +773,89 @@ impl BotClient {
             startup_in_progress: self.startup_in_progress.clone(),
             enable_bazaar_flips: self.enable_bazaar_flips.clone(),
             order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
+            command_processor_started: self.command_processor_started.clone(),
+            disconnect_requested: self.disconnect_requested.clone(),
         };
-        
-        // Build and start the client (this blocks until disconnection)
+
+        // Build and start the client (this blocks until disconnection).
+        // The PacketAcceleratorPlugin (ECS-level observers that fire during the
+        // frame, bypassing the Event::Packet pipeline) is rebuilt per connection
+        // attempt inside the loop below from the shared Notify/info Arcs.
         let handler_state_clone = handler_state.clone();
-        // Create the PacketAcceleratorPlugin sharing the same Notify/info as BotClientState.
-        // The plugin registers ECS-level observers that fire DURING the frame
-        // (in apply_deferred), bypassing the multi-hop Event::Packet channel pipeline.
-        let accelerator_plugin = PacketAcceleratorPlugin::new(
-            handler_state.window_open_notify.clone(),
-            handler_state.window_open_info.clone(),
-            handler_state.slot_data_notify.clone(),
-        );
+        // azalea 0.16 removed the built-in auto-reconnect plugin, so we drive
+        // reconnection ourselves here. `ClientBuilder::start()` returns when the
+        // client disconnects; we then reconnect after a short delay UNLESS the
+        // disconnect was intentional (a humanization rest break, signalled by
+        // `disconnect_requested`). Bans are handled elsewhere: the
+        // `BotEvent::Disconnected` handler in main.rs detects them and calls
+        // `process::exit`, which tears down this loop before it can rejoin.
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new()
                 .expect("Failed to create tokio runtime for bot - this should never happen unless system resources are exhausted");
             rt.block_on(async move {
-                let exit_result = ClientBuilder::new()
-                    .add_plugins(accelerator_plugin)
-                    .set_handler(event_handler)
-                    .set_state(handler_state_clone)
-                    .start(account, "mc.hypixel.net")
-                    .await;
-                    
-                match exit_result {
-                    AppExit::Success => {
-                        info!("Bot disconnected successfully");
+                const RECONNECT_DELAY_SECS: u64 = 5;
+                loop {
+                    // Rebuild the accelerator plugin each attempt — it only wraps
+                    // the shared Notify/info Arcs held by BotClientState.
+                    let plugin = PacketAcceleratorPlugin::new(
+                        handler_state_clone.window_open_notify.clone(),
+                        handler_state_clone.window_open_info.clone(),
+                        handler_state_clone.slot_data_notify.clone(),
+                    );
+                    let exit_result = {
+                        let mut join_opts = azalea::JoinOpts::default();
+                        // Route the game connection AND the Mojang session
+                        // server through the configured SOCKS5 proxy. Without
+                        // this Hypixel (and Mojang) only ever see the default
+                        // interface's IP, which defeats per-IP separation.
+                        if let Some(proxy) = crate::utils::proxy::azalea_proxy() {
+                            info!(
+                                "[Connect] Using SOCKS5 proxy {} for the Minecraft connection",
+                                proxy
+                            );
+                            join_opts = join_opts.proxy(proxy);
+                        }
+                        ClientBuilder::new()
+                            .add_plugins(plugin)
+                            .set_handler(event_handler)
+                            .set_state(handler_state_clone.clone())
+                            .start_with_opts(account.clone(), "mc.hypixel.net", join_opts)
+                            .await
+                    };
+
+                    match exit_result {
+                        AppExit::Success => info!("Bot client exited (disconnected)"),
+                        AppExit::Error(code) => {
+                            error!("Bot client exited with error code: {:?}", code)
+                        }
                     }
-                    AppExit::Error(code) => {
-                        error!("Bot exited with error code: {:?}", code);
+
+                    // Intentional disconnect (rest break): do not reconnect — the
+                    // humanization flow restarts the whole process afterwards.
+                    if handler_state_clone
+                        .disconnect_requested
+                        .load(Ordering::Acquire)
+                    {
+                        info!("[Reconnect] Intentional disconnect — staying offline");
+                        break;
                     }
+
+                    // Bad disconnect (timeout/kick/network): reconnect after a delay.
+                    warn!(
+                        "[Reconnect] Bot disconnected unexpectedly — reconnecting in {}s",
+                        RECONNECT_DELAY_SECS
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_DELAY_SECS))
+                        .await;
                 }
             });
         });
-        
+
         // Wait for connection to establish
         tokio::time::sleep(tokio::time::Duration::from_secs(CONNECTION_WAIT_SECONDS)).await;
-        
+
         info!("Bot connection initiated");
-        
+
         Ok(())
     }
 
@@ -687,17 +887,18 @@ impl BotClient {
     }
 
     /// Send a command to the bot for execution
-    /// 
+    ///
     /// This queues a command to be executed by the bot event handler.
     /// Commands are processed in the context of the Azalea client where
     /// chat messages and window clicks can be sent.
     pub fn send_command(&self, command: QueuedCommand) -> Result<()> {
-        self.command_tx.send(command)
+        self.command_tx
+            .send(command)
             .map_err(|e| anyhow!("Failed to send command to bot: {}", e))
     }
 
     /// Get the current action counter value
-    /// 
+    ///
     /// The action counter is incremented with each window click to prevent
     /// server-side bot detection. This matches the TypeScript implementation's
     /// anti-cheat behavior.
@@ -740,22 +941,26 @@ impl BotClient {
         };
         // Sort entries by score descending (matches mineflayer sidebar order)
         let mut entries: Vec<(&String, &(String, u32))> = objective.iter().collect();
-        entries.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.1 .1));
         // Build a member -> (prefix+suffix) lookup from team data for proper display
         let teams = self.scoreboard_teams.read();
         let mut member_display: HashMap<String, String> = HashMap::new();
-        for (_, (prefix, suffix, members)) in teams.iter() {
+        for (prefix, suffix, members) in teams.values() {
             let text = format!("{}{}", prefix, suffix);
             for member in members {
                 member_display.insert(member.clone(), text.clone());
             }
         }
         drop(teams);
-        entries.iter().map(|(owner, (display, _))| {
-            member_display.get(owner.as_str())
-                .cloned()
-                .unwrap_or_else(|| display.clone())
-        }).collect()
+        entries
+            .iter()
+            .map(|(owner, (display, _))| {
+                member_display
+                    .get(owner.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| display.clone())
+            })
+            .collect()
     }
 
     /// Parse the player's current purse from the SkyBlock scoreboard sidebar.
@@ -803,6 +1008,51 @@ impl BotClient {
     /// My Auctions window yet.
     pub fn get_cached_my_auctions_json(&self) -> Option<String> {
         self.cached_my_auctions_json.read().clone()
+    }
+
+    /// Returns the number of items currently tracked as active auction listings.
+    ///
+    /// Prefers the cached "Manage Auctions" GUI data (the same source the web
+    /// panel uses — ground truth from Hypixel) and falls back to the in-memory
+    /// chat-tracked set only when no GUI snapshot exists yet. The chat-tracked
+    /// set alone under-counts (lost on restart, misses manual and /cofl sell
+    /// listings) and over-counts (never sees expirations), which made webhook
+    /// counts diverge from the web panel.
+    pub fn active_auction_count(&self) -> usize {
+        if let Some(cached) = self.get_cached_my_auctions_json() {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&cached) {
+                return arr
+                    .iter()
+                    .filter(|a| a.get("status").and_then(|s| s.as_str()) == Some("active"))
+                    .count();
+            }
+        }
+        self.active_auction_listings.read().len()
+    }
+
+    /// Total coins locked in ACTIVE auction listings ("waiting to sell") and
+    /// the count of them, parsed in one pass from the cached Manage Auctions
+    /// GUI. Used to report account WORTH (purse + locked) and auction-slot
+    /// usage to the finder so it can size flips to the true account size and
+    /// avoid overfilling the auction house. Returns (0, 0) when no GUI snapshot
+    /// exists yet.
+    pub fn active_listing_value_and_count(&self) -> (u64, usize) {
+        if let Some(cached) = self.get_cached_my_auctions_json() {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&cached) {
+                let mut value: u64 = 0;
+                let mut count: usize = 0;
+                for a in &arr {
+                    if a.get("status").and_then(|s| s.as_str()) == Some("active") {
+                        count += 1;
+                        value = value.saturating_add(
+                            a.get("starting_bid").and_then(|v| v.as_u64()).unwrap_or(0),
+                        );
+                    }
+                }
+                return (value, count);
+            }
+        }
+        (0, 0)
     }
 
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
@@ -855,6 +1105,38 @@ impl BotClient {
         self.auction_at_limit.store(false, Ordering::Relaxed);
     }
 
+    /// Request the bot to disconnect from Hypixel (web GUI "Disconnect" button).
+    /// Sets the `disconnect_requested` flag so the command processor tears down
+    /// the live TCP connection (`enforce_offline`) AND the reconnect loop stays
+    /// offline instead of rejoining ~5s later. Also parks state at Idle for the
+    /// UI. The flag is cleared only by the process restart the web "Reconnect"
+    /// button performs.
+    ///
+    /// Without setting the flag this only set state=Idle, which left the live
+    /// connection up (nothing tears it down on Idle) and told the AFK handler the
+    /// bot was free — so the bot silently rejoined Hypixel on its own.
+    pub fn disconnect(&self) {
+        info!("[BotClient] Disconnect requested via web GUI — going offline and staying offline");
+        self.disconnect_requested.store(true, Ordering::Release);
+        self.set_state(BotState::Idle);
+    }
+
+    /// True once a manual/rest-break disconnect has been requested and the bot
+    /// should stay offline. Watched by the AFK-return handler so it doesn't fight
+    /// a deliberate disconnect by rejoining the island.
+    pub fn is_disconnect_requested(&self) -> bool {
+        self.disconnect_requested.load(Ordering::Acquire)
+    }
+
+    /// Request a clean TCP-level disconnect from the Hypixel server.
+    /// Sets the `disconnect_requested` flag that the command-processor loop
+    /// watches; the loop then calls `bot.disconnect()` on the live Azalea
+    /// `Client`, which tears down the TCP connection.
+    pub fn request_disconnect(&self) {
+        info!("[BotClient] Requesting Azalea disconnect");
+        self.disconnect_requested.store(true, Ordering::Release);
+    }
+
     /// Returns true if inventory is full (items stashed / no space to claim).
     /// Also checks the cached empty-slot count: if the inventory has free
     /// slots the flag is auto-cleared so stale "stashed away" reminders
@@ -866,7 +1148,10 @@ impl BotClient {
         // Reality-check: the flag might be stale after a manual instasell.
         let empty = self.cached_empty_player_slots.load(Ordering::Relaxed);
         if empty >= MIN_FREE_SLOTS_FOR_BUY {
-            info!("[Inventory] Clearing stale inventory_full flag — cached {} empty slots", empty);
+            info!(
+                "[Inventory] Clearing stale inventory_full flag — cached {} empty slots",
+                empty
+            );
             self.inventory_full.store(false, Ordering::Relaxed);
             return false;
         }
@@ -929,13 +1214,13 @@ impl BotClient {
     }
 
     /// Documentation for sending chat messages
-    /// 
+    ///
     /// **Important**: This method cannot be called directly because the azalea Client
     /// is not accessible from outside event handlers. Chat messages must be sent from
     /// within the event_handler where the Client is available.
-    /// 
+    ///
     /// # Example (within event_handler)
-    /// 
+    ///
     /// ```no_run
     /// # use azalea::prelude::*;
     /// # async fn example(bot: Client) {
@@ -943,7 +1228,9 @@ impl BotClient {
     /// bot.write_chat_packet("/bz");
     /// # }
     /// ```
-    #[deprecated(note = "Cannot be called from outside event handlers. Use the Client directly within event_handler. See method documentation for example.")]
+    #[deprecated(
+        note = "Cannot be called from outside event handlers. Use the Client directly within event_handler. See method documentation for example."
+    )]
     pub async fn chat(&self, _message: &str) -> Result<()> {
         Err(anyhow!(
             "chat() cannot be called from outside event handlers. \
@@ -953,19 +1240,19 @@ impl BotClient {
     }
 
     /// Documentation for clicking window slots
-    /// 
+    ///
     /// **Important**: This method cannot be called directly because the azalea Client
     /// is not accessible from outside event handlers. Window clicks must be sent from
     /// within the event_handler where the Client is available.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `slot` - The slot number to click (0-indexed)
     /// * `button` - Mouse button (0 = left, 1 = right, 2 = middle)
     /// * `click_type` - Click operation type (Pickup, ShiftClick, etc.)
-    /// 
+    ///
     /// # Example (within event_handler)
-    /// 
+    ///
     /// ```no_run
     /// # use azalea::prelude::*;
     /// # use azalea_protocol::packets::game::s_container_click::ServerboundContainerClick;
@@ -984,8 +1271,15 @@ impl BotClient {
     /// bot.write_packet(packet);
     /// # }
     /// ```
-    #[deprecated(note = "Cannot be called from outside event handlers. Use the Client directly within event_handler. See method documentation for example.")]
-    pub async fn click_window(&self, _slot: i16, _button: u8, _click_type: ClickType) -> Result<()> {
+    #[deprecated(
+        note = "Cannot be called from outside event handlers. Use the Client directly within event_handler. See method documentation for example."
+    )]
+    pub async fn click_window(
+        &self,
+        _slot: i16,
+        _button: u8,
+        _click_type: ClickType,
+    ) -> Result<()> {
         Err(anyhow!(
             "click_window() cannot be called from outside event handlers. \
              The azalea Client is only accessible within event_handler. \
@@ -994,12 +1288,14 @@ impl BotClient {
     }
 
     /// Click the purchase button (slot 31) in BIN Auction View
-    /// 
+    ///
     /// **Important**: See `click_window()` documentation. This method cannot be called
     /// from outside event handlers. Use the pattern shown there within event_handler.
-    /// 
+    ///
     /// The purchase button is at slot 31 (gold ingot) in Hypixel's BIN Auction View.
-    #[deprecated(note = "Cannot be called from outside event handlers. See click_window() documentation.")]
+    #[deprecated(
+        note = "Cannot be called from outside event handlers. See click_window() documentation."
+    )]
     pub async fn click_purchase(&self, _price: u64) -> Result<()> {
         Err(anyhow!(
             "click_purchase() cannot be called from outside event handlers. \
@@ -1008,12 +1304,14 @@ impl BotClient {
     }
 
     /// Click the confirm button (slot 11) in Confirm Purchase window
-    /// 
+    ///
     /// **Important**: See `click_window()` documentation. This method cannot be called
     /// from outside event handlers. Use the pattern shown there within event_handler.
-    /// 
+    ///
     /// The confirm button is at slot 11 (green stained clay) in Hypixel's Confirm Purchase window.
-    #[deprecated(note = "Cannot be called from outside event handlers. See click_window() documentation.")]
+    #[deprecated(
+        note = "Cannot be called from outside event handlers. See click_window() documentation."
+    )]
     pub async fn click_confirm(&self, _price: u64, _item_name: &str) -> Result<()> {
         Err(anyhow!(
             "click_confirm() cannot be called from outside event handlers. \
@@ -1033,17 +1331,16 @@ impl Default for BotClient {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuctionStep {
     #[default]
-    Initial,       // Just sent /ah, waiting for "Auction House"
-    OpenManage,    // Clicked slot 15 in AH, waiting for "Manage Auctions"
-    ClickCreate,   // Clicked "Create Auction" in Manage Auctions, waiting for "Create Auction"
-    SelectBIN,     // Clicked slot 48 in "Create Auction", waiting for "Create BIN Auction"
-    PriceSign,     // Clicked item + slot 31, sign expected (setPrice=false in TS)
-    SetDuration,   // Price sign done; "Create BIN Auction" second visit → click slot 33
-    DurationSign,  // "Auction Duration" opened + slot 16 clicked; sign expected for duration
-    ConfirmSell,   // Duration sign done; "Create BIN Auction" third visit → click slot 29
-    FinalConfirm,  // In "Confirm BIN Auction" → click slot 11
+    Initial, // Just sent /ah, waiting for "Auction House"
+    OpenManage,   // Clicked slot 15 in AH, waiting for "Manage Auctions"
+    ClickCreate,  // Clicked "Create Auction" in Manage Auctions, waiting for "Create Auction"
+    SelectBIN,    // Clicked slot 48 in "Create Auction", waiting for "Create BIN Auction"
+    PriceSign,    // Clicked item + slot 31, sign expected (setPrice=false in TS)
+    SetDuration,  // Price sign done; "Create BIN Auction" second visit → click slot 33
+    DurationSign, // "Auction Duration" opened + slot 16 clicked; sign expected for duration
+    ConfirmSell,  // Duration sign done; "Create BIN Auction" third visit → click slot 29
+    FinalConfirm, // In "Confirm BIN Auction" → click slot 11
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BazaarStep {
@@ -1061,11 +1358,11 @@ pub enum BazaarStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CookieStep {
     #[default]
-    Initial,         // Sent /bz booster cookie, waiting for Bazaar window
-    ItemDetail,      // Clicked cookie item (slot 11), waiting for detail window
-    BuyConfirm,      // Clicked Buy Instantly (slot 10), waiting for confirm window
+    Initial, // Sent /bz booster cookie, waiting for Bazaar window
+    ItemDetail,       // Clicked cookie item (slot 11), waiting for detail window
+    BuyConfirm,       // Clicked Buy Instantly (slot 10), waiting for confirm window
     WaitingForCookie, // Clicked Confirm, waiting for cookie to appear in inventory
-    ConsumingCookie, // Right-clicked cookie, waiting for cookie GUI window
+    ConsumingCookie,  // Right-clicked cookie, waiting for cookie GUI window
 }
 
 /// State type for bot client event handler
@@ -1085,6 +1382,7 @@ pub struct BotClientState {
     /// Time when we joined SkyBlock (for timeout detection)
     pub skyblock_join_time: Arc<RwLock<Option<tokio::time::Instant>>>,
     /// WebSocket client for sending messages (e.g., inventory uploads)
+    #[allow(dead_code)]
     pub ws_client: Option<CoflWebSocket>,
     /// true = claiming purchased item, false = claiming sold item
     pub claiming_purchased: Arc<RwLock<bool>>,
@@ -1128,11 +1426,11 @@ pub struct BotClientState {
     /// MAX_AUCTION_STUCK_ITEM_RETRIES the bot gives up and goes Idle.
     pub auction_stuck_item_retries: Arc<std::sync::atomic::AtomicU8>,
     /// Scoreboard scores: objective_name -> (owner -> (display_text, score))
-    pub scoreboard_scores: Arc<RwLock<HashMap<String, HashMap<String, (String, u32)>>>>,
+    pub scoreboard_scores: ScoreboardScores,
     /// Which objective is currently displayed in the sidebar slot
     pub sidebar_objective: Arc<RwLock<Option<String>>>,
     /// Team data for scoreboard rendering: team_name -> (prefix, suffix, members)
-    pub scoreboard_teams: Arc<RwLock<HashMap<String, (String, String, Vec<String>)>>>,
+    pub scoreboard_teams: ScoreboardTeams,
     /// Count of bazaar orders cancelled during startup order management (shared with run_startup_workflow)
     pub manage_orders_cancelled: Arc<RwLock<u64>>,
     /// Set when Hypixel sends "You reached your maximum of XY Bazaar orders!".
@@ -1153,17 +1451,24 @@ pub struct BotClientState {
     /// competitive enough").  Cleared before each confirm-click so only the
     /// response to the *current* placement attempt is captured.
     pub bazaar_order_rejected: Arc<AtomicBool>,
-    /// Time when /viewauction was sent — start of buy-speed measurement.
+    /// Time when /viewauction was sent. Used for internal timing diagnostics.
     /// Shared with `BotClient` so main.rs can set it when the flip arrives.
     pub purchase_start_time: Arc<RwLock<Option<std::time::Instant>>>,
+    /// Time when the BIN Auction View window opened for the current purchase —
+    /// the start of the (new) buy-speed measurement.
+    pub bin_view_open_time: Arc<RwLock<Option<std::time::Instant>>>,
     /// Buy speed in ms: from /viewauction sent to "Putting coins in escrow..."
     pub last_buy_speed_ms: Arc<RwLock<Option<u64>>>,
+    /// How the last buy resolved: `Some(true)` if it went through a bed
+    /// (grace-period) timing loop, `Some(false)` if it was an instant gold_nugget
+    /// buy. Taken alongside `last_buy_speed_ms` when the purchase confirms.
+    pub last_buy_via_bed: Arc<RwLock<Option<bool>>>,
     /// Set to true while a grace-period spam-click loop is running so a second
     /// chat message does not start a duplicate loop.
     pub grace_period_spam_active: Arc<AtomicBool>,
     /// Raw COFL `purchaseAt` epoch-ms timestamp from the flip.  Converted to a
     /// local `Instant` only when a bed (grace-period) is detected in the BIN
-    /// Auction View **and** freemoney mode is enabled.
+    /// Auction View **and** bedtiming mode is enabled.
     pub pending_purchase_at_ms: Arc<RwLock<Option<i64>>>,
     /// Set to true while the bot is waiting for a bed (grace-period) to expire so
     /// the 5-second GUI watchdog does not incorrectly auto-close the BIN Auction View.
@@ -1171,6 +1476,11 @@ pub struct BotClientState {
     /// Set when a skip-click (pre-click on predicted Confirm Purchase window) is sent.
     /// The Confirm Purchase handler checks this to avoid sending a duplicate reactive click.
     pub skip_click_sent: Arc<AtomicBool>,
+    /// Set when the fast-path purchase task (spawned in execute_command, triggered
+    /// by the ECS observer's window_open_notify) has already sent the buy-click
+    /// and skip-click.  The Event::Packet handle_window_interaction checks this
+    /// to avoid sending duplicate clicks.  Reset at the start of each purchase.
+    pub fast_buy_clicked: Arc<AtomicBool>,
     /// Notified when ContainerSetSlot / ContainerSetContent arrives so the purchase
     /// handler can react instantly instead of polling every 10ms.
     pub slot_data_notify: Arc<tokio::sync::Notify>,
@@ -1184,10 +1494,10 @@ pub struct BotClientState {
     pub cached_inventory_json: Arc<RwLock<Option<String>>>,
     /// AUTO_COOKIE config value (hours threshold to trigger a cookie buy). 0 = disabled.
     pub auto_cookie_hours: Arc<RwLock<u64>>,
-    /// Hidden config gate for purchaseAt bed timing mode.
-    pub freemoney: bool,
-    /// Enable fast-buy: skip-click on predicted Confirm Purchase window.
-    pub fastbuy: bool,
+    /// Config gate for purchaseAt-based bed (grace-period) timing mode.
+    pub bedtiming: bool,
+    /// Enable skip-click: pre-click confirm on predicted Confirm Purchase window.
+    pub skip: bool,
     /// Interval in milliseconds for grace-period bed/gold_nugget click loops.
     pub bed_spam_click_delay: u64,
     /// Measured remaining cookie time in seconds (set during CheckingCookie).
@@ -1198,9 +1508,6 @@ pub struct BotClientState {
     /// watchdog can detect whether a new command has started since the watched
     /// window was opened and skip the auto-close if so.
     pub command_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Ensures the dedicated command processor is only spawned once, using the
-    /// first live Azalea `Client` handle delivered to `event_handler`.
-    pub command_processor_started: Arc<AtomicBool>,
     /// Set when "[Bazaar] You don't have the space required to claim that!" is
     /// received.  The ManageOrders loop reads this flag to stop trying to collect
     /// and log the remaining orders to pending_claims.log.
@@ -1222,6 +1529,10 @@ pub struct BotClientState {
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     /// When false, it only collects filled orders and leaves open orders untouched.
     pub manage_orders_cancel_open: Arc<AtomicBool>,
+    /// When set, the ManageOrders handler targets a specific order for cancellation
+    /// instead of processing all orders.  Format: `(item_name, is_buy_order)`.
+    /// Cleared at the start of each ManageOrders command.
+    pub manage_orders_target_item: Arc<RwLock<Option<crate::types::BazaarOrderTarget>>>,
     /// Cancel open bazaar orders when they are older than this many minutes per million coins.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes_per_million: u64,
@@ -1232,7 +1543,7 @@ pub struct BotClientState {
     /// `order_identity` is the `(is_buy, item_tag)` tuple used by
     /// `should_cancel_open_order_due_to_age()`, and `filled_amount` is the actual
     /// filled quantity parsed from the "Filled: X/Y" lore line.
-    pub managing_order_context: Arc<RwLock<Option<(bool, String, Option<(bool, String)>, Option<u64>)>>>,
+    pub managing_order_context: ManagingOrderContext,
     /// Cached "My Auctions" JSON shared with BotClient for instant replies.
     pub cached_my_auctions_json: Arc<RwLock<Option<String>>>,
     /// Persistent set of processed order names (normalized, slot-index-free) across
@@ -1279,18 +1590,28 @@ pub struct BotClientState {
     /// After `MAX_CANCEL_RETRIES` failures for the same order, the order is skipped.
     /// Cleared on successful cancel or at the start of a `cancel_open` ManageOrders run.
     pub order_cancel_failures: Arc<RwLock<HashMap<String, u32>>>,
+    /// Ensures the dedicated command processor is only spawned once.
+    pub command_processor_started: Arc<AtomicBool>,
+    /// Set to true to request a clean disconnect from Hypixel.
+    /// The command processor polls this flag and calls `bot.disconnect()` when set.
+    pub disconnect_requested: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
     fn default() -> Self {
         let (event_tx, _) = mpsc::unbounded_channel();
         let (_, command_rx) = mpsc::unbounded_channel();
+        // Shared with the handlers so a window close clears it. See
+        // `BotEventHandlers::last_window_id`.
+        let last_window_id = Arc::new(RwLock::new(0u8));
         Self {
             bot_state: Arc::new(RwLock::new(BotState::GracePeriod)),
-            handlers: Arc::new(BotEventHandlers::new()),
+            handlers: Arc::new(BotEventHandlers::with_shared_window_id(
+                last_window_id.clone(),
+            )),
             event_tx,
             action_counter: Arc::new(RwLock::new(1)),
-            last_window_id: Arc::new(RwLock::new(0)),
+            last_window_id,
             command_rx: Arc::new(tokio::sync::Mutex::new(command_rx)),
             joined_skyblock: Arc::new(RwLock::new(false)),
             teleported_to_island: Arc::new(RwLock::new(false)),
@@ -1323,23 +1644,25 @@ impl Default for BotClientState {
             auction_slot_blocked: Arc::new(AtomicBool::new(false)),
             bazaar_order_rejected: Arc::new(AtomicBool::new(false)),
             purchase_start_time: Arc::new(RwLock::new(None)),
+            bin_view_open_time: Arc::new(RwLock::new(None)),
             last_buy_speed_ms: Arc::new(RwLock::new(None)),
+            last_buy_via_bed: Arc::new(RwLock::new(None)),
             grace_period_spam_active: Arc::new(AtomicBool::new(false)),
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
+            fast_buy_clicked: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_info: Arc::new(RwLock::new(None)),
             cached_inventory_json: Arc::new(RwLock::new(None)),
             auto_cookie_hours: Arc::new(RwLock::new(0)),
-            freemoney: false,
-            fastbuy: false,
+            bedtiming: false,
+            skip: false,
             bed_spam_click_delay: 100,
             cookie_time_secs: Arc::new(RwLock::new(0)),
             cookie_step: Arc::new(RwLock::new(CookieStep::Initial)),
             command_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            command_processor_started: Arc::new(AtomicBool::new(false)),
             inventory_full: Arc::new(AtomicBool::new(false)),
             cached_empty_player_slots: Arc::new(std::sync::atomic::AtomicU8::new(36)),
             insta_sell_item: Arc::new(RwLock::new(None)),
@@ -1347,6 +1670,7 @@ impl Default for BotClientState {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
+            manage_orders_target_item: Arc::new(RwLock::new(None)),
             bazaar_order_cancel_minutes_per_million: 5,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
@@ -1363,6 +1687,8 @@ impl Default for BotClientState {
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
             order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
+            command_processor_started: Arc::new(AtomicBool::new(false)),
+            disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1380,7 +1706,7 @@ impl BotClientState {
         // get_scoreboard_lines() so that the purse line is found the same way.
         let teams = self.scoreboard_teams.read();
         let mut member_display: HashMap<String, String> = HashMap::with_capacity(teams.len());
-        for (_, (prefix, suffix, members)) in teams.iter() {
+        for (prefix, suffix, members) in teams.values() {
             let text = format!("{}{}", prefix, suffix);
             for member in members {
                 member_display.insert(member.clone(), text.clone());
@@ -1388,13 +1714,18 @@ impl BotClientState {
         }
         drop(teams);
         for (owner, (display, _)) in objective.iter() {
-            let text = member_display.get(owner.as_str())
+            let text = member_display
+                .get(owner.as_str())
                 .cloned()
                 .unwrap_or_else(|| display.clone());
             let clean = remove_mc_colors(&text);
             for prefix in &["Purse: ", "Piggy: "] {
                 if let Some(rest) = clean.trim().strip_prefix(prefix) {
-                    let num = rest.split_whitespace().next().unwrap_or("").replace(',', "");
+                    let num = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .replace(',', "");
                     if let Ok(n) = num.parse::<u64>() {
                         return Some(n);
                     }
@@ -1464,7 +1795,9 @@ fn get_item_display_name_from_slot(item: &azalea_inventory::ItemStack) -> Option
 /// Get the display name of an item slot preserving §-color codes for rarity display.
 /// Same logic as `get_item_display_name_from_slot` but uses `extract_text_with_colors`
 /// so the web panel can render the name in the item's rarity color.
-fn get_item_display_name_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Option<String> {
+fn get_item_display_name_with_colors_from_slot(
+    item: &azalea_inventory::ItemStack,
+) -> Option<String> {
     if let Some(item_data) = item.as_present() {
         if let Ok(value) = serde_json::to_value(item_data) {
             let components = value.get("components");
@@ -1477,7 +1810,8 @@ fn get_item_display_name_with_colors_from_slot(item: &azalea_inventory::ItemStac
                 } else {
                     name_val.to_string()
                 };
-                let colored = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let colored = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw)
+                {
                     extract_text_with_colors(&json_val)
                 } else {
                     raw
@@ -1520,11 +1854,21 @@ fn extract_text_with_colors(val: &serde_json::Value) -> String {
     // Emit color/format codes from the component's properties
     if let Some(color) = val.get("color").and_then(|v| v.as_str()) {
         let code = match color {
-            "black" => Some('0'), "dark_blue" => Some('1'), "dark_green" => Some('2'),
-            "dark_aqua" => Some('3'), "dark_red" => Some('4'), "dark_purple" => Some('5'),
-            "gold" => Some('6'), "gray" => Some('7'), "dark_gray" => Some('8'),
-            "blue" => Some('9'), "green" => Some('a'), "aqua" => Some('b'),
-            "red" => Some('c'), "light_purple" => Some('d'), "yellow" => Some('e'),
+            "black" => Some('0'),
+            "dark_blue" => Some('1'),
+            "dark_green" => Some('2'),
+            "dark_aqua" => Some('3'),
+            "dark_red" => Some('4'),
+            "dark_purple" => Some('5'),
+            "gold" => Some('6'),
+            "gray" => Some('7'),
+            "dark_gray" => Some('8'),
+            "blue" => Some('9'),
+            "green" => Some('a'),
+            "aqua" => Some('b'),
+            "red" => Some('c'),
+            "light_purple" => Some('d'),
+            "yellow" => Some('e'),
             "white" => Some('f'),
             _ => None,
         };
@@ -1533,11 +1877,21 @@ fn extract_text_with_colors(val: &serde_json::Value) -> String {
             result.push(c);
         }
     }
-    if val.get("bold").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§l"); }
-    if val.get("italic").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§o"); }
-    if val.get("underlined").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§n"); }
-    if val.get("strikethrough").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§m"); }
-    if val.get("obfuscated").and_then(|v| v.as_bool()) == Some(true) { result.push_str("§k"); }
+    if val.get("bold").and_then(|v| v.as_bool()) == Some(true) {
+        result.push_str("§l");
+    }
+    if val.get("italic").and_then(|v| v.as_bool()) == Some(true) {
+        result.push_str("§o");
+    }
+    if val.get("underlined").and_then(|v| v.as_bool()) == Some(true) {
+        result.push_str("§n");
+    }
+    if val.get("strikethrough").and_then(|v| v.as_bool()) == Some(true) {
+        result.push_str("§m");
+    }
+    if val.get("obfuscated").and_then(|v| v.as_bool()) == Some(true) {
+        result.push_str("§k");
+    }
     if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
         result.push_str(text);
     }
@@ -1549,31 +1903,47 @@ fn extract_text_with_colors(val: &serde_json::Value) -> String {
     result
 }
 
-/// Get lore lines from an item slot as plain strings (no color codes)
-fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
-    let mut lore_lines = Vec::new();
+/// Read the raw `minecraft:lore` array directly from an item's Lore component.
+///
+/// This deliberately avoids `serde_json::to_value(item_data)` on the whole stack:
+/// that fails for enchanted items (their `HashMap<Enchantment, i32>` has non-string
+/// map keys), which previously made lore come back empty even though the item's own
+/// `Lore` component serialises fine. Reading the component directly is robust and
+/// keeps the top-level `lore` consistent with the `nbt.minecraft:lore` we emit.
+fn lore_component_array(item: &azalea_inventory::ItemStack) -> Vec<serde_json::Value> {
+    use azalea_inventory::components::Lore;
     if let Some(item_data) = item.as_present() {
-        if let Ok(value) = serde_json::to_value(item_data) {
-            if let Some(lore_arr) = value
-                .get("components")
-                .and_then(|c| c.get("minecraft:lore"))
-                .and_then(|l| l.as_array())
-            {
-                for entry in lore_arr {
-                    let raw = if entry.is_string() {
-                        entry.as_str().unwrap_or("").to_string()
-                    } else {
-                        entry.to_string()
-                    };
-                    let plain = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        extract_text_from_chat_component(&json_val)
-                    } else {
-                        remove_mc_colors(&raw)
-                    };
-                    lore_lines.push(plain);
+        if let Some(lore) = item_data.component_patch.get::<Lore>() {
+            if let Ok(val) = serde_json::to_value(lore) {
+                // Depending on the azalea version the Lore component serialises either
+                // as a bare array of text components or as `{ "lines": [...] }`.
+                if let Some(arr) = val.as_array() {
+                    return arr.clone();
+                }
+                if let Some(arr) = val.get("lines").and_then(|l| l.as_array()) {
+                    return arr.clone();
                 }
             }
         }
+    }
+    Vec::new()
+}
+
+/// Get lore lines from an item slot as plain strings (no color codes)
+fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
+    let mut lore_lines = Vec::new();
+    for entry in lore_component_array(item) {
+        let raw = if entry.is_string() {
+            entry.as_str().unwrap_or("").to_string()
+        } else {
+            entry.to_string()
+        };
+        let plain = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            extract_text_from_chat_component(&json_val)
+        } else {
+            remove_mc_colors(&raw)
+        };
+        lore_lines.push(plain);
     }
     lore_lines
 }
@@ -1582,28 +1952,18 @@ fn get_item_lore_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
 /// Used by the web panel to render colorful lore tooltips.
 fn get_item_lore_with_colors_from_slot(item: &azalea_inventory::ItemStack) -> Vec<String> {
     let mut lore_lines = Vec::new();
-    if let Some(item_data) = item.as_present() {
-        if let Ok(value) = serde_json::to_value(item_data) {
-            if let Some(lore_arr) = value
-                .get("components")
-                .and_then(|c| c.get("minecraft:lore"))
-                .and_then(|l| l.as_array())
-            {
-                for entry in lore_arr {
-                    let raw = if entry.is_string() {
-                        entry.as_str().unwrap_or("").to_string()
-                    } else {
-                        entry.to_string()
-                    };
-                    let colored = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        extract_text_with_colors(&json_val)
-                    } else {
-                        raw
-                    };
-                    lore_lines.push(colored);
-                }
-            }
-        }
+    for entry in lore_component_array(item) {
+        let raw = if entry.is_string() {
+            entry.as_str().unwrap_or("").to_string()
+        } else {
+            entry.to_string()
+        };
+        let colored = if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            extract_text_with_colors(&json_val)
+        } else {
+            raw
+        };
+        lore_lines.push(colored);
     }
     lore_lines
 }
@@ -1634,7 +1994,7 @@ fn format_with_commas(n: i64) -> String {
     let s = n.unsigned_abs().to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(ch);
@@ -1700,13 +2060,65 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
     None
 }
 
-fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
-    let needle_lower = needle.to_lowercase();
-    lore.iter()
-        .any(|line| remove_mc_colors(line).to_lowercase().contains(&needle_lower))
+/// Like [`find_slot_by_name`] but restricted to the player-inventory portion of
+/// an open container (`inv_start`..end) and to non-empty slots.
+///
+/// The auction "select item" flow uses this for its name fallback so it can only
+/// ever resolve to a real item the player is holding — never a GUI/display slot
+/// (clicking one to "sell" a non-item is an impossible action Watchdog flags),
+/// and never an empty slot. Returns the absolute slot index.
+fn find_inventory_slot_by_name(
+    slots: &[azalea_inventory::ItemStack],
+    inv_start: usize,
+    name: &str,
+) -> Option<usize> {
+    if inv_start >= slots.len() {
+        return None;
+    }
+    let name_lower = name.to_lowercase();
+    let name_norm = normalize_for_matching(name);
+    let tokens: Vec<&str> = name_norm.split_whitespace().collect();
+    // Phase 0: exact contains; 1: normalized contains; 2: all-tokens-present.
+    for phase in 0..3u8 {
+        for (i, slot) in slots.iter().enumerate().skip(inv_start) {
+            if slot.is_empty() {
+                continue;
+            }
+            let display = match get_item_display_name_from_slot(slot) {
+                Some(d) => d,
+                None => continue,
+            };
+            let hit = match phase {
+                0 => display.to_lowercase().contains(&name_lower),
+                1 => normalize_for_matching(&display).contains(&name_norm),
+                _ => {
+                    tokens.len() > 1 && {
+                        let dn = normalize_for_matching(&display);
+                        tokens.iter().all(|t| dn.contains(t))
+                    }
+                }
+            };
+            if hit {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
-fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &str) -> Option<usize> {
+fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
+    let needle_lower = needle.to_lowercase();
+    lore.iter().any(|line| {
+        remove_mc_colors(line)
+            .to_lowercase()
+            .contains(&needle_lower)
+    })
+}
+
+fn find_slot_by_lore_contains(
+    slots: &[azalea_inventory::ItemStack],
+    needle: &str,
+) -> Option<usize> {
     slots.iter().enumerate().find_map(|(i, item)| {
         let lore = get_item_lore_from_slot(item);
         lore_contains_phrase(&lore, needle).then_some(i)
@@ -1720,7 +2132,10 @@ fn find_slot_by_lore_contains(slots: &[azalea_inventory::ItemStack], needle: &st
 fn parse_bed_remaining_secs(item: &azalea_inventory::ItemStack) -> Option<u64> {
     let name = get_item_display_name_from_slot(item).unwrap_or_default();
     let lore = get_item_lore_from_slot(item);
-    let all_text = std::iter::once(name).chain(lore).collect::<Vec<_>>().join(" ");
+    let all_text = std::iter::once(name)
+        .chain(lore)
+        .collect::<Vec<_>>()
+        .join(" ");
     parse_bed_remaining_secs_from_text(&all_text)
 }
 
@@ -1737,7 +2152,11 @@ fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
                 let mut secs = String::new();
                 for _ in 0..2 {
                     if let Some(d) = chars.next() {
-                        if d.is_ascii_digit() { secs.push(d); } else { break; }
+                        if d.is_ascii_digit() {
+                            secs.push(d);
+                        } else {
+                            break;
+                        }
                     }
                 }
                 if secs.len() == 2 {
@@ -1777,6 +2196,14 @@ fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
     None
 }
 
+/// Check if a lowercased string contains "ended" as a standalone word
+/// (e.g. "auction ended") but NOT as a suffix of another word (e.g.
+/// "recommended", "mended", "befriended").  Uses a regex word boundary.
+fn contains_word_ended(text: &str) -> bool {
+    static RE: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\bended\b").unwrap());
+    RE.is_match(text)
+}
+
 /// Returns true if the item is a claimable (sold/ended/expired) auction slot.
 /// Matches TypeScript ingameMessageHandler claimableIndicators / activeIndicators.
 fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
@@ -1787,7 +2214,7 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     let combined = lore.join("\n").to_lowercase();
     // Must have at least one claimable indicator (from TypeScript claimableIndicators)
     let has_claimable = combined.contains("sold!")
-        || combined.contains("ended")
+        || contains_word_ended(&combined)
         || combined.contains("expired")
         || combined.contains("click to claim")
         || combined.contains("claim your");
@@ -1796,6 +2223,40 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
         || combined.contains("buy it now")
         || combined.contains("starting bid");
     has_claimable && !is_active
+}
+
+/// Whether a claimable "Manage Auctions" slot was listed by *this* account.
+///
+/// Only consulted when `only_claim_own_auctions` is on. Anything we cannot
+/// positively attribute is left for its owner — see [`crate::auction_ownership`]
+/// for why an undecidable slot is skipped rather than claimed.
+fn claim_slot_is_ours(item: &azalea_inventory::ItemStack, slot: usize) -> bool {
+    use crate::auction_ownership::{ownership_of, Ownership};
+    let Some(display_name) = get_item_display_name_from_slot(item) else {
+        return false;
+    };
+    let price = extract_price_from_lore(&get_item_lore_from_slot(item));
+    match ownership_of(&display_name, price) {
+        Ownership::Ours => true,
+        Ownership::Foreign => {
+            debug!(
+                "[ClaimSold] Slot {} ('{}') is not one of ours — leaving it for the co-op",
+                slot,
+                remove_mc_colors(&display_name)
+            );
+            false
+        }
+        Ownership::Unknown => {
+            warn!(
+                "[ClaimSold] Cannot tell whether slot {} ('{}') is ours — skipping it. \
+                 No listing history yet and no auctions returned for this account; \
+                 it will resolve once the bot lists something or the API answers.",
+                slot,
+                remove_mc_colors(&display_name)
+            );
+            false
+        }
+    }
 }
 
 fn is_my_auctions_window_title(window_title: &str) -> bool {
@@ -1863,8 +2324,14 @@ fn parse_bazaar_filled_notification(message: &str) -> Option<(String, bool)> {
     if !is_buy && !is_sell {
         return None;
     }
-    let prefix = if is_buy { "Buy Order for " } else { "Sell Offer for " };
-    let item_name = message.split(prefix).nth(1)
+    let prefix = if is_buy {
+        "Buy Order for "
+    } else {
+        "Sell Offer for "
+    };
+    let item_name = message
+        .split(prefix)
+        .nth(1)
         .and_then(|s| s.split(" was filled").next())
         .unwrap_or("")
         .trim()
@@ -1990,8 +2457,7 @@ fn parse_bazaar_order_identity_from_lore(lore: &[String]) -> Option<(bool, Strin
 
 fn is_buy_bazaar_order_name(name: &str) -> bool {
     let lower = name.trim_start().to_lowercase();
-    starts_with_phrase_delimited(&lower, "buy order")
-        || lower.starts_with("buy ")
+    starts_with_phrase_delimited(&lower, "buy order") || lower.starts_with("buy ")
 }
 
 fn parse_bazaar_order_identity(name: &str, lore: &[String]) -> Option<(bool, String)> {
@@ -2054,10 +2520,64 @@ fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
                 let filled_str = after[..slash_pos].replace(',', "");
                 let rest = &after[slash_pos + 1..];
                 // Total ends at the next space or end of string
-                let total_str = rest.split_whitespace().next().unwrap_or("").replace(',', "");
-                if let (Ok(filled), Ok(total)) = (filled_str.parse::<u64>(), total_str.parse::<u64>()) {
+                let total_str = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .replace(',', "");
+                if let (Ok(filled), Ok(total)) =
+                    (filled_str.parse::<u64>(), total_str.parse::<u64>())
+                {
                     return Some((filled, total));
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Parse the total order amount from Hypixel's order lore.
+///
+/// Lore lines contain `"Order amount: 64x"` (e.g. `"Order amount: 2,560x"`).
+/// Returns the total amount when found.
+fn parse_order_amount_from_lore(lore: &[String]) -> Option<u64> {
+    for line in lore {
+        let clean = remove_mc_colors(line);
+        let lower = clean.to_lowercase();
+        if let Some(idx) = lower.find("order amount:") {
+            let after = &clean[idx + "order amount:".len()..].trim_start();
+            // Strip trailing 'x' and commas, e.g. "2,560x" → "2560"
+            let num_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect::<String>()
+                .replace(',', "");
+            if let Ok(amount) = num_str.parse::<u64>() {
+                return Some(amount);
+            }
+        }
+    }
+    // Fallback: try to extract the total from the Filled line (X/Y → Y)
+    parse_filled_amount_from_lore(lore).map(|(_, total)| total)
+}
+
+/// Parse the price per unit from Hypixel's order lore.
+///
+/// Lore lines contain `"Price per unit: 1,958.0 coins"`.
+/// Returns the price when found.
+fn parse_unit_price_from_lore(lore: &[String]) -> Option<f64> {
+    for line in lore {
+        let clean = remove_mc_colors(line);
+        let lower = clean.to_lowercase();
+        if let Some(idx) = lower.find("price per unit:") {
+            let after = &clean[idx + "price per unit:".len()..].trim_start();
+            let num_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+                .collect::<String>()
+                .replace(',', "");
+            if let Ok(price) = num_str.parse::<f64>() {
+                return Some(price);
             }
         }
     }
@@ -2072,14 +2592,15 @@ fn is_terminal_purchase_failure_message(message: &str) -> bool {
         || message.contains("The auction wasn't found!")
         || message.contains("You cannot view this auction!")
         || message.contains("You cannot afford this auction!")
+        || message.contains("don't have the space required to claim")
+        || message.contains("Your inventory is full!")
 }
 
 /// Handle events from the Azalea client
-async fn event_handler(
-    bot: Client,
-    event: Event,
-    state: BotClientState,
-) -> Result<()> {
+async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Result<()> {
+    // Spawn the dedicated command processor on the first event_handler call.
+    // Commands are processed as soon as they arrive rather than waiting for
+    // the next Azalea event.
     if !state.command_processor_started.swap(true, Ordering::AcqRel) {
         let command_bot = bot.clone();
         let command_state = state.clone();
@@ -2088,20 +2609,39 @@ async fn event_handler(
         });
     }
 
+    // While an intentional disconnect (humanization rest break) is in effect,
+    // stay offline: re-disable auto-reconnect and drop the connection on every
+    // event — including the Login fired by any reconnect attempt — so the bot
+    // cannot silently rejoin and resume flipping mid-break. Reset by the
+    // post-break process restart.
+    if state.disconnect_requested.load(Ordering::Acquire) {
+        enforce_offline(&bot);
+        return Ok(());
+    }
+
     match event {
         Event::Login => {
             info!("Bot logged in successfully");
             if state.event_tx.send(BotEvent::Login).is_err() {
                 debug!("Failed to send Login event - receiver dropped");
             }
-            
+
             // Reset startup flags on (re)login so the startup sequence runs again.
             // Keep state at GracePeriod (allows commands), matching TypeScript where
             // 'gracePeriod' does NOT block flips – only 'startup' does.
             *state.joined_skyblock.write() = false;
             *state.teleported_to_island.write() = false;
             *state.skyblock_join_time.write() = None;
-            
+
+            // IMPORTANT: reset startup_in_progress so that if the bot disconnected
+            // mid-startup (while the flag was true), the new session's startup
+            // workflow is not silently skipped.  Without this reset,
+            // run_startup_workflow() would see the stale `true` value, bail out
+            // immediately, and leave the flag permanently set — causing every
+            // non-startup command (BazaarBuyOrder, ManageOrders, …) to be dropped
+            // by the main.rs command-processor guard indefinitely.
+            state.startup_in_progress.store(false, Ordering::Relaxed);
+
             // Reset the cancel-failure tracker on login so previously-stuck
             // orders get a fresh set of retry attempts after reconnect.
             state.order_cancel_failures.write().clear();
@@ -2110,91 +2650,150 @@ async fn event_handler(
             // Do NOT set to Startup here; Startup is reserved for an active startup workflow.
             *state.bot_state.write() = BotState::GracePeriod;
 
-            // Spawn a 30-second startup-completion watchdog (matching TypeScript's ~5.5 s grace
-            // period + runStartupWorkflow).  If the chat-based detection hasn't fired by then,
-            // this guarantees the bot exits GracePeriod and becomes fully ready.
+            // Spawn a last-resort startup-completion watchdog. The normal
+            // paths (SkyBlock join chat line, or the join-timeout timer from
+            // Event::Init) almost always claim the transition first. On
+            // proxied/high-latency links the SkyBlock switch legitimately
+            // takes longer than the old fixed 30s — and forcing early ran
+            // /sbmenu and /ah while the bot was still in the lobby, which is
+            // exactly the "Command CheckCookie timed out after 60s" /
+            // "Command ClaimSoldItem timed out after 60s" failure. Poll
+            // instead of assuming, and only force when nothing claimed it.
             {
-                let bot_state_wd = state.bot_state.clone();
+                let state_wd = state.clone();
                 let teleported_wd = state.teleported_to_island.clone();
                 let joined_wd = state.joined_skyblock.clone();
                 let bot_wd = bot.clone();
-                let event_tx_wd = state.event_tx.clone();
-                let manage_orders_cancelled_wd = state.manage_orders_cancelled.clone();
-                let auto_cookie_wd = state.auto_cookie_hours.clone();
-                let command_queue_wd = state.command_queue.clone();
-                let startup_in_progress_wd = state.startup_in_progress.clone();
-                let enable_bazaar_flips_wd = state.enable_bazaar_flips.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                    let already_done = *teleported_wd.read();
-                    if !already_done {
-                        warn!("[Startup] 30-second watchdog: forcing startup completion");
-                        *joined_wd.write() = true;
-                        *teleported_wd.write() = true;
-                        // Retry /play sb in case the initial attempt failed (lobby not ready)
+                    const WATCHDOG_SECS: u64 = 90;
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(WATCHDOG_SECS);
+                    while std::time::Instant::now() < deadline {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        if *teleported_wd.read() {
+                            return; // normal path already ran the startup flow
+                        }
+                    }
+                    // Read BEFORE claiming: the claim marks joined=true, so
+                    // afterwards this can no longer tell whether the SkyBlock
+                    // switch ever confirmed.
+                    let was_joined = *joined_wd.read();
+                    if !claim_startup_transition(&state_wd) {
+                        return;
+                    }
+                    warn!(
+                        "[Startup] {}s watchdog: forcing startup completion",
+                        WATCHDOG_SECS
+                    );
+                    if !was_joined {
+                        // Retry the SkyBlock switch and give the world a real
+                        // chance to load (proxied links can take tens of
+                        // seconds) instead of the old fixed 7s.
                         send_chat_command(&bot_wd, "/play sb");
-                        // Wait for SkyBlock to load (5s) + island teleport delay combined
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5 + ISLAND_TELEPORT_DELAY_SECS)).await;
-                        send_chat_command(&bot_wd, "/is");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-                        run_startup_workflow(bot_wd, bot_state_wd, event_tx_wd, manage_orders_cancelled_wd, auto_cookie_wd, command_queue_wd, startup_in_progress_wd, enable_bazaar_flips_wd).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                    }
+                    spawn_startup_after_teleport(bot_wd, &state_wd);
+                });
+            }
+
+            // Spawn the live-RTT pinger for this login. Sends a vanilla F3+3 ping
+            // every few seconds so `hypixel_ping::LATEST_LIVE_PING_MS` reflects the
+            // true game-connection RTT (proxy hop included) for bed timing.
+            {
+                let my_gen = PINGER_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                let bot_ping = bot.clone();
+                tokio::spawn(async move {
+                    // Let the connection settle into the play state first.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                    while PINGER_GEN.load(Ordering::Acquire) == my_gen {
+                        send_ping_request(&bot_ping);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                     }
                 });
             }
         }
-        
+
         Event::Init => {
             info!("Bot initialized and spawned in world");
             if state.event_tx.send(BotEvent::Spawn).is_err() {
                 debug!("Failed to send Spawn event - receiver dropped");
             }
-            
+
             // Check if we've already joined SkyBlock
             let joined_skyblock = *state.joined_skyblock.read();
-            
+
             if !joined_skyblock {
                 // First spawn -- we're in the lobby, join SkyBlock
                 info!("Joining Hypixel SkyBlock...");
-                
+
                 // Spawn a task to send the command after delay (non-blocking)
                 let bot_clone = bot.clone();
                 let skyblock_join_time = state.skyblock_join_time.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(LOBBY_COMMAND_DELAY_SECS)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(LOBBY_COMMAND_DELAY_SECS))
+                        .await;
                     send_chat_command(&bot_clone, "/play sb");
                 });
-                
+
                 // Set the join time for timeout tracking
                 *skyblock_join_time.write() = Some(tokio::time::Instant::now());
+
+                // The join deadline used to be evaluated only inside the chat
+                // handler, so it fired only if SOME chat message happened to
+                // arrive after it. On a quiet or proxied link that meant
+                // nothing ran at all and only the blunt watchdog recovered.
+                // Run the deadline on a real timer so the startup flow is
+                // guaranteed to start even with zero chat traffic.
+                {
+                    let state_timer = state.clone();
+                    let bot_timer = bot.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                            SKYBLOCK_JOIN_TIMEOUT_SECS,
+                        ))
+                        .await;
+                        if !claim_startup_transition(&state_timer) {
+                            return; // chat detection already ran the flow
+                        }
+                        info!("Timeout waiting for SkyBlock confirmation - attempting to teleport to island anyway...");
+                        spawn_startup_after_teleport(bot_timer, &state_timer);
+                    });
+                }
             }
             // Note: startup-completion watchdog is spawned from Event::Login,
             // which fires reliably after the bot is authenticated and in the game.
         }
-        
+
         Event::Chat(chat) => {
             // Filter out overlay messages (action bar - e.g., health/defense/mana stats)
             let is_overlay = matches!(chat, ChatPacket::System(ref packet) if packet.overlay);
-            
+
             if is_overlay {
                 // Skip overlay messages - they spam the logs with stats updates
                 return Ok(());
             }
-            
+
             let message = chat.message().to_string();
             state.handlers.handle_chat_message(&message).await;
-            if state.event_tx.send(BotEvent::ChatMessage(message.clone())).is_err() {
+            if state
+                .event_tx
+                .send(BotEvent::ChatMessage(message.clone()))
+                .is_err()
+            {
                 debug!("Failed to send ChatMessage event - receiver dropped");
             }
 
             // Buffer the message for periodic chatBatch upload to Coflnet.
             // Uses clean text (color codes stripped) matching the Coflnet mod protocol.
-            let clean_for_batch = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
+            let clean_for_batch =
+                crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
             if !clean_for_batch.trim().is_empty() {
                 state.chat_batch_buffer.write().push(clean_for_batch);
             }
 
             // Detect purchase/sold messages and emit events
-            let clean_message = crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
+            let clean_message =
+                crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
 
             if clean_message.contains("You purchased") && clean_message.contains("coins!") {
                 // "You purchased <item> for <price> coins!"
@@ -2205,30 +2804,63 @@ async fn event_handler(
                     let estimated_server_ack_ms = buy_speed_ms
                         .zip(ping_ms)
                         .map(|(speed, ping)| speed.saturating_sub((ping / 2).max(1)));
+                    // Whether this buy went through bed timing (vs an instant nugget).
+                    let via_bed = state.last_buy_via_bed.write().take();
+                    // Drill part-out: if enabled and this looks like a drill, strip its
+                    // installed parts before it is listed. The workflow re-checks NBT.
+                    if REMOVE_DRILL_PARTS.load(Ordering::Relaxed)
+                        && item_name.to_lowercase().contains("drill")
+                    {
+                        tokio::spawn(remove_drill_parts_workflow(
+                            bot.clone(),
+                            state.clone(),
+                            item_name.clone(),
+                        ));
+                    }
                     let _ = state.event_tx.send(BotEvent::ItemPurchased {
                         item_name,
                         price,
                         buy_speed_ms,
                         ping_ms,
                         estimated_server_ack_ms,
+                        via_bed,
                     });
                 }
             } else if clean_message.contains("Putting coins in escrow") {
                 // "Putting coins in escrow..." — purchase accepted by server.
-                // Calculate buy speed from when /viewauction was sent.
-                if let Some(start) = state.purchase_start_time.write().take() {
+                // Buy speed is measured from when the BIN Auction View opened
+                // (act-on-open speed), falling back to the /viewauction send time
+                // if the view-open marker is somehow missing.
+                let start = state
+                    .bin_view_open_time
+                    .write()
+                    .take()
+                    .or_else(|| *state.purchase_start_time.read());
+                // Always clear the /viewauction marker too so it doesn't leak.
+                *state.purchase_start_time.write() = None;
+                // If the bed branch never fired for this purchase, it was an
+                // instant gold_nugget buy ("nugget"). Don't overwrite a bed flag.
+                {
+                    let mut via = state.last_buy_via_bed.write();
+                    if via.is_none() {
+                        *via = Some(false);
+                    }
+                }
+                if let Some(start) = start {
                     let speed_ms = start.elapsed().as_millis() as u64;
                     *state.last_buy_speed_ms.write() = Some(speed_ms);
                     let ping_ms = current_tab_ping_ms(&bot);
-                    let est_server_ms = ping_ms.map(|ping| speed_ms.saturating_sub((ping / 2).max(1)));
+                    let est_server_ms =
+                        ping_ms.map(|ping| speed_ms.saturating_sub((ping / 2).max(1)));
                     let timing_suffix = match (ping_ms, est_server_ms) {
                         (Some(ping), Some(est)) => format!(" (~{}ms server, {}ms ping)", est, ping),
                         (Some(ping), None) => format!(" ({}ms ping)", ping),
                         _ => String::new(),
                     };
-                    let _ = state.event_tx.send(BotEvent::ChatMessage(
-                        format!("\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}aAuction bought in {}ms{}", speed_ms, timing_suffix)
-                    ));
+                    let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
+                        "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}aAuction bought in {}ms{}",
+                        speed_ms, timing_suffix
+                    )));
                     info!("[AH] Buy speed: {}ms", speed_ms);
                 }
             } else if *state.bot_state.read() == BotState::Purchasing
@@ -2257,7 +2889,9 @@ async fn event_handler(
                     if window_id > 0 {
                         send_raw_close(&bot, window_id, &state.handlers);
                     }
-                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                    state
+                        .grace_period_spam_active
+                        .store(false, Ordering::Relaxed);
                     state.skip_click_sent.store(false, Ordering::Relaxed);
                     *state.purchase_start_time.write() = None;
                     *state.pending_purchase_at_ms.write() = None;
@@ -2267,7 +2901,76 @@ async fn event_handler(
                         let _ = state.event_tx.send(BotEvent::NoCookieDetected);
                     }
                 }
-            } else if clean_message.contains("[Auction]") && clean_message.contains("bought") && clean_message.contains("for") && clean_message.contains("coins") {
+            } else if matches!(
+                *state.bot_state.read(),
+                BotState::ClaimingSold | BotState::ClaimingPurchased
+            ) && (clean_message.contains("This auction wasn't found!")
+                || clean_message.contains("The auction wasn't found!"))
+            {
+                // "auction wasn't found" during a claim means the auction is already
+                // gone — it was ALREADY claimed/collected (e.g. via Claim All or the
+                // chat CLICK link). No window opens in this case, so the window
+                // handlers never fire and the claim would otherwise hang until the
+                // 60s queue timeout. Treat it as a completed claim, go idle now.
+                let was_claiming = {
+                    let mut bs = state.bot_state.write();
+                    if matches!(*bs, BotState::ClaimingSold | BotState::ClaimingPurchased) {
+                        *bs = BotState::Idle;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if was_claiming {
+                    info!("[Claim] Auction not found (already claimed) — treating as done, going idle");
+                    let window_id = *state.last_window_id.read();
+                    if window_id > 0 {
+                        send_raw_close(&bot, window_id, &state.handlers);
+                    }
+                    state.auction_slot_blocked.store(false, Ordering::Relaxed);
+                }
+            } else if clean_message.contains("canceled your auction for")
+                || clean_message.contains("cancelled your auction for")
+            {
+                // An auction was cancelled (bot command, manual, or web panel) — a
+                // listing slot just freed. Clear the sticky auction-limit flag so
+                // queued SellToAuction commands (e.g. /trex sellinv) stop being
+                // dropped, and clear any slot-blocked state for good measure. The
+                // flag is otherwise only cleared on a SALE, so a cancel left it
+                // stuck true and the bot silently refused to list anything.
+                if state.auction_at_limit.load(Ordering::Relaxed) {
+                    info!("[Auction] Auction cancelled — clearing auction-limit flag (slot freed)");
+                    state.auction_at_limit.store(false, Ordering::Relaxed);
+                }
+                state.auction_slot_blocked.store(false, Ordering::Relaxed);
+                // THIS is where a cancellation is actually confirmed. Hypixel
+                // cancels the moment "Cancel Auction" is clicked and opens NO
+                // confirm window, so the `window_title.contains("Confirm")` arm
+                // of the CancellingAuction flow never runs and the cancel
+                // watchdog logs "No follow-up window after 2s" instead — which
+                // meant `AuctionCancelled` was never emitted and no webhook was
+                // ever sent for a cancel, from the web panel or anywhere else.
+                // Emitting here covers every route into a cancellation: panel,
+                // backend command, /trex, or the user doing it by hand in game.
+                if let Some(item) = parse_cancelled_auction_message(&clean_message) {
+                    // The bid is only known when WE asked for this cancel; a
+                    // hand-cancelled auction reports 0 rather than a wrong number.
+                    let requested = state.cancel_auction_item_name.read().clone();
+                    let bid = if !requested.is_empty()
+                        && remove_mc_colors(&requested).to_lowercase()
+                            == remove_mc_colors(&item).to_lowercase()
+                    {
+                        (*state.cancel_auction_starting_bid.read()).max(0) as u64
+                    } else {
+                        0
+                    };
+                    emit_auction_cancelled(&state, item, bid, "chat confirmation");
+                }
+            } else if clean_message.contains("[Auction]")
+                && clean_message.contains("bought")
+                && clean_message.contains("for")
+                && clean_message.contains("coins")
+            {
                 // "[Auction] <buyer> bought <item> for <price> coins"
                 // Always claim sold auctions. The active_auction_listings filter was
                 // previously used for coop filtering but it is an in-memory set that
@@ -2284,7 +2987,9 @@ async fn event_handler(
                     if !own_name.is_empty() && buyer.eq_ignore_ascii_case(&own_name) {
                         debug!("[Auction] Ignoring own purchase notification: \"{}\" bought \"{}\" for {}", buyer, item_name, price);
                     } else {
-                        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+                        let item_key =
+                            crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name)
+                                .to_lowercase();
                         // Housekeeping: remove from active listings if present
                         state.active_auction_listings.write().remove(&item_key);
                         // Try to extract the auction UUID from the JSON representation of the
@@ -2293,7 +2998,8 @@ async fn event_handler(
                         // but present in the serialised FormattedText JSON.  We try the JSON
                         // path first because for Hypixel sold messages the UUID is *only* in
                         // the click event, so trying plain text first would always fail.
-                        let uuid = serde_json::to_string(&chat.message()).ok()
+                        let uuid = serde_json::to_string(&chat.message())
+                            .ok()
                             .as_deref()
                             .and_then(extract_viewauction_uuid)
                             .or_else(|| extract_viewauction_uuid(&clean_message));
@@ -2313,7 +3019,12 @@ async fn event_handler(
                             info!("[Auction] Auction sold, clearing auction-limit flag");
                             state.auction_at_limit.store(false, Ordering::Relaxed);
                         }
-                        let _ = state.event_tx.send(BotEvent::ItemSold { item_name, price, buyer, auction_uuid: state.claim_sold_uuid.read().clone() });
+                        let _ = state.event_tx.send(BotEvent::ItemSold {
+                            item_name,
+                            price,
+                            buyer,
+                            auction_uuid: state.claim_sold_uuid.read().clone(),
+                        });
                     }
                 }
             } else if clean_message.contains("You already have an item in the auction slot") {
@@ -2323,7 +3034,9 @@ async fn event_handler(
                 if *state.bot_state.read() == BotState::Selling {
                     // fetch_add returns the *previous* value, so attempt 0..2 are the
                     // 3 retry attempts (when MAX is 3); attempt 3 triggers the give-up.
-                    let attempt = state.auction_stuck_item_retries.fetch_add(1, Ordering::Relaxed);
+                    let attempt = state
+                        .auction_stuck_item_retries
+                        .fetch_add(1, Ordering::Relaxed);
 
                     // Common to both paths: abort current flow.
                     state.auction_sell_aborted.store(true, Ordering::Relaxed);
@@ -2334,7 +3047,9 @@ async fn event_handler(
                         // does NOT always clear Hypixel's internal auction-slot state,
                         // causing the same error on retry.  Clicking the slot tells the
                         // server to return the item to the player's inventory.
-                        info!("[Auction] Clicking slot 13 to clear stuck item before closing window");
+                        info!(
+                            "[Auction] Clicking slot 13 to clear stuck item before closing window"
+                        );
                         send_raw_click(&bot, window_id, 13);
                         send_raw_close(&bot, window_id, &state.handlers);
                     }
@@ -2357,11 +3072,16 @@ async fn event_handler(
                         let bot_clone = bot.clone();
                         let state_clone = state.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(AUCTION_RETRY_AFTER_STUCK_ITEM_MS)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                AUCTION_RETRY_AFTER_STUCK_ITEM_MS,
+                            ))
+                            .await;
                             // Only retry if still in Selling state (not interrupted by another command)
                             if *state_clone.bot_state.read() == BotState::Selling {
                                 info!("[Auction] Retrying auction after removing stuck item — sending /ah");
-                                state_clone.auction_sell_aborted.store(false, Ordering::Relaxed);
+                                state_clone
+                                    .auction_sell_aborted
+                                    .store(false, Ordering::Relaxed);
                                 send_chat_command(&bot_clone, "/ah");
                             }
                         });
@@ -2372,8 +3092,8 @@ async fn event_handler(
                 // was accepted.  Emit AuctionListed using the context stored in state.
                 // This matches TypeScript sellHandler.ts messageListener pattern.
                 let item = state.auction_item_name.read().clone();
-                let bid  = *state.auction_starting_bid.read();
-                let dur  = *state.auction_duration_hours.read();
+                let bid = *state.auction_starting_bid.read();
+                let dur = *state.auction_duration_hours.read();
                 let expected_profit = *state.auction_expected_profit.read();
 
                 // Diagnostic safety check: verify the listed item roughly matches what
@@ -2386,11 +3106,18 @@ async fn event_handler(
                     .nth(1)
                     .and_then(|s| s.strip_suffix('!'))
                 {
-                    let actual_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(actual_item)
-                        .trim().to_lowercase();
-                    let intended_clean = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item)
-                        .trim().to_lowercase();
-                    if !intended_clean.is_empty() && !actual_clean.contains(&intended_clean) && !intended_clean.contains(&actual_clean) {
+                    let actual_clean =
+                        crate::bot::handlers::BotEventHandlers::remove_color_codes(actual_item)
+                            .trim()
+                            .to_lowercase();
+                    let intended_clean =
+                        crate::bot::handlers::BotEventHandlers::remove_color_codes(&item)
+                            .trim()
+                            .to_lowercase();
+                    if !intended_clean.is_empty()
+                        && !actual_clean.contains(&intended_clean)
+                        && !intended_clean.contains(&actual_clean)
+                    {
                         error!(
                             "[Auction] ITEM MISMATCH! Intended: \"{}\" but Hypixel listed: \"{}\". \
                              This may indicate the wrong item was sold!",
@@ -2401,8 +3128,14 @@ async fn event_handler(
 
                 // Track this as our active listing for coop sale filtering
                 if !item.is_empty() {
-                    let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item).to_lowercase();
+                    let item_key =
+                        crate::bot::handlers::BotEventHandlers::remove_color_codes(&item)
+                            .to_lowercase();
                     state.active_auction_listings.write().insert(item_key);
+                    // Persisted ownership history: this is the record that lets
+                    // `only_claim_own_auctions` tell our sold auctions apart from
+                    // a co-op member's in the shared Manage Auctions window.
+                    crate::auction_ownership::note_own_listing(&item, bid as i64);
                 }
                 // Listing succeeded — clear any stale auction-limit flag and
                 // reset the stuck-item retry counter so the next SellToAuction
@@ -2410,7 +3143,10 @@ async fn event_handler(
                 state.auction_at_limit.store(false, Ordering::Relaxed);
                 state.auction_stuck_item_retries.store(0, Ordering::Relaxed);
                 if !item.is_empty() {
-                    info!("[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)", item, bid, dur);
+                    info!(
+                        "[Auction] Chat confirmed listing of \"{}\" @ {} coins ({}h)",
+                        item, bid, dur
+                    );
                     let _ = state.event_tx.send(BotEvent::AuctionListed {
                         item_name: item,
                         starting_bid: bid,
@@ -2424,7 +3160,8 @@ async fn event_handler(
                 // 100 ms until the Confirm Purchase window opens — matches
                 // AutoBuy.initBedSpam() which clicks whenever slotName === "gold_nugget".
                 if *state.bot_state.read() == BotState::Purchasing {
-                    let already_active = state.grace_period_spam_active.swap(true, Ordering::Relaxed);
+                    let already_active =
+                        state.grace_period_spam_active.swap(true, Ordering::Relaxed);
                     if !already_active {
                         let bot_clone = bot.clone();
                         let window_id = *state.last_window_id.read();
@@ -2432,7 +3169,10 @@ async fn event_handler(
                         let bot_state = state.bot_state.clone();
                         let spam_flag = state.grace_period_spam_active.clone();
                         let click_interval_ms = state.bed_spam_click_delay.max(1);
-                        info!("[AH] Grace period detected — starting bed spam ({} ms interval)", click_interval_ms);
+                        info!(
+                            "[AH] Grace period detected — starting bed spam ({} ms interval)",
+                            click_interval_ms
+                        );
                         tokio::spawn(async move {
                             const MAX_FAILED_CLICKS: usize = 5;
                             let mut failed_clicks: usize = 0;
@@ -2448,10 +3188,16 @@ async fn event_handler(
                                 let current_kind = {
                                     let menu = bot_clone.menu();
                                     let slots = menu.slots();
-                                    slots.get(31).map(|s| {
-                                        if s.is_empty() { "air".to_string() }
-                                        else { s.kind().to_string().to_lowercase() }
-                                    }).unwrap_or_else(|| "air".to_string())
+                                    slots
+                                        .get(31)
+                                        .map(|s| {
+                                            if s.is_empty() {
+                                                "air".to_string()
+                                            } else {
+                                                s.kind().to_string().to_lowercase()
+                                            }
+                                        })
+                                        .unwrap_or_else(|| "air".to_string())
                                 };
                                 if current_kind.contains("air") {
                                     info!("[AH] Grace period spam: window closed");
@@ -2461,17 +3207,27 @@ async fn event_handler(
                                     // Grace period may still be active — keep clicking.
                                     // Reset failed counter: slot is correct, just waiting.
                                     failed_clicks = 0;
-                                    click_window_slot(&bot_clone, &shared_window_id, window_id, 31).await;
+                                    click_window_slot(&bot_clone, &shared_window_id, window_id, 31)
+                                        .await;
                                 } else {
                                     failed_clicks += 1;
-                                    debug!("[AH] Grace period spam: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                                    debug!(
+                                        "[AH] Grace period spam: slot 31 = {} (failed {}/{})",
+                                        current_kind, failed_clicks, MAX_FAILED_CLICKS
+                                    );
                                     if failed_clicks >= MAX_FAILED_CLICKS {
-                                        warn!("[AH] Grace period spam stopped after {} failed clicks", failed_clicks);
+                                        warn!(
+                                            "[AH] Grace period spam stopped after {} failed clicks",
+                                            failed_clicks
+                                        );
                                         *bot_state.write() = BotState::Idle;
                                         break;
                                     }
                                 }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    click_interval_ms,
+                                ))
+                                .await;
                             }
                             spam_flag.store(false, Ordering::Relaxed);
                         });
@@ -2481,10 +3237,15 @@ async fn event_handler(
 
             // Detect bazaar order limit ("You reached your maximum of XY Bazaar orders!")
             // and clear it when an order fills ("Claimed ... coins from ...").
-            if clean_message.contains("You reached your maximum of") && clean_message.contains("Bazaar orders") {
+            if clean_message.contains("You reached your maximum of")
+                && clean_message.contains("Bazaar orders")
+            {
                 warn!("[Bazaar] Order limit reached — pausing bazaar flips until a slot frees up");
                 state.bazaar_at_limit.store(true, Ordering::Relaxed);
-            } else if clean_message.contains("[Bazaar]") && (clean_message.contains("coins from selling") || clean_message.contains("coins from buying")) {
+            } else if clean_message.contains("[Bazaar]")
+                && (clean_message.contains("coins from selling")
+                    || clean_message.contains("coins from buying"))
+            {
                 // An order was collected — a slot is now free
                 if state.bazaar_at_limit.load(Ordering::Relaxed) {
                     info!("[Bazaar] Order collected, clearing order-limit flag");
@@ -2493,14 +3254,20 @@ async fn event_handler(
             }
 
             // Detect bazaar daily sell value limit
-            if clean_message.contains("You reached the daily limit") && clean_message.contains("bazaar") {
-                warn!("[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC");
+            if clean_message.contains("You reached the daily limit")
+                && clean_message.contains("bazaar")
+            {
+                warn!(
+                    "[Bazaar] Daily sell value limit reached — pausing bazaar flips until 0:00 UTC"
+                );
                 state.bazaar_daily_limit.store(true, Ordering::Relaxed);
             }
 
             // Detect bazaar order rejection ("Your price isn't competitive enough")
             // so the confirm handler knows not to emit BazaarOrderPlaced.
-            if clean_message.contains("[Bazaar]") && clean_message.contains("Your price isn't competitive enough") {
+            if clean_message.contains("[Bazaar]")
+                && clean_message.contains("Your price isn't competitive enough")
+            {
                 warn!("[Bazaar] Order rejected — price not competitive");
                 state.bazaar_order_rejected.store(true, Ordering::Relaxed);
             }
@@ -2508,7 +3275,11 @@ async fn event_handler(
             // Detect "[Bazaar] Your Buy Order/Sell Offer for X was filled!" — trigger a
             // ManageOrders run so the filled items are collected promptly.
             if let Some((filled_item, is_buy)) = parse_bazaar_filled_notification(&clean_message) {
-                info!("[BazaarOrders] Order fill notification — {} \"{}\"", if is_buy { "BUY" } else { "SELL" }, filled_item);
+                info!(
+                    "[BazaarOrders] Order fill notification — {} \"{}\"",
+                    if is_buy { "BUY" } else { "SELL" },
+                    filled_item
+                );
                 let _ = state.event_tx.send(BotEvent::BazaarOrderFilled {
                     item_name: filled_item,
                     is_buy_order: is_buy,
@@ -2517,9 +3288,19 @@ async fn event_handler(
 
             // Detect "You don't have the space required to claim that!" and set the
             // inventory_full flag so ManageOrders can stop and log remaining orders.
+            // Verify actual slot count to avoid a stale flag if inventory was freed
+            // between the server sending the message and us processing it.
             if clean_message.contains("don't have the space required to claim") {
-                warn!("[ManageOrders] Inventory full — logging unclaimed orders");
-                state.inventory_full.store(true, Ordering::Relaxed);
+                let empty = count_empty_player_slots(&bot);
+                if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
+                    warn!(
+                        "[ManageOrders] Inventory full — {} empty slots, logging unclaimed orders",
+                        empty
+                    );
+                    state.inventory_full.store(true, Ordering::Relaxed);
+                } else {
+                    info!("[ManageOrders] Claim-space warning but {} empty slots — ignoring stale message", empty);
+                }
             }
 
             // Detect "You have X item(s) stashed away!" — Hypixel sends this both
@@ -2531,7 +3312,10 @@ async fn event_handler(
             if clean_message.contains("stashed away") {
                 let empty = count_empty_player_slots(&bot);
                 if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
-                    warn!("[ManageOrders] Items stashed and inventory nearly full ({} empty slots)", empty);
+                    warn!(
+                        "[ManageOrders] Items stashed and inventory nearly full ({} empty slots)",
+                        empty
+                    );
                     state.inventory_full.store(true, Ordering::Relaxed);
                 } else {
                     debug!("[ManageOrders] Stashed-away reminder ignored — inventory has {} empty slots", empty);
@@ -2546,10 +3330,16 @@ async fn event_handler(
             if clean_message.contains("Inventory full?") {
                 let empty = count_empty_player_slots(&bot);
                 if empty < MIN_FREE_SLOTS_FOR_BUY as usize {
-                    warn!("[ManageOrders] Inventory full hint detected ({} empty slots)", empty);
+                    warn!(
+                        "[ManageOrders] Inventory full hint detected ({} empty slots)",
+                        empty
+                    );
                     state.inventory_full.store(true, Ordering::Relaxed);
                 } else {
-                    debug!("[ManageOrders] Inventory-full hint ignored — inventory has {} empty slots", empty);
+                    debug!(
+                        "[ManageOrders] Inventory-full hint ignored — inventory has {} empty slots",
+                        empty
+                    );
                 }
             }
 
@@ -2570,63 +3360,35 @@ async fn event_handler(
             // Check if we've teleported to island yet
             let teleported = *state.teleported_to_island.read();
             let join_time = *state.skyblock_join_time.read();
-            
+
             // Look for messages indicating we're in SkyBlock and should go to island
             if let Some(join_time) = join_time {
                 if !teleported {
                     // Check for timeout (if we've been waiting too long, try anyway)
-                    let should_timeout = join_time.elapsed() > tokio::time::Duration::from_secs(SKYBLOCK_JOIN_TIMEOUT_SECS);
-                    
+                    let should_timeout = join_time.elapsed()
+                        > tokio::time::Duration::from_secs(SKYBLOCK_JOIN_TIMEOUT_SECS);
+
                     // Check if message is a SkyBlock join confirmation
-                    let skyblock_detected = {
-                        if clean_message.starts_with("Welcome to Hypixel SkyBlock") {
-                            true
-                        }
-                        else if clean_message.starts_with("[Profile]") && clean_message.contains("currently") {
-                            true
-                        }
-                        else if clean_message.starts_with("[") {
-                            let upper = clean_message.to_uppercase();
-                            upper.contains("SKYBLOCK") && upper.contains("PROFILE")
-                        } else {
-                            false
-                        }
-                    };
-                    
+                    let skyblock_detected = is_skyblock_join_message(&clean_message);
+
                     if skyblock_detected || should_timeout {
-                        // Mark as joined now that we've confirmed
-                        *state.joined_skyblock.write() = true;
-                        *state.teleported_to_island.write() = true;
-                        
-                        if should_timeout {
+                        // Mark as joined now that we've confirmed. The claim is
+                        // atomic so the join-timeout timer and the watchdog can
+                        // never run a second startup workflow alongside this.
+                        if !claim_startup_transition(&state) {
+                            // Another path already claimed it.
+                        } else if should_timeout {
                             info!("Timeout waiting for SkyBlock confirmation - attempting to teleport to island anyway...");
+                            spawn_startup_after_teleport(bot.clone(), &state);
                         } else {
                             info!("Detected SkyBlock join - teleporting to island...");
+                            spawn_startup_after_teleport(bot.clone(), &state);
                         }
-                        
-                        // Spawn a task to handle teleportation and startup workflow (non-blocking)
-                        let bot_clone = bot.clone();
-                        let bot_state = state.bot_state.clone();
-                        let event_tx_startup = state.event_tx.clone();
-                        let manage_orders_cancelled_startup = state.manage_orders_cancelled.clone();
-                        let auto_cookie_startup = state.auto_cookie_hours.clone();
-                        let command_queue_startup = state.command_queue.clone();
-                        let startup_in_progress_startup = state.startup_in_progress.clone();
-                        let enable_bazaar_flips_startup = state.enable_bazaar_flips.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(ISLAND_TELEPORT_DELAY_SECS)).await;
-                            send_chat_command(&bot_clone, "/is");
-                            
-                            // Wait for teleport to complete
-                            tokio::time::sleep(tokio::time::Duration::from_secs(TELEPORT_COMPLETION_WAIT_SECS)).await;
-
-                            run_startup_workflow(bot_clone, bot_state, event_tx_startup, manage_orders_cancelled_startup, auto_cookie_startup, command_queue_startup, startup_in_progress_startup, enable_bazaar_flips_startup).await;
-                        });
                     }
                 }
             }
         }
-        
+
         Event::Packet(packet) => {
             // Handle specific packets for window open/close and inventory updates
             match packet.as_ref() {
@@ -2641,14 +3403,15 @@ async fn event_handler(
                     if let Some(t0) = *state.purchase_start_time.read() {
                         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
                         // Read the observer timestamp, dropping the lock immediately.
-                        let observer_ts = state.window_open_info.read()
+                        let observer_ts = state
+                            .window_open_info
+                            .read()
                             .as_ref()
                             .map(|info| info.timestamp);
                         if let Some(obs_ts) = observer_ts {
                             let observer_ms = obs_ts.duration_since(t0).as_secs_f64() * 1000.0;
-                            let pipeline_ms = event_handler_at
-                                .duration_since(obs_ts)
-                                .as_secs_f64() * 1000.0;
+                            let pipeline_ms =
+                                event_handler_at.duration_since(obs_ts).as_secs_f64() * 1000.0;
                             info!(
                                 "[Timing] /viewauction → window: ECS observer {:.1}ms, \
                                  Event::Packet handler {:.1}ms (+{:.1}ms pipeline overhead)",
@@ -2666,14 +3429,17 @@ async fn event_handler(
                     let window_id = open_screen.container_id;
                     let window_type = format!("{:?}", open_screen.menu_type);
                     let title = open_screen.title.to_string();
-                    
+
                     // Parse the title from JSON format
                     let parsed_title = state.handlers.parse_window_title(&title);
-                    
+
                     // Store window ID
                     *state.last_window_id.write() = window_id as u8;
-                    
-                    state.handlers.handle_window_open(window_id as u8, &window_type, &parsed_title).await;
+
+                    state
+                        .handlers
+                        .handle_window_open(window_id as u8, &window_type, &parsed_title)
+                        .await;
 
                     // Log the synchronous overhead of the OpenScreen handler
                     // itself (title parsing + state writes + logging).  This
@@ -2701,7 +3467,15 @@ async fn event_handler(
                             rebuild_cached_window_json(&cache_bot, &cache_state);
                         });
                     }
-                    if state.event_tx.send(BotEvent::WindowOpen(window_id as u8, window_type.clone(), parsed_title.clone())).is_err() {
+                    if state
+                        .event_tx
+                        .send(BotEvent::WindowOpen(
+                            window_id as u8,
+                            window_type.clone(),
+                            parsed_title.clone(),
+                        ))
+                        .is_err()
+                    {
                         debug!("Failed to send WindowOpen event - receiver dropped");
                     }
 
@@ -2714,33 +3488,67 @@ async fn event_handler(
                     // Also skips if a newer command started since this window was opened
                     // (prevents a stale watchdog from interrupting a new command).
                     {
-                        let wdog_bot   = bot.clone();
-                        let wdog_wid   = window_id as u8;
+                        let wdog_bot = bot.clone();
+                        let wdog_wid = window_id as u8;
                         let wdog_state = state.bot_state.clone();
-                        let wdog_last  = state.last_window_id.clone();
-                        let wdog_spam  = state.grace_period_spam_active.clone();
-                        let wdog_bed   = state.bed_timing_active.clone();
-                        let wdog_gen   = state.command_generation.clone();
+                        let wdog_last = state.last_window_id.clone();
+                        let wdog_spam = state.grace_period_spam_active.clone();
+                        let wdog_bed = state.bed_timing_active.clone();
+                        let wdog_gen = state.command_generation.clone();
                         let wdog_gen_at_open = state.command_generation.load(Ordering::SeqCst);
                         let wdog_deadline = state.manage_orders_deadline.clone();
                         let wdog_bz_limit = state.bazaar_at_limit.clone();
                         let wdog_handlers = state.handlers.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            let still_open  = *wdog_last.read() == wdog_wid;
-                            let cur_state   = *wdog_state.read();
-                            let is_bed      = wdog_bed.load(Ordering::Relaxed);
-                            let is_interactive = matches!(cur_state,
-                                BotState::Purchasing | BotState::Bazaar | BotState::Selling
-                                | BotState::ClaimingPurchased | BotState::ClaimingSold
-                                | BotState::InstaSelling
-                                | BotState::CancellingAuction | BotState::SellingInventoryBz
-                                | BotState::ManagingOrders
+                            // ManagingOrders owns its window for a full multi-click
+                            // cancel/collect flow bounded by its OWN ~10s deadline
+                            // (check_manage_orders_deadline) plus per-action
+                            // confirmation waits. Firing the flat 5s close here yanks
+                            // the window out from under that handler mid-click, which
+                            // Hypixel reads as a desync ("Out of sync, check your
+                            // internet connection!") and answers by dropping the bot
+                            // into Limbo. So for ManagingOrders, wait out the handler's
+                            // own deadline (+2s margin) before acting as the last-resort
+                            // stuck-window net; the state is fully re-read afterwards, so
+                            // if the handler already finished we do nothing.
+                            if *wdog_state.read() == BotState::ManagingOrders {
+                                // Copy the deadline out and drop the lock guard BEFORE
+                                // awaiting — a parking_lot guard held across .await is
+                                // not Send and would make this task unspawnable.
+                                let deadline = *wdog_deadline.read();
+                                if let Some(deadline) = deadline {
+                                    let now = tokio::time::Instant::now();
+                                    if now < deadline {
+                                        tokio::time::sleep(
+                                            (deadline - now) + tokio::time::Duration::from_secs(2),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            let still_open = *wdog_last.read() == wdog_wid;
+                            let cur_state = *wdog_state.read();
+                            let is_bed = wdog_bed.load(Ordering::Relaxed);
+                            let is_interactive = matches!(
+                                cur_state,
+                                BotState::Purchasing
+                                    | BotState::Bazaar
+                                    | BotState::Selling
+                                    | BotState::ClaimingPurchased
+                                    | BotState::ClaimingSold
+                                    | BotState::InstaSelling
+                                    | BotState::CancellingAuction
+                                    | BotState::SellingInventoryBz
+                                    | BotState::ManagingOrders
                             );
                             // Only fire if no new command started since this window was opened.
                             let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
                             if still_open && is_interactive && !is_bed && gen_unchanged {
-                                warn!("[GUI] Window {} open for >5 s in state {:?} — auto-closing", wdog_wid, cur_state);
+                                warn!(
+                                    "[GUI] Window {} open for >5 s in state {:?} — auto-closing",
+                                    wdog_wid, cur_state
+                                );
                                 send_raw_close(&wdog_bot, wdog_wid, &wdog_handlers);
                                 // Clean up ManagingOrders-specific state so the bot
                                 // doesn't remain stuck with a stale deadline or the
@@ -2766,20 +3574,33 @@ async fn event_handler(
                         let state_s = state.clone();
                         let title_s = parsed_title.clone();
                         tokio::spawn(async move {
-                            let result = std::panic::AssertUnwindSafe(
-                                handle_window_interaction(&bot_s, &state_s, window_id as u8, &title_s)
-                            );
+                            let result = std::panic::AssertUnwindSafe(handle_window_interaction(
+                                &bot_s,
+                                &state_s,
+                                window_id as u8,
+                                &title_s,
+                            ));
                             if let Err(e) = futures::FutureExt::catch_unwind(result).await {
-                                error!("[WindowHandler] panic in handle_window_interaction: {:?}", e);
+                                error!(
+                                    "[WindowHandler] panic in handle_window_interaction: {:?}",
+                                    e
+                                );
                             }
                         });
                     }
                 }
-                
+
+                ClientboundGamePacket::PongResponse(pong) => {
+                    // Reply to our F3+3 ping — measures true live-connection RTT.
+                    crate::hypixel_ping::record_pong(pong.time);
+                }
+
                 ClientboundGamePacket::ContainerClose(_) => {
                     // Clear grace-period spam and bed-timing flags so a new BIN Auction View
                     // can start fresh.
-                    state.grace_period_spam_active.store(false, Ordering::Relaxed);
+                    state
+                        .grace_period_spam_active
+                        .store(false, Ordering::Relaxed);
                     *state.pending_purchase_at_ms.write() = None;
                     state.bed_timing_active.store(false, Ordering::Relaxed);
                     state.handlers.handle_window_close().await;
@@ -2799,7 +3620,7 @@ async fn event_handler(
                         debug!("Failed to send WindowClose event - receiver dropped");
                     }
                 }
-                
+
                 ClientboundGamePacket::ContainerSetSlot(_slot_update) => {
                     // Wake the purchase handler FIRST so it can react to slot 31
                     // data on another thread without waiting for the inventory
@@ -2811,30 +3632,46 @@ async fn event_handler(
                     // inventory slots to JSON.  Coalescing into a single rebuild
                     // after the debounce window dramatically reduces both CPU usage
                     // and World-lock contention that causes slow ECS frames.
-                    if !state.inventory_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
+                    if !state
+                        .inventory_cache_rebuild_scheduled
+                        .swap(true, Ordering::Relaxed)
+                    {
                         let bot_inv = bot.clone();
                         let state_inv = state.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(INVENTORY_CACHE_REBUILD_DEBOUNCE_MS)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                INVENTORY_CACHE_REBUILD_DEBOUNCE_MS,
+                            ))
+                            .await;
                             rebuild_cached_inventory_json(&bot_inv, &state_inv);
-                            state_inv.inventory_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                            state_inv
+                                .inventory_cache_rebuild_scheduled
+                                .store(false, Ordering::Relaxed);
                         });
                     }
                     // Debounce the window-JSON rebuild: individual slot updates can fire
                     // dozens of times per GUI interaction.  Coalesce them into a single
                     // rebuild after the debounce window to avoid excessive CPU from
                     // repeated NBT extraction + JSON serialisation.
-                    if !state.window_cache_rebuild_scheduled.swap(true, Ordering::Relaxed) {
+                    if !state
+                        .window_cache_rebuild_scheduled
+                        .swap(true, Ordering::Relaxed)
+                    {
                         let bot_clone = bot.clone();
                         let state_clone = state.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CACHE_REBUILD_DEBOUNCE_MS)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                WINDOW_CACHE_REBUILD_DEBOUNCE_MS,
+                            ))
+                            .await;
                             rebuild_cached_window_json(&bot_clone, &state_clone);
-                            state_clone.window_cache_rebuild_scheduled.store(false, Ordering::Relaxed);
+                            state_clone
+                                .window_cache_rebuild_scheduled
+                                .store(false, Ordering::Relaxed);
                         });
                     }
                 }
-                
+
                 ClientboundGamePacket::ContainerSetContent(_content) => {
                     // Log when ContainerSetContent arrives during a purchase
                     // flow — this populates slot 31 and unblocks the buy-click.
@@ -2946,7 +3783,10 @@ async fn event_handler(
                             }
                             AuctionStep::DurationSign => {
                                 let hours = *state.auction_duration_hours.read();
-                                info!("[Auction] Sign opened for duration — writing: {} hours", hours);
+                                info!(
+                                    "[Auction] Sign opened for duration — writing: {} hours",
+                                    hours
+                                );
                                 (hours.to_string(), AuctionStep::ConfirmSell)
                             }
                             _ => {
@@ -2959,12 +3799,7 @@ async fn event_handler(
                         let packet = ServerboundSignUpdate {
                             pos,
                             is_front_text: is_front,
-                            lines: [
-                                text_to_write,
-                                String::new(),
-                                String::new(),
-                                String::new(),
-                            ],
+                            lines: [text_to_write, String::new(), String::new(), String::new()],
                         };
                         bot.write_packet(packet);
                     }
@@ -2974,12 +3809,14 @@ async fn event_handler(
                 // Track scoreboard data from Hypixel SkyBlock sidebar.
                 // The sidebar contains player purse, stats, etc. which COFL uses
                 // to validate flip eligibility (e.g. purse check before buying).
-
                 ClientboundGamePacket::SetDisplayObjective(pkt) => {
                     // Slot 1 = sidebar
                     if matches!(pkt.slot, DisplaySlot::Sidebar) {
                         *state.sidebar_objective.write() = Some(pkt.objective_name.clone());
-                        debug!("[Scoreboard] Sidebar objective set to: {}", pkt.objective_name);
+                        debug!(
+                            "[Scoreboard] Sidebar objective set to: {}",
+                            pkt.objective_name
+                        );
                     }
                 }
 
@@ -2987,11 +3824,20 @@ async fn event_handler(
                     // Store score entry: objective -> owner -> (display, score)
                     // Hypixel SkyBlock encodes sidebar text in the owner field;
                     // the optional display override is absent for most entries.
-                    let display_text = pkt.display
+                    let display_text = pkt
+                        .display
                         .as_ref()
-                        .and_then(|d| { let s = d.to_string(); if s.is_empty() { None } else { Some(s) } })
+                        .and_then(|d| {
+                            let s = d.to_string();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s)
+                            }
+                        })
                         .unwrap_or_else(|| pkt.owner.clone());
-                    state.scoreboard_scores
+                    state
+                        .scoreboard_scores
                         .write()
                         .entry(pkt.objective_name.clone())
                         .or_default()
@@ -3045,31 +3891,63 @@ async fn event_handler(
                         }
                         TeamMethod::Leave(members) => {
                             if let Some((_, _, entry_members)) = teams.get_mut(&pkt.name) {
-                                let leaving: std::collections::HashSet<&String> = members.iter().collect();
+                                let leaving: std::collections::HashSet<&String> =
+                                    members.iter().collect();
                                 entry_members.retain(|m| !leaving.contains(m));
                             }
                         }
                     }
                 }
-                
+
                 _ => {}
             }
         }
-        
+
         Event::Disconnect(reason) => {
             info!("Bot disconnected: {:?}", reason);
             let reason_str = format!("{:?}", reason);
-            if state.event_tx.send(BotEvent::Disconnected(reason_str)).is_err() {
+            if state
+                .event_tx
+                .send(BotEvent::Disconnected(reason_str))
+                .is_err()
+            {
                 debug!("Failed to send Disconnected event - receiver dropped");
             }
         }
-        
+
         _ => {}
     }
-    
+
     Ok(())
 }
 
+/// If `disconnect_requested` is set, clears it, calls `bot.disconnect()`, and returns `true`.
+/// The caller should return immediately when this returns `true`.
+/// Force the client offline and keep it offline.
+///
+/// azalea 0.16 removed the built-in auto-reconnect plugin — a single client no
+/// longer rejoins on its own — so `bot.disconnect()` is sufficient to stay
+/// offline. We still call this from `event_handler` on every event while
+/// `disconnect_requested` is set, so that if anything (e.g. a swarm-level
+/// reconnect) re-establishes the connection during a break, the resulting
+/// `Login` event drops it again. The post-break process restart clears the flag.
+fn enforce_offline(bot: &Client) {
+    bot.disconnect();
+}
+
+fn handle_disconnect_if_requested(bot: &Client, state: &BotClientState) -> bool {
+    if state.disconnect_requested.load(Ordering::Acquire) {
+        info!("[CommandProcessor] Disconnect requested — going offline (auto-reconnect disabled)");
+        // NOTE: deliberately do NOT clear `disconnect_requested`. event_handler
+        // keeps enforcing offline on every event so any auto-reconnect is
+        // immediately dropped again. The flag is reset only by the post-break
+        // process restart.
+        enforce_offline(bot);
+        true
+    } else {
+        false
+    }
+}
 /// Process queued bot commands independently from the Azalea event stream.
 ///
 /// Previously commands were only drained opportunistically from `event_handler`,
@@ -3077,26 +3955,37 @@ async fn event_handler(
 /// This dedicated loop removes that extra scheduling jitter.
 async fn command_processor(bot: Client, state: BotClientState) {
     loop {
+        // Check for a pending disconnect request before waiting for the next command.
+        if handle_disconnect_if_requested(&bot, &state) {
+            return;
+        }
+
         let command = {
             let mut command_rx = state.command_rx.lock().await;
-            command_rx.recv().await
+            // Use a short timeout so we can re-check disconnect_requested periodically.
+            tokio::time::timeout(tokio::time::Duration::from_millis(200), command_rx.recv()).await
         };
 
-        let Some(command) = command else {
-            debug!("Bot command channel closed; stopping command processor");
-            break;
-        };
-
-        execute_command(&bot, &command, &state).await;
+        match command {
+            // Timeout — loop back and re-check disconnect_requested.
+            Err(_elapsed) => continue,
+            Ok(None) => {
+                debug!("Bot command channel closed; stopping command processor");
+                break;
+            }
+            Ok(Some(cmd)) => {
+                // Re-check disconnect flag; don't execute more commands if we're about to disconnect.
+                if handle_disconnect_if_requested(&bot, &state) {
+                    return;
+                }
+                execute_command(&bot, &cmd, &state).await;
+            }
+        }
     }
 }
 
 /// Execute a command from the command queue
-async fn execute_command(
-    bot: &Client,
-    command: &QueuedCommand,
-    state: &BotClientState,
-) {
+async fn execute_command(bot: &Client, command: &QueuedCommand, state: &BotClientState) {
     use crate::types::CommandType;
 
     // Increment the command generation counter so the GUI watchdog knows a new
@@ -3111,7 +4000,11 @@ async fn execute_command(
     // in an inventory" or silently fail.  Closing the window first prevents the bot
     // from being stuck "in an inventory".
     if let Some(open_wid) = state.handlers.current_window_id() {
-        warn!("[SafeClose] Closing window {} before executing {}", open_wid, command.command_type.display_name());
+        warn!(
+            "[SafeClose] Closing window {} before executing {}",
+            open_wid,
+            command.command_type.display_name()
+        );
         send_raw_close(bot, open_wid, &state.handlers);
         tokio::time::sleep(tokio::time::Duration::from_millis(WINDOW_CLOSE_DELAY_MS)).await;
     }
@@ -3130,7 +4023,10 @@ async fn execute_command(
             let uuid = match flip.uuid.as_deref().filter(|s| !s.is_empty()) {
                 Some(u) => u,
                 None => {
-                    warn!("Cannot purchase auction for '{}': missing UUID", flip.item_name);
+                    warn!(
+                        "Cannot purchase auction for '{}': missing UUID",
+                        flip.item_name
+                    );
                     return;
                 }
             };
@@ -3147,6 +4043,14 @@ async fn execute_command(
             // Clear stale observer data from any previous window so the timing
             // comparison in the OpenScreen handler is accurate for THIS purchase.
             *state.window_open_info.write() = None;
+            // Reset the bed/nugget classifier for THIS purchase.
+            *state.last_buy_via_bed.write() = None;
+
+            // Send /viewauction immediately — do NOT wait for tick alignment.
+            // The server processes incoming packets at the end of each 50ms
+            // tick anyway, so sending instantly means the packet lands in the
+            // very next tick window.  Waiting for a tick boundary only added
+            // up to 50ms of unnecessary latency.
 
             // Record buy-speed start time right before sending /viewauction
             // so the measurement covers command-send → coins-in-escrow (the
@@ -3154,22 +4058,174 @@ async fn execute_command(
             // unrelated queue wait time.
             // Safe: commands execute sequentially from the queue processor.
             *state.purchase_start_time.write() = Some(std::time::Instant::now());
+            // Clear the BIN-view-open marker; it's set when the auction view
+            // actually opens, and buy speed is measured from there.
+            *state.bin_view_open_time.write() = None;
 
             send_raw_chat_command(bot, &chat_command);
 
             // Store raw COFL purchaseAt timestamp.  It is only converted to a
             // local Instant later — and only when the auction turns out to be a
-            // bed (grace-period) and freemoney mode is enabled.
+            // bed (grace-period) and bedtiming mode is enabled.
             *state.pending_purchase_at_ms.write() = flip.purchase_at_ms;
-            
+
+            // Reset fast-buy flag before setting state to Purchasing.
+            state.fast_buy_clicked.store(false, Ordering::Relaxed);
+
             // Set state to purchasing
             *state.bot_state.write() = BotState::Purchasing;
+
+            // ---- Fast-path purchase task ----
+            // Spawn a task that waits on the ECS observer's window_open_notify
+            // (fires during apply_deferred, 20-70ms BEFORE Event::Packet delivers
+            // the OpenScreen event).  When the BIN Auction View opens, this task
+            // reads slot 31 and sends buy-click + skip-click immediately, bypassing
+            // the Event::Packet pipeline overhead entirely.
+            //
+            // Anti-cheat safety:
+            // - Still waits for the server to send OpenScreen before clicking
+            // - Still checks slot 31 contains gold_nugget before any click
+            // - Uses identical ServerboundContainerClick packets
+            // - TCP ordering guarantees the server has prepared the window
+            // - This is equivalent to having lower client-side latency
+            {
+                let fast_bot = bot.clone();
+                let fast_state = state.clone();
+                tokio::spawn(async move {
+                    // Wait for the ECS observer to detect OpenScreen.
+                    // The observer fires during apply_deferred (~20-70ms before
+                    // Event::Packet would deliver it).  The /viewauction RTT is
+                    // at least 50ms (one server tick) + network RTT, so this task
+                    // is always waiting before the notification fires.
+                    fast_state.window_open_notify.notified().await;
+
+                    // Verify we're still purchasing (could have been aborted).
+                    if *fast_state.bot_state.read() != BotState::Purchasing {
+                        return;
+                    }
+
+                    // Read window info set by the ECS observer.
+                    let info = fast_state.window_open_info.read().clone();
+                    let info = match info {
+                        Some(i) => i,
+                        None => return,
+                    };
+
+                    let window_id = info.window_id as u8;
+                    let title = fast_state.handlers.parse_window_title(&info.title);
+
+                    if !title.contains("BIN Auction View") && !title.contains("Auction View") {
+                        return;
+                    }
+
+                    // Mark when the BIN Auction View opened — buy speed is measured
+                    // from here. Only set once per purchase (the fast path is the
+                    // earliest detector).
+                    {
+                        let mut w = fast_state.bin_view_open_time.write();
+                        if w.is_none() {
+                            *w = Some(std::time::Instant::now());
+                        }
+                    }
+
+                    if let Some(t0) = *fast_state.purchase_start_time.read() {
+                        info!(
+                            "[Timing] /viewauction → fast-path started: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+
+                    // Wait for slot 31 data — same safety gate as the Event::Packet
+                    // path.  If OpenScreen and ContainerSetContent arrive in the same
+                    // TCP segment (common), the ECS frame processes both before
+                    // releasing the World lock, so slot 31 is already populated when
+                    // we read it.
+                    let slot_31_kind = {
+                        let poll_deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+                        let mut kind;
+                        loop {
+                            let notified = fast_state.slot_data_notify.notified();
+                            let menu = fast_bot.menu();
+                            let slots = menu.slots();
+                            kind = slots
+                                .get(31)
+                                .map(|s| {
+                                    if s.is_empty() {
+                                        "air".to_string()
+                                    } else {
+                                        s.kind().to_string().to_lowercase()
+                                    }
+                                })
+                                .unwrap_or_else(|| "air".to_string());
+                            if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
+                                break;
+                            }
+                            let remaining = poll_deadline - tokio::time::Instant::now();
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep(remaining) => {}
+                            }
+                        }
+                        kind
+                    };
+
+                    if !slot_31_kind.contains("gold_nugget") {
+                        // Not a buyable auction (bed, potato, feather, etc.).
+                        // Only gold_nugget is the real, server-sent buy button, so
+                        // we send NEITHER the buy click NOR the skip pre-click unless
+                        // it is confirmed present. Let the Event::Packet handler deal
+                        // with non-buyable cases.
+                        return;
+                    }
+
+                    // gold_nugget confirmed — slot 31 is the real, server-sent
+                    // buy button, so clicking it now is clicking something that
+                    // is actually there.  Click immediately (event-driven: we
+                    // react the moment the confirmed state arrives, so the action
+                    // resolves within one tick).
+                    if let Some(t0) = *fast_state.purchase_start_time.read() {
+                        info!(
+                            "[Timing] /viewauction → fast-path buy click: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+
+                    // Buy click on the confirmed window/slot 31.
+                    send_raw_click(&fast_bot, window_id, 31);
+
+                    if fast_state.skip {
+                        // Same-burst pre-click. The gold_nugget is confirmed present,
+                        // so the buy click deterministically opens the confirm window;
+                        // if it isn't open in time the Confirm Purchase handler clicks
+                        // when it actually opens.
+                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                        fast_state.skip_click_sent.store(true, Ordering::Relaxed);
+                        info!("[AH] Fast-path skip: pre-clicking confirm slot 11 on window {} (same burst)", next_wid);
+                        send_raw_click(&fast_bot, next_wid, 11);
+                    } else {
+                        info!("[AH] Fast-path: gold_nugget confirmed — buy click sent");
+                    }
+
+                    // Signal that the fast path handled the buy click so the
+                    // Event::Packet handler doesn't send a duplicate click.
+                    fast_state.fast_buy_clicked.store(true, Ordering::Relaxed);
+                });
+            }
         }
-        CommandType::BazaarBuyOrder { item_name, item_tag, amount, price_per_unit } => {
+        CommandType::BazaarBuyOrder {
+            item_name,
+            item_tag,
+            amount,
+            price_per_unit,
+        } => {
             // Abort immediately if at the bazaar order limit — no point opening
             // the GUI only to have the order rejected.
             if state.bazaar_at_limit.load(Ordering::Relaxed) {
-                warn!("[Bazaar] Skipping BUY order for \"{}\" — already at bazaar order limit", item_name);
+                warn!(
+                    "[Bazaar] Skipping BUY order for \"{}\" — already at bazaar order limit",
+                    item_name
+                );
                 return;
             }
             // Store order context so window/sign handlers can use it
@@ -3180,7 +4236,9 @@ async fn execute_command(
             *state.bazaar_step.write() = BazaarStep::Initial;
 
             // Use itemTag when available (skips search results page), else title-case itemName
-            let search_term = item_tag.as_ref().map(|s| s.as_str())
+            let search_term = item_tag
+                .as_ref()
+                .map(|s| s.as_str())
                 .unwrap_or_else(|| item_name.as_str());
             let cmd = if item_tag.is_some() {
                 format!("/bz {}", search_term)
@@ -3191,7 +4249,12 @@ async fn execute_command(
             send_chat_command(bot, &cmd);
             *state.bot_state.write() = BotState::Bazaar;
         }
-        CommandType::BazaarSellOrder { item_name, item_tag, amount, price_per_unit } => {
+        CommandType::BazaarSellOrder {
+            item_name,
+            item_tag,
+            amount,
+            price_per_unit,
+        } => {
             // Do NOT abort SELL orders when at the bazaar order limit.
             // The server may reject the order, but it's better to try
             // (the limit flag may be stale) than to silently drop a sell
@@ -3207,7 +4270,9 @@ async fn execute_command(
             *state.bazaar_step.write() = BazaarStep::Initial;
 
             // Use itemTag when available, else title-case itemName
-            let search_term = item_tag.as_ref().map(|s| s.as_str())
+            let search_term = item_tag
+                .as_ref()
+                .map(|s| s.as_str())
                 .unwrap_or_else(|| item_name.as_str());
             let cmd = if item_tag.is_some() {
                 format!("/bz {}", search_term)
@@ -3280,7 +4345,10 @@ async fn execute_command(
         }
         CommandType::ClaimSoldItem => {
             *state.claiming_purchased.write() = false;
-            let uuid = state.claim_sold_uuid_queue.write().pop_front()
+            let uuid = state
+                .claim_sold_uuid_queue
+                .write()
+                .pop_front()
                 .or_else(|| state.claim_sold_uuid.write().take());
             if let Some(uuid) = uuid {
                 info!("Claiming sold item via direct /viewauction {}", uuid);
@@ -3311,9 +4379,29 @@ async fn execute_command(
             send_chat_command(bot, "/sbmenu");
             *state.bot_state.write() = BotState::CheckingCookie;
         }
-        CommandType::ManageOrders { cancel_open } => {
-            let mode = if *cancel_open { "startup (cancel+collect)" } else { "collect-only" };
+        CommandType::ManageOrders {
+            cancel_open,
+            target_item,
+        } => {
+            let mode = if *cancel_open {
+                "startup (cancel+collect)"
+            } else {
+                "collect-only"
+            };
             info!("[ManageOrders] Triggered ({}) — opening /bz", mode);
+            if let Some(target) = target_item {
+                let side = if target.is_buy { "BUY" } else { "SELL" };
+                match target.price_per_unit {
+                    Some(price) => info!(
+                        "[ManageOrders] Targeting specific order: {} ({}) @ {:.1}",
+                        target.item_name, side, price
+                    ),
+                    None => info!(
+                        "[ManageOrders] Targeting specific order: {} ({})",
+                        target.item_name, side
+                    ),
+                }
+            }
             *state.manage_orders_cancelled.write() = 0;
             // NOTE: inventory_full is intentionally NOT cleared here.  Clearing
             // it caused a tight loop where ManageOrders would reset the flag,
@@ -3323,7 +4411,10 @@ async fn execute_command(
             //   2. InstaSell completion.
             // This lets ManageOrders skip BUY orders when the flag is set while
             // still collecting SELL orders (which yield coins, not items).
-            state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
+            state
+                .manage_orders_cancel_open
+                .store(*cancel_open, Ordering::Relaxed);
+            *state.manage_orders_target_item.write() = target_item.clone();
             state.manage_orders_processed.write().clear();
             // Do NOT clear order_cancel_failures here — let failures accumulate
             // across ManageOrders cycles so MAX_CANCEL_RETRIES actually works.
@@ -3331,41 +4422,63 @@ async fn execute_command(
             // Set an internal deadline so the handler can bail out cleanly
             // (closing windows) instead of burning through the external timeout.
             // Only processes ONE order per cycle, so 10s is plenty.
-            *state.manage_orders_deadline.write() = Some(
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(10)
-            );
-            let initial_wid = *state.last_window_id.read();
+            *state.manage_orders_deadline.write() =
+                Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10));
             send_chat_command(bot, "/bz");
             *state.bot_state.write() = BotState::ManagingOrders;
 
             // Safety: if no window opens within 5 seconds (e.g. chat throttle,
             // server lag), retry /bz once.  If still no window after another 5 s,
             // give up and return to Idle so the queue isn't blocked for 60 s.
+            //
+            // `last_window_id` now means "container open right now" (it is zeroed on
+            // every close), so `> 0` is a direct read of "the /bz window is up and the
+            // handler is working".  The previous version compared against the id
+            // captured before `/bz` was sent, which under the new semantics cannot
+            // distinguish "no window opened" from "a window opened and closed".  The
+            // handler finishing fast is already covered by the state check above:
+            // it leaves `ManagingOrders`, so no spurious retry is sent.
             {
                 let retry_state = state.bot_state.clone();
                 let retry_wid = state.last_window_id.clone();
                 let retry_bot = bot.clone();
-                let saved_wid = initial_wid;
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    if *retry_state.read() != BotState::ManagingOrders { return; }
-                    if *retry_wid.read() != saved_wid { return; } // window opened, handler working
+                    if *retry_state.read() != BotState::ManagingOrders {
+                        return;
+                    }
+                    if *retry_wid.read() > 0 {
+                        return;
+                    } // window open, handler working
                     warn!("[ManageOrders] No window after 5 s — retrying /bz");
                     send_chat_command(&retry_bot, "/bz");
 
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    if *retry_state.read() != BotState::ManagingOrders { return; }
-                    if *retry_wid.read() != saved_wid { return; }
+                    if *retry_state.read() != BotState::ManagingOrders {
+                        return;
+                    }
+                    if *retry_wid.read() > 0 {
+                        return;
+                    }
                     warn!("[ManageOrders] Still no window after retry — forcing Idle");
                     *retry_state.write() = BotState::Idle;
                 });
             }
         }
         CommandType::DiscoverOrders | CommandType::ExecuteOrders => {
-            info!("Command type not yet fully implemented in execute_command: {:?}", command.command_type);
+            info!(
+                "Command type not yet fully implemented in execute_command: {:?}",
+                command.command_type
+            );
         }
-        CommandType::CancelAuction { item_name, starting_bid } => {
-            info!("[CancelAuction] Cancelling auction: {} (bid: {})", item_name, starting_bid);
+        CommandType::CancelAuction {
+            item_name,
+            starting_bid,
+        } => {
+            info!(
+                "[CancelAuction] Cancelling auction: {} (bid: {})",
+                item_name, starting_bid
+            );
             *state.cancel_auction_item_name.write() = item_name.clone();
             *state.cancel_auction_starting_bid.write() = *starting_bid;
             send_chat_command(bot, "/ah");
@@ -3376,6 +4489,11 @@ async fn execute_command(
             *state.bazaar_step.write() = BazaarStep::Initial;
             send_chat_command(bot, "/bz");
             *state.bot_state.write() = BotState::SellingInventoryBz;
+        }
+        CommandType::GoToIsland => {
+            // Return home — friend's island (/visit + slot 11) when visitfriend
+            // is active, else the bot's own island (/is).
+            go_to_island(bot, &state.last_window_id).await;
         }
     }
 }
@@ -3397,14 +4515,43 @@ async fn handle_window_interaction(
         build_cached_my_auctions_json(&slots, state);
     }
 
-    let bot_state = *state.bot_state.read();
-    
+    let mut bot_state = *state.bot_state.read();
+
+    // Auto-buy: if a BIN Auction View opens while the bot is idle — e.g. the
+    // operator manually ran `/viewauction <uuid>` from the panel chat — promote to
+    // Purchasing so the standard buy flow below runs on it. Gated to Idle/GracePeriod
+    // so it never hijacks windows opened for claiming sold/purchased items (those run
+    // in ClaimingSold/ClaimingPurchased) or any other active workflow.
+    if matches!(bot_state, BotState::Idle | BotState::GracePeriod)
+        && (window_title.contains("BIN Auction View") || window_title.contains("Auction View"))
+        && !is_my_auctions_window_title(window_title)
+    {
+        info!(
+            "[AH] Auto-buy: '{}' opened while {:?} — running buy flow on manually-opened auction",
+            window_title, bot_state
+        );
+        *state.bot_state.write() = BotState::Purchasing;
+        // No flip context for a manual open: clear stale timing/purchaseAt so the
+        // buy flow treats it as a fresh, untimed purchase (bed timing falls back to
+        // the bed's own displayed grace time).
+        *state.purchase_start_time.write() = None;
+        *state.pending_purchase_at_ms.write() = None;
+        *state.last_buy_via_bed.write() = None;
+        state.fast_buy_clicked.store(false, Ordering::Relaxed);
+        bot_state = BotState::Purchasing;
+    }
+
     match bot_state {
         BotState::Purchasing => {
             if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
-                // purchase_start_time is set in execute_command when
-                // /viewauction is sent, so buy speed measures
-                // command-send → coins-in-escrow.
+                // Mark when the BIN Auction View opened (buy-speed start). Only
+                // set if the fast-path observer didn't already record it.
+                {
+                    let mut w = state.bin_view_open_time.write();
+                    if w.is_none() {
+                        *w = Some(std::time::Instant::now());
+                    }
+                }
 
                 // Log the time from /viewauction to the spawned task
                 // actually starting.  The delta between this and the
@@ -3435,7 +4582,8 @@ async fn handle_window_interaction(
                 // slot 31.  Uses a Notify that fires instantly when the packet
                 // arrives instead of polling every 10ms.
                 let slot_31_kind = {
-                    let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+                    let poll_deadline =
+                        tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
                     let mut kind;
                     loop {
                         // Register the Notify listener BEFORE reading slots.
@@ -3448,10 +4596,16 @@ async fn handle_window_interaction(
 
                         let menu = bot.menu();
                         let slots = menu.slots();
-                        kind = slots.get(31).map(|s| {
-                            if s.is_empty() { "air".to_string() }
-                            else { s.kind().to_string().to_lowercase() }
-                        }).unwrap_or_else(|| "air".to_string());
+                        kind = slots
+                            .get(31)
+                            .map(|s| {
+                                if s.is_empty() {
+                                    "air".to_string()
+                                } else {
+                                    s.kind().to_string().to_lowercase()
+                                }
+                            })
+                            .unwrap_or_else(|| "air".to_string());
                         if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
                             break;
                         }
@@ -3479,6 +4633,9 @@ async fn handle_window_interaction(
                 }
 
                 if slot_31_kind.contains("bed") {
+                    // Bed = auction is still in grace period. Remember that this
+                    // purchase was won via bed timing so the webhook can label it.
+                    *state.last_buy_via_bed.write() = Some(true);
                     // Bed = auction is still in grace period.
                     // No buy-click or skip-click was sent (we waited for
                     // confirmation first).  The bed-spam loop below
@@ -3487,20 +4644,44 @@ async fn handle_window_interaction(
                     // Signal the 5-second GUI watchdog to leave this window open.
                     state.bed_timing_active.store(true, Ordering::Relaxed);
 
-                    const BED_FREEMONEY_CLICK_INTERVAL_MS: u64 = 20;
+                    // Bed-timing fires a tight 20ms burst (like TPM) starting
+                    // bed_pre_click_ms (~30ms) before COFL's purchaseAt, so a click
+                    // brackets the exact grace-period→buyable transition. Hypixel
+                    // throttles window clicks to ~5 per 500ms, so the burst is capped
+                    // to that budget (CLICK_BUDGET / CLICK_WINDOW) — 5 clicks across
+                    // ~100ms land right on the deadline without tripping the throttle.
+                    const BED_TIMING_CLICK_INTERVAL_MS: u64 = 20;
                     const BED_WAIT_POLL_MS: u64 = 20;
                     const MAX_FAILED_CLICKS: usize = 5;
-                    let click_interval_ms = if state.freemoney {
-                        BED_FREEMONEY_CLICK_INTERVAL_MS
+                    const CLICK_BUDGET: usize = 5;
+                    const CLICK_WINDOW: tokio::time::Duration =
+                        tokio::time::Duration::from_millis(500);
+                    let click_interval_ms = if state.bedtiming {
+                        BED_TIMING_CLICK_INTERVAL_MS
                     } else {
                         state.bed_spam_click_delay.max(1)
                     };
 
-                    if state.freemoney {
-                        // Freemoney mode: use COFL purchaseAt timing for bed auctions.
-                        // Start clicking bed_pre_click_ms (default 30ms) before the deadline.
-                        // If purchaseAt is not available, fall through to immediate bed spam.
-                        let pre_click_lead_ms = state.bed_pre_click_ms;
+                    if state.bedtiming {
+                        // Bedtiming mode: use COFL purchaseAt timing for bed auctions.
+                        // Lead the first click by the real connection latency so the
+                        // click *arrives* at Hypixel right as the grace period ends.
+                        // Prefer the live game-connection RTT (measured via F3+3
+                        // ping, includes the proxy hop); fall back to the SLP figure,
+                        // then to the configured static lead. Clicking early on a bed
+                        // is safe (the item just isn't buyable yet) whereas clicking
+                        // late misses it.
+                        // Ping-adaptive lead is operator-gated: only lead by the
+                        // measured RTT when the backend has enabled it for this
+                        // instance; otherwise use the static configured lead.
+                        let pre_click_lead_ms = if crate::hypixel_ping::adaptive_bed_enabled() {
+                            match crate::hypixel_ping::best_ping_ms() {
+                                Some(ping) => ping + 20,
+                                None => state.bed_pre_click_ms,
+                            }
+                        } else {
+                            state.bed_pre_click_ms
+                        };
                         // Convert the raw epoch-ms timestamp to a remaining-ms delta.
                         let remaining_ms_from_purchase_at = state.pending_purchase_at_ms.read()
                             .and_then(|purchase_at_ms| {
@@ -3510,14 +4691,28 @@ async fn handle_window_interaction(
                                     .map(|d| d.as_millis() as i64)?;
                                 let diff = purchase_at_ms - now_ms;
                                 if diff <= 0 { None } else { Some(diff as u64) }
+                            })
+                            // Fallback: COFL's `flip` message almost never carries a
+                            // `purchaseAt`, so without this the bed branch has NO timing
+                            // signal and degrades to reactive clicking (which loses the
+                            // grace-end race by ~1 RTT). Read the countdown straight off
+                            // the bed item Hypixel placed in slot 31 — it renders the
+                            // remaining grace as "M:SS" in the item name/lore.
+                            .or_else(|| {
+                                let menu = bot.menu();
+                                let slots = menu.slots();
+                                let secs = slots.get(31).and_then(parse_bed_remaining_secs)?;
+                                info!("[AH] Bed timing: no COFL purchaseAt — using bed's own countdown ({}s remaining)", secs);
+                                Some(secs.saturating_mul(1000))
                             });
 
                         if let Some(remaining_ms) = remaining_ms_from_purchase_at {
                             let wait_ms = remaining_ms.saturating_sub(pre_click_lead_ms);
                             if wait_ms > 0 {
-                                info!("[AH] Bed timing (freemoney): purchaseAt in {}ms — waiting {}ms, then clicking at {}ms intervals (lead: {}ms)",
+                                info!("[AH] Bed timing: purchaseAt in {}ms — waiting {}ms, then clicking at {}ms intervals (lead: {}ms)",
                                     remaining_ms, wait_ms, click_interval_ms, pre_click_lead_ms);
-                                let wait_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+                                let wait_deadline = tokio::time::Instant::now()
+                                    + tokio::time::Duration::from_millis(wait_ms);
                                 loop {
                                     if tokio::time::Instant::now() >= wait_deadline {
                                         break;
@@ -3525,30 +4720,57 @@ async fn handle_window_interaction(
                                     let kind_now = {
                                         let menu = bot.menu();
                                         let slots = menu.slots();
-                                        slots.get(31).map(|s| {
-                                            if s.is_empty() { "air".to_string() }
-                                            else { s.kind().to_string().to_lowercase() }
-                                        }).unwrap_or_else(|| "air".to_string())
+                                        slots
+                                            .get(31)
+                                            .map(|s| {
+                                                if s.is_empty() {
+                                                    "air".to_string()
+                                                } else {
+                                                    s.kind().to_string().to_lowercase()
+                                                }
+                                            })
+                                            .unwrap_or_else(|| "air".to_string())
                                     };
                                     if !kind_now.contains("bed") {
                                         break;
                                     }
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(BED_WAIT_POLL_MS)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                                        BED_WAIT_POLL_MS,
+                                    ))
+                                    .await;
                                 }
-                                info!("[AH] Bed timing (freemoney): entering rapid-click phase ({}ms interval)", click_interval_ms);
+                                info!(
+                                    "[AH] Bed timing: entering rapid-click phase ({}ms interval)",
+                                    click_interval_ms
+                                );
                             } else {
-                                info!("[AH] Bed timing (freemoney): purchaseAt imminent — starting clicks at {}ms interval", click_interval_ms);
+                                info!("[AH] Bed timing: purchaseAt imminent — starting clicks at {}ms interval", click_interval_ms);
                             }
                         } else {
-                            info!("[AH] Bed timing (freemoney): no purchaseAt — starting immediate bed spam at {}ms interval", click_interval_ms);
+                            info!("[AH] Bed timing: no purchaseAt — starting immediate bed spam at {}ms interval", click_interval_ms);
                         }
                     } else {
                         // Default mode: simple immediate bed spam at bed_spam_click_delay.
-                        info!("[AH] Bed detected in slot 31 — starting bed spam at {}ms interval", click_interval_ms);
+                        info!(
+                            "[AH] Bed detected in slot 31 — starting bed spam at {}ms interval",
+                            click_interval_ms
+                        );
                     }
 
-                    let bed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
+                    let bed_deadline =
+                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(70);
                     let mut failed_clicks: usize = 0;
+                    // Poll the slot state frequently (a cheap local ECS read) so the
+                    // bed → gold_nugget transition is caught within DETECT_POLL_MS,
+                    // while bed pre-clicks stay rate-limited to click_interval_ms so we
+                    // never exceed Hypixel's packet limit. Faster detection = the buy
+                    // click lands sooner, without sending any extra packets.
+                    const DETECT_POLL_MS: u64 = 5;
+                    let mut last_bed_click: Option<tokio::time::Instant> = None;
+                    // Timestamps of recent bed pre-clicks, used to enforce the
+                    // ~5-clicks-per-500ms throttle budget.
+                    let mut recent_clicks: std::collections::VecDeque<tokio::time::Instant> =
+                        std::collections::VecDeque::with_capacity(CLICK_BUDGET);
                     loop {
                         if tokio::time::Instant::now() >= bed_deadline {
                             warn!("[AH] Bed timing: grace period did not end — giving up");
@@ -3561,10 +4783,16 @@ async fn handle_window_interaction(
                         let current_kind = {
                             let menu = bot.menu();
                             let slots = menu.slots();
-                            slots.get(31).map(|s| {
-                                if s.is_empty() { "air".to_string() }
-                                else { s.kind().to_string().to_lowercase() }
-                            }).unwrap_or_else(|| "air".to_string())
+                            slots
+                                .get(31)
+                                .map(|s| {
+                                    if s.is_empty() {
+                                        "air".to_string()
+                                    } else {
+                                        s.kind().to_string().to_lowercase()
+                                    }
+                                })
+                                .unwrap_or_else(|| "air".to_string())
                         };
 
                         if current_kind == "air" || current_kind.contains("air") {
@@ -3583,79 +4811,98 @@ async fn handle_window_interaction(
                         } else if current_kind.contains("potato") {
                             warn!("[AH] Bed timing: potato detected — auction not purchasable, closing");
                             let _ = state.event_tx.send(BotEvent::ChatMessage(
-                                "§f[§4BAF§f]: §cAuction already bought by someone else".to_string()
+                                "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}cAuction already bought by someone else".to_string()
                             ));
                             state.bed_timing_active.store(false, Ordering::Relaxed);
                             send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                             return;
                         } else if current_kind.contains("bed") {
-                            if state.freemoney {
-                                debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
-                                if *state.last_window_id.read() == window_id {
-                                    send_raw_click(bot, window_id, 31);
+                            if state.bedtiming {
+                                let now = tokio::time::Instant::now();
+                                // Drop click timestamps older than the throttle window.
+                                while recent_clicks
+                                    .front()
+                                    .is_some_and(|t| now.duration_since(*t) >= CLICK_WINDOW)
+                                {
+                                    recent_clicks.pop_front();
+                                }
+                                // Fire at the 20ms burst cadence, but only while we still
+                                // have throttle budget left in the current 500ms window.
+                                let cadence_ok = last_bed_click.is_none_or(|t| {
+                                    now.duration_since(t)
+                                        >= tokio::time::Duration::from_millis(click_interval_ms)
+                                });
+                                let budget_ok = recent_clicks.len() < CLICK_BUDGET;
+                                if cadence_ok && budget_ok {
+                                    debug!("[AH] Bed timing: grace period active, pre-clicking slot 31");
+                                    if *state.last_window_id.read() == window_id {
+                                        send_raw_click(bot, window_id, 31);
+                                    }
+                                    last_bed_click = Some(now);
+                                    recent_clicks.push_back(now);
                                 }
                             } else {
-                                debug!("[AH] Bed timing: grace period active, waiting for gold_nugget");
+                                debug!(
+                                    "[AH] Bed timing: grace period active, waiting for gold_nugget"
+                                );
                             }
                         } else {
                             failed_clicks += 1;
-                            debug!("[AH] Bed timing: slot 31 = {} (failed {}/{})", current_kind, failed_clicks, MAX_FAILED_CLICKS);
+                            debug!(
+                                "[AH] Bed timing: slot 31 = {} (failed {}/{})",
+                                current_kind, failed_clicks, MAX_FAILED_CLICKS
+                            );
                             if failed_clicks >= MAX_FAILED_CLICKS {
-                                warn!("[AH] Bed timing: stopped after {} unexpected slot states", failed_clicks);
+                                warn!(
+                                    "[AH] Bed timing: stopped after {} unexpected slot states",
+                                    failed_clicks
+                                );
                                 state.bed_timing_active.store(false, Ordering::Relaxed);
                                 send_raw_close(bot, window_id, &state.handlers);
                                 *state.bot_state.write() = BotState::Idle;
                                 return;
                             }
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(click_interval_ms)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(DETECT_POLL_MS))
+                            .await;
                     }
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction (SAFE: gold_nugget confirmed) ----
-                    // Now that we know slot 31 is gold_nugget (the buy button),
-                    // send the buy-click.  Sending AFTER confirmation avoids
-                    // clicking non-interactive items like feather (loading
-                    // placeholder) which is an "impossible action" that can
-                    // trigger Hypixel anti-cheat.
-                    //
-                    // Anti-cheat safety: This click only happens AFTER the
-                    // server has sent both OpenScreen AND ContainerSetContent
-                    // with gold_nugget in slot 31.  The PacketAcceleratorPlugin
-                    // reduces how long we wait to notice these packets, but the
-                    // click still occurs after the server has prepared the
-                    // window — which is exactly what a fast human player does.
-                    if let Some(t0) = *state.purchase_start_time.read() {
+                    // Check if the fast-path purchase task (spawned in
+                    // execute_command, triggered by ECS observer) already sent
+                    // the buy-click and skip-click.  If so, skip to avoid
+                    // duplicate clicks.
+                    if state.fast_buy_clicked.load(Ordering::Relaxed) {
                         info!(
-                            "[Timing] /viewauction → buy click sent: {:.1}ms",
-                            t0.elapsed().as_secs_f64() * 1000.0
+                            "[AH] Fast-path already sent buy click — skipping Event::Packet click"
                         );
-                    }
-                    if state.fastbuy {
-                        info!("[AH] gold_nugget confirmed — sending buy + skip (fastbuy)");
                     } else {
-                        info!("[AH] gold_nugget confirmed — sending buy click");
-                    }
-                    // Use raw connection to bypass ECS queue for the buy click.
-                    send_raw_click(bot, window_id, 31);
-
-                    // Skip-click: only when fastbuy is explicitly enabled,
-                    // pre-click slot 11 on the predicted Confirm Purchase
-                    // window in the same TCP burst as the buy-click.
-                    // When fastbuy is off the Confirm Purchase handler will
-                    // click confirm reactively when the window opens.
-                    if state.fastbuy {
-                        // Redundant second buy click to guard against packet
-                        // loss — only needed when we also send the skip-click,
-                        // because a lost buy-click + queued confirm-click on a
-                        // window that never opens is an impossible action.
+                        // Fallback: fast path did not fire (e.g. window was not
+                        // BIN Auction View, or the observer didn't trigger).
+                        // slot 31 is confirmed gold_nugget — the real buy button
+                        // is there — so click it immediately.
+                        if let Some(t0) = *state.purchase_start_time.read() {
+                            info!(
+                                "[Timing] /viewauction → buy click sent (fallback): {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        // Buy click on the confirmed window/slot 31.
                         send_raw_click(bot, window_id, 31);
 
-                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        info!("[AH] Fastbuy: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
-                        state.skip_click_sent.store(true, Ordering::Relaxed);
-                        // Use raw connection for the skip-click too.
-                        send_raw_click(bot, next_wid, 11);
+                        if state.skip {
+                            // Same-burst click-ahead (gold_nugget present ⇒ the buy
+                            // click opens the confirm window). Lands an RTT early when
+                            // the server opens the window in time; otherwise the
+                            // Confirm Purchase handler clicks on window-open.
+                            let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                            info!("[AH] Skip: pre-clicking confirm slot 11 on window {} (same burst, fallback)", next_wid);
+                            state.skip_click_sent.store(true, Ordering::Relaxed);
+                            send_raw_click(bot, next_wid, 11);
+                        } else {
+                            info!("[AH] gold_nugget confirmed — buy click sent (fallback)");
+                        }
                     }
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
@@ -3679,15 +4926,18 @@ async fn handle_window_interaction(
                     };
                     if should_close {
                         let msg = if slot_31_kind.contains("poisonous_potato") {
-                            "§f[§4BAF§f]: §cCan't afford auction"
+                            "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}cCan't afford auction"
                         } else if slot_31_kind.contains("potato") {
-                            "§f[§4BAF§f]: §cAuction already bought by someone else"
+                            "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}cAuction already bought by someone else"
                         } else if slot_31_kind.contains("feather") {
-                            "§f[§4BAF§f]: §cAuction no longer available"
+                            "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}cAuction no longer available"
                         } else {
-                            "§f[§4BAF§f]: §cAuction not purchasable"
+                            "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}cAuction not purchasable"
                         };
-                        warn!("[AH] Slot 31 = {} — auction not purchasable, closing window", slot_31_kind);
+                        warn!(
+                            "[AH] Slot 31 = {} — auction not purchasable, closing window",
+                            slot_31_kind
+                        );
                         let _ = state.event_tx.send(BotEvent::ChatMessage(msg.to_string()));
                         *state.purchase_start_time.write() = None;
                         *state.pending_purchase_at_ms.write() = None;
@@ -3706,14 +4956,18 @@ async fn handle_window_interaction(
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                // If a skip-click was already sent for this window, don't fire a
-                // redundant reactive click — the pre-click packet should already be
-                // queued on the server for the same tick.
+                // CRITICAL: every confirm click reserves the coins in escrow, so a
+                // duplicate click on an already-bought/expired auction churns escrow
+                // (put → AUCTION_EXPIRED → refund). To avoid that:
+                //  * If a `skip` pre-click was already sent for this window, DON'T
+                //    click reactively now — that would race the pre-click and double
+                //    up. Instead wait one retry interval (~one RTT) so the pre-click's
+                //    outcome settles; the bounded retry below only fires if the window
+                //    is *still* open (i.e. the pre-click missed).
+                //  * Cap the retries so a contested/stuck Confirm Purchase window
+                //    can't churn escrow indefinitely.
                 let skip_was_sent = state.skip_click_sent.swap(false, Ordering::Relaxed);
-                if skip_was_sent {
-                    info!("[AH] Skip-click was sent — skipping reactive confirm click");
-                } else {
-                    // No skip-click — click confirm (slot 11) immediately via raw connection.
+                if !skip_was_sent {
                     send_raw_click(bot, window_id, 11);
                 }
 
@@ -3724,15 +4978,24 @@ async fn handle_window_interaction(
                 let initial_wait_ms = CONFIRM_PURCHASE_RETRY_MS;
                 tokio::time::sleep(tokio::time::Duration::from_millis(initial_wait_ms)).await;
 
-                // Safety retry loop: if the window is still open (pre-click failed,
-                // click was lost, or the server needs more time), keep retrying.
-                while state.handlers.current_window_title()
-                    .as_deref()
-                    .map(|t| t.contains("Confirm Purchase"))
-                    .unwrap_or(false)
+                // Bounded safety retry: only while the window is still the Confirm
+                // Purchase window (a successful or expired purchase closes it).
+                const MAX_CONFIRM_RETRIES: u32 = 3;
+                let mut retries = 0u32;
+                while retries < MAX_CONFIRM_RETRIES
+                    && state
+                        .handlers
+                        .current_window_title()
+                        .as_deref()
+                        .map(|t| t.contains("Confirm Purchase"))
+                        .unwrap_or(false)
                 {
                     send_raw_click(bot, window_id, 11);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(CONFIRM_PURCHASE_RETRY_MS)).await;
+                    retries += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        CONFIRM_PURCHASE_RETRY_MS,
+                    ))
+                    .await;
                 }
 
                 send_raw_close(bot, window_id, &state.handlers);
@@ -3762,13 +5025,17 @@ async fn handle_window_interaction(
             let is_buy_order = *state.bazaar_is_buy_order.read();
             let current_step = *state.bazaar_step.read();
 
-            info!("[Bazaar] Window: \"{}\" | step: {:?}", window_title, current_step);
+            info!(
+                "[Bazaar] Window: \"{}\" | step: {:?}",
+                window_title, current_step
+            );
 
-            // Poll every 50ms for up to 1500ms for slots to be populated by ContainerSetContent.
-            // Matching TypeScript's findAndClick() poll pattern (checks every 50ms, up to ~600ms).
-            // This is more reliable than a fixed sleep because ContainerSetContent may arrive
-            // at any time after OpenScreen.
-            let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+            // Poll every 20ms for up to 1500ms for slots to be populated by ContainerSetContent.
+            // Polling the (in-memory) menu is far more reliable than a fixed sleep because
+            // ContainerSetContent may arrive at any time after OpenScreen — and it breaks the
+            // instant the slot appears, so it never waits longer than detection needs.
+            let poll_deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
 
             // Helper: read the current slots from the menu
             let read_slots = || {
@@ -3777,7 +5044,11 @@ async fn handle_window_interaction(
             };
 
             // Determine which button name to look for on the item-detail page
-            let order_btn_name = if is_buy_order { "Create Buy Order" } else { "Create Sell Offer" };
+            let order_btn_name = if is_buy_order {
+                "Create Buy Order"
+            } else {
+                "Create Sell Offer"
+            };
 
             // Step 2: Item-detail page — poll for the order-creation button.
             // Only relevant when we haven't clicked an order button yet (Initial or SearchResults).
@@ -3788,11 +5059,14 @@ async fn handle_window_interaction(
                 let order_button_slot = loop {
                     // Guard: if a newer window has opened this handler is stale — bail out.
                     if *state.last_window_id.read() != window_id {
-                        debug!("[Bazaar] Window {} superseded during order-button poll, aborting", window_id);
+                        debug!(
+                            "[Bazaar] Window {} superseded during order-button poll, aborting",
+                            window_id
+                        );
                         return;
                     }
                     let slots = read_slots();
-                    let buy_s  = find_slot_by_name(&slots, "Create Buy Order");
+                    let buy_s = find_slot_by_name(&slots, "Create Buy Order");
                     let sell_s = find_slot_by_name(&slots, "Create Sell Offer");
                     let found = if is_buy_order { buy_s } else { sell_s };
                     if found.is_some() {
@@ -3801,7 +5075,7 @@ async fn handle_window_interaction(
                     // Also break early if we're on a search-results or amount/price screen
                     // (those don't have order buttons, no point waiting)
                     let has_custom_amount = find_slot_by_name(&slots, "Custom Amount").is_some();
-                    let has_custom_price  = find_slot_by_name(&slots, "Custom Price").is_some();
+                    let has_custom_price = find_slot_by_name(&slots, "Custom Price").is_some();
                     if has_custom_amount || has_custom_price {
                         break None;
                     }
@@ -3812,7 +5086,10 @@ async fn handle_window_interaction(
                     }
                     if tokio::time::Instant::now() >= poll_deadline {
                         // Log all non-empty slots for debugging
-                        warn!("[Bazaar] Polling timed out waiting for \"{}\" in \"{}\"", order_btn_name, window_title);
+                        warn!(
+                            "[Bazaar] Polling timed out waiting for \"{}\" in \"{}\"",
+                            order_btn_name, window_title
+                        );
                         for (i, item) in slots.iter().enumerate() {
                             if let Some(name) = get_item_display_name_from_slot(item) {
                                 warn!("[Bazaar]   slot {}: {}", i, name);
@@ -3820,21 +5097,24 @@ async fn handle_window_interaction(
                         }
                         break None;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                 };
 
                 if let Some(i) = order_button_slot {
                     // Final guard before clicking — reject if a newer window has taken over.
                     if *state.last_window_id.read() != window_id {
-                        debug!("[Bazaar] Window {} superseded before order-button click, aborting", window_id);
+                        debug!(
+                            "[Bazaar] Window {} superseded before order-button click, aborting",
+                            window_id
+                        );
                         return;
                     }
-                    info!("[Bazaar] Item detail: clicking \"{}\" at slot {}", order_btn_name, i);
+                    info!(
+                        "[Bazaar] Item detail: clicking \"{}\" at slot {}",
+                        order_btn_name, i
+                    );
                     *state.bazaar_step.write() = BazaarStep::SelectOrderType;
-                    // Add randomized human-like delay before clicking (200-500ms)
-                    let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 300) as u64;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
-                    if *state.last_window_id.read() != window_id { return; }
+                    // Click the instant the button is detected — no fixed delay.
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     return;
                 }
@@ -3849,27 +5129,31 @@ async fn handle_window_interaction(
 
                 // Poll briefly for the item to appear in search results
                 let found = loop {
-                    if *state.last_window_id.read() != window_id { return; }
+                    if *state.last_window_id.read() != window_id {
+                        return;
+                    }
                     let slots = read_slots();
                     let f = find_slot_by_name(&slots, &item_name);
                     if f.is_some() || tokio::time::Instant::now() >= poll_deadline {
                         break f;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                 };
 
                 match found {
                     Some(i) => {
-                        if *state.last_window_id.read() != window_id { return; }
+                        if *state.last_window_id.read() != window_id {
+                            return;
+                        }
                         info!("[Bazaar] Found item at slot {}", i);
-                        // Add randomized human-like delay (200-450ms)
-                        let jitter = 200 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 250) as u64;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
-                        if *state.last_window_id.read() != window_id { return; }
+                        // Click the instant the item is detected — no fixed delay.
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
-                        warn!("[Bazaar] Item \"{}\" not found in search results; going idle", item_name);
+                        warn!(
+                            "[Bazaar] Item \"{}\" not found in search results; going idle",
+                            item_name
+                        );
                         send_raw_close(bot, window_id, &state.handlers);
                         *state.bot_state.write() = BotState::Idle;
                     }
@@ -3877,56 +5161,60 @@ async fn handle_window_interaction(
                 return;
             }
 
-            // For steps 3-5: poll for the relevant button (Custom Amount / Custom Price) for up
-            // to 1500ms matching the order-button poll above.  A single fixed sleep is unreliable
-            // because ContainerSetContent may arrive at any time after OpenScreen.
-            let poll_deadline2 = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
-            let (amount_slot, price_slot) = loop {
-                if *state.last_window_id.read() != window_id { return; }
-                let slots = read_slots();
-                let ca = if is_buy_order { find_slot_by_name(&slots, "Custom Amount") } else { None };
-                let cp = find_slot_by_name(&slots, "Custom Price");
-                if ca.is_some() || cp.is_some() || tokio::time::Instant::now() >= poll_deadline2 {
-                    break (ca, cp);
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            };
-
-            // Step 3: Amount screen (buy orders only)
-            if let (Some(i), true) = (amount_slot,
-                is_buy_order && current_step == BazaarStep::SelectOrderType)
-            {
-                if *state.last_window_id.read() != window_id { return; }
-                info!("[Bazaar] Amount screen: clicking Custom Amount at slot {}", i);
-                *state.bazaar_step.write() = BazaarStep::SetAmount;
-                click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                // Sign response is sent in the OpenSignEditor packet handler
-            }
-            // Step 4: Price screen
-            else if let (Some(i), true) = (price_slot,
-                current_step == BazaarStep::SelectOrderType || current_step == BazaarStep::SetAmount)
-            {
-                if *state.last_window_id.read() != window_id { return; }
-                info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
-                *state.bazaar_step.write() = BazaarStep::SetPrice;
-                click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                // Sign response is sent in the OpenSignEditor packet handler
-            }
-            // Step 5: Confirm screen — anything that opens after SetPrice
-            else if current_step == BazaarStep::SetPrice {
-                if *state.last_window_id.read() != window_id { return; }
-                info!("[Bazaar] Confirm screen: clicking slot 13");
+            // ── Step 5: Confirm screen (step == SetPrice) ────────────────────
+            // Past the amount/price steps the only thing left is pressing the
+            // confirm button (slot 13). Handle it here, ahead of the amount/price
+            // poll below, so we don't wait on that poll before confirming. Detect
+            // slot 13 by polling tightly and click the instant it's populated —
+            // no fixed delay. If it never populates, abort rather than click an
+            // empty slot.
+            if current_step == BazaarStep::SetPrice {
                 *state.bazaar_step.write() = BazaarStep::Confirm;
                 // Clear rejection flag before clicking so we only capture the
                 // response to *this* placement attempt.
                 state.bazaar_order_rejected.store(false, Ordering::Relaxed);
-                // Add randomized human-like delay before confirming (300-700ms)
-                let jitter = 300 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() % 400) as u64;
-                tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
-                click_window_slot(bot, &state.last_window_id, window_id, 13).await;
 
-                // Wait briefly for the server to respond (limit/rejection message arrives asynchronously)
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                const CONFIRM_SLOT: usize = 13;
+                // Poll every 20ms (≤800ms cap) for slot 13 to hold a real item,
+                // since ContainerSetContent may lag OpenScreen. Breaks the instant
+                // it's ready — no polling slower than detection needs.
+                let confirm_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(800);
+                let confirm_ready = loop {
+                    if *state.last_window_id.read() != window_id {
+                        return;
+                    }
+                    let slots = read_slots();
+                    if slots
+                        .get(CONFIRM_SLOT)
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
+                    {
+                        break true;
+                    }
+                    if tokio::time::Instant::now() >= confirm_deadline {
+                        break false;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                };
+                if !confirm_ready {
+                    warn!("[Bazaar] Confirm button (slot {}) never populated — aborting instead of clicking an empty slot", CONFIRM_SLOT);
+                    send_raw_close(bot, window_id, &state.handlers);
+                    *state.bot_state.write() = BotState::Idle;
+                    return;
+                }
+
+                info!("[Bazaar] Confirm screen: clicking slot {}", CONFIRM_SLOT);
+                // Click the instant slot 13 is detected — no fixed delay.
+                click_window_slot(bot, &state.last_window_id, window_id, CONFIRM_SLOT as i16).await;
+
+                // NOT a padding delay: this is the rejection window. The
+                // limit/"price not competitive" reply arrives async as a chat
+                // message that flips the flags below, so give it a brief moment
+                // before deciding whether the order really placed (otherwise we'd
+                // log/emit a placed order that the server actually rejected). Runs
+                // after the click, so it never delays the buy itself.
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
                 if state.bazaar_at_limit.load(Ordering::Relaxed) {
                     warn!("[Bazaar] Order rejected (at limit) — not emitting BazaarOrderPlaced");
@@ -3948,7 +5236,66 @@ async fn handle_window_interaction(
                 }
                 send_raw_close(bot, window_id, &state.handlers);
                 *state.bot_state.write() = BotState::Idle;
+                return;
             }
+
+            // ── Steps 3-4: Amount / Price screens ────────────────────────────
+            // The confirm screen was already handled and returned above, so poll
+            // here for whichever "Custom Amount" / "Custom Price" slot this screen
+            // exposes. Poll every 20ms (≤1500ms cap) — ContainerSetContent may lag
+            // OpenScreen — and break the instant the slot appears so we never wait
+            // longer than detection actually needs.
+            let poll_deadline2 =
+                tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+            let (amount_slot, price_slot) = loop {
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
+                let slots = read_slots();
+                let ca = if is_buy_order {
+                    find_slot_by_name(&slots, "Custom Amount")
+                } else {
+                    None
+                };
+                let cp = find_slot_by_name(&slots, "Custom Price");
+                if ca.is_some() || cp.is_some() || tokio::time::Instant::now() >= poll_deadline2 {
+                    break (ca, cp);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            };
+
+            // Step 3: Amount screen (buy orders only)
+            if let (Some(i), true) = (
+                amount_slot,
+                is_buy_order && current_step == BazaarStep::SelectOrderType,
+            ) {
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
+                info!(
+                    "[Bazaar] Amount screen: clicking Custom Amount at slot {}",
+                    i
+                );
+                *state.bazaar_step.write() = BazaarStep::SetAmount;
+                click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                // Sign response is sent in the OpenSignEditor packet handler
+            }
+            // Step 4: Price screen
+            else if let (Some(i), true) = (
+                price_slot,
+                current_step == BazaarStep::SelectOrderType
+                    || current_step == BazaarStep::SetAmount,
+            ) {
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
+                info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
+                *state.bazaar_step.write() = BazaarStep::SetPrice;
+                click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                // Sign response is sent in the OpenSignEditor packet handler
+            }
+            // Any other window/step combination has no actionable slot here — fall
+            // through and do nothing rather than click a slot that isn't there.
         }
         BotState::InstaSelling => {
             // Sell a dominant inventory item via /bz → Sell Instantly to free space.
@@ -3978,27 +5325,42 @@ async fn handle_window_interaction(
             }
 
             let step = *state.bazaar_step.read();
-            info!("[InstaSell] Window: \"{}\" | step: {:?} | item: \"{}\"", window_title, step, item_name);
+            info!(
+                "[InstaSell] Window: \"{}\" | step: {:?} | item: \"{}\"",
+                window_title, step, item_name
+            );
 
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            if *state.last_window_id.read() != window_id { return; }
+            if *state.last_window_id.read() != window_id {
+                return;
+            }
 
             if step == BazaarStep::Initial && window_title.contains("Bazaar") {
                 // Search results: find the item by name and click it
-                let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+                let poll_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
                 let item_slot = loop {
-                    if *state.last_window_id.read() != window_id { return; }
+                    if *state.last_window_id.read() != window_id {
+                        return;
+                    }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, &item_name) {
                         break Some(i);
                     }
-                    if tokio::time::Instant::now() >= poll_deadline { break None; }
+                    if tokio::time::Instant::now() >= poll_deadline {
+                        break None;
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
                 match item_slot {
                     Some(i) => {
-                        if *state.last_window_id.read() != window_id { return; }
-                        info!("[InstaSell] Found \"{}\" at slot {}, clicking", item_name, i);
+                        if *state.last_window_id.read() != window_id {
+                            return;
+                        }
+                        info!(
+                            "[InstaSell] Found \"{}\" at slot {}, clicking",
+                            item_name, i
+                        );
                         *state.bazaar_step.write() = BazaarStep::SearchResults;
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
@@ -4011,19 +5373,26 @@ async fn handle_window_interaction(
                 }
             } else if step == BazaarStep::SearchResults {
                 // Item detail page: find "Sell Instantly" and click it
-                let poll_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
+                let poll_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
                 let sell_slot = loop {
-                    if *state.last_window_id.read() != window_id { return; }
+                    if *state.last_window_id.read() != window_id {
+                        return;
+                    }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, "Sell Instantly") {
                         break Some(i);
                     }
-                    if tokio::time::Instant::now() >= poll_deadline { break None; }
+                    if tokio::time::Instant::now() >= poll_deadline {
+                        break None;
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
                 match sell_slot {
                     Some(i) => {
-                        if *state.last_window_id.read() != window_id { return; }
+                        if *state.last_window_id.read() != window_id {
+                            return;
+                        }
                         info!("[InstaSell] Clicking \"Sell Instantly\" at slot {}", i);
                         *state.bazaar_step.write() = BazaarStep::SelectOrderType;
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
@@ -4039,17 +5408,24 @@ async fn handle_window_interaction(
                 // Confirmation page (warning may be present for up to 5 seconds).
                 // Wait up to 5 s for a "Confirm" button, then click it.
                 info!("[InstaSell] Waiting up to 5s for confirm button...");
-                let confirm_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                let confirm_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
                 let confirm_slot = loop {
-                    if *state.last_window_id.read() != window_id { return; }
+                    if *state.last_window_id.read() != window_id {
+                        return;
+                    }
                     let slots = bot.menu().slots();
                     if let Some(i) = find_slot_by_name(&slots, "Confirm") {
                         break Some(i);
                     }
-                    if tokio::time::Instant::now() >= confirm_deadline { break None; }
+                    if tokio::time::Instant::now() >= confirm_deadline {
+                        break None;
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
-                if *state.last_window_id.read() != window_id { return; }
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
                 match confirm_slot {
                     Some(i) => {
                         info!("[InstaSell] Clicking Confirm at slot {}", i);
@@ -4094,15 +5470,16 @@ async fn handle_window_interaction(
                     found = true;
                 }
                 if !found {
-                    // Look for purchased item with "Status: Sold!" in lore (TypeScript pattern)
+                    // Look for a claimable purchased item using the same
+                    // indicators as ClaimingSold (sold!, ended, expired,
+                    // click to claim, claim your) — not just "Status: Sold".
                     // Only scan window slots, not player inventory.
                     let window_slot_count = window_content_slot_count(slots.len());
                     for (i, item) in slots.iter().enumerate().take(window_slot_count) {
-                        let lore = get_item_lore_from_slot(item);
-                        let lore_lower = lore.join("\n").to_lowercase();
-                        if lore_lower.contains("status:") && lore_lower.contains("sold") {
-                            info!("[ClaimPurchased] Found purchased item with Sold status at slot {}", i);
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                        if is_claimable_auction_slot(item) {
+                            info!("[ClaimPurchased] Found claimable item at slot {}", i);
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16)
+                                .await;
                             // Stay in ClaimingPurchased — next window should be BIN Auction View
                             found = true;
                             break;
@@ -4114,7 +5491,9 @@ async fn handle_window_interaction(
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
-            } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
+            } else if window_title.contains("BIN Auction View")
+                || window_title.contains("Auction View")
+            {
                 info!("[ClaimPurchased] Auction View opened - clicking slot 31 to collect");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 31).await;
@@ -4122,7 +5501,10 @@ async fn handle_window_interaction(
                 *state.bot_state.write() = BotState::Idle;
             } else {
                 // Unrecognized window while claiming purchased — close and go idle.
-                warn!("[ClaimPurchased] Unexpected window '{}' — closing and going idle", window_title);
+                warn!(
+                    "[ClaimPurchased] Unexpected window '{}' — closing and going idle",
+                    window_title
+                );
                 send_raw_close(bot, window_id, &state.handlers);
                 *state.bot_state.write() = BotState::Idle;
             }
@@ -4154,8 +5536,18 @@ async fn handle_window_interaction(
                 // Only scan the window slots (typically 0..27 for a 3-row GUI),
                 // not the player inventory at the bottom, to avoid false matches.
                 let window_slot_count = window_content_slot_count(slots.len());
+                // On a co-op profile this window also lists what co-op members
+                // put up, and "Claim All" would sweep their coins into our
+                // purse. With `only_claim_own_auctions` on we never press it and
+                // fall through to the per-slot scan, which checks ownership.
+                let own_only = crate::auction_ownership::enabled();
+                let claim_all = if own_only {
+                    None
+                } else {
+                    find_slot_by_name(&slots, "Claim All")
+                };
                 // Look for Claim All first
-                if let Some(i) = find_slot_by_name(&slots, "Claim All") {
+                if let Some(i) = claim_all {
                     info!("[ClaimSold] Clicking Claim All at slot {}", i);
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     // Claim All finishes everything — close window and go idle
@@ -4165,38 +5557,83 @@ async fn handle_window_interaction(
                 } else {
                     // Look for first claimable item (only window slots)
                     let mut found = false;
+                    let mut skipped_foreign = 0usize;
                     for (i, item) in slots.iter().enumerate().take(window_slot_count) {
-                        if is_claimable_auction_slot(item) {
-                            info!("[ClaimSold] Clicking claimable item at slot {}", i);
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                            // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
-                            found = true;
-                            break;
+                        if !is_claimable_auction_slot(item) {
+                            continue;
                         }
+                        if own_only && !claim_slot_is_ours(item, i) {
+                            skipped_foreign += 1;
+                            continue;
+                        }
+                        info!("[ClaimSold] Clicking claimable item at slot {}", i);
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                        // Stay in ClaimingSold — Hypixel re-opens Manage Auctions after the detail
+                        found = true;
+                        break;
                     }
                     if !found {
-                        info!("[ClaimSold] Nothing to claim, closing window and going idle");
+                        if skipped_foreign > 0 {
+                            info!(
+                                "[ClaimSold] Nothing of ours to claim — left {} claimable auction(s) \
+                                 alone, they were not listed by this account (only_claim_own_auctions \
+                                 is on). Closing window and going idle",
+                                skipped_foreign
+                            );
+                        } else {
+                            info!("[ClaimSold] Nothing to claim, closing window and going idle");
+                        }
                         send_raw_close(bot, window_id, &state.handlers);
                         state.auction_slot_blocked.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
                 }
-            } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
+            } else if window_title.contains("BIN Auction View")
+                || window_title.contains("Auction View")
+            {
                 info!("[ClaimSold] Auction detail opened - looking for Claim button");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 let menu = bot.menu();
                 let slots = menu.slots();
                 // Prefer fixed slot 31 in auction detail; use name matching only as fallback.
-                let slot_31_name = slots.get(31).and_then(get_item_display_name_from_slot).unwrap_or_default();
+                let slot_31_name = slots
+                    .get(31)
+                    .and_then(get_item_display_name_from_slot)
+                    .unwrap_or_default();
                 let slot_31_lower = remove_mc_colors(&slot_31_name).to_lowercase();
-                if slot_31_lower.contains("claim") {
+                // Guard ONLY against the relist/create button: when an auction was
+                // already claimed, this view can offer "Sell Again"/"Create BIN
+                // Auction" at slot 31 — clicking it would relist the item (the
+                // earlier "Unexpected window 'Create BIN Auction'" bug). For every
+                // other case default to clicking the claim slot, because the slot-31
+                // name read sometimes races the window content (it arrives a tick
+                // later) and an over-strict "only if it literally says claim" check
+                // silently dropped legitimate single-item claims.
+                let slot_31_is_relist = slot_31_lower.contains("create")
+                    || slot_31_lower.contains("sell again")
+                    || slot_31_lower.contains("relist")
+                    || slot_31_lower.contains("bin auction")
+                    || slot_31_lower.contains("auction again");
+                if slot_31_is_relist {
+                    warn!("[ClaimSold] Slot 31 is a relist/create button — closing (avoiding accidental relist)");
+                    send_raw_close(bot, window_id, &state.handlers);
+                    state.auction_slot_blocked.store(false, Ordering::Relaxed);
+                    *state.bot_state.write() = BotState::Idle;
+                } else if slot_31_lower.contains("claim") || slot_31_lower.contains("collect") {
                     info!("[ClaimSold] Clicking preferred Claim slot 31");
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
-                } else if let Some(i) = find_slot_by_name(&slots, "Claim") {
-                    info!("[ClaimSold] Slot 31 not claimable, falling back to Claim name match at slot {}", i);
+                } else if let Some(i) = find_slot_by_name(&slots, "Claim")
+                    .or_else(|| find_slot_by_name(&slots, "Collect"))
+                {
+                    info!(
+                        "[ClaimSold] Falling back to Claim/Collect name match at slot {}",
+                        i
+                    );
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 } else {
-                    info!("[ClaimSold] Claim button not found, clicking slot 31 fallback");
+                    // Ambiguous (likely the slot-31 item hasn't synced yet) and NOT a
+                    // relist button — click slot 31, the historical claim position.
+                    info!("[ClaimSold] Claim name not yet resolved — clicking slot 31 (claim position)");
                     click_window_slot(bot, &state.last_window_id, window_id, 31).await;
                 }
                 // Spawn a short watchdog: if Hypixel doesn't re-open Manage Auctions within
@@ -4212,7 +5649,10 @@ async fn handle_window_interaction(
             } else {
                 // Unrecognized window while claiming — close and go idle to avoid
                 // getting stuck in an unexpected GUI.
-                warn!("[ClaimSold] Unexpected window '{}' — closing and going idle", window_title);
+                warn!(
+                    "[ClaimSold] Unexpected window '{}' — closing and going idle",
+                    window_title
+                );
                 send_raw_close(bot, window_id, &state.handlers);
                 state.auction_slot_blocked.store(false, Ordering::Relaxed);
                 *state.bot_state.write() = BotState::Idle;
@@ -4245,28 +5685,37 @@ async fn handle_window_interaction(
                 // Find the auction slot matching item_name + starting_bid
                 let mut found = false;
                 for (i, item) in slots.iter().enumerate() {
-                    if item.is_empty() { continue; }
+                    if item.is_empty() {
+                        continue;
+                    }
                     let display_name = match get_item_display_name_from_slot(item) {
                         Some(n) => n,
                         None => continue,
                     };
                     let clean = remove_mc_colors(&display_name).to_lowercase();
-                    if !clean.contains(&target_lower) { continue; }
+                    if !clean.contains(&target_lower) {
+                        continue;
+                    }
                     // Verify price matches for accurate identification
                     let lore = get_item_lore_from_slot(item);
                     let price = extract_price_from_lore(&lore);
                     if let Some(p) = price {
-                        if p != target_bid { continue; }
+                        if p != target_bid {
+                            continue;
+                        }
                     }
                     // Verify this is an active auction (not sold/expired)
                     let combined_lower = lore.join("\n").to_lowercase();
                     if combined_lower.contains("sold!")
                         || combined_lower.contains("expired")
-                        || combined_lower.contains("ended")
+                        || contains_word_ended(&combined_lower)
                     {
                         continue;
                     }
-                    info!("[CancelAuction] Found matching auction '{}' at slot {} (price: {:?})", display_name, i, price);
+                    info!(
+                        "[CancelAuction] Found matching auction '{}' at slot {} (price: {:?})",
+                        display_name, i, price
+                    );
                     click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     found = true;
                     break;
@@ -4276,7 +5725,9 @@ async fn handle_window_interaction(
                     send_raw_close(bot, window_id, &state.handlers);
                     *state.bot_state.write() = BotState::Idle;
                 }
-            } else if window_title.contains("BIN Auction View") || window_title.contains("Auction View") {
+            } else if window_title.contains("BIN Auction View")
+                || window_title.contains("Auction View")
+            {
                 info!("[CancelAuction] Auction detail opened - looking for Cancel Auction button");
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 let menu = bot.menu();
@@ -4311,14 +5762,21 @@ async fn handle_window_interaction(
                     info!("[CancelAuction] Confirm not found by name, clicking slot 11");
                     click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 }
-                info!("[CancelAuction] Auction cancellation confirmed, closing window and going idle");
+                info!(
+                    "[CancelAuction] Auction cancellation confirmed, closing window and going idle"
+                );
                 send_raw_close(bot, window_id, &state.handlers);
                 let cancelled_name = state.cancel_auction_item_name.read().clone();
                 let cancelled_bid = *state.cancel_auction_starting_bid.read();
-                let _ = state.event_tx.send(BotEvent::AuctionCancelled {
-                    item_name: cancelled_name,
-                    starting_bid: cancelled_bid as u64,
-                });
+                // Kept for the day Hypixel does show a confirm window. In
+                // practice it does not, and the chat handler is what fires;
+                // whichever wins, the de-dupe stops a double webhook.
+                emit_auction_cancelled(
+                    state,
+                    cancelled_name,
+                    cancelled_bid.max(0) as u64,
+                    "confirm window",
+                );
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -4342,7 +5800,10 @@ async fn handle_window_interaction(
             // proceed — close the window and bail.  The retry task spawned by the
             // chat handler will re-open /ah once the window is closed.
             if state.auction_sell_aborted.load(Ordering::Relaxed) {
-                warn!("[Auction] Window opened but auction sell aborted — closing window {}", window_id);
+                warn!(
+                    "[Auction] Window opened but auction sell aborted — closing window {}",
+                    window_id
+                );
                 send_raw_close(bot, window_id, &state.handlers);
                 return;
             }
@@ -4374,13 +5835,18 @@ async fn handle_window_interaction(
                             info!("[Auction] Clicking Create Auction at slot {}", i);
                             *state.auction_step.write() = AuctionStep::ClickCreate;
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16)
+                                .await;
                         } else {
-                            warn!("[Auction] Create Auction not found in Manage Auctions, going idle");
+                            warn!(
+                                "[Auction] Create Auction not found in Manage Auctions, going idle"
+                            );
                             send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                         }
-                    } else if window_title.contains("Create Auction") && !window_title.contains("BIN") {
+                    } else if window_title.contains("Create Auction")
+                        && !window_title.contains("BIN")
+                    {
                         // Co-op AH or similar: jumped directly to "Create Auction" — click slot 48 (BIN)
                         info!("[Auction] Skipped Manage Auctions, in Create Auction — clicking slot 48 (BIN)");
                         *state.auction_step.write() = AuctionStep::SelectBIN;
@@ -4393,7 +5859,7 @@ async fn handle_window_interaction(
                         clear_auction_preview_slot(bot, state, window_id, &slots).await;
                         let player_start = *menu.player_slots_range().start();
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
-                            if mj_slot >= 9 && mj_slot <= 44 {
+                            if (9..=44).contains(&mj_slot) {
                                 let offset = (mj_slot as usize) - 9;
                                 let ws = player_start + offset;
                                 if ws < slots.len() && !slots[ws].is_empty() {
@@ -4407,17 +5873,46 @@ async fn handle_window_interaction(
                         } else {
                             find_slot_by_name(&slots, &item_name)
                         };
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot.
+                        // A name-search fallback can otherwise resolve to a GUI/control slot
+                        // or an emptied slot; clicking that to "sell" a non-item is an
+                        // impossible action Hypixel Watchdog flags. Invalid → fall through to
+                        // the abort branch below instead of clicking garbage.
+                        let target_slot = target_slot.filter(|&i| {
+                            i >= player_start && i < slots.len() && !slots[i].is_empty()
+                        });
                         if let Some(i) = target_slot {
+                            if slots[i].count() > 1 {
+                                refuse_stacked_listing(
+                                    bot,
+                                    state,
+                                    window_id,
+                                    &item_name,
+                                    slots[i].count().max(0) as u32,
+                                );
+                                return;
+                            }
                             info!("[Auction] Co-op AH: clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16)
+                                .await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Co-op AH: clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
+                            click_window_slot_carrying(
+                                bot,
+                                &state.last_window_id,
+                                window_id,
+                                31,
+                                &item_to_carry,
+                            )
+                            .await;
                         } else {
-                            warn!("[Auction] Co-op AH: item \"{}\" not found, going idle", item_name);
+                            warn!(
+                                "[Auction] Co-op AH: item \"{}\" not found, going idle",
+                                item_name
+                            );
                             send_raw_close(bot, window_id, &state.handlers);
                             *state.bot_state.write() = BotState::Idle;
                         }
@@ -4439,7 +5934,7 @@ async fn handle_window_interaction(
                         clear_auction_preview_slot(bot, state, window_id, &slots).await;
                         let player_start = *menu.player_slots_range().start();
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
-                            if mj_slot >= 9 && mj_slot <= 44 {
+                            if (9..=44).contains(&mj_slot) {
                                 let offset = (mj_slot as usize) - 9;
                                 let ws = player_start + offset;
                                 if ws < slots.len() && !slots[ws].is_empty() {
@@ -4453,15 +5948,51 @@ async fn handle_window_interaction(
                         } else {
                             find_slot_by_name(&slots, &item_name)
                         };
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot —
+                        // never a GUI/display slot or an empty slot (selling a non-item is an
+                        // impossible action Watchdog flags). But if the resolved slot is
+                        // rejected (e.g. a whole-window name search matched a GUI display
+                        // slot), fall back to searching ONLY the player inventory so a
+                        // legitimately-held item is still listed instead of aborting the sale.
+                        let target_slot = target_slot
+                            .filter(|&i| {
+                                i >= player_start && i < slots.len() && !slots[i].is_empty()
+                            })
+                            .or_else(|| {
+                                find_inventory_slot_by_name(&slots, player_start, &item_name)
+                            });
                         if let Some(i) = target_slot {
-                            info!("[Auction] ClickCreate→SelectBIN: clicking item at slot {}", i);
+                            if slots[i].count() > 1 {
+                                refuse_stacked_listing(
+                                    bot,
+                                    state,
+                                    window_id,
+                                    &item_name,
+                                    slots[i].count().max(0) as u32,
+                                );
+                                return;
+                            }
+                            info!(
+                                "[Auction] ClickCreate→SelectBIN: clicking item at slot {}",
+                                i
+                            );
                             let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16)
+                                .await;
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                            info!("[Auction] ClickCreate→SelectBIN: clicking slot 31 (price setter)");
+                            info!(
+                                "[Auction] ClickCreate→SelectBIN: clicking slot 31 (price setter)"
+                            );
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
+                            click_window_slot_carrying(
+                                bot,
+                                &state.last_window_id,
+                                window_id,
+                                31,
+                                &item_to_carry,
+                            )
+                            .await;
                         } else {
                             warn!("[Auction] ClickCreate→SelectBIN: item \"{}\" not found, going idle", item_name);
                             send_raw_close(bot, window_id, &state.handlers);
@@ -4485,11 +6016,14 @@ async fn handle_window_interaction(
                         let target_slot = if let Some(mj_slot) = item_slot_opt {
                             // TypeScript: itemSlot = data.slot - bot.inventory.inventoryStart + sellWindow.inventoryStart
                             // mineflayer inventoryStart = 9; slots 9-44 are player inventory (36 slots)
-                            if mj_slot >= 9 && mj_slot <= 44 {
+                            if (9..=44).contains(&mj_slot) {
                                 let offset = (mj_slot as usize) - 9;
                                 let ws = player_start + offset;
                                 if ws < slots.len() && !slots[ws].is_empty() {
-                                    info!("[Auction] Using computed slot {} for item (mj_slot={})", ws, mj_slot);
+                                    info!(
+                                        "[Auction] Using computed slot {} for item (mj_slot={})",
+                                        ws, mj_slot
+                                    );
                                     Some(ws)
                                 } else {
                                     info!("[Auction] Computed slot {} empty/invalid, falling back to name search", ws);
@@ -4503,16 +6037,47 @@ async fn handle_window_interaction(
                             find_slot_by_name(&slots, &item_name)
                         };
 
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot —
+                        // never a GUI/display slot or an empty slot (selling a non-item is an
+                        // impossible action Watchdog flags). But if the resolved slot is
+                        // rejected (e.g. a whole-window name search matched a GUI display
+                        // slot), fall back to searching ONLY the player inventory so a
+                        // legitimately-held item is still listed instead of aborting the sale.
+                        let target_slot = target_slot
+                            .filter(|&i| {
+                                i >= player_start && i < slots.len() && !slots[i].is_empty()
+                            })
+                            .or_else(|| {
+                                find_inventory_slot_by_name(&slots, player_start, &item_name)
+                            });
                         if let Some(i) = target_slot {
+                            if slots[i].count() > 1 {
+                                refuse_stacked_listing(
+                                    bot,
+                                    state,
+                                    window_id,
+                                    &item_name,
+                                    slots[i].count().max(0) as u32,
+                                );
+                                return;
+                            }
                             info!("[Auction] Clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                            click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16)
+                                .await;
                             // Click slot 31 (price setter) — sign will open, handled in OpenSignEditor
                             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             info!("[Auction] Clicking slot 31 (price setter)");
                             *state.auction_step.write() = AuctionStep::PriceSign;
-                            click_window_slot_carrying(bot, &state.last_window_id, window_id, 31, &item_to_carry).await;
+                            click_window_slot_carrying(
+                                bot,
+                                &state.last_window_id,
+                                window_id,
+                                31,
+                                &item_to_carry,
+                            )
+                            .await;
                         } else {
                             warn!("[Auction] Item \"{}\" not found in Create BIN Auction window, going idle", item_name);
                             send_raw_close(bot, window_id, &state.handlers);
@@ -4560,7 +6125,9 @@ async fn handle_window_interaction(
                     // "Confirm BIN Auction" window — click slot 11 to finalize.
                     // AuctionListed event is emitted from the chat handler when Hypixel sends
                     // "BIN Auction started for ..." (matches TypeScript sellHandler.ts).
-                    if window_title.contains("Confirm BIN Auction") || window_title.contains("Confirm") {
+                    if window_title.contains("Confirm BIN Auction")
+                        || window_title.contains("Confirm")
+                    {
                         // Check if the sell was aborted (e.g. wrong item in auction slot)
                         if state.auction_sell_aborted.load(Ordering::Relaxed) {
                             warn!("[Auction] FinalConfirm aborted — wrong item detected, closing window");
@@ -4595,29 +6162,47 @@ async fn handle_window_interaction(
             }
 
             let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
+            let target_item = state.manage_orders_target_item.read().clone();
             if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
                 // Bazaar page (main or category) — find "Manage Orders" button
                 // dynamically.  Hypixel may rearrange slots across updates, so we
                 // search by name instead of relying on a hardcoded slot index.
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                if *state.last_window_id.read() != window_id { return; }
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
                 let slots = bot.menu().slots();
-                let manage_slot = find_slot_by_name(&slots, "Manage Orders").unwrap_or(MANAGE_ORDERS_FALLBACK_SLOT);
-                info!("[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})", manage_slot);
+                let manage_slot = find_slot_by_name(&slots, "Manage Orders")
+                    .unwrap_or(MANAGE_ORDERS_FALLBACK_SLOT);
+                info!(
+                    "[ManageOrders] Bazaar window open, clicking Manage Orders (slot {})",
+                    manage_slot
+                );
                 click_window_slot(bot, &state.last_window_id, window_id, manage_slot as i16).await;
             } else if is_bazaar_orders_window_title(window_title) {
                 // ── Process ONE order per ManageOrders cycle ──
                 // On Hypixel, clicking a filled order slot directly collects items/coins.
                 // If the order is open (nothing to collect), "Order options" opens instead.
                 // We process only one order then go Idle so bazaar flips aren't blocked.
-                let mode_str = if cancel_open { "cancel+collect" } else { "collect-only" };
-                info!("[ManageOrders] Processing orders ({}) — single order per cycle", mode_str);
+                let mode_str = if cancel_open {
+                    "cancel+collect"
+                } else {
+                    "collect-only"
+                };
+                info!(
+                    "[ManageOrders] Processing orders ({}) — single order per cycle",
+                    mode_str
+                );
                 let persistent_processed = &state.manage_orders_processed;
 
                 // Wait for ContainerSetContent to populate the window
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                if check_manage_orders_deadline(bot, state, window_id) { return; }
-                if *state.last_window_id.read() != window_id { return; }
+                if check_manage_orders_deadline(bot, state, window_id) {
+                    return;
+                }
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
 
                 let slots = bot.menu().slots();
 
@@ -4626,8 +6211,17 @@ async fn handle_window_interaction(
                 //   SELL before BUY within each tier.
                 // Priority (cancel mode): SELL first, then BUY (all orders).
                 //
-                // Tuple: (slot, name, identity, order_key, claimable, filled_amount)
-                type OrderEntry = (usize, String, Option<(bool, String)>, String, bool, Option<u64>);
+                // Tuple: (slot, name, identity, order_key, claimable, filled_amount, order_amount, unit_price)
+                type OrderEntry = (
+                    usize,
+                    String,
+                    Option<(bool, String)>,
+                    String,
+                    bool,
+                    Option<u64>,
+                    u64,
+                    f64,
+                );
                 let mut sell_orders: Vec<OrderEntry> = Vec::new();
                 let mut buy_orders: Vec<OrderEntry> = Vec::new();
 
@@ -4642,16 +6236,37 @@ async fn handle_window_interaction(
                         if !should_treat_as_bazaar_order_slot(&name, identity.as_ref()) {
                             continue;
                         }
-                        let is_buy = identity.as_ref()
+                        let is_buy = identity
+                            .as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&name));
                         let claimable = is_order_claimable_from_lore(&lore);
                         let filled_amount = parse_filled_amount_from_lore(&lore).map(|(f, _)| f);
+                        let order_amount = parse_order_amount_from_lore(&lore).unwrap_or(0);
+                        let unit_price = parse_unit_price_from_lore(&lore).unwrap_or(0.0);
                         let order_key = format!("{}::{}", i, name_key);
                         if is_buy {
-                            buy_orders.push((i, name, identity, order_key, claimable, filled_amount));
+                            buy_orders.push((
+                                i,
+                                name,
+                                identity,
+                                order_key,
+                                claimable,
+                                filled_amount,
+                                order_amount,
+                                unit_price,
+                            ));
                         } else {
-                            sell_orders.push((i, name, identity, order_key, claimable, filled_amount));
+                            sell_orders.push((
+                                i,
+                                name,
+                                identity,
+                                order_key,
+                                claimable,
+                                filled_amount,
+                                order_amount,
+                                unit_price,
+                            ));
                         }
                     }
                 }
@@ -4662,14 +6277,19 @@ async fn handle_window_interaction(
                 // stale entries that no longer exist in-game.
                 {
                     let mut ingame_orders = Vec::with_capacity(total_orders);
-                    for (_, name, identity, _, _, _) in sell_orders.iter().chain(buy_orders.iter()) {
-                        let is_buy = identity.as_ref()
+                    for (_, name, identity, _, _, _, order_amount, unit_price) in
+                        sell_orders.iter().chain(buy_orders.iter())
+                    {
+                        let is_buy = identity
+                            .as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(name));
                         let clean = clean_order_item_name(name, identity);
-                        ingame_orders.push((clean, is_buy));
+                        ingame_orders.push((clean, is_buy, *order_amount, *unit_price));
                     }
-                    let _ = state.event_tx.send(BotEvent::BazaarOrdersSnapshot { ingame_orders });
+                    let _ = state
+                        .event_tx
+                        .send(BotEvent::BazaarOrdersSnapshot { ingame_orders });
                 }
 
                 // In collect-only mode, ONLY click claimable orders.  Open
@@ -4686,34 +6306,98 @@ async fn handle_window_interaction(
                 // enough free slots to hold a stack, clear the flag and let
                 // BUY orders through.
                 if inv_full {
-                    let empty = count_empty_player_slots(&bot);
+                    let empty = count_empty_player_slots(bot);
                     if empty >= MIN_FREE_SLOTS_FOR_BUY as usize {
                         info!("[ManageOrders] inventory_full flag was set but {} empty slots found — clearing flag", empty);
                         state.inventory_full.store(false, Ordering::Relaxed);
                         inv_full = false;
                     }
                 }
-                let chosen_order: Option<OrderEntry> = if !cancel_open {
+                let chosen_order: Option<OrderEntry> = if let Some(ref target) = target_item {
+                    // Targeted cancel: find the specific order matching the web GUI
+                    // request or COFL's `cancelOrder` message.
+                    let tgt_norm =
+                        crate::bazaar_tracker::normalize_for_match_pub(&target.item_name);
+                    // All same-item, same-side orders are candidates. When COFL
+                    // supplied a price, several orders may share the item+side at
+                    // different price levels — the price picks the exact one.
+                    let candidates: Vec<&OrderEntry> = sell_orders
+                        .iter()
+                        .chain(buy_orders.iter())
+                        .filter(|(_, name, identity, _, _, _, _, _)| {
+                            let order_is_buy = identity
+                                .as_ref()
+                                .map(|(b, _)| *b)
+                                .unwrap_or_else(|| is_buy_bazaar_order_name(name));
+                            if order_is_buy != target.is_buy {
+                                return false;
+                            }
+                            let clean = clean_order_item_name(name, identity);
+                            crate::bazaar_tracker::normalize_for_match_pub(&clean) == tgt_norm
+                        })
+                        .collect();
+                    match target.price_per_unit {
+                        // Price given: pick the candidate whose unit price is closest.
+                        Some(tgt_price) => candidates
+                            .into_iter()
+                            .min_by(|a, b| {
+                                let da = (a.7 - tgt_price).abs();
+                                let db = (b.7 - tgt_price).abs();
+                                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .cloned(),
+                        // No price: first same-item, same-side order (legacy behaviour).
+                        None => candidates.into_iter().next().cloned(),
+                    }
+                } else if !cancel_open {
                     // Always try claimable sell orders first (yield coins, no
                     // inventory space needed).
-                    sell_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
+                    sell_orders
+                        .iter()
+                        .find(|&(_, _, _, _, claimable, _, _, _)| *claimable)
+                        .cloned()
                         // Claimable buy orders — skip entirely when inventory is
                         // full so we don't waste a ManageOrders cycle opening /bz,
                         // navigating to the order, and then aborting.
                         .or_else(|| {
-                            if inv_full { None } else {
-                                buy_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
+                            if inv_full {
+                                None
+                            } else {
+                                buy_orders
+                                    .iter()
+                                    .find(|&(_, _, _, _, claimable, _, _, _)| *claimable)
+                                    .cloned()
                             }
                         })
-                        .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable, _)| {
-                            !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
-                        }).cloned())
-                        .or_else(|| buy_orders.iter().find(|&(_, _, identity, _, claimable, _)| {
-                            !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
-                        }).cloned())
+                        .or_else(|| {
+                            sell_orders
+                                .iter()
+                                .find(|&(_, _, identity, _, claimable, _, _, _)| {
+                                    !claimable
+                                        && should_cancel_open_order_due_to_age(
+                                            identity.clone(),
+                                            cancel_mins,
+                                        )
+                                })
+                                .cloned()
+                        })
+                        .or_else(|| {
+                            buy_orders
+                                .iter()
+                                .find(|&(_, _, identity, _, claimable, _, _, _)| {
+                                    !claimable
+                                        && should_cancel_open_order_due_to_age(
+                                            identity.clone(),
+                                            cancel_mins,
+                                        )
+                                })
+                                .cloned()
+                        })
                 } else {
                     // cancel mode: sell first, then buy (original behaviour)
-                    sell_orders.into_iter().next()
+                    sell_orders
+                        .into_iter()
+                        .next()
                         .or_else(|| buy_orders.into_iter().next())
                 };
 
@@ -4726,8 +6410,18 @@ async fn handle_window_interaction(
                         state.bazaar_at_limit.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
-                    Some((i, order_name, order_identity, _processed_key, _claimable, order_filled_amount)) => {
-                        let order_is_buy = order_identity.as_ref()
+                    Some((
+                        i,
+                        order_name,
+                        order_identity,
+                        _processed_key,
+                        _claimable,
+                        order_filled_amount,
+                        _,
+                        _,
+                    )) => {
+                        let order_is_buy = order_identity
+                            .as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
 
@@ -4738,14 +6432,16 @@ async fn handle_window_interaction(
                         if order_is_buy && !cancel_open {
                             let still_full = state.inventory_full.load(Ordering::Relaxed);
                             if still_full {
-                                let empty = count_empty_player_slots(&bot);
+                                let empty = count_empty_player_slots(bot);
                                 if empty >= MIN_FREE_SLOTS_FOR_BUY as usize {
                                     info!("[ManageOrders] inventory_full flag stale — {} empty slots, proceeding with BUY order \"{}\"", empty, order_name);
                                     state.inventory_full.store(false, Ordering::Relaxed);
                                 } else {
                                     warn!("[ManageOrders] Inventory full ({} empty slots) — skipping BUY order \"{}\"", empty, order_name);
                                     log_pending_claim(&order_name);
-                                    persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
+                                    persistent_processed
+                                        .write()
+                                        .insert(normalize_bazaar_order_text(&order_name));
                                     send_raw_close(bot, window_id, &state.handlers);
                                     *state.manage_orders_deadline.write() = None;
                                     *state.bot_state.write() = BotState::Idle;
@@ -4755,9 +6451,17 @@ async fn handle_window_interaction(
                         }
 
                         // Store context for the Order options handler (Branch C)
-                        *state.managing_order_context.write() = Some((order_is_buy, order_name.clone(), order_identity.clone(), order_filled_amount));
+                        *state.managing_order_context.write() = Some((
+                            order_is_buy,
+                            order_name.clone(),
+                            order_identity.clone(),
+                            order_filled_amount,
+                        ));
 
-                        info!("[ManageOrders] Clicking order at slot {}: \"{}\"", i, order_name);
+                        info!(
+                            "[ManageOrders] Clicking order at slot {}: \"{}\"",
+                            i, order_name
+                        );
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
 
                         // Wait up to 5 seconds for Hypixel's response.
@@ -4766,8 +6470,8 @@ async fn handle_window_interaction(
                         //   by clicking the slot (Hypixel collects filled orders on click).
                         // • If a new "Bazaar Orders" window opens (same list, new ID) →
                         //   the order was collected and Hypixel refreshed the list.
-                        let click_deadline = tokio::time::Instant::now()
-                            + tokio::time::Duration::from_secs(5);
+                        let click_deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
                         let mut order_options_opened = false;
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
@@ -4802,7 +6506,10 @@ async fn handle_window_interaction(
                         if !order_options_opened {
                             // No "Order options" window → order was collected by clicking.
                             // Emit the collected event.
-                            info!("[ManageOrders] Order \"{}\" collected (no Order options opened)", order_name);
+                            info!(
+                                "[ManageOrders] Order \"{}\" collected (no Order options opened)",
+                                order_name
+                            );
                             let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
                                 item_name: clean_order_item_name(&order_name, &order_identity),
                                 is_buy_order: order_is_buy,
@@ -4810,7 +6517,9 @@ async fn handle_window_interaction(
                                 // amount from lore; falls back to tracker amount in handler.
                                 claimed_amount: order_filled_amount,
                             });
-                            persistent_processed.write().insert(normalize_bazaar_order_text(&order_name));
+                            persistent_processed
+                                .write()
+                                .insert(normalize_bazaar_order_text(&order_name));
                             state.bazaar_at_limit.store(false, Ordering::Relaxed);
                         }
                         // else: "Order options" opened — Branch C handler takes over.
@@ -4842,10 +6551,13 @@ async fn handle_window_interaction(
                         // because that handler is still active.
                         if total_orders > 1 && !order_options_opened {
                             if let Some(queue) = state.command_queue.read().as_ref() {
-                                if !queue.has_manage_orders() {
+                                if !queue.has_manage_orders() && target_item.is_none() {
                                     info!("[ManageOrders] {} more order(s) remain — re-queuing ManageOrders", total_orders - 1);
                                     queue.enqueue(
-                                        crate::types::CommandType::ManageOrders { cancel_open },
+                                        crate::types::CommandType::ManageOrders {
+                                            cancel_open,
+                                            target_item: None,
+                                        },
                                         crate::types::CommandPriority::Normal,
                                         false,
                                     );
@@ -4861,281 +6573,445 @@ async fn handle_window_interaction(
 
                 let order_ctx = state.managing_order_context.read().clone();
                 let (order_name, order_identity, order_filled_amount) = match &order_ctx {
-                    Some((_is_buy, name, identity, filled)) => (name.clone(), identity.clone(), *filled),
+                    Some((_is_buy, name, identity, filled)) => {
+                        (name.clone(), identity.clone(), *filled)
+                    }
                     None => (String::new(), None, None),
                 };
-                let order_identity_for_clean = order_ctx.as_ref().and_then(|(_, _, id, _)| id.clone());
+                let order_identity_for_clean =
+                    order_ctx.as_ref().and_then(|(_, _, id, _)| id.clone());
 
                 let name_key = normalize_bazaar_order_text(&order_name);
-                if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key) {
-                    debug!("[ManageOrders] Order \"{}\" already processed — closing", order_name);
+                if !name_key.is_empty() && state.manage_orders_processed.read().contains(&name_key)
+                {
+                    debug!(
+                        "[ManageOrders] Order \"{}\" already processed — closing",
+                        order_name
+                    );
                     send_raw_close(bot, window_id, &state.handlers);
                     *state.manage_orders_deadline.write() = None;
                     *state.bot_state.write() = BotState::Idle;
                 } else {
-                // Determine cancel_due_to_age BEFORE deciding whether to skip.
-                // This allows stale orders to be cancelled even in collect-only mode.
-                let cancel_due_to_age = !cancel_open
-                    && should_cancel_open_order_due_to_age(order_identity, state.bazaar_order_cancel_minutes_per_million);
+                    // Protect recently-placed orders (< 5 min) from cancellation,
+                    // even in cancel_open (startup) mode.
+                    let too_young_to_cancel = is_order_below_min_cancel_age(&order_identity);
+                    if too_young_to_cancel {
+                        info!(
+                        "[ManageOrders] Order \"{}\" is less than {} seconds old — too young to cancel",
+                        order_name, MIN_ORDER_AGE_BEFORE_CANCEL_SECS
+                    );
+                    }
 
-                // Check cancel retry limit early — if exceeded, close immediately.
-                let cancel_fail_key = normalize_bazaar_order_text(&order_name);
-                let prior_failures = *state.order_cancel_failures.read().get(&cancel_fail_key).unwrap_or(&0);
-                let cancel_exceeded = prior_failures >= MAX_CANCEL_RETRIES;
+                    // Determine cancel_due_to_age BEFORE deciding whether to skip.
+                    // This allows stale orders to be cancelled even in collect-only mode.
+                    let cancel_due_to_age = !cancel_open
+                        && should_cancel_open_order_due_to_age(
+                            order_identity,
+                            state.bazaar_order_cancel_minutes_per_million,
+                        );
 
-                if cancel_exceeded && (cancel_open || cancel_due_to_age) {
-                    warn!(
+                    // Check cancel retry limit early — if exceeded, close immediately.
+                    let cancel_fail_key = normalize_bazaar_order_text(&order_name);
+                    let prior_failures = *state
+                        .order_cancel_failures
+                        .read()
+                        .get(&cancel_fail_key)
+                        .unwrap_or(&0);
+                    let cancel_exceeded = prior_failures >= MAX_CANCEL_RETRIES;
+
+                    if cancel_exceeded && (cancel_open || cancel_due_to_age) && !too_young_to_cancel
+                    {
+                        warn!(
                         "[ManageOrders] Order \"{}\" exceeded {} cancel attempts — closing GUI and giving up",
                         order_name, MAX_CANCEL_RETRIES
                     );
-                    if !name_key.is_empty() {
-                        state.manage_orders_processed.write().insert(name_key);
-                    }
-                    if *state.last_window_id.read() == window_id {
-                        send_raw_close(bot, window_id, &state.handlers);
-                    }
-                    *state.manage_orders_deadline.write() = None;
-                    state.bazaar_at_limit.store(false, Ordering::Relaxed);
-                    *state.bot_state.write() = BotState::Idle;
-                } else if !cancel_open && !cancel_due_to_age {
-                    // Collect-only mode and order is NOT stale.
-                    // "Order options" opened, so this order is not 100% filled (those
-                    // collect on click).  It may be PARTIALLY filled (has a Collect
-                    // button) or completely open (no Collect button).
-                    // Look for a Collect button first — if found, collect the partial
-                    // fill before closing.
-                    let probe_deadline =
-                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-                    let mut collect_slot_probe: Option<usize> = None;
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        if *state.last_window_id.read() != window_id { break; }
-                        let slots_probe = bot.menu().slots();
-                        collect_slot_probe = find_slot_by_name(&slots_probe, "Collect")
-                            .or_else(|| find_slot_by_name(&slots_probe, "Claim"))
-                            .or_else(|| find_slot_by_lore_contains(&slots_probe, "click to collect"))
-                            .or_else(|| find_slot_by_lore_contains(&slots_probe, "claim your"));
-                        if collect_slot_probe.is_some() { break; }
-                        // Also check for Cancel — if present but no Collect, order is
-                        // truly open with nothing to collect.
-                        let has_cancel = find_slot_by_name(&slots_probe, "Cancel").is_some()
-                            || find_slot_by_lore_contains(&slots_probe, "click to cancel").is_some();
-                        if has_cancel { break; }
-                        if tokio::time::Instant::now() >= probe_deadline { break; }
-                    }
-
-                    if let Some(cs) = collect_slot_probe {
-                        // Partially filled order — collect before closing.
-                        info!("[ManageOrders] Partially filled order \"{}\" — clicking Collect at slot {} (collect-only)", order_name, cs);
+                        if !name_key.is_empty() {
+                            state.manage_orders_processed.write().insert(name_key);
+                        }
                         if *state.last_window_id.read() == window_id {
-                            click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                            if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
-                                if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
-                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                        item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
-                                        is_buy_order: *ctx_is_buy,
-                                        // Partial fill — use filled amount parsed from
-                                        // the Manage Orders lore before we clicked.
-                                        claimed_amount: order_filled_amount,
-                                    });
-                                    // For BUY orders, cancel the remaining order after
-                                    // collecting the partial fill.  This lets cofl send
-                                    // sell recommendations for all collected items at
-                                    // once instead of waiting for the full order to fill.
-                                    if *ctx_is_buy {
-                                        let cancel_slot = find_slot_by_name(&bot.menu().slots(), "Cancel")
-                                            .or_else(|| find_slot_by_lore_contains(&bot.menu().slots(), "click to cancel"))
-                                            .or_else(|| find_slot_by_lore_contains(&bot.menu().slots(), "cancel order"));
-                                        if let Some(cs) = cancel_slot {
-                                            if *state.last_window_id.read() == window_id {
-                                                info!("[ManageOrders] Cancelling remaining BUY order \"{}\" after partial collect — prefer immediate sell via cofl", order_name);
-                                                click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                                                if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
-                                                    *state.manage_orders_cancelled.write() += 1;
-                                                    state.order_cancel_failures.write().remove(&cancel_fail_key);
-                                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                        item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
-                                                        is_buy_order: true,
-                                                        already_collected: true,
+                            send_raw_close(bot, window_id, &state.handlers);
+                        }
+                        *state.manage_orders_deadline.write() = None;
+                        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                        *state.bot_state.write() = BotState::Idle;
+                    } else if (!cancel_open && !cancel_due_to_age) || too_young_to_cancel {
+                        // Collect-only mode (or order too young to cancel).
+                        // "Order options" opened, so this order is not 100% filled (those
+                        // collect on click).  It may be PARTIALLY filled (has a Collect
+                        // button) or completely open (no Collect button).
+                        // Look for a Collect button first — if found, collect the partial
+                        // fill before closing.
+                        let probe_deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+                        let mut collect_slot_probe: Option<usize> = None;
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            if *state.last_window_id.read() != window_id {
+                                break;
+                            }
+                            let slots_probe = bot.menu().slots();
+                            collect_slot_probe = find_slot_by_name(&slots_probe, "Collect")
+                                .or_else(|| find_slot_by_name(&slots_probe, "Claim"))
+                                .or_else(|| {
+                                    find_slot_by_lore_contains(&slots_probe, "click to collect")
+                                })
+                                .or_else(|| find_slot_by_lore_contains(&slots_probe, "claim your"));
+                            if collect_slot_probe.is_some() {
+                                break;
+                            }
+                            // Also check for Cancel — if present but no Collect, order is
+                            // truly open with nothing to collect.
+                            let has_cancel = find_slot_by_name(&slots_probe, "Cancel").is_some()
+                                || find_slot_by_lore_contains(&slots_probe, "click to cancel")
+                                    .is_some();
+                            if has_cancel {
+                                break;
+                            }
+                            if tokio::time::Instant::now() >= probe_deadline {
+                                break;
+                            }
+                        }
+
+                        if let Some(cs) = collect_slot_probe {
+                            // Partially filled order — collect before closing.
+                            info!("[ManageOrders] Partially filled order \"{}\" — clicking Collect at slot {} (collect-only)", order_name, cs);
+                            if *state.last_window_id.read() == window_id {
+                                click_window_slot(bot, &state.last_window_id, window_id, cs as i16)
+                                    .await;
+                                if wait_for_collect_confirmation(
+                                    bot,
+                                    &state.last_window_id,
+                                    window_id,
+                                )
+                                .await
+                                {
+                                    if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
+                                        let _ =
+                                            state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                                item_name: clean_order_item_name(
+                                                    &order_name,
+                                                    &order_identity_for_clean,
+                                                ),
+                                                is_buy_order: *ctx_is_buy,
+                                                // Partial fill — use filled amount parsed from
+                                                // the Manage Orders lore before we clicked.
+                                                claimed_amount: order_filled_amount,
+                                            });
+                                        // For BUY orders, cancel the remaining order after
+                                        // collecting the partial fill.  This lets cofl send
+                                        // sell recommendations for all collected items at
+                                        // once instead of waiting for the full order to fill.
+                                        // Skip if order is too young (< 5 min) — give it
+                                        // more time to fill.
+                                        if *ctx_is_buy && !too_young_to_cancel {
+                                            let cancel_slot =
+                                                find_slot_by_name(&bot.menu().slots(), "Cancel")
+                                                    .or_else(|| {
+                                                        find_slot_by_lore_contains(
+                                                            &bot.menu().slots(),
+                                                            "click to cancel",
+                                                        )
+                                                    })
+                                                    .or_else(|| {
+                                                        find_slot_by_lore_contains(
+                                                            &bot.menu().slots(),
+                                                            "cancel order",
+                                                        )
                                                     });
-                                                } else {
-                                                    warn!("[ManageOrders] Cancel after partial BUY collect for \"{}\" was not confirmed", order_name);
+                                            if let Some(cs) = cancel_slot {
+                                                if *state.last_window_id.read() == window_id {
+                                                    info!("[ManageOrders] Cancelling remaining BUY order \"{}\" after partial collect — prefer immediate sell via cofl", order_name);
+                                                    click_window_slot(
+                                                        bot,
+                                                        &state.last_window_id,
+                                                        window_id,
+                                                        cs as i16,
+                                                    )
+                                                    .await;
+                                                    if wait_for_cancel_confirmation(
+                                                        bot,
+                                                        &state.last_window_id,
+                                                        window_id,
+                                                    )
+                                                    .await
+                                                    {
+                                                        *state.manage_orders_cancelled.write() += 1;
+                                                        state
+                                                            .order_cancel_failures
+                                                            .write()
+                                                            .remove(&cancel_fail_key);
+                                                        let _ = state.event_tx.send(
+                                                            BotEvent::BazaarOrderCancelled {
+                                                                item_name: clean_order_item_name(
+                                                                    &order_name,
+                                                                    &order_identity_for_clean,
+                                                                ),
+                                                                is_buy_order: true,
+                                                                already_collected: true,
+                                                            },
+                                                        );
+                                                    } else {
+                                                        warn!("[ManageOrders] Cancel after partial BUY collect for \"{}\" was not confirmed", order_name);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                } else {
+                                    warn!("[ManageOrders] Collect click for partially filled \"{}\" was not confirmed", order_name);
                                 }
-                            } else {
-                                warn!("[ManageOrders] Collect click for partially filled \"{}\" was not confirmed", order_name);
+                            }
+                        } else {
+                            debug!(
+                                "[ManageOrders] Order \"{}\" is open — skipping ({})",
+                                order_name,
+                                if too_young_to_cancel {
+                                    "too young to cancel"
+                                } else {
+                                    "collect-only mode"
+                                }
+                            );
+                        }
+
+                        if !name_key.is_empty() {
+                            state.manage_orders_processed.write().insert(name_key);
+                        }
+                        if *state.last_window_id.read() == window_id {
+                            send_raw_close(bot, window_id, &state.handlers);
+                        }
+                        *state.manage_orders_deadline.write() = None;
+                        *state.bot_state.write() = BotState::Idle;
+
+                        // Re-queue so remaining orders are processed without
+                        // waiting for the full periodic-check interval.
+                        if collect_slot_probe.is_some() {
+                            if let Some(queue) = state.command_queue.read().as_ref() {
+                                if !queue.has_manage_orders() {
+                                    info!("[ManageOrders] Re-queuing ManageOrders after partial collect in Order options");
+                                    queue.enqueue(
+                                        crate::types::CommandType::ManageOrders {
+                                            cancel_open,
+                                            target_item: None,
+                                        },
+                                        crate::types::CommandPriority::Normal,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     } else {
-                        debug!("[ManageOrders] Order \"{}\" is open — skipping in collect-only mode", order_name);
-                    }
+                        // cancel_open mode OR cancel_due_to_age: look for Cancel/Collect buttons.
+                        info!(
+                    "[ManageOrders] Order options window opened ({}) — looking for Cancel/Collect buttons",
+                    if cancel_open { "startup cancel mode" } else { "cancel due to age" }
+                );
 
-                    if !name_key.is_empty() {
-                        state.manage_orders_processed.write().insert(name_key);
-                    }
-                    if *state.last_window_id.read() == window_id {
-                        send_raw_close(bot, window_id, &state.handlers);
-                    }
-                    *state.manage_orders_deadline.write() = None;
-                    *state.bot_state.write() = BotState::Idle;
+                        let action_deadline =
+                            tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+                        let mut cancel_slot: Option<usize> = None;
+                        let mut collect_slot: Option<usize> = None;
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            if *state.last_window_id.read() != window_id {
+                                break;
+                            }
+                            let slots2 = bot.menu().slots();
+                            collect_slot = find_slot_by_name(&slots2, "Collect")
+                                .or_else(|| find_slot_by_name(&slots2, "Claim"))
+                                .or_else(|| find_slot_by_lore_contains(&slots2, "click to collect"))
+                                .or_else(|| find_slot_by_lore_contains(&slots2, "claim your"));
+                            cancel_slot = find_slot_by_name(&slots2, "Cancel")
+                                .or_else(|| find_slot_by_lore_contains(&slots2, "click to cancel"))
+                                .or_else(|| find_slot_by_lore_contains(&slots2, "cancel order"));
+                            if collect_slot.is_some() || cancel_slot.is_some() {
+                                break;
+                            }
+                            if tokio::time::Instant::now() >= action_deadline {
+                                let slot_names: Vec<String> = slots2
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(idx, item)| {
+                                        get_item_display_name_from_slot(item)
+                                            .map(|n| format!("{}={}", idx, n))
+                                    })
+                                    .collect();
+                                warn!(
+                            "[ManageOrders] No Collect/Cancel button found in Order options — visible slots: [{}]",
+                            slot_names.join(", ")
+                        );
+                                break;
+                            }
+                        }
 
-                    // Re-queue so remaining orders are processed without
-                    // waiting for the full periodic-check interval.
-                    if collect_slot_probe.is_some() {
+                        if cancel_due_to_age && cancel_slot.is_some() {
+                            info!(
+                        "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel (Order options)",
+                        order_name, state.bazaar_order_cancel_minutes_per_million
+                    );
+                        }
+
+                        if let Some(cs) = collect_slot {
+                            if *state.last_window_id.read() == window_id {
+                                info!(
+                                    "[ManageOrders] Clicking Collect at slot {} in Order options",
+                                    cs
+                                );
+                                click_window_slot(bot, &state.last_window_id, window_id, cs as i16)
+                                    .await;
+                                if wait_for_collect_confirmation(
+                                    bot,
+                                    &state.last_window_id,
+                                    window_id,
+                                )
+                                .await
+                                {
+                                    if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
+                                        let _ =
+                                            state.event_tx.send(BotEvent::BazaarOrderCollected {
+                                                item_name: clean_order_item_name(
+                                                    &order_name,
+                                                    &order_identity_for_clean,
+                                                ),
+                                                is_buy_order: *ctx_is_buy,
+                                                // Partial or full fill from Order Options — use
+                                                // filled amount parsed from the Manage Orders lore.
+                                                claimed_amount: order_filled_amount,
+                                            });
+                                    }
+                                } else {
+                                    warn!("[ManageOrders] Collect click for \"{}\" was not confirmed in Order options", order_name);
+                                }
+                                if (cancel_open || cancel_due_to_age) && !cancel_exceeded {
+                                    if let Some(cancel_after) =
+                                        find_slot_by_name(&bot.menu().slots(), "Cancel")
+                                    {
+                                        if *state.last_window_id.read() == window_id {
+                                            info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
+                                            click_window_slot(
+                                                bot,
+                                                &state.last_window_id,
+                                                window_id,
+                                                cancel_after as i16,
+                                            )
+                                            .await;
+                                            if wait_for_cancel_confirmation(
+                                                bot,
+                                                &state.last_window_id,
+                                                window_id,
+                                            )
+                                            .await
+                                            {
+                                                *state.manage_orders_cancelled.write() += 1;
+                                                state
+                                                    .order_cancel_failures
+                                                    .write()
+                                                    .remove(&cancel_fail_key);
+                                                if let Some((ctx_is_buy, _, _, _)) =
+                                                    order_ctx.as_ref()
+                                                {
+                                                    let _ = state.event_tx.send(
+                                                        BotEvent::BazaarOrderCancelled {
+                                                            item_name: clean_order_item_name(
+                                                                &order_name,
+                                                                &order_identity_for_clean,
+                                                            ),
+                                                            is_buy_order: *ctx_is_buy,
+                                                            already_collected: true,
+                                                        },
+                                                    );
+                                                }
+                                            } else {
+                                                *state
+                                                    .order_cancel_failures
+                                                    .write()
+                                                    .entry(cancel_fail_key.clone())
+                                                    .or_insert(0) += 1;
+                                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(cs) = cancel_slot {
+                            if (cancel_open || cancel_due_to_age) && !cancel_exceeded {
+                                if *state.last_window_id.read() == window_id {
+                                    info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
+                                    click_window_slot(
+                                        bot,
+                                        &state.last_window_id,
+                                        window_id,
+                                        cs as i16,
+                                    )
+                                    .await;
+                                    if wait_for_cancel_confirmation(
+                                        bot,
+                                        &state.last_window_id,
+                                        window_id,
+                                    )
+                                    .await
+                                    {
+                                        *state.manage_orders_cancelled.write() += 1;
+                                        state
+                                            .order_cancel_failures
+                                            .write()
+                                            .remove(&cancel_fail_key);
+                                        if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
+                                            let _ = state.event_tx.send(
+                                                BotEvent::BazaarOrderCancelled {
+                                                    item_name: clean_order_item_name(
+                                                        &order_name,
+                                                        &order_identity_for_clean,
+                                                    ),
+                                                    is_buy_order: *ctx_is_buy,
+                                                    already_collected: false,
+                                                },
+                                            );
+                                        }
+                                    } else {
+                                        *state
+                                            .order_cancel_failures
+                                            .write()
+                                            .entry(cancel_fail_key.clone())
+                                            .or_insert(0) += 1;
+                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
+                                    }
+                                }
+                            } else if !cancel_open && !cancel_due_to_age {
+                                debug!("[ManageOrders] Skipping open order \"{}\" in Order options (collect-only mode)", order_name);
+                            }
+                        } else {
+                            warn!(
+                                "[ManageOrders] No actionable button in Order options for \"{}\"",
+                                order_name
+                            );
+                        }
+
+                        // Mark as processed, close, and go Idle (one order per cycle)
+                        if !name_key.is_empty() {
+                            state.manage_orders_processed.write().insert(name_key);
+                        }
+                        if *state.last_window_id.read() == window_id {
+                            send_raw_close(bot, window_id, &state.handlers);
+                        }
+                        *state.manage_orders_deadline.write() = None;
+                        state.bazaar_at_limit.store(false, Ordering::Relaxed);
+                        *state.bot_state.write() = BotState::Idle;
+
+                        // Re-queue so remaining orders are processed promptly.
                         if let Some(queue) = state.command_queue.read().as_ref() {
                             if !queue.has_manage_orders() {
-                                info!("[ManageOrders] Re-queuing ManageOrders after partial collect in Order options");
+                                info!("[ManageOrders] Re-queuing ManageOrders after Order options (cancel/collect)");
                                 queue.enqueue(
-                                    crate::types::CommandType::ManageOrders { cancel_open },
+                                    crate::types::CommandType::ManageOrders {
+                                        cancel_open,
+                                        target_item: None,
+                                    },
                                     crate::types::CommandPriority::Normal,
                                     false,
                                 );
                             }
                         }
                     }
-                } else {
-                // cancel_open mode OR cancel_due_to_age: look for Cancel/Collect buttons.
-                info!(
-                    "[ManageOrders] Order options window opened ({}) — looking for Cancel/Collect buttons",
-                    if cancel_open { "startup cancel mode" } else { "cancel due to age" }
-                );
-
-                let action_deadline =
-                    tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
-                let mut cancel_slot: Option<usize> = None;
-                let mut collect_slot: Option<usize> = None;
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    if *state.last_window_id.read() != window_id {
-                        break;
-                    }
-                    let slots2 = bot.menu().slots();
-                    collect_slot = find_slot_by_name(&slots2, "Collect")
-                        .or_else(|| find_slot_by_name(&slots2, "Claim"))
-                        .or_else(|| find_slot_by_lore_contains(&slots2, "click to collect"))
-                        .or_else(|| find_slot_by_lore_contains(&slots2, "claim your"));
-                    cancel_slot = find_slot_by_name(&slots2, "Cancel")
-                        .or_else(|| find_slot_by_lore_contains(&slots2, "click to cancel"))
-                        .or_else(|| find_slot_by_lore_contains(&slots2, "cancel order"));
-                    if collect_slot.is_some() || cancel_slot.is_some() {
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= action_deadline {
-                        let slot_names: Vec<String> = slots2
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, item)| {
-                                get_item_display_name_from_slot(item).map(|n| format!("{}={}", idx, n))
-                            })
-                            .collect();
-                        warn!(
-                            "[ManageOrders] No Collect/Cancel button found in Order options — visible slots: [{}]",
-                            slot_names.join(", ")
-                        );
-                        break;
-                    }
-                }
-
-                if cancel_due_to_age && cancel_slot.is_some() {
-                    info!(
-                        "[ManageOrders] Open order \"{}\" exceeds cancel threshold ({}m/M) — will cancel (Order options)",
-                        order_name, state.bazaar_order_cancel_minutes_per_million
-                    );
-                }
-
-                if let Some(cs) = collect_slot {
-                    if *state.last_window_id.read() == window_id {
-                        info!("[ManageOrders] Clicking Collect at slot {} in Order options", cs);
-                        click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                        if wait_for_collect_confirmation(bot, &state.last_window_id, window_id).await {
-                            if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
-                                let _ = state.event_tx.send(BotEvent::BazaarOrderCollected {
-                                    item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
-                                    is_buy_order: *ctx_is_buy,
-                                    // Partial or full fill from Order Options — use
-                                    // filled amount parsed from the Manage Orders lore.
-                                    claimed_amount: order_filled_amount,
-                                });
-                            }
-                        } else {
-                            warn!("[ManageOrders] Collect click for \"{}\" was not confirmed in Order options", order_name);
-                        }
-                        if (cancel_open || cancel_due_to_age) && !cancel_exceeded {
-                            if let Some(cancel_after) = find_slot_by_name(&bot.menu().slots(), "Cancel") {
-                                if *state.last_window_id.read() == window_id {
-                                    info!("[ManageOrders] Clicking Cancel at slot {} after collecting in Order options", cancel_after);
-                                    click_window_slot(bot, &state.last_window_id, window_id, cancel_after as i16).await;
-                                    if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
-                                        *state.manage_orders_cancelled.write() += 1;
-                                        state.order_cancel_failures.write().remove(&cancel_fail_key);
-                                        if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
-                                            let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                                item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
-                                                is_buy_order: *ctx_is_buy,
-                                                already_collected: true,
-                                            });
-                                        }
-                                    } else {
-                                        *state.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
-                                        warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(cs) = cancel_slot {
-                    if (cancel_open || cancel_due_to_age) && !cancel_exceeded {
-                        if *state.last_window_id.read() == window_id {
-                            info!("[ManageOrders] Clicking Cancel at slot {} in Order options", cs);
-                            click_window_slot(bot, &state.last_window_id, window_id, cs as i16).await;
-                            if wait_for_cancel_confirmation(bot, &state.last_window_id, window_id).await {
-                                *state.manage_orders_cancelled.write() += 1;
-                                state.order_cancel_failures.write().remove(&cancel_fail_key);
-                                if let Some((ctx_is_buy, _, _, _)) = order_ctx.as_ref() {
-                                    let _ = state.event_tx.send(BotEvent::BazaarOrderCancelled {
-                                        item_name: clean_order_item_name(&order_name, &order_identity_for_clean),
-                                        is_buy_order: *ctx_is_buy,
-                                        already_collected: false,
-                                    });
-                                }
-                            } else {
-                                *state.order_cancel_failures.write().entry(cancel_fail_key.clone()).or_insert(0) += 1;
-                                warn!("[ManageOrders] Cancel click for \"{}\" was not confirmed in Order options (attempt {})", order_name, prior_failures + 1);
-                            }
-                        }
-                    } else if !cancel_open && !cancel_due_to_age {
-                        debug!("[ManageOrders] Skipping open order \"{}\" in Order options (collect-only mode)", order_name);
-                    }
-                } else {
-                    warn!("[ManageOrders] No actionable button in Order options for \"{}\"", order_name);
-                }
-
-                // Mark as processed, close, and go Idle (one order per cycle)
-                if !name_key.is_empty() {
-                    state.manage_orders_processed.write().insert(name_key);
-                }
-                if *state.last_window_id.read() == window_id {
-                    send_raw_close(bot, window_id, &state.handlers);
-                }
-                *state.manage_orders_deadline.write() = None;
-                state.bazaar_at_limit.store(false, Ordering::Relaxed);
-                *state.bot_state.write() = BotState::Idle;
-
-                // Re-queue so remaining orders are processed promptly.
-                if let Some(queue) = state.command_queue.read().as_ref() {
-                    if !queue.has_manage_orders() {
-                        info!("[ManageOrders] Re-queuing ManageOrders after Order options (cancel/collect)");
-                        queue.enqueue(
-                            crate::types::CommandType::ManageOrders { cancel_open },
-                            crate::types::CommandPriority::Normal,
-                            false,
-                        );
-                    }
-                }
-                }
                 }
             } else {
                 // Unexpected window title while in ManagingOrders state.
@@ -5167,17 +7043,23 @@ async fn handle_window_interaction(
                 // Bazaar page (main or category) — find "Sell Inventory Now"
                 // button dynamically.
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                if *state.last_window_id.read() != window_id { return; }
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
                 let slots = bot.menu().slots();
-                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now").unwrap_or(SELL_INVENTORY_NOW_FALLBACK_SLOT);
+                let sell_inv_slot = find_slot_by_name(&slots, "Sell Inventory Now")
+                    .unwrap_or(SELL_INVENTORY_NOW_FALLBACK_SLOT);
                 info!("[SellInventoryBz] Bazaar window open — clicking 'Sell Inventory Now' at slot {}", sell_inv_slot);
                 *state.bazaar_step.write() = BazaarStep::SearchResults;
-                click_window_slot(bot, &state.last_window_id, window_id, sell_inv_slot as i16).await;
+                click_window_slot(bot, &state.last_window_id, window_id, sell_inv_slot as i16)
+                    .await;
             } else if step == BazaarStep::SearchResults {
                 // Confirmation page — click slot 11 ("Selling whole inventory")
                 info!("[SellInventoryBz] Confirmation window open — clicking slot 11 to sell");
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                if *state.last_window_id.read() != window_id { return; }
+                if *state.last_window_id.read() != window_id {
+                    return;
+                }
                 click_window_slot(bot, &state.last_window_id, window_id, 11).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 info!("[SellInventoryBz] Done — closing window and going idle");
@@ -5218,12 +7100,19 @@ async fn handle_window_interaction(
                 }
                 Some(secs) => {
                     let hours = secs / 3600;
-                    let color = if hours >= auto_cookie_hours { "§a" } else { "§c" };
+                    let color = if hours >= auto_cookie_hours {
+                        "§a"
+                    } else {
+                        "§c"
+                    };
                     let _ = state.event_tx.send(BotEvent::ChatMessage(format!(
                         "§f[§4BAF§f]: §3Cookie time remaining: {}{}h§3 (threshold: {}h)",
                         color, hours, auto_cookie_hours
                     )));
-                    info!("[Cookie] Cookie time: {}h, threshold: {}h", hours, auto_cookie_hours);
+                    info!(
+                        "[Cookie] Cookie time: {}h, threshold: {}h",
+                        hours, auto_cookie_hours
+                    );
                     *state.cookie_time_secs.write() = secs;
 
                     if hours >= auto_cookie_hours {
@@ -5239,12 +7128,18 @@ async fn handle_window_interaction(
                                 "§f[§4BAF§f]: §c[AutoCookie] Not enough coins to buy cookie (need 7.5M, have {}M)",
                                 purse / 1_000_000
                             )));
-                            warn!("[Cookie] Insufficient coins ({}) — skipping cookie buy", purse);
+                            warn!(
+                                "[Cookie] Insufficient coins ({}) — skipping cookie buy",
+                                purse
+                            );
                             *state.bot_state.write() = BotState::Idle;
                         } else {
-                            info!("[Cookie] Buying cookie ({}h remaining < {}h threshold)...", hours, auto_cookie_hours);
+                            info!(
+                                "[Cookie] Buying cookie ({}h remaining < {}h threshold)...",
+                                hours, auto_cookie_hours
+                            );
                             let _ = state.event_tx.send(BotEvent::ChatMessage(
-                                "§f[§4BAF§f]: §6[AutoCookie] Buying booster cookie...".to_string()
+                                "§f[§4BAF§f]: §6[AutoCookie] Buying booster cookie...".to_string(),
                             ));
                             *state.cookie_step.write() = CookieStep::Initial;
                             send_chat_command(bot, "/bz Booster Cookie");
@@ -5306,14 +7201,20 @@ async fn handle_window_interaction(
                 let menu = bot.menu();
                 let all_slots = menu.slots();
                 let player_range = menu.player_slots_range();
-                let cookie_slot = all_slots[player_range.clone()].iter().enumerate().find_map(|(i, item)| {
-                    let name = get_item_display_name_from_slot(item).unwrap_or_default().to_lowercase();
-                    if name.contains("booster cookie") || name.contains("cookie") {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                });
+                let cookie_slot =
+                    all_slots[player_range.clone()]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, item)| {
+                            let name = get_item_display_name_from_slot(item)
+                                .unwrap_or_default()
+                                .to_lowercase();
+                            if name.contains("booster cookie") || name.contains("cookie") {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        });
 
                 match cookie_slot {
                     Some(idx) => {
@@ -5384,7 +7285,9 @@ async fn handle_window_interaction(
                 };
                 if !claimed {
                     // Already handled — close stale window and bail.
-                    info!("[Cookie] ConsumingCookie already handled by another task — closing window");
+                    info!(
+                        "[Cookie] ConsumingCookie already handled by another task — closing window"
+                    );
                     send_raw_close(bot, window_id, &state.handlers);
                     return;
                 }
@@ -5405,7 +7308,10 @@ async fn handle_window_interaction(
                     "§f[§4BAF§f]: §aBought and consumed booster cookie! Time: {}h → {}h",
                     old_hours, new_hours
                 )));
-                info!("[Cookie] Cookie consumed successfully! Time: {}h → {}h", old_hours, new_hours);
+                info!(
+                    "[Cookie] Cookie consumed successfully! Time: {}h → {}h",
+                    old_hours, new_hours
+                );
                 *state.bot_state.write() = BotState::Idle;
             }
         }
@@ -5420,9 +7326,15 @@ async fn handle_window_interaction(
 fn parse_cookie_duration_secs(lore_text: &str) -> u64 {
     let clean = remove_mc_colors(lore_text);
     let mut total: u64 = 0;
-    if let Some(m) = regex_first_u64(&clean, r"(\d+)d") { total += m * 86400; }
-    if let Some(m) = regex_first_u64(&clean, r"(\d+)h") { total += m * 3600; }
-    if let Some(m) = regex_first_u64(&clean, r"(\d+)m") { total += m * 60; }
+    if let Some(m) = regex_first_u64(&clean, r"(\d+)d") {
+        total += m * 86400;
+    }
+    if let Some(m) = regex_first_u64(&clean, r"(\d+)h") {
+        total += m * 3600;
+    }
+    if let Some(m) = regex_first_u64(&clean, r"(\d+)m") {
+        total += m * 60;
+    }
     total
 }
 
@@ -5446,7 +7358,7 @@ fn regex_first_u64(text: &str, pattern: &str) -> Option<u64> {
 fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Value {
     match serde_json::to_value(&item_data.component_patch) {
         Ok(value) => {
-            if value.as_object().map_or(false, |o| o.is_empty()) {
+            if value.as_object().is_some_and(|o| o.is_empty()) {
                 serde_json::Value::Null
             } else {
                 value
@@ -5484,7 +7396,9 @@ fn extract_item_nbt_components(item_data: &azalea_inventory::ItemStackData) -> s
 /// Extract individual item components that are known to serialize without errors.
 /// Used as a fallback when the full component_patch serialization fails (e.g., due to
 /// HashMap<Enchantment, i32> non-string map keys in enchanted items).
-fn extract_serializable_components(item_data: &azalea_inventory::ItemStackData) -> serde_json::Map<String, serde_json::Value> {
+fn extract_serializable_components(
+    item_data: &azalea_inventory::ItemStackData,
+) -> serde_json::Map<String, serde_json::Value> {
     use azalea_inventory::components::{CustomData, CustomName, Lore, Profile, TooltipDisplay};
     let mut obj = serde_json::Map::new();
 
@@ -5538,7 +7452,9 @@ fn should_suppress_component_patch_serialization_warning(error: &serde_json::Err
 /// Extract the SkyBlock item tag (ExtraAttributes.id or direct id) from the CustomData component.
 /// This bypasses the full component_patch serialization and works even when that fails
 /// (e.g., due to enchantment HashMap key serialization issues).
-fn extract_skyblock_tag_from_custom_data(item_data: &azalea_inventory::ItemStackData) -> Option<String> {
+fn extract_skyblock_tag_from_custom_data(
+    item_data: &azalea_inventory::ItemStackData,
+) -> Option<String> {
     use azalea_inventory::components::CustomData;
     let custom_data = item_data.component_patch.get::<CustomData>()?;
     // Serialize just the CustomData.nbt compound to JSON and extract the id
@@ -5561,18 +7477,21 @@ fn resolve_pet_tag(tag: &str, nbt_data: &serde_json::Value) -> String {
         return tag.to_string();
     }
     // Try to extract petInfo from various NBT paths
-    let pet_info_str = nbt_data.get("minecraft:custom_data")
-        .and_then(|cd| {
-            // Path: custom_data.nbt.ExtraAttributes.petInfo
-            cd.get("nbt")
-                .and_then(|n| n.get("ExtraAttributes"))
-                .and_then(|ea| ea.get("petInfo"))
-                .and_then(|p| p.as_str())
-                // Fallback: custom_data.ExtraAttributes.petInfo
-                .or_else(|| cd.get("ExtraAttributes").and_then(|ea| ea.get("petInfo")).and_then(|p| p.as_str()))
-                // Fallback: custom_data.petInfo (direct)
-                .or_else(|| cd.get("petInfo").and_then(|p| p.as_str()))
-        });
+    let pet_info_str = nbt_data.get("minecraft:custom_data").and_then(|cd| {
+        // Path: custom_data.nbt.ExtraAttributes.petInfo
+        cd.get("nbt")
+            .and_then(|n| n.get("ExtraAttributes"))
+            .and_then(|ea| ea.get("petInfo"))
+            .and_then(|p| p.as_str())
+            // Fallback: custom_data.ExtraAttributes.petInfo
+            .or_else(|| {
+                cd.get("ExtraAttributes")
+                    .and_then(|ea| ea.get("petInfo"))
+                    .and_then(|p| p.as_str())
+            })
+            // Fallback: custom_data.petInfo (direct)
+            .or_else(|| cd.get("petInfo").and_then(|p| p.as_str()))
+    });
     if let Some(info_str) = pet_info_str {
         if let Ok(info) = serde_json::from_str::<serde_json::Value>(info_str) {
             if let Some(pet_type) = info.get("type").and_then(|t| t.as_str()) {
@@ -5618,13 +7537,29 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             // Log display name status for debugging; items without a displayName will fall
             // back to the registry name (e.g. minecraft:prismarine_shard) in createAuction.
             if display_name.is_empty() {
-                debug!("[Inventory] slot {}: {}x {} — no displayName (NBT keys: {})",
-                    mineflayer_slot, item.count(), item_name,
-                    nbt_data.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default()
+                debug!(
+                    "[Inventory] slot {}: {}x {} — no displayName (NBT keys: {})",
+                    mineflayer_slot,
+                    item.count(),
+                    item_name,
+                    nbt_data
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default()
                 );
             }
-            let display_label = if display_name.is_empty() { "no-name" } else { &display_name };
-            slot_descriptions.push(format!("slot {}: {}x {} ({})", mineflayer_slot, item.count(), item_name, display_label));
+            let display_label = if display_name.is_empty() {
+                "no-name"
+            } else {
+                &display_name
+            };
+            slot_descriptions.push(format!(
+                "slot {}: {}x {} ({})",
+                mineflayer_slot,
+                item.count(),
+                item_name,
+                display_label
+            ));
             let mut slot_obj = serde_json::json!({
                 "type": item_type,
                 "count": item.count(),
@@ -5634,17 +7569,23 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                 "slot": mineflayer_slot
             });
             if !display_name.is_empty() {
-                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
-                    "displayName".to_string(),
-                    serde_json::Value::String(display_name),
-                );
+                slot_obj
+                    .as_object_mut()
+                    .expect("slot_obj should be a JSON object")
+                    .insert(
+                        "displayName".to_string(),
+                        serde_json::Value::String(display_name),
+                    );
             }
             // Add colored display name (with §-codes) for rarity-colored tooltip title
             if let Some(colored_name) = get_item_display_name_with_colors_from_slot(item) {
-                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
-                    "displayNameColored".to_string(),
-                    serde_json::Value::String(colored_name),
-                );
+                slot_obj
+                    .as_object_mut()
+                    .expect("slot_obj should be a JSON object")
+                    .insert(
+                        "displayNameColored".to_string(),
+                        serde_json::Value::String(colored_name),
+                    );
             }
             // Extract SkyBlock item tag for icon lookup.
             // The NBT path differs between the extraction paths:
@@ -5652,7 +7593,8 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             //   fallback (individual components): nbt["minecraft:custom_data"]["ExtraAttributes"]["id"]
             //   direct id (cosmetics etc.): nbt["minecraft:custom_data"]["id"]
             //   direct id under nbt wrapper: nbt["minecraft:custom_data"]["nbt"]["id"]
-            let tag_from_json = nbt_data.get("minecraft:custom_data")
+            let tag_from_json = nbt_data
+                .get("minecraft:custom_data")
                 .and_then(|cd| {
                     // Try full component_patch path first (has extra "nbt" wrapper)
                     cd.get("nbt")
@@ -5672,10 +7614,7 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
                                 .and_then(|id| id.as_str())
                         })
                         // Direct id under custom_data (cosmetics, skins, etc.)
-                        .or_else(|| {
-                            cd.get("id")
-                                .and_then(|id| id.as_str())
-                        })
+                        .or_else(|| cd.get("id").and_then(|id| id.as_str()))
                 })
                 .map(|s| s.to_string());
 
@@ -5692,31 +7631,48 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
             let tag = tag.map(|t| resolve_pet_tag(&t, &nbt_data));
 
             if let Some(ref tag_str) = tag {
-                slot_obj.as_object_mut().expect("slot_obj should be a JSON object").insert(
-                    "tag".to_string(),
-                    serde_json::Value::String(tag_str.clone()),
-                );
+                slot_obj
+                    .as_object_mut()
+                    .expect("slot_obj should be a JSON object")
+                    .insert(
+                        "tag".to_string(),
+                        serde_json::Value::String(tag_str.clone()),
+                    );
             }
             // Add lore lines with §-color codes for colorful tooltip display in the web panel.
             let lore_lines = get_item_lore_with_colors_from_slot(item);
             if !lore_lines.is_empty() {
-                slot_obj.as_object_mut().expect("slot_obj is a JSON object created via json! macro").insert(
-                    "lore".to_string(),
-                    serde_json::Value::Array(lore_lines.into_iter().map(serde_json::Value::String).collect()),
-                );
+                slot_obj
+                    .as_object_mut()
+                    .expect("slot_obj is a JSON object created via json! macro")
+                    .insert(
+                        "lore".to_string(),
+                        serde_json::Value::Array(
+                            lore_lines
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
             }
             slots_array[mineflayer_slot] = slot_obj;
         }
     }
 
-    debug!("[Inventory] Rebuilt cache: {} non-empty slots — {}", slot_descriptions.len(), slot_descriptions.join(", "));
+    debug!(
+        "[Inventory] Rebuilt cache: {} non-empty slots — {}",
+        slot_descriptions.len(),
+        slot_descriptions.join(", ")
+    );
 
     // Update cached empty-slot count.  The player inventory occupies mineflayer slots 9..44.
     // Count nulls in slots_array which correspond to empty (air) slots.
     let empty_count = (9..=44usize)
         .filter(|&s| slots_array.get(s).map(|v| v.is_null()).unwrap_or(true))
         .count() as u8;
-    let prev = state.cached_empty_player_slots.swap(empty_count, Ordering::Relaxed);
+    let prev = state
+        .cached_empty_player_slots
+        .swap(empty_count, Ordering::Relaxed);
     if prev != empty_count {
         debug!("[Inventory] Empty player slots: {} → {}", prev, empty_count);
     }
@@ -5724,7 +7680,10 @@ fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
     // This handles manual instasells, external trades, and any other action that
     // frees inventory without going through the bot's InstaSell flow.
     if empty_count >= MIN_FREE_SLOTS_FOR_BUY && state.inventory_full.load(Ordering::Relaxed) {
-        info!("[Inventory] Clearing stale inventory_full flag — {} empty slots detected", empty_count);
+        info!(
+            "[Inventory] Clearing stale inventory_full flag — {} empty slots detected",
+            empty_count
+        );
         state.inventory_full.store(false, Ordering::Relaxed);
     }
 
@@ -5796,14 +7755,23 @@ fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
                 serde_json::Value::Null
             };
 
-            let tag = nbt_data.get("minecraft:custom_data")
+            let tag = nbt_data
+                .get("minecraft:custom_data")
                 .and_then(|cd| {
                     cd.get("nbt")
                         .and_then(|n| n.get("ExtraAttributes"))
                         .and_then(|ea| ea.get("id"))
                         .and_then(|id| id.as_str())
-                        .or_else(|| cd.get("ExtraAttributes").and_then(|ea| ea.get("id")).and_then(|id| id.as_str()))
-                        .or_else(|| cd.get("nbt").and_then(|n| n.get("id")).and_then(|id| id.as_str()))
+                        .or_else(|| {
+                            cd.get("ExtraAttributes")
+                                .and_then(|ea| ea.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
+                        .or_else(|| {
+                            cd.get("nbt")
+                                .and_then(|n| n.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
                         .or_else(|| cd.get("id").and_then(|id| id.as_str()))
                 })
                 .map(|s| s.to_string())
@@ -5826,14 +7794,27 @@ fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
                 "count": item.count(),
             });
             if let Some(cn) = colored_name {
-                slot_obj.as_object_mut().unwrap().insert("displayNameColored".to_string(), serde_json::Value::String(cn));
+                slot_obj.as_object_mut().unwrap().insert(
+                    "displayNameColored".to_string(),
+                    serde_json::Value::String(cn),
+                );
             }
             if let Some(ref t) = tag {
-                slot_obj.as_object_mut().unwrap().insert("tag".to_string(), serde_json::Value::String(t.clone()));
+                slot_obj
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("tag".to_string(), serde_json::Value::String(t.clone()));
             }
             if !lore_lines.is_empty() {
-                slot_obj.as_object_mut().unwrap().insert("lore".to_string(),
-                    serde_json::Value::Array(lore_lines.into_iter().map(serde_json::Value::String).collect()));
+                slot_obj.as_object_mut().unwrap().insert(
+                    "lore".to_string(),
+                    serde_json::Value::Array(
+                        lore_lines
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
             }
             slots_json.push(slot_obj);
         }
@@ -5864,6 +7845,9 @@ fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
 /// We extract the item name, lore, tag, and parse bid/time/status from lore.
 fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &BotClientState) {
     let mut auctions: Vec<serde_json::Value> = Vec::new();
+    // Per-window tallies so the summary line says what the panel will show.
+    let (mut n_active, mut n_sold, mut n_expired) = (0usize, 0usize, 0usize);
+    let (mut n_grace, mut n_unknown_time) = (0usize, 0usize);
 
     // Auction slots are typically in the first rows of the chest (slots 0-53).
     // Skip navigation items (like Close, Create Auction, page arrows, etc.)
@@ -5890,20 +7874,24 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
             || combined_lower.contains("starting bid")
             || combined_lower.contains("sold")
             || combined_lower.contains("expired")
-            || combined_lower.contains("ended")
-            || combined_lower.contains("click to claim");
+            || contains_word_ended(&combined_lower)
+            || combined_lower.contains("click to claim")
+            // A listing still inside its grace period may show only the
+            // "Can be bought in 20s" countdown, with no price/"Ends in" line.
+            || is_grace_period_lore(&combined_lower);
         if !is_auction_slot {
             continue;
         }
 
         // Determine status
-        let status = if combined_lower.contains("sold!") || combined_lower.contains("click to claim") {
-            "sold"
-        } else if combined_lower.contains("expired") || combined_lower.contains("ended") {
-            "expired"
-        } else {
-            "active"
-        };
+        let status =
+            if combined_lower.contains("sold!") || combined_lower.contains("click to claim") {
+                "sold"
+            } else if combined_lower.contains("expired") || contains_word_ended(&combined_lower) {
+                "expired"
+            } else {
+                "active"
+            };
 
         // Determine BIN vs Auction
         let bin = combined_lower.contains("buy it now");
@@ -5918,17 +7906,74 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
             None
         };
 
+        // Hypixel holds a freshly listed auction in a ~20s grace period during
+        // which its lore shows "Can be bought in 20s" and carries no "Ends in:"
+        // line yet. `unwrap_or(0)` turned that missing value into "0 seconds
+        // left", so the web panel rendered brand-new listings as "Expired".
+        // Report an unparsable time on an ACTIVE auction as JSON null (unknown)
+        // — only a sold/ended auction is genuinely at zero — and pass the grace
+        // countdown along so the panel can show what is really happening.
+        let grace_secs = if status == "active" {
+            extract_grace_seconds_from_lore(&lore)
+        } else {
+            None
+        };
+        let time_remaining_json = match time_remaining_secs {
+            Some(secs) => serde_json::json!(secs),
+            None if status == "active" => serde_json::Value::Null,
+            None => serde_json::json!(0),
+        };
+
+        match status {
+            "sold" => n_sold += 1,
+            "expired" => n_expired += 1,
+            _ => n_active += 1,
+        }
+        if grace_secs.is_some() {
+            n_grace += 1;
+        }
+        if status == "active" && time_remaining_secs.is_none() {
+            n_unknown_time += 1;
+            if grace_secs.is_none() {
+                // An ACTIVE auction whose lore we could parse neither an
+                // "Ends in:" nor a grace countdown out of. That is the exact
+                // shape that used to render as "Expired", so dump the real lore
+                // — Hypixel's wording is the only thing that can tell us which
+                // pattern to add next, and it is unreachable from a bug report.
+                warn!(
+                    "[MyAuctions] Active auction with UNPARSABLE time — please report this lore. item={:?} lore={:?}",
+                    remove_mc_colors(&display_name),
+                    lore,
+                );
+            } else {
+                debug!(
+                    "[MyAuctions] '{}' is in its listing grace period ({}s until buyable)",
+                    remove_mc_colors(&display_name),
+                    grace_secs.unwrap_or(0),
+                );
+            }
+        }
+
         // Extract tag for icon lookup
         let tag = if let Some(item_data) = item.as_present() {
             let nbt_data = extract_item_nbt_components(item_data);
-            let raw_tag = nbt_data.get("minecraft:custom_data")
+            let raw_tag = nbt_data
+                .get("minecraft:custom_data")
                 .and_then(|cd| {
                     cd.get("nbt")
                         .and_then(|n| n.get("ExtraAttributes"))
                         .and_then(|ea| ea.get("id"))
                         .and_then(|id| id.as_str())
-                        .or_else(|| cd.get("ExtraAttributes").and_then(|ea| ea.get("id")).and_then(|id| id.as_str()))
-                        .or_else(|| cd.get("nbt").and_then(|n| n.get("id")).and_then(|id| id.as_str()))
+                        .or_else(|| {
+                            cd.get("ExtraAttributes")
+                                .and_then(|ea| ea.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
+                        .or_else(|| {
+                            cd.get("nbt")
+                                .and_then(|n| n.get("id"))
+                                .and_then(|id| id.as_str())
+                        })
                         .or_else(|| cd.get("id").and_then(|id| id.as_str()))
                 })
                 .map(|s| s.to_string())
@@ -5946,7 +7991,8 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
             "starting_bid": price.unwrap_or(0),
             "highest_bid": 0,
             "lore": lore_colored,
-            "time_remaining_seconds": time_remaining_secs.unwrap_or(0),
+            "time_remaining_seconds": time_remaining_json,
+            "buyable_in_seconds": grace_secs,
         });
 
         // Add colored item name (with §-codes) for rarity-colored tooltip title
@@ -5958,13 +8004,25 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
         }
 
         if let Some(tag_str) = &tag {
-            entry.as_object_mut().unwrap().insert("tag".to_string(), serde_json::Value::String(tag_str.clone()));
+            entry.as_object_mut().unwrap().insert(
+                "tag".to_string(),
+                serde_json::Value::String(tag_str.clone()),
+            );
         }
 
         auctions.push(entry);
     }
 
-    info!("[MyAuctions] Cached {} auction entries from Manage Auctions window", auctions.len());
+    info!(
+        "[MyAuctions] Cached {} auction entries from Manage Auctions window \
+         (active {} / sold {} / expired {}; {} in listing grace period, {} with unknown time left)",
+        auctions.len(),
+        n_active,
+        n_sold,
+        n_expired,
+        n_grace,
+        n_unknown_time,
+    );
 
     if let Ok(json_str) = serde_json::to_string(&auctions) {
         *state.cached_my_auctions_json.write() = Some(json_str);
@@ -5980,7 +8038,8 @@ fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
         // Match various price patterns
         for prefix in &["buy it now:", "starting bid:", "top bid:", "sold for:"] {
             if let Some(rest) = clean.strip_prefix(prefix) {
-                let num_str: String = rest.chars()
+                let num_str: String = rest
+                    .chars()
                     .filter(|c| c.is_ascii_digit() || *c == ',')
                     .collect::<String>()
                     .replace(',', "");
@@ -5993,12 +8052,46 @@ fn extract_price_from_lore(lore: &[String]) -> Option<i64> {
     None
 }
 
+/// True when a lowercased, color-stripped lore blob shows Hypixel's post-listing
+/// grace period ("Can be bought in 20s"), during which the auction exists but
+/// nobody may buy it yet.
+fn is_grace_period_lore(combined_lower: &str) -> bool {
+    combined_lower.contains("can be bought in")
+        || combined_lower.contains("buyable in")
+        || combined_lower.contains("purchasable in")
+}
+
+/// Seconds left in the post-listing grace period, if the lore is showing one.
+/// Returns `None` for an ordinary listing that is already buyable.
+fn extract_grace_seconds_from_lore(lore: &[String]) -> Option<i64> {
+    for line in lore {
+        let clean = remove_mc_colors(line).to_lowercase();
+        if !is_grace_period_lore(&clean) {
+            continue;
+        }
+        // Parse from the countdown onward so a price earlier on the line (e.g.
+        // "Buy it now: 20,000 coins — can be bought in 5s") can't be read as a
+        // duration.
+        let tail = clean
+            .find("bought in")
+            .or_else(|| clean.find("buyable in"))
+            .or_else(|| clean.find("purchasable in"))
+            .map(|i| &clean[i..])
+            .unwrap_or(&clean);
+        if let Some(secs) = parse_bed_remaining_secs_from_text(tail) {
+            return Some(secs as i64);
+        }
+    }
+    None
+}
+
 /// Extract time remaining from lore lines.
 /// Looks for patterns like "Ends in: 1d 2h 30m" or "Ends in: 45m 20s"
 fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
     static RE_DAYS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*d").unwrap());
     static RE_HOURS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*h").unwrap());
-    static RE_MINS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*m(?:[^s]|$)").unwrap());
+    static RE_MINS: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(\d+)\s*m(?:[^s]|$)").unwrap());
     static RE_SECS: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\d+)\s*s").unwrap());
 
     for line in lore {
@@ -6036,7 +8129,9 @@ fn extract_time_remaining_from_lore(lore: &[String]) -> Option<i64> {
 
 fn bazaar_order_log_path() -> std::path::PathBuf {
     match std::env::current_exe() {
-        Ok(exe) => exe.parent().map(|p| p.join("bazaar_orders.log"))
+        Ok(exe) => exe
+            .parent()
+            .map(|p| p.join("bazaar_orders.log"))
             .unwrap_or_else(|| std::path::PathBuf::from("bazaar_orders.log")),
         Err(_) => std::path::PathBuf::from("bazaar_orders.log"),
     }
@@ -6050,9 +8145,19 @@ fn log_bazaar_order_placed(is_buy: bool, item_name: &str, total_value: f64) {
     if normalized_item.is_empty() {
         return;
     }
-    let line = format!("{}|{}|{}|{:.0}\n", chrono::Utc::now().timestamp(), side, normalized_item, total_value);
+    let line = format!(
+        "{}|{}|{}|{:.0}\n",
+        chrono::Utc::now().timestamp(),
+        side,
+        normalized_item,
+        total_value
+    );
     let log_path = bazaar_order_log_path();
-    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(mut f) => {
             if let Err(e) = f.write_all(line.as_bytes()) {
                 warn!("[ManageOrders] Failed to append bazaar_orders.log: {}", e);
@@ -6077,7 +8182,8 @@ fn last_logged_order_info(is_buy: bool, item_name: &str) -> Option<(i64, f64)> {
         let side = parts.next()?.trim();
         let item = parts.next()?.trim();
         if side == target_side && item == target_item {
-            let total_value = parts.next()
+            let total_value = parts
+                .next()
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .unwrap_or(1_000_000.0); // backward compat: old entries default to 1M
             return Some((ts, total_value));
@@ -6096,7 +8202,10 @@ fn last_logged_order_timestamp(is_buy: bool, item_name: &str) -> Option<i64> {
 /// give them at least 5 minutes to fill.
 const MIN_ORDER_AGE_BEFORE_CANCEL_SECS: u64 = 300; // 5 minutes
 
-fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, cancel_minutes_per_million: u64) -> bool {
+fn should_cancel_open_order_due_to_age(
+    order_identity: Option<(bool, String)>,
+    cancel_minutes_per_million: u64,
+) -> bool {
     if cancel_minutes_per_million == 0 {
         return false;
     }
@@ -6107,9 +8216,10 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
     let (last_logged, total_value) = match last_logged_order_info(is_buy, &item_name) {
         Some(info) => info,
         // No log entry for this order — it was placed before tracking started
-        // or the log was cleared.  Treat it as stale so it gets cancelled
-        // instead of sitting around forever.
-        None => return true,
+        // or the log was cleared.  We cannot determine the age, so err on the
+        // side of caution and leave the order alone.  It will be cleaned up
+        // on the next startup (cancel_open mode) or when the log is populated.
+        None => return false,
     };
     let now = chrono::Utc::now().timestamp();
     let age_secs = if now > last_logged {
@@ -6129,6 +8239,30 @@ fn should_cancel_open_order_due_to_age(order_identity: Option<(bool, String)>, c
     age_secs >= cancel_secs
 }
 
+/// Returns true if the order has a known placement time that is less than
+/// `MIN_ORDER_AGE_BEFORE_CANCEL_SECS` ago.  Used to protect recently-placed
+/// orders from cancellation even in cancel_open (startup) mode.
+/// Returns false when the identity is unknown or no log entry exists (cannot
+/// determine age → assume old enough).
+fn is_order_below_min_cancel_age(order_identity: &Option<(bool, String)>) -> bool {
+    let (is_buy, item_name) = match order_identity {
+        Some(ref id) => (id.0, id.1.as_str()),
+        None => return false,
+    };
+    match last_logged_order_info(is_buy, item_name) {
+        Some((last_logged, _)) => {
+            let now = chrono::Utc::now().timestamp();
+            let age_secs = if now > last_logged {
+                (now - last_logged) as u64
+            } else {
+                0
+            };
+            age_secs < MIN_ORDER_AGE_BEFORE_CANCEL_SECS
+        }
+        None => false,
+    }
+}
+
 /// Append an unclaimed bazaar order to `pending_claims.log` with an RFC 3339 timestamp.
 /// Called when inventory is full and a filled order cannot be collected.
 /// The log can be reviewed later to know which orders need manual collection.
@@ -6137,15 +8271,26 @@ fn log_pending_claim(order_name: &str) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let line = format!("{} {}\n", timestamp, order_name);
     let log_path = match std::env::current_exe() {
-        Ok(exe) => exe.parent().map(|p| p.join("pending_claims.log"))
+        Ok(exe) => exe
+            .parent()
+            .map(|p| p.join("pending_claims.log"))
             .unwrap_or_else(|| std::path::PathBuf::from("pending_claims.log")),
         Err(_) => std::path::PathBuf::from("pending_claims.log"),
     };
-    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(mut f) => {
+            let _ = f.write_all(line.as_bytes());
+        }
         Err(e) => warn!("[ManageOrders] Failed to write pending_claims.log: {}", e),
     }
-    warn!("[ManageOrders] Logged unclaimed order \"{}\" to {:?}", order_name, log_path);
+    warn!(
+        "[ManageOrders] Logged unclaimed order \"{}\" to {:?}",
+        order_name, log_path
+    );
 }
 
 /// Count the number of empty (air) slots in the player's inventory (36 slots).
@@ -6158,40 +8303,18 @@ fn count_empty_player_slots(bot: &Client) -> usize {
     player_slots.iter().filter(|s| s.is_empty()).count()
 }
 
-/// Returns the display name of the item that occupies more than half of the player's
-/// inventory slots (> half of 36 = 18 slots). Used to detect a dominant stackable item
-/// that should be instasold to free space when inventory is full.
-/// Returns None if no single item type dominates the inventory.
-fn find_dominant_inventory_item(bot: &Client) -> Option<String> {
-    let menu = bot.menu();
-    let all_slots = menu.slots();
-    let player_range = menu.player_slots_range();
-    let player_slots = &all_slots[player_range];
-
-    let total = player_slots.len(); // 36 for a standard player inventory
-    let half = total / 2;
-
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for slot in player_slots.iter() {
-        if !slot.is_empty() {
-            if let Some(name) = get_item_display_name_from_slot(slot) {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-        }
-    }
-
-    counts.into_iter()
-        .find(|(_, count)| *count > half)
-        .map(|(name, _)| name)
-}
-
 /// Click a window slot via raw TCP, matching the transport used by
 /// `send_raw_close` so that click → close ordering is preserved on the wire.
 /// Previously this used `bot.write_packet()` (ECS trigger pipeline) which
 /// queued the click *behind* an `apply_deferred` boundary, while
 /// `send_raw_close` wrote directly to TCP — causing the close to reach the
 /// server before the click, silently discarding Claim All / Collect actions.
-async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, window_id: u8, slot: i16) {
+async fn click_window_slot(
+    bot: &Client,
+    last_window_id: &Arc<RwLock<u8>>,
+    window_id: u8,
+    slot: i16,
+) {
     // Window 0 is the player's own inventory — always valid, no container guard.
     // For all GUI containers, refuse to click if a newer window has replaced this one;
     // clicking a closed/stale container is physically impossible for a real player and
@@ -6199,7 +8322,9 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
     if window_id != 0 && *last_window_id.read() != window_id {
         warn!(
             "Blocked stale window click: attempted slot {} in window {} but current window is {}",
-            slot, window_id, *last_window_id.read()
+            slot,
+            window_id,
+            *last_window_id.read()
         );
         return;
     }
@@ -6213,7 +8338,10 @@ async fn click_window_slot(bot: &Client, last_window_id: &Arc<RwLock<u8>>, windo
 /// The function strips it before putting the command string into the packet.
 fn send_chat_command(bot: &Client, content: &str) {
     let command = content.strip_prefix('/').unwrap_or_else(|| {
-        debug!("send_chat_command called without leading '/' — sending as-is: {}", content);
+        debug!(
+            "send_chat_command called without leading '/' — sending as-is: {}",
+            content
+        );
         content
     });
     bot.write_packet(ServerboundChatCommand {
@@ -6232,9 +8360,32 @@ fn send_chat_command(bot: &Client, content: &str) {
 /// and confirm clicks on the auction purchase path.
 ///
 /// `content` should include the leading `/` (e.g. `"/viewauction <uuid>"`).
+/// Generation counter for the live-RTT pinger. Each `Event::Login` bumps it and
+/// spawns a fresh pinger bound to that generation; the loop exits when a newer
+/// login supersedes it, guaranteeing exactly one active pinger on a fresh client
+/// handle across reconnects.
+static PINGER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Send a vanilla F3+3 ping (`ServerboundPingRequest`) on the live connection,
+/// recording the token/send-time so the `PongResponse` handler can measure RTT.
+/// Bypasses the ECS queue via the raw connection for an accurate timestamp.
+fn send_ping_request(bot: &Client) {
+    use azalea_protocol::packets::game::s_ping_request::ServerboundPingRequest;
+    let token = crate::hypixel_ping::ping_request_started();
+    let packet = ServerboundPingRequest { time: token };
+    bot.with_raw_connection_mut(|mut raw_conn| {
+        if let Err(e) = raw_conn.write(packet) {
+            debug!("ping request write failed: {e}");
+        }
+    });
+}
+
 fn send_raw_chat_command(bot: &Client, content: &str) {
     let command = content.strip_prefix('/').unwrap_or_else(|| {
-        debug!("send_raw_chat_command called without leading '/' — sending as-is: {}", content);
+        debug!(
+            "send_raw_chat_command called without leading '/' — sending as-is: {}",
+            content
+        );
         content
     });
     let cmd_packet = ServerboundChatCommand {
@@ -6254,8 +8405,7 @@ fn send_raw_chat_command(bot: &Client, content: &str) {
 /// auction purchase path where every millisecond matters.
 fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
     use azalea_protocol::packets::game::s_container_click::{
-        ServerboundContainerClick,
-        HashedStack,
+        HashedStack, ServerboundContainerClick,
     };
     let packet = ServerboundContainerClick {
         container_id: window_id as i32,
@@ -6268,10 +8418,332 @@ fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
     };
     bot.with_raw_connection_mut(|mut raw_conn| {
         if let Err(e) = raw_conn.write(packet) {
-            error!("raw click write failed (window {} slot {}): {e}", window_id, slot);
+            error!(
+                "raw click write failed (window {} slot {}): {e}",
+                window_id, slot
+            );
         }
     });
     info!("Raw-clicked slot {} in window {}", slot, window_id);
+}
+
+// ═══════════════════════════ Drill part-out ═══════════════════════════
+// Config-gated (`remove_drill_parts`, off by default) workflow that pulls the
+// installed parts out of a just-bought drill via Jotraeline Greatforge (Abiphone)
+// so the parts + stripped drill sell separately. Deliberately slow and defensive:
+// waits for every GUI to load, opens no other menus, and bails cleanly (closing
+// any open window) the instant anything is unexpected. Listing afterwards is left
+// to the normal periodic finder inventory upload.
+
+/// Set once from config at startup; read by the purchase handler in the event loop.
+pub static REMOVE_DRILL_PARTS: AtomicBool = AtomicBool::new(false);
+/// Single-flight guard so two part-outs never overlap.
+static DRILL_WORKFLOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the drill part-out workflow (called from `main` with the config value).
+pub fn set_remove_drill_parts(enabled: bool) {
+    REMOVE_DRILL_PARTS.store(enabled, Ordering::Relaxed);
+}
+
+/// Anvil ("Drill Anvil") slot map, confirmed from the SlotLogger trace: the drill
+/// goes into slot 29; the three left-column buttons remove Fuel Tank / Drill
+/// Engine / Upgrade Module (clicking one with no part attached is a harmless
+/// "does not have a … attached" chat message, so it is always safe to click all).
+const DRILL_ANVIL_INPUT_SLOT: i16 = 29;
+const DRILL_REMOVE_SLOTS: [i16; 3] = [9, 18, 27];
+
+/// True for each Hypixel drill-part slot that currently has a part installed.
+/// `ExtraAttributes` stores an installed part under `drill_part_fuel_tank` /
+/// `drill_part_engine` / `drill_part_upgrade_module`.
+fn drill_parts_installed(item_data: &azalea_inventory::ItemStackData) -> [bool; 3] {
+    use azalea_inventory::components::CustomData;
+    let Some(custom_data) = item_data.component_patch.get::<CustomData>() else {
+        return [false; 3];
+    };
+    let Ok(nbt_val) = serde_json::to_value(&custom_data.nbt) else {
+        return [false; 3];
+    };
+    let ea = nbt_val.get("ExtraAttributes");
+    let has = |k: &str| ea.and_then(|e| e.get(k)).is_some();
+    [
+        has("drill_part_fuel_tank"),
+        has("drill_part_engine"),
+        has("drill_part_upgrade_module"),
+    ]
+}
+
+/// Locate a drill WITH at least one removable part in the player inventory.
+/// Returns the player-range-relative index and the item's display name.
+fn find_drill_with_parts(bot: &Client) -> Option<(usize, String)> {
+    let menu = bot.menu();
+    let slots = menu.slots();
+    let range = menu.player_slots_range();
+    for (i, item) in slots[range.clone()].iter().enumerate() {
+        if let azalea_inventory::ItemStack::Present(data) = item {
+            let name = get_item_display_name_from_slot(item).unwrap_or_default();
+            if name.to_lowercase().contains("drill")
+                && drill_parts_installed(data).iter().any(|&p| p)
+            {
+                return Some((i, name));
+            }
+        }
+    }
+    None
+}
+
+/// First player-inventory item whose (lowercased) name matches `pred`.
+/// Returns the player-range-relative index and the display name.
+fn find_in_player_inv<F: Fn(&str) -> bool>(bot: &Client, pred: F) -> Option<(usize, String)> {
+    let menu = bot.menu();
+    let slots = menu.slots();
+    let range = menu.player_slots_range();
+    for (i, item) in slots[range.clone()].iter().enumerate() {
+        let name = get_item_display_name_from_slot(item).unwrap_or_default();
+        if !name.is_empty() && pred(&name.to_lowercase()) {
+            return Some((i, name));
+        }
+    }
+    None
+}
+
+/// First slot in the currently open window whose name contains `needle`.
+fn find_window_slot_named(bot: &Client, needle: &str) -> Option<i16> {
+    let menu = bot.menu();
+    let slots = menu.slots();
+    let needle = needle.to_lowercase();
+    for (i, item) in slots.iter().enumerate() {
+        let name = get_item_display_name_from_slot(item).unwrap_or_default();
+        if !name.is_empty() && name.to_lowercase().contains(&needle) {
+            return Some(i as i16);
+        }
+    }
+    None
+}
+
+/// Poll until a slot named `needle` appears in the open window, or `timeout`.
+async fn wait_for_slot_named(
+    bot: &Client,
+    needle: &str,
+    timeout: std::time::Duration,
+) -> Option<i16> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(slot) = find_window_slot_named(bot, needle) {
+            return Some(slot);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll until the current window's title matches `pred`, or `timeout`. Returns the window id.
+async fn wait_for_window<F: Fn(&str) -> bool>(
+    state: &BotClientState,
+    timeout: std::time::Duration,
+    pred: F,
+) -> Option<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let (Some(id), Some(title)) = (
+            state.handlers.current_window_id(),
+            state.handlers.current_window_title(),
+        ) {
+            if pred(&title) {
+                return Some(id);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// Shift-click (QUICK_MOVE) a slot, moves its whole stack to the other grid.
+fn send_raw_shift_click(bot: &Client, window_id: u8, slot: i16) {
+    use azalea_protocol::packets::game::s_container_click::{
+        HashedStack, ServerboundContainerClick,
+    };
+    let packet = ServerboundContainerClick {
+        container_id: window_id as i32,
+        state_id: 0,
+        slot_num: slot,
+        button_num: 0,
+        click_type: ClickType::QuickMove,
+        changed_slots: Default::default(),
+        carried_item: HashedStack(None),
+    };
+    bot.with_raw_connection_mut(|mut raw_conn| {
+        if let Err(e) = raw_conn.write(packet) {
+            error!(
+                "raw shift-click write failed (window {} slot {}): {e}",
+                window_id, slot
+            );
+        }
+    });
+    info!("Raw shift-clicked slot {} in window {}", slot, window_id);
+}
+
+/// Move the player-inventory item at player-range-relative index `rel_idx` into a
+/// hotbar slot, select it, and right-click to use it (opens the Abiphone).
+async fn select_and_use_item(bot: &Client, state: &BotClientState, rel_idx: usize) {
+    let player_start = *bot.menu().player_slots_range().start();
+    let hotbar_slot: u16 = if rel_idx >= 27 {
+        // Already in the hotbar (indices 27-35 → hotbar 0-8).
+        (rel_idx - 27) as u16
+    } else {
+        // In the main inventory: pick it up and drop it into hotbar slot 0 (slot 36).
+        let inv_slot = (player_start + rel_idx) as i16;
+        click_window_slot(bot, &state.last_window_id, 0, inv_slot).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        click_window_slot(bot, &state.last_window_id, 0, 36).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        0
+    };
+    bot.write_packet(ServerboundSetCarriedItem { slot: hotbar_slot });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    bot.write_packet(ServerboundUseItem {
+        hand: InteractionHand::MainHand,
+        seq: 0,
+        y_rot: 0.0,
+        x_rot: 0.0,
+    });
+}
+
+/// Entry point spawned from the purchase handler. Confirms the buy is a drill with
+/// parts, marks the bot busy, runs the strip, then always restores state + closes
+/// any window it left open.
+async fn remove_drill_parts_workflow(bot: Client, state: BotClientState, purchased_name: String) {
+    if DRILL_WORKFLOW_ACTIVE.swap(true, Ordering::AcqRel) {
+        debug!(
+            "[DrillParts] Already running, skipping '{}'",
+            purchased_name
+        );
+        return;
+    }
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            DRILL_WORKFLOW_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    let _active = ActiveGuard;
+
+    // Let the buy settle into the inventory before inspecting it.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    // Only act on a drill that actually has removable parts.
+    let Some((_rel_idx, drill_name)) = find_drill_with_parts(&bot) else {
+        debug!(
+            "[DrillParts] '{}' has no removable parts, nothing to do",
+            purchased_name
+        );
+        return;
+    };
+    info!(
+        "[DrillParts] '{}' has parts, starting part-out (intentionally slow)",
+        drill_name
+    );
+
+    // Mark busy so the listing path doesn't grab the assembled drill mid-strip.
+    let prev_state = *state.bot_state.read();
+    *state.bot_state.write() = BotState::Purchasing;
+
+    let result = drill_parts_inner(&bot, &state, &drill_name).await;
+
+    // Always clean up: close any window we left open, then restore the prior state.
+    if let Some(wid) = state.handlers.current_window_id() {
+        send_raw_close(&bot, wid, &state.handlers);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    *state.bot_state.write() = prev_state;
+
+    match result {
+        Ok(()) => info!(
+            "[DrillParts] '{}' parted out; parts + stripped drill re-list on the next inventory upload",
+            drill_name
+        ),
+        Err(e) => warn!("[DrillParts] '{}' aborted safely: {}", drill_name, e),
+    }
+}
+
+/// The sequential GUI steps. Returns Err (triggering cleanup) on anything unexpected.
+async fn drill_parts_inner(
+    bot: &Client,
+    state: &BotClientState,
+    drill_name: &str,
+) -> std::result::Result<(), String> {
+    // Start clean: close any stray window and let it settle.
+    if let Some(wid) = state.handlers.current_window_id() {
+        send_raw_close(bot, wid, &state.handlers);
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+
+    // 1. Abiphone → hotbar → right-click to open the contacts screen.
+    let (abi_idx, abi_name) = find_in_player_inv(bot, |n| n.contains("abiphone"))
+        .ok_or_else(|| "no abiphone in inventory".to_string())?;
+    info!("[DrillParts] Opening {}", abi_name);
+    select_and_use_item(bot, state, abi_idx).await;
+
+    // 2. Wait for the contacts screen and find Jotraeline Greatforge by name.
+    let jot_slot = wait_for_slot_named(
+        bot,
+        "jotraeline greatforge",
+        std::time::Duration::from_secs(6),
+    )
+    .await
+    .ok_or_else(|| "Abiphone contacts did not show Jotraeline Greatforge".to_string())?;
+    let contacts_wid = state
+        .handlers
+        .current_window_id()
+        .ok_or_else(|| "contacts window closed unexpectedly".to_string())?;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    info!(
+        "[DrillParts] Calling Jotraeline Greatforge (slot {})",
+        jot_slot
+    );
+    click_window_slot(bot, &state.last_window_id, contacts_wid, jot_slot).await;
+
+    // 3. Wait for the call to connect and the Drill Anvil to open (it rings a few seconds).
+    let anvil_wid = wait_for_window(state, std::time::Duration::from_secs(12), |t| {
+        t.to_lowercase().contains("drill anvil")
+    })
+    .await
+    .ok_or_else(|| "Drill Anvil did not open".to_string())?;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await; // let slot data load
+
+    // 4. Put the drill into the anvil's input slot (29).
+    let drill_slot = find_window_slot_named(bot, drill_name)
+        .ok_or_else(|| "drill not visible in the anvil window".to_string())?;
+    info!(
+        "[DrillParts] Inserting drill from slot {} into input {}",
+        drill_slot, DRILL_ANVIL_INPUT_SLOT
+    );
+    click_window_slot(bot, &state.last_window_id, anvil_wid, drill_slot).await; // pick up
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    click_window_slot(
+        bot,
+        &state.last_window_id,
+        anvil_wid,
+        DRILL_ANVIL_INPUT_SLOT,
+    )
+    .await; // place
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await; // let the buttons populate
+
+    // 5. Remove each part (harmless chat error if a part isn't present).
+    for slot in DRILL_REMOVE_SLOTS {
+        click_window_slot(bot, &state.last_window_id, anvil_wid, slot).await;
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    // 6. Take the stripped drill back out (shift-click the input slot).
+    send_raw_shift_click(bot, anvil_wid, DRILL_ANVIL_INPUT_SLOT);
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    Ok(())
 }
 
 /// Send a container close packet directly to the TCP socket via
@@ -6296,7 +8768,10 @@ fn send_raw_close(bot: &Client, window_id: u8, handlers: &BotEventHandlers) {
         if let Err(e) = raw_conn.write(ServerboundContainerClose {
             container_id: window_id as i32,
         }) {
-            error!("raw container close write failed (window {}): {e}", window_id);
+            error!(
+                "raw container close write failed (window {}): {e}",
+                window_id
+            );
         }
     });
     handlers.clear_window_tracking();
@@ -6312,7 +8787,8 @@ async fn wait_for_cancel_confirmation(
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         // Window changed — server processed the action
@@ -6339,7 +8815,8 @@ async fn wait_for_collect_confirmation(
     last_window_id: &Arc<RwLock<u8>>,
     window_id: u8,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(ORDER_ACTION_CONFIRMATION_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         // Window changed — server processed the action
@@ -6362,11 +8839,7 @@ async fn wait_for_collect_confirmation(
 /// Check the internal ManageOrders deadline.  If exceeded, close the current window
 /// and return the bot to Idle so the command queue isn't blocked for the full 60-second
 /// external timeout.  Returns `true` when the deadline was hit (caller should `return`).
-fn check_manage_orders_deadline(
-    bot: &Client,
-    state: &BotClientState,
-    window_id: u8,
-) -> bool {
+fn check_manage_orders_deadline(bot: &Client, state: &BotClientState, window_id: u8) -> bool {
     if let Some(deadline) = *state.manage_orders_deadline.read() {
         if tokio::time::Instant::now() >= deadline {
             warn!("[ManageOrders] Internal deadline exceeded — closing window and going Idle");
@@ -6396,16 +8869,40 @@ fn check_manage_orders_deadline(
 /// chat command gives the server time to process the ContainerClose before the
 /// new /bz command arrives, and avoids "Sending packets too fast!" kicks.
 /// Raised from 500 → 800 ms to reduce kick frequency under heavy GUI cycling.
-async fn close_window_and_reopen_bz(
-    bot: &Client,
-    state: &BotClientState,
-    window_id: u8,
-) {
+async fn close_window_and_reopen_bz(bot: &Client, state: &BotClientState, window_id: u8) {
     if *state.last_window_id.read() == window_id {
         send_raw_close(bot, window_id, &state.handlers);
         tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
         send_chat_command(bot, "/bz");
     }
+}
+
+/// Refuse to list a slot whose stack count is greater than one: warn, emit an
+/// event for the chat/panel layer, close the window and go idle.
+///
+/// Every listing price this bot uses (finder `listAt`, COFL `createAuction`)
+/// is a PER-UNIT price, while Hypixel charges the full ask for the WHOLE
+/// placed stack. Listing a count-N slot at the unit price sells N copies for
+/// the price of one (user report: two drills sold for a single drill's price,
+/// -60M). The item stays in the inventory; the operator must unstack it
+/// before the next listing attempt succeeds.
+fn refuse_stacked_listing(
+    bot: &Client,
+    state: &BotClientState,
+    window_id: u8,
+    item_name: &str,
+    count: u32,
+) {
+    warn!(
+        "[Auction] Refusing to list \"{}\" — slot holds {}x but the listing price is for 1; unstack to list",
+        item_name, count
+    );
+    let _ = state.event_tx.send(BotEvent::AuctionRefusedStacked {
+        item_name: item_name.to_string(),
+        count,
+    });
+    send_raw_close(bot, window_id, &state.handlers);
+    *state.bot_state.write() = BotState::Idle;
 }
 
 /// If the auction item preview slot (slot 13) in "Create BIN Auction" is already
@@ -6424,8 +8921,12 @@ async fn clear_auction_preview_slot(
 ) {
     if slots.len() > 13 && !slots[13].is_empty() {
         let kind = slots[13].kind().to_string().to_lowercase();
-        if kind.contains("glass_pane") || kind.contains("barrier") || kind.contains("stone_button") {
-            debug!("[Auction] Slot 13 is GUI filler ({}) — not a stuck item, skipping", kind);
+        if kind.contains("glass_pane") || kind.contains("barrier") || kind.contains("stone_button")
+        {
+            debug!(
+                "[Auction] Slot 13 is GUI filler ({}) — not a stuck item, skipping",
+                kind
+            );
             return;
         }
         warn!("[Auction] Slot 13 already occupied ({}) — clicking to clear stuck item before placing ours", kind);
@@ -6457,8 +8958,7 @@ async fn click_window_slot_carrying(
         return;
     }
     use azalea_protocol::packets::game::s_container_click::{
-        ServerboundContainerClick,
-        HashedStack,
+        HashedStack, ServerboundContainerClick,
     };
 
     let carried_item = bot.with_registry_holder(|reg| HashedStack::from_item_stack(carried, reg));
@@ -6475,10 +8975,16 @@ async fn click_window_slot_carrying(
 
     bot.with_raw_connection_mut(|mut raw_conn| {
         if let Err(e) = raw_conn.write(packet) {
-            error!("raw click (carrying) write failed (window {} slot {}): {e}", window_id, slot);
+            error!(
+                "raw click (carrying) write failed (window {} slot {}): {e}",
+                window_id, slot
+            );
         }
     });
-    info!("Raw-clicked slot {} in window {} (carrying item)", slot, window_id);
+    info!(
+        "Raw-clicked slot {} in window {} (carrying item)",
+        slot, window_id
+    );
 }
 
 /// Shared startup workflow: cancel old orders, claim sold items, then emit StartupComplete.
@@ -6488,6 +8994,7 @@ async fn click_window_slot_carrying(
 /// Commands are enqueued through the shared CommandQueue so they go through
 /// `execute_command`, which handles all required initialisation (deadlines,
 /// processed-set clearing, SafeClose of stale windows, etc.).
+#[allow(clippy::too_many_arguments)]
 async fn run_startup_workflow(
     _bot: Client,
     bot_state: Arc<RwLock<BotState>>,
@@ -6496,9 +9003,9 @@ async fn run_startup_workflow(
     auto_cookie_hours: Arc<RwLock<u64>>,
     command_queue: Arc<RwLock<Option<CommandQueue>>>,
     startup_in_progress: Arc<AtomicBool>,
-    _enable_bazaar_flips: Arc<AtomicBool>,
+    enable_bazaar_flips: Arc<AtomicBool>,
 ) {
-    use crate::types::{CommandType, CommandPriority};
+    use crate::types::{CommandPriority, CommandType};
 
     // Prevent duplicate startup runs.
     if startup_in_progress.swap(true, Ordering::SeqCst) {
@@ -6508,15 +9015,18 @@ async fn run_startup_workflow(
 
     // Do not run startup steps while another interactive flow is active.
     // Wait briefly for idle/grace period; abort if the bot stays busy.
-    let entry_deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(STARTUP_ENTRY_TIMEOUT_SECS);
+    let entry_deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(STARTUP_ENTRY_TIMEOUT_SECS);
     loop {
         let current_state = *bot_state.read();
         if matches!(current_state, BotState::GracePeriod | BotState::Idle) {
             break;
         }
         if tokio::time::Instant::now() >= entry_deadline {
-            warn!("[Startup] Skipping startup workflow: bot stayed busy in state {:?}", current_state);
+            warn!(
+                "[Startup] Skipping startup workflow: bot stayed busy in state {:?}",
+                current_state
+            );
             startup_in_progress.store(false, Ordering::Relaxed);
             return;
         }
@@ -6539,7 +9049,7 @@ async fn run_startup_workflow(
     };
 
     info!("╔══════════════════════════════════════╗");
-        info!("║        TWM Startup Workflow          ║");
+    info!("║        TWM Startup Workflow          ║");
     info!("╚══════════════════════════════════════╝");
 
     // Helper: enqueue a command and wait until the queue processor completes it.
@@ -6551,8 +9061,7 @@ async fn run_startup_workflow(
         timeout_secs: u64,
     ) -> bool {
         let cmd_id = queue.enqueue(cmd_type, CommandPriority::Critical, false);
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
             // Command has been fully processed by the queue processor
@@ -6571,31 +9080,49 @@ async fn run_startup_workflow(
     if cookie_hours > 0 {
         info!("[Startup] Step 1/4: Checking cookie status...");
         let _ = event_tx.send(BotEvent::ChatMessage(
-            "§f[§4BAF§f]: §7[Startup] §bStep 1/4: §fChecking cookie status...".to_string()
+            "§f[§4BAF§f]: §7[Startup] §bStep 1/4: §fChecking cookie status...".to_string(),
         ));
         await_queued_command(&queue, &bot_state, CommandType::CheckCookie, 60).await;
         info!("[Startup] Step 1/4: Cookie check complete");
         let _ = event_tx.send(BotEvent::ChatMessage(
-            "§f[§4BAF§f]: §a[Startup] Cookie check complete".to_string()
+            "§f[§4BAF§f]: §a[Startup] Cookie check complete".to_string(),
         ));
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     } else {
         info!("[Startup] Step 1/4: Cookie check skipped (AUTO_COOKIE=0)");
     }
 
-    // Step 2/4: Bazaar order management — always cancel all open orders and
-    // collect filled ones on startup so the bot starts with a clean slate.
-    let cancel_open = true;
-    let mode_str = if cancel_open { "cancel + collect" } else { "collect-only" };
-    info!("[Startup] Step 2/4: Managing bazaar orders (startup: {})...", mode_str);
-    await_queued_command(
-        &queue,
-        &bot_state,
-        CommandType::ManageOrders { cancel_open },
-        50,
-    ).await;
-    let orders_cancelled = *manage_orders_cancelled.read();
-    info!("[Startup] Step 2/4: Order management complete — {} order(s) cancelled", orders_cancelled);
+    // Step 2/4: Bazaar order management.
+    //
+    // Skipped ENTIRELY when bazaar flips are disabled.  Not just the destructive
+    // "clean slate" cancel — the collect-only pass is skipped too.  A user who
+    // turned the bazaar finder off is using those orders themselves (co-op
+    // buy/sell orders, other macros), and having the bot claim filled orders out
+    // from under them fills the inventory and stops AH flips.  With bazaar flips
+    // off the bot never touches the orders window on its own; only explicit
+    // user actions (web panel buttons) still manage orders.
+    let orders_cancelled = if enable_bazaar_flips.load(Ordering::Relaxed) {
+        info!("[Startup] Step 2/4: Managing bazaar orders (startup: cancel + collect)...");
+        await_queued_command(
+            &queue,
+            &bot_state,
+            CommandType::ManageOrders {
+                cancel_open: true,
+                target_item: None,
+            },
+            50,
+        )
+        .await;
+        let cancelled = *manage_orders_cancelled.read();
+        info!(
+            "[Startup] Step 2/4: Order management complete — {} order(s) cancelled",
+            cancelled
+        );
+        cancelled
+    } else {
+        info!("[Startup] Step 2/4: Skipped — bazaar flips disabled (no cancel, no claim)");
+        0
+    };
 
     // Step 3/4: Claim sold items
     info!("[Startup] Step 3/4: Claiming sold items...");
@@ -6635,6 +9162,69 @@ fn current_tab_ping_ms(bot: &Client) -> Option<u64> {
 }
 
 /// Parse "[Auction] <buyer> bought <item> for <price> coins" → (buyer, item_name, price)
+/// Pull the item name out of Hypixel's cancel confirmation, e.g.
+/// `You canceled your auction for [Lvl 100] Hedgehog!`.
+///
+/// Deliberately anchored on "your auction for": the AH also broadcasts
+/// `<player> cancelled an auction for <item>!` for other people's cancels, and
+/// that must never be mistaken for our own.
+fn parse_cancelled_auction_message(msg: &str) -> Option<String> {
+    let idx = msg
+        .find("your auction for ")
+        .map(|i| i + "your auction for ".len())?;
+    let item = msg[idx..].trim().trim_end_matches('!').trim();
+    if item.is_empty() {
+        None
+    } else {
+        Some(item.to_string())
+    }
+}
+
+/// Last cancel we emitted an [`BotEvent::AuctionCancelled`] for, so the GUI
+/// confirm-window path and the chat confirmation cannot both fire for the same
+/// cancellation. Keyed by color-stripped lowercase item name.
+static LAST_CANCEL_EMIT: Lazy<RwLock<Option<(String, std::time::Instant)>>> =
+    Lazy::new(|| RwLock::new(None));
+
+/// Window in which a second cancel event for the same item is treated as a
+/// duplicate of the first rather than a new cancellation.
+const CANCEL_EMIT_DEDUPE_SECS: u64 = 15;
+
+/// Emit an `AuctionCancelled` event unless we just emitted one for this item.
+/// Returns whether the event was sent.
+fn emit_auction_cancelled(
+    state: &BotClientState,
+    item_name: String,
+    starting_bid: u64,
+    source: &str,
+) -> bool {
+    let key = remove_mc_colors(&item_name).to_lowercase();
+    {
+        let mut last = LAST_CANCEL_EMIT.write();
+        if let Some((prev_key, at)) = last.as_ref() {
+            if *prev_key == key
+                && at.elapsed() < std::time::Duration::from_secs(CANCEL_EMIT_DEDUPE_SECS)
+            {
+                debug!(
+                    "[CancelAuction] Duplicate cancel event for '{}' from {} — already reported",
+                    key, source
+                );
+                return false;
+            }
+        }
+        *last = Some((key, std::time::Instant::now()));
+    }
+    info!(
+        "[CancelAuction] Auction cancelled ({}): '{}' @ {} coins",
+        source, item_name, starting_bid
+    );
+    let _ = state.event_tx.send(BotEvent::AuctionCancelled {
+        item_name,
+        starting_bid,
+    });
+    true
+}
+
 fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
     // "[Auction] <buyer> bought <item> for <price> coins"
     let after = msg.strip_prefix("[Auction] ")?;
@@ -6651,7 +9241,10 @@ fn parse_sold_message(msg: &str) -> Option<(String, String, u64)> {
 }
 
 #[cfg(test)]
-fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Option<(String, u64, String)> {
+fn parse_claimed_sold_event_from_lore(
+    item_name: &str,
+    lore: &[String],
+) -> Option<(String, u64, String)> {
     if lore.is_empty() {
         return None;
     }
@@ -6684,9 +9277,15 @@ fn parse_claimed_sold_event_from_lore(item_name: &str, lore: &[String]) -> Optio
 fn extract_viewauction_uuid(msg: &str) -> Option<String> {
     let idx = msg.find("/viewauction ")?;
     let rest = &msg[idx + 13..];
-    let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"')
+        .unwrap_or(rest.len());
     let uuid = rest[..end].trim().to_string();
-    if uuid.is_empty() { None } else { Some(uuid) }
+    if uuid.is_empty() {
+        None
+    } else {
+        Some(uuid)
+    }
 }
 
 #[cfg(test)]
@@ -6743,7 +9342,14 @@ mod tests {
     fn test_parse_sold_message() {
         let msg = "[Auction] SomePlayer bought Gemstone Fuel Tank for 45,000,000 coins!";
         let result = parse_sold_message(msg);
-        assert_eq!(result, Some(("SomePlayer".to_string(), "Gemstone Fuel Tank".to_string(), 45_000_000)));
+        assert_eq!(
+            result,
+            Some((
+                "SomePlayer".to_string(),
+                "Gemstone Fuel Tank".to_string(),
+                45_000_000
+            ))
+        );
     }
 
     #[test]
@@ -6757,7 +9363,11 @@ mod tests {
         let result = parse_claimed_sold_event_from_lore("Gemstone Fuel Tank", &lore);
         assert_eq!(
             result,
-            Some(("Gemstone Fuel Tank".to_string(), 45_000_000, "SomePlayer".to_string()))
+            Some((
+                "Gemstone Fuel Tank".to_string(),
+                45_000_000,
+                "SomePlayer".to_string()
+            ))
         );
     }
 
@@ -6770,16 +9380,17 @@ mod tests {
         let result = parse_claimed_sold_event_from_lore("Golden Pickaxe", &lore);
         assert_eq!(
             result,
-            Some(("Golden Pickaxe".to_string(), 1_000_000, "Unknown".to_string()))
+            Some((
+                "Golden Pickaxe".to_string(),
+                1_000_000,
+                "Unknown".to_string()
+            ))
         );
     }
 
     #[test]
     fn test_parse_claimed_sold_event_from_lore_non_sold() {
-        let lore = vec![
-            "Status: Active".to_string(),
-            "Ends in: 5m".to_string(),
-        ];
+        let lore = vec!["Status: Active".to_string(), "Ends in: 5m".to_string()];
         let result = parse_claimed_sold_event_from_lore("Golden Pickaxe", &lore);
         assert!(result.is_none());
     }
@@ -6817,16 +9428,107 @@ mod tests {
     #[test]
     fn test_parse_bed_remaining_secs_from_text() {
         assert_eq!(parse_bed_remaining_secs_from_text("Ends in 0:45"), Some(45));
-        assert_eq!(parse_bed_remaining_secs_from_text("Purchase in 1m 05s"), Some(65));
-        assert_eq!(parse_bed_remaining_secs_from_text("Grace period: 59s"), Some(59));
+        assert_eq!(
+            parse_bed_remaining_secs_from_text("Purchase in 1m 05s"),
+            Some(65)
+        );
+        assert_eq!(
+            parse_bed_remaining_secs_from_text("Grace period: 59s"),
+            Some(59)
+        );
         assert_eq!(parse_bed_remaining_secs_from_text("No time here"), None);
     }
 
     #[test]
+    fn test_extract_grace_seconds_from_lore() {
+        // A listing inside Hypixel's post-listing grace period.
+        assert_eq!(
+            extract_grace_seconds_from_lore(&[
+                "§7Buy it now: §65,000,000 coins".to_string(),
+                "§cCan be bought in §e20s".to_string(),
+            ]),
+            Some(20)
+        );
+        assert_eq!(
+            extract_grace_seconds_from_lore(&["Auction can be bought in 20 seconds".to_string()]),
+            Some(20)
+        );
+        // A price earlier on the line must not be read as the countdown.
+        assert_eq!(
+            extract_grace_seconds_from_lore(&[
+                "§7Buy it now: §620,000,000 coins — can be bought in §e5s".to_string()
+            ]),
+            Some(5)
+        );
+        // An ordinary, already-buyable listing has no grace countdown.
+        assert_eq!(
+            extract_grace_seconds_from_lore(&[
+                "§7Buy it now: §65,000,000 coins".to_string(),
+                "§7Ends in: §e1d 4h".to_string(),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_grace_period_lore_is_not_mistaken_for_an_ended_auction() {
+        // The bug: a freshly listed auction has no "Ends in:" line yet, so the
+        // time extractor found nothing. It must stay recognisable as a real
+        // auction slot and must NOT report a time of zero.
+        let combined = "buy it now: 5,000,000 coins\ncan be bought in 20s".to_string();
+        assert!(is_grace_period_lore(&combined));
+        assert!(!contains_word_ended(&combined));
+        assert!(!combined.contains("expired"));
+        assert_eq!(
+            extract_time_remaining_from_lore(&["§cCan be bought in §e20s".to_string()]),
+            None,
+            "grace lore carries no 'Ends in', so the remaining time is UNKNOWN"
+        );
+    }
+
+    #[test]
     fn test_is_terminal_purchase_failure_message() {
-        assert!(is_terminal_purchase_failure_message("You didn't participate in this auction!"));
-        assert!(is_terminal_purchase_failure_message("This auction wasn't found!"));
-        assert!(!is_terminal_purchase_failure_message("Putting coins in escrow..."));
+        assert!(is_terminal_purchase_failure_message(
+            "You didn't participate in this auction!"
+        ));
+        assert!(is_terminal_purchase_failure_message(
+            "This auction wasn't found!"
+        ));
+        assert!(is_terminal_purchase_failure_message(
+            "You don't have the space required to claim that!"
+        ));
+        assert!(is_terminal_purchase_failure_message(
+            "Your inventory is full!"
+        ));
+        assert!(!is_terminal_purchase_failure_message(
+            "Putting coins in escrow..."
+        ));
+    }
+
+    #[test]
+    fn parses_the_cancel_confirmation_hypixel_actually_sends() {
+        // Real line from a prod log, alongside the AH broadcast that accompanies
+        // it — only the personal one may produce a cancel event.
+        assert_eq!(
+            parse_cancelled_auction_message("You canceled your auction for [Lvl 100] Hedgehog!")
+                .as_deref(),
+            Some("[Lvl 100] Hedgehog")
+        );
+        assert_eq!(
+            parse_cancelled_auction_message("You cancelled your auction for Hyperion!").as_deref(),
+            Some("Hyperion")
+        );
+        // Someone else's cancel, broadcast to the co-op/party: "an", not "your".
+        assert_eq!(
+            parse_cancelled_auction_message(
+                "[MVP+] sung_drip_wooooo cancelled an auction for [Lvl 100] Hedgehog!"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_cancelled_auction_message("You canceled your auction for "),
+            None
+        );
     }
 
     #[test]
@@ -6918,10 +9620,7 @@ mod tests {
 
     #[test]
     fn test_parse_filled_amount_fully_filled() {
-        let lore = vec![
-            "Buy Order".to_string(),
-            "Filled: 64/64 100%!".to_string(),
-        ];
+        let lore = vec!["Buy Order".to_string(), "Filled: 64/64 100%!".to_string()];
         assert_eq!(parse_filled_amount_from_lore(&lore), Some((64, 64)));
     }
 
@@ -6947,9 +9646,7 @@ mod tests {
 
     #[test]
     fn test_parse_filled_amount_zero() {
-        let lore = vec![
-            "Filled: 0/64 0%".to_string(),
-        ];
+        let lore = vec!["Filled: 0/64 0%".to_string()];
         assert_eq!(parse_filled_amount_from_lore(&lore), Some((0, 64)));
     }
 
@@ -6964,9 +9661,7 @@ mod tests {
 
     #[test]
     fn test_parse_filled_amount_large_numbers() {
-        let lore = vec![
-            "Filled: 1,280/2,560 50%".to_string(),
-        ];
+        let lore = vec!["Filled: 1,280/2,560 50%".to_string()];
         assert_eq!(parse_filled_amount_from_lore(&lore), Some((1280, 2560)));
     }
 
@@ -7004,7 +9699,10 @@ mod tests {
             "§7Product: Booster Cookie".to_string(),
         ];
         let identity = parse_bazaar_order_identity("Booster Cookie", &lore);
-        assert!(should_treat_as_bazaar_order_slot("Booster Cookie", identity.as_ref()));
+        assert!(should_treat_as_bazaar_order_slot(
+            "Booster Cookie",
+            identity.as_ref()
+        ));
     }
 
     #[test]
@@ -7015,8 +9713,14 @@ mod tests {
             "Product: Enchanted Diamond".to_string(),
         ];
         let lore_identity = parse_bazaar_order_identity("Enchanted Diamond", &lore_only);
-        assert!(should_treat_as_bazaar_order_slot("Enchanted Diamond", lore_identity.as_ref()));
-        assert!(should_treat_as_bazaar_order_slot("Buy Order: Enchanted Diamond", None));
+        assert!(should_treat_as_bazaar_order_slot(
+            "Enchanted Diamond",
+            lore_identity.as_ref()
+        ));
+        assert!(should_treat_as_bazaar_order_slot(
+            "Buy Order: Enchanted Diamond",
+            None
+        ));
         assert!(!should_treat_as_bazaar_order_slot("Booster Cookie", None));
     }
 
@@ -7042,7 +9746,41 @@ mod tests {
         );
         log_bazaar_order_placed(true, &item_name, 5_000_000.0);
         let last = last_logged_order_timestamp(true, &item_name);
-        assert!(last.is_some(), "placed order should be present in bazaar_orders.log");
+        assert!(
+            last.is_some(),
+            "placed order should be present in bazaar_orders.log"
+        );
+    }
+
+    #[test]
+    fn test_is_order_below_min_cancel_age_none_identity() {
+        // Unknown identity → cannot determine age → not too young
+        assert!(!is_order_below_min_cancel_age(&None));
+    }
+
+    #[test]
+    fn test_is_order_below_min_cancel_age_no_log_entry() {
+        // Order with no log entry → cannot determine age → not too young
+        let identity = Some((true, "nonexistent_item_xyz_9999".to_string()));
+        assert!(!is_order_below_min_cancel_age(&identity));
+    }
+
+    #[test]
+    fn test_is_order_below_min_cancel_age_recently_placed() {
+        // Log an order just now — it should be below the min cancel age
+        let item_name = format!(
+            "unit_test_young_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        log_bazaar_order_placed(true, &item_name, 1_000_000.0);
+        let identity = Some((true, item_name));
+        assert!(
+            is_order_below_min_cancel_age(&identity),
+            "just-placed order should be below min cancel age"
+        );
     }
 
     #[test]
@@ -7098,7 +9836,11 @@ mod tests {
         // Verify that ItemKind::to_string() produces minecraft: prefixed names
         let kind = ItemKind::PlayerHead;
         let name = kind.to_string();
-        assert!(name.starts_with("minecraft:"), "Expected minecraft: prefix, got: {}", name);
+        assert!(
+            name.starts_with("minecraft:"),
+            "Expected minecraft: prefix, got: {}",
+            name
+        );
         assert_eq!(name, "minecraft:player_head");
     }
 
@@ -7122,8 +9864,12 @@ mod tests {
         let result = parse_sold_message(msg);
         assert!(result.is_some());
         let (_, item_name, _) = result.unwrap();
-        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
-        assert!(listings.contains(&item_key), "Our listing should be detected");
+        let item_key =
+            crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+        assert!(
+            listings.contains(&item_key),
+            "Our listing should be detected"
+        );
     }
 
     #[test]
@@ -7139,17 +9885,40 @@ mod tests {
         let result = parse_sold_message(msg);
         assert!(result.is_some());
         let (_, item_name, _) = result.unwrap();
-        let item_key = crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
-        assert!(!listings.contains(&item_key), "Coop member's listing should not match");
+        let item_key =
+            crate::bot::handlers::BotEventHandlers::remove_color_codes(&item_name).to_lowercase();
+        assert!(
+            !listings.contains(&item_key),
+            "Coop member's listing should not match"
+        );
     }
 
     #[test]
     fn test_parse_cookie_duration_various_formats() {
         // Test various duration formats
-        assert_eq!(parse_cookie_duration_secs("Duration: 3d 5h"), 3 * 86400 + 5 * 3600);
-        assert_eq!(parse_cookie_duration_secs("Duration: 23h 45m"), 23 * 3600 + 45 * 60);
-        assert_eq!(parse_cookie_duration_secs("Duration: 1h 30m"), 1 * 3600 + 30 * 60);
+        assert_eq!(
+            parse_cookie_duration_secs("Duration: 3d 5h"),
+            3 * 86400 + 5 * 3600
+        );
+        assert_eq!(
+            parse_cookie_duration_secs("Duration: 23h 45m"),
+            23 * 3600 + 45 * 60
+        );
+        assert_eq!(
+            parse_cookie_duration_secs("Duration: 1h 30m"),
+            3600 + 30 * 60
+        );
         assert_eq!(parse_cookie_duration_secs("Duration: 0d 0h 0m"), 0);
+    }
+
+    #[test]
+    fn profile_status_message_starts_skyblock_workflow() {
+        assert!(is_skyblock_join_message(
+            "You are playing on profile: Apple"
+        ));
+        assert!(is_skyblock_join_message("you are playing on profile: Pear"));
+        assert!(is_skyblock_join_message("Welcome to Hypixel SkyBlock"));
+        assert!(!is_skyblock_join_message("You are playing SkyBlock"));
     }
 
     #[test]
@@ -7159,13 +9928,16 @@ mod tests {
         // An item with no extra components should return an empty map
         let item_data = ItemStackData::from(ItemKind::Stone);
         let result = extract_serializable_components(&item_data);
-        assert!(result.is_empty(), "Stone with no components should have empty serializable components");
+        assert!(
+            result.is_empty(),
+            "Stone with no components should have empty serializable components"
+        );
     }
 
     #[test]
     fn test_extract_serializable_components_with_map_id() {
         use azalea::registry::builtin::ItemKind;
-        use azalea_inventory::{ItemStack, components::MapId};
+        use azalea_inventory::{components::MapId, ItemStack};
         // An item with MapId only — no custom_data, custom_name, lore, profile, tooltip_display
         // should return an empty map (since we only extract those 5 specific components).
         let item = ItemStack::from(ItemKind::Map).with_component(MapId { id: 42 });
@@ -7212,7 +9984,10 @@ mod tests {
                 "id": "ASPECT_OF_THE_END"
             }
         });
-        assert_eq!(resolve_pet_tag("ASPECT_OF_THE_END", &nbt), "ASPECT_OF_THE_END");
+        assert_eq!(
+            resolve_pet_tag("ASPECT_OF_THE_END", &nbt),
+            "ASPECT_OF_THE_END"
+        );
     }
 
     #[test]
@@ -7240,7 +10015,10 @@ mod tests {
 
     #[test]
     fn test_normalize_collapses_whitespace() {
-        assert_eq!(normalize_for_matching("  turbo   wheat   v  "), "turbo wheat v");
+        assert_eq!(
+            normalize_for_matching("  turbo   wheat   v  "),
+            "turbo wheat v"
+        );
     }
 
     #[test]
@@ -7262,7 +10040,7 @@ mod tests {
 
     /// Helper: build a minimal `ItemStack` whose display name is `display_name`.
     fn make_named_item(display_name: &str) -> ItemStack {
-        use azalea_chat::{FormattedText, text_component::TextComponent};
+        use azalea_chat::{text_component::TextComponent, FormattedText};
         use azalea_inventory::components::CustomName;
         let cn = CustomName {
             name: FormattedText::Text(TextComponent::new(display_name.to_string())),
@@ -7294,28 +10072,20 @@ mod tests {
 
     #[test]
     fn test_find_slot_case_insensitive() {
-        let slots = vec![
-            make_named_item("Create Buy Order"),
-        ];
+        let slots = vec![make_named_item("Create Buy Order")];
         assert_eq!(find_slot_by_name(&slots, "create buy order"), Some(0));
     }
 
     #[test]
     fn test_find_slot_token_matching() {
-        let slots = vec![
-            ItemStack::Empty,
-            make_named_item("Turbo-Wheat Hoe V"),
-        ];
+        let slots = vec![ItemStack::Empty, make_named_item("Turbo-Wheat Hoe V")];
         // Token matching: "turbo", "wheat", "v" all in "turbo wheat hoe v"
         assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), Some(1));
     }
 
     #[test]
     fn test_find_slot_no_match() {
-        let slots = vec![
-            make_named_item("Enchanted Bread"),
-            make_named_item("Wheat"),
-        ];
+        let slots = vec![make_named_item("Enchanted Bread"), make_named_item("Wheat")];
         assert_eq!(find_slot_by_name(&slots, "turbo wheat v"), None);
     }
 

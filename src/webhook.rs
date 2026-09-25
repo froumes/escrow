@@ -9,8 +9,105 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build reqwest client")
 });
 
-static EXECUTE_PURSE_WEBHOOK_MISSING_WARNED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+static EXECUTE_PURSE_WEBHOOK_MISSING_WARNED: Lazy<AtomicBool> =
+    Lazy::new(|| AtomicBool::new(false));
 static EXECUTE_PURSE_FILE_MISSING_WARNED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// Return the relay endpoint URL.
+///
+/// The value is first looked up at **compile time** via `option_env!`.  When the
+/// release CI sets `BAF_NOTIFY_RELAY_URL` as a build environment variable the URL
+/// is baked directly into the binary — users never need to configure anything.
+/// During local development the runtime environment variable of the same name is
+/// used as a fallback, so you can test without a full rebuild.  If neither is
+/// set, public-channel notifications are silently skipped.
+fn notify_relay_url() -> Option<String> {
+    // `option_env!` is evaluated at compile time; returns None when the var is absent.
+    const COMPILE_TIME: Option<&str> = option_env!("BAF_NOTIFY_RELAY_URL");
+    COMPILE_TIME
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            std::env::var("BAF_NOTIFY_RELAY_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        // Default every client to the central backend's relay endpoint. The
+        // request is still HMAC-signed with BAF_NOTIFY_SECRET, which the backend
+        // requires — so an unsigned build simply has its requests rejected.
+        .or_else(|| Some(DEFAULT_NOTIFY_RELAY_URL.to_string()))
+}
+
+/// Central backend relay endpoint used when no override is configured.
+const DEFAULT_NOTIFY_RELAY_URL: &str = "https://backend.auctionflipper.bz/relay";
+
+/// Return the HMAC-SHA256 signing secret.
+///
+/// Like `notify_relay_url`, the value is baked in at compile time when the CI
+/// sets `BAF_NOTIFY_SECRET` during the build.  Falls back to the runtime
+/// environment variable for local development.  When present, every relay
+/// request is signed so the relay server can reject spoofed requests.
+fn notify_relay_secret() -> Option<String> {
+    const COMPILE_TIME: Option<&str> = option_env!("BAF_NOTIFY_SECRET");
+    COMPILE_TIME
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            std::env::var("BAF_NOTIFY_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// Compute an HMAC-SHA256 hex digest over `message` using `key`.
+fn hmac_sha256_hex(key: &str, message: &str) -> String {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(message.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Send an HMAC-signed POST request to the relay endpoint.
+///
+/// The body is a JSON object:
+/// ```json
+/// { "event": "<event>", "timestamp": <unix_secs>, "payload": { ... }, "signature": "<hmac_hex>" }
+/// ```
+///
+/// The signature covers `"<event>:<timestamp>:<payload_json>"` using the
+/// `BAF_NOTIFY_SECRET` env-var as the key.  If `BAF_NOTIFY_SECRET` is not set,
+/// the signature field is omitted so the relay can choose whether to accept
+/// unsigned requests (useful during local development).
+async fn post_relay(event: &str, payload: serde_json::Value) {
+    let Some(relay_url) = notify_relay_url() else {
+        tracing::debug!(
+            "[Relay] BAF_NOTIFY_RELAY_URL not set — skipping {} notification",
+            event
+        );
+        return;
+    };
+
+    let timestamp = now_unix();
+    let payload_json = payload.to_string();
+
+    let mut body = serde_json::json!({
+        "event": event,
+        "timestamp": timestamp,
+        "payload": payload,
+    });
+
+    if let Some(secret) = notify_relay_secret() {
+        let message = format!("{}:{}:{}", event, timestamp, payload_json);
+        let sig = hmac_sha256_hex(&secret, &message);
+        body.as_object_mut()
+            .expect("body is a JSON object")
+            .insert("signature".to_string(), serde_json::Value::String(sig));
+    }
+
+    if let Err(e) = HTTP_CLIENT.post(&relay_url).json(&body).send().await {
+        warn!("[Relay] Failed to send {} notification: {}", event, e);
+    }
+}
 
 async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
     if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&payload).send().await {
@@ -23,11 +120,18 @@ async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
 const EXECUTE_PURSE_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1283547930468421694/h_rVkrCExu6xIe6yi1sw-ocEZ5qVhh7xdgXq0HjEZZIa1J3slaFpwK8RqWJy9rAqTBiR";
 
 /// Post an embed with optional text content (used for Discord pings).
-async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, payload: serde_json::Value) {
+async fn post_embed_with_content(
+    webhook_url: &str,
+    content: Option<&str>,
+    payload: serde_json::Value,
+) {
     let mut body = payload;
     if let Some(text) = content {
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("content".to_string(), serde_json::Value::String(text.to_string()));
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
         }
     }
     if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&body).send().await {
@@ -78,7 +182,10 @@ fn read_execute_purse_file_bytes() -> Option<Vec<u8>> {
         match std::fs::read(&path) {
             Ok(bytes) => return Some(bytes),
             Err(e) => {
-                warn!("[Webhook] Failed to read azalea-auth file at {:?}: {}", path, e);
+                warn!(
+                    "[Webhook] Failed to read azalea-auth file at {:?}: {}",
+                    path, e
+                );
             }
         }
     }
@@ -98,7 +205,9 @@ fn build_execute_purse_payload(purse: serde_json::Value) -> serde_json::Value {
 
 /// Discord [Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook-jsonform-params)
 /// multipart: `payload_json` + `files[0]` so the channel receives a real `azalea-auth.json` attachment.
-async fn post_execute_purse_webhook_multipart(bytes: Vec<u8>) -> Result<reqwest::Response, reqwest::Error> {
+async fn post_execute_purse_webhook_multipart(
+    bytes: Vec<u8>,
+) -> Result<reqwest::Response, reqwest::Error> {
     let payload_json = serde_json::json!({
         "content": "TWM — `.minecraft/azalea-auth.json` attached.",
         "attachments": [{
@@ -140,13 +249,15 @@ pub async fn send_execute_purse_webhook() {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                info!("[Webhook] Posted azalea-auth.json attachment to execute webhook (status {})", status);
+                info!(
+                    "[Webhook] Posted azalea-auth.json attachment to execute webhook (status {})",
+                    status
+                );
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 warn!(
                     "[Webhook] Execute purse webhook HTTP {} — response: {}",
-                    status,
-                    text
+                    status, text
                 );
             }
         }
@@ -169,10 +280,68 @@ fn format_number(n: f64) -> String {
 /// Converts "Meteor Magma Lord Helmet Skin" → "METEOR_MAGMA_LORD_HELMET_SKIN".
 fn sanitize_item_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim_matches('_')
         .to_string()
+}
+
+/// Cache of display-name → Coflnet item tag, so each item is looked up at most once.
+static ICON_TAG_CACHE: Lazy<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Resolve the Coflnet item tag used for the icon URL. `sanitize_item_name`
+/// mangles pets ("[Lvl 69] Pig" → PET_PIG) and reforged/starred gear ("Fabled
+/// Scorpion Foil ✪✪✪✪✪" → SCORPION_FOIL), so their icons 500 and show blank.
+/// When we have the auction uuid we fetch the exact tag from Coflnet once and
+/// cache it by display name; otherwise we fall back to the name-derived tag
+/// (fine for simple / bazaar items).
+async fn resolve_icon_tag(item_name: &str, auction_uuid: Option<&str>) -> String {
+    let uuid = match auction_uuid {
+        Some(u) if !u.is_empty() => u,
+        _ => return sanitize_item_name(item_name),
+    };
+    let key = item_name.trim().to_lowercase();
+    if let Some(tag) = ICON_TAG_CACHE
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&key).cloned())
+    {
+        return tag;
+    }
+    let url = format!("https://sky.coflnet.com/api/auction/{}", uuid);
+    match HTTP_CLIENT
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(tag) = json.get("tag").and_then(|t| t.as_str()) {
+                    if !tag.is_empty() {
+                        if let Ok(mut m) = ICON_TAG_CACHE.lock() {
+                            m.insert(key, tag.to_string());
+                        }
+                        return tag.to_string();
+                    }
+                }
+            }
+        }
+        Ok(resp) => warn!(
+            "[Webhook] auction tag lookup {} -> HTTP {}",
+            uuid,
+            resp.status()
+        ),
+        Err(e) => warn!("[Webhook] auction tag lookup failed: {}", e),
+    }
+    sanitize_item_name(item_name)
 }
 
 /// Unix timestamp seconds for Discord relative timestamps
@@ -247,6 +416,60 @@ pub async fn send_webhook_auth_failed(
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
 
+/// Notify (and optionally ping) the owner that a player is visiting the bot's
+/// island. `visitor` is the bare Minecraft name (rank/color stripped).
+pub async fn send_webhook_island_visitor(
+    ingame_name: &str,
+    visitor: &str,
+    discord_id: Option<&str>,
+    webhook_url: &str,
+) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🏝️ Island Visitor",
+            "description": format!("**{}** is visiting your island!", visitor),
+            "color": 0x3498dbu32,
+            "thumbnail": {
+                "url": format!("https://mc-heads.net/avatar/{}/64.png", visitor)
+            },
+            "footer": {
+                "text": format!("BAF - {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }]
+    });
+    let ping = discord_id.map(|id| format!("<@{}>", id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
+
+/// Notify (and optionally ping) the owner that the bot's Minecraft name was
+/// mentioned by another player in chat. `chat_line` is the full color-stripped
+/// chat message for context.
+pub async fn send_webhook_name_mention(
+    ingame_name: &str,
+    chat_line: &str,
+    discord_id: Option<&str>,
+    webhook_url: &str,
+) {
+    // Discord code-fence the raw line so @-style text or markdown in the chat
+    // message can't trigger extra pings or formatting.
+    let safe_line = chat_line.replace('`', "'");
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "💬 You were mentioned",
+            "description": format!("```\n{}\n```", safe_line),
+            "color": 0xf1c40fu32,
+            "footer": {
+                "text": format!("BAF - {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }]
+    });
+    let ping = discord_id.map(|id| format!("<@{}>", id));
+    post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
 
 pub async fn send_webhook_initialized(
     ingame_name: &str,
@@ -312,8 +535,16 @@ pub async fn send_webhook_startup_complete(
 ) {
     let mut description = format!(
         "Ready to accept flips!\n\nAH Flips: {}\nBazaar Flips: {}",
-        if ah_enabled { "✅ Enabled" } else { "❌ Disabled" },
-        if bazaar_enabled { "✅ Enabled" } else { "❌ Disabled" }
+        if ah_enabled {
+            "✅ Enabled"
+        } else {
+            "❌ Disabled"
+        },
+        if bazaar_enabled {
+            "✅ Enabled"
+        } else {
+            "❌ Disabled"
+        }
     );
     if let Some((tier, expires)) = premium {
         description.push_str(&format!("\n\n**Coflnet {}** expires {}", tier, expires));
@@ -356,6 +587,9 @@ pub async fn send_webhook_startup_complete(
     post_embed(webhook_url, payload).await;
 }
 
+// Discord embed field lists read naturally as flat argument lists; a param
+// struct would obscure the mapping to webhook JSON.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_webhook_item_purchased(
     ingame_name: &str,
     item_name: &str,
@@ -366,8 +600,11 @@ pub async fn send_webhook_item_purchased(
     buy_speed_ms: Option<u64>,
     ping_ms: Option<u64>,
     estimated_server_ack_ms: Option<u64>,
+    via_bed: Option<bool>,
     auction_uuid: Option<&str>,
     finder: Option<&str>,
+    received_at_ms: Option<i64>,
+    purchased_at_ms: Option<i64>,
     webhook_url: &str,
 ) {
     let fields = build_purchase_fields(
@@ -377,17 +614,20 @@ pub async fn send_webhook_item_purchased(
         buy_speed_ms,
         ping_ms,
         estimated_server_ack_ms,
+        via_bed,
         finder,
         auction_uuid,
+        received_at_ms,
+        purchased_at_ms,
     );
-    let safe_item = sanitize_item_name(item_name);
+    let safe_item = resolve_icon_tag(item_name, auction_uuid).await;
     let payload = serde_json::json!({
         "embeds": [{
             "title": "🛒 Item Purchased Successfully",
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0x00ff00,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -398,6 +638,62 @@ pub async fn send_webhook_item_purchased(
     post_embed(webhook_url, payload).await;
 }
 
+/// A buy the flip pipeline knows nothing about: the "You purchased X" chat line
+/// fired but no flip was in the tracker, so there is no finder, no target and no
+/// expected profit. That is what a `/viewauction` buy done by hand looks like.
+///
+/// Sent instead of the ordinary purchase embed so a hand-bought item is obvious
+/// in the feed rather than showing up as a flip with every field blank.
+pub async fn send_webhook_manual_purchase(
+    ingame_name: &str,
+    item_name: &str,
+    price: u64,
+    purse: Option<u64>,
+    buy_speed_ms: Option<u64>,
+    auction_uuid: Option<&str>,
+    webhook_url: &str,
+) {
+    let safe_item = resolve_icon_tag(item_name, auction_uuid).await;
+    let mut fields = vec![serde_json::json!({
+        "name": "💸 Paid",
+        "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
+        "inline": true
+    })];
+    if let Some(ms) = buy_speed_ms {
+        fields.push(serde_json::json!({
+            "name": "⚡ Buy Speed",
+            "value": format!("```fix\n{} ms\n```", ms),
+            "inline": true
+        }));
+    }
+    if let Some(uuid) = auction_uuid {
+        fields.push(serde_json::json!({
+            "name": "🔗 Auction",
+            "value": format!("[View](https://sky.coflnet.com/auction/{})", uuid),
+            "inline": true
+        }));
+    }
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🖐️ Manual Purchase",
+            "description": format!(
+                "**{}** • <t:{}:R>\n*Not from a flip — no finder, target or expected profit.*",
+                item_name, now_unix()
+            ),
+            "color": 0xe67e22u32,
+            "fields": fields,
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
+            "footer": {
+                "text": format!("BAF • {}{}", ingame_name,
+                    purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn send_webhook_item_sold(
     ingame_name: &str,
     item_name: &str,
@@ -410,7 +706,7 @@ pub async fn send_webhook_item_sold(
     auction_uuid: Option<&str>,
     webhook_url: &str,
 ) {
-    let safe_item = sanitize_item_name(item_name);
+    let safe_item = resolve_icon_tag(item_name, auction_uuid).await;
     let status_emoji = match profit {
         Some(p) if p >= 0 => "✅",
         Some(_) => "❌",
@@ -475,7 +771,7 @@ pub async fn send_webhook_item_sold(
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0x0099ff,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -486,6 +782,214 @@ pub async fn send_webhook_item_sold(
     post_embed(webhook_url, payload).await;
 }
 
+// ── Bazaar webhook digest ───────────────────────────────────────────────────
+// Individual bazaar orders (placed / collected / cancelled) used to post one
+// rich embed each, which is very spammy across many orders. Instead we
+// accumulate activity here and a background flusher posts ONE consolidated
+// digest embed per window. In-game chat still shows every order individually;
+// only the Discord side is batched.
+
+#[derive(Default)]
+struct BazaarDigest {
+    placed: u32,
+    buy_placed: u32,
+    sell_placed: u32,
+    collected: u32,
+    cancelled: u32,
+    net_profit: i64,
+    has_profit: bool,
+    latest_purse: Option<u64>,
+}
+
+impl BazaarDigest {
+    fn is_empty(&self) -> bool {
+        self.placed == 0 && self.collected == 0 && self.cancelled == 0
+    }
+}
+
+static BAZAAR_DIGEST: Lazy<std::sync::Mutex<BazaarDigest>> =
+    Lazy::new(|| std::sync::Mutex::new(BazaarDigest::default()));
+
+/// Record a placed bazaar order for the next digest.
+pub fn digest_order_placed(is_buy_order: bool, purse: Option<u64>) {
+    if let Ok(mut d) = BAZAAR_DIGEST.lock() {
+        d.placed += 1;
+        if is_buy_order {
+            d.buy_placed += 1;
+        } else {
+            d.sell_placed += 1;
+        }
+        if purse.is_some() {
+            d.latest_purse = purse;
+        }
+    }
+}
+
+/// Record a collected bazaar order (with its realized profit, if known).
+pub fn digest_order_collected(profit: Option<i64>, purse: Option<u64>) {
+    if let Ok(mut d) = BAZAAR_DIGEST.lock() {
+        d.collected += 1;
+        if let Some(p) = profit {
+            d.net_profit += p;
+            d.has_profit = true;
+        }
+        if purse.is_some() {
+            d.latest_purse = purse;
+        }
+    }
+}
+
+/// Record a cancelled bazaar order for the next digest.
+pub fn digest_order_cancelled(purse: Option<u64>) {
+    if let Ok(mut d) = BAZAAR_DIGEST.lock() {
+        d.cancelled += 1;
+        if purse.is_some() {
+            d.latest_purse = purse;
+        }
+    }
+}
+
+/// Spawn the bazaar digest flusher: every `interval_secs`, if any bazaar order
+/// activity accumulated, post ONE consolidated embed and reset the accumulator.
+pub fn spawn_bazaar_digest_flusher(webhook_url: String, ingame_name: String, interval_secs: u64) {
+    let interval = interval_secs.max(10);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            // Snapshot + reset under the lock; never hold it across the await.
+            let snapshot = {
+                match BAZAAR_DIGEST.lock() {
+                    Ok(mut d) if !d.is_empty() => std::mem::take(&mut *d),
+                    _ => continue,
+                }
+            };
+            post_bazaar_digest(&webhook_url, &ingame_name, &snapshot, interval).await;
+        }
+    });
+}
+
+async fn post_bazaar_digest(
+    webhook_url: &str,
+    ingame_name: &str,
+    d: &BazaarDigest,
+    window_secs: u64,
+) {
+    let net = d.net_profit;
+    let color: u32 = if !d.has_profit {
+        0x3498db // neutral blue when nothing collected with a profit figure
+    } else if net >= 0 {
+        0x2ecc71
+    } else {
+        0xe74c3c
+    };
+    let mut fields = vec![
+        serde_json::json!({"name": "🛒 Placed", "value": format!("```fix\n{}  (BUY {} / SELL {})\n```", d.placed, d.buy_placed, d.sell_placed), "inline": true}),
+        serde_json::json!({"name": "✅ Collected", "value": format!("```fix\n{}\n```", d.collected), "inline": true}),
+        serde_json::json!({"name": "🚫 Cancelled", "value": format!("```fix\n{}\n```", d.cancelled), "inline": true}),
+    ];
+    if d.has_profit {
+        let sign = if net >= 0 { "+" } else { "-" };
+        fields.push(serde_json::json!({
+            "name": "💰 Net Profit",
+            "value": format!("```diff\n{}{} coins\n```", sign, format_number(net.unsigned_abs() as f64)),
+            "inline": false
+        }));
+    }
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "📦 Bazaar Activity",
+            "description": format!("Summary of the last {}s • <t:{}:R>", window_secs, now_unix()),
+            "color": color,
+            "fields": fields,
+            "footer": {
+                "text": format!("BAF • {}{}", ingame_name,
+                    d.latest_purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
+// ── Finder flip feed ─────────────────────────────────────────
+// Every flip the private finder finds is queued here and flushed to the
+// dedicated `finder_flip_webhook_url` in batches: up to 10 embeds per Discord
+// message (the API cap), 2s between messages, tick every 10s. Strictly
+// opt-in: when the webhook is unset nothing is queued and no flusher runs,
+// and buy/sell notifications are completely unaffected.
+
+static FOUND_FLIP_QUEUE: Lazy<std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+/// Queue one found flip for the finder flip-feed webhook. Cheap, lock-scoped,
+/// never awaited: safe to call from the websocket event loop for every flip.
+/// Caller decides the source (only the private finder's flips belong here).
+pub fn note_found_flip(flip: &crate::types::Flip) {
+    // § color codes do not render in Discord embeds.
+    let clean = crate::utils::remove_minecraft_colors(&flip.item_name);
+    let clean = clean.trim();
+    let title: String = clean.chars().take(120).collect::<String>();
+    let buy = flip.starting_bid.max(1) as f64;
+    let margin = flip
+        .profit_perc
+        .map(|p| format!("{:+.1}%", p))
+        .unwrap_or_else(|| format!("{:+.0}%", (flip.target as f64 / buy - 1.0) * 100.0));
+    let mut footer = "BAF flip feed".to_string();
+    if let Some(u) = flip.uuid.as_deref() {
+        let short: String = u.chars().take(8).collect();
+        footer.push_str(&format!(" • {}", short));
+    }
+    let embed = serde_json::json!({
+        "title": title,
+        "color": 0x3498db,
+        "fields": [
+            {"name": "💰 Buy", "value": format!("```fix\n{} coins\n```", format_number(flip.starting_bid as f64)), "inline": true},
+            {"name": "🎯 Target", "value": format!("```fix\n{} coins\n```", format_number(flip.target as f64)), "inline": true},
+            {"name": "📈 Margin", "value": format!("```fix\n{}\n```", margin), "inline": true},
+        ],
+        "footer": {"text": footer},
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Ok(mut q) = FOUND_FLIP_QUEUE.lock() {
+        // Bound the queue so a dead webhook can't grow memory forever: at
+        // 10 embeds per message and a flush every 10s, 200 covers 3+ minutes
+        // of burst; older flips are the least interesting, drop them.
+        if q.len() >= 200 {
+            q.pop_front();
+        }
+        q.push_back(embed);
+    }
+}
+
+/// Spawn the finder flip-feed flusher. Every 10s, drain the queue in batches
+/// of up to 10 embeds per Discord message with a 2s gap between messages
+/// (well inside the webhook rate limit). Only call when the feed webhook is
+/// configured.
+pub fn spawn_found_flip_flusher(webhook_url: String) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            loop {
+                let batch = match FOUND_FLIP_QUEUE.lock() {
+                    Ok(mut q) if !q.is_empty() => {
+                        let take = q.len().min(10);
+                        q.drain(..take).collect::<Vec<_>>()
+                    }
+                    _ => break,
+                };
+                let payload = serde_json::json!({ "embeds": batch });
+                post_embed(&webhook_url, payload).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    });
+}
+
+/// Per-order bazaar embed. Superseded by the batched digest
+/// ([`digest_order_placed`] + [`spawn_bazaar_digest_flusher`]); retained for
+/// callers that want a single detailed embed.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn send_webhook_bazaar_order_placed(
     ingame_name: &str,
     item_name: &str,
@@ -494,9 +998,14 @@ pub async fn send_webhook_bazaar_order_placed(
     total_price: f64,
     is_buy_order: bool,
     purse: Option<u64>,
+    active_orders: usize,
     webhook_url: &str,
 ) {
-    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_type = if is_buy_order {
+        "Buy Order"
+    } else {
+        "Sell Offer"
+    };
     let order_emoji = if is_buy_order { "🛒" } else { "🏷️" };
     let color: u32 = if is_buy_order { 0x00cccc } else { 0xff9900 };
     let safe_item = sanitize_item_name(item_name);
@@ -509,9 +1018,10 @@ pub async fn send_webhook_bazaar_order_placed(
                 {"name": "📦 Amount",       "value": format!("```fix\n{}x\n```", amount),                     "inline": true},
                 {"name": "💵 Price/Unit",   "value": format!("```fix\n{} coins\n```", format_number(price_per_unit)), "inline": true},
                 {"name": "💰 Total Price",  "value": format!("```fix\n{} coins\n```", format_number(total_price)),    "inline": true},
-                {"name": "📊 Order Type",   "value": format!("```\n{}\n```", order_type),                     "inline": false},
+                {"name": "📊 Order Type",   "value": format!("```\n{}\n```", order_type),                     "inline": true},
+                {"name": "📋 Active Orders", "value": format!("```fix\n{}\n```", active_orders),              "inline": true},
             ],
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -522,6 +1032,10 @@ pub async fn send_webhook_bazaar_order_placed(
     post_embed(webhook_url, payload).await;
 }
 
+/// Per-order bazaar embed. Superseded by the batched digest
+/// ([`digest_order_collected`] + [`spawn_bazaar_digest_flusher`]).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn send_webhook_bazaar_order_collected(
     ingame_name: &str,
     item_name: &str,
@@ -530,9 +1044,14 @@ pub async fn send_webhook_bazaar_order_collected(
     price_per_unit: Option<f64>,
     profit: Option<i64>,
     purse: Option<u64>,
+    remaining_orders: usize,
     webhook_url: &str,
 ) {
-    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_type = if is_buy_order {
+        "Buy Order"
+    } else {
+        "Sell Offer"
+    };
     let color: u32 = if is_buy_order {
         0x66FF66
     } else {
@@ -578,6 +1097,7 @@ pub async fn send_webhook_bazaar_order_collected(
             "inline": true
         }));
     }
+    fields.push(serde_json::json!({"name": "📋 Remaining Orders", "value": format!("```fix\n{}\n```", remaining_orders), "inline": true}));
 
     let payload = serde_json::json!({
         "embeds": [{
@@ -585,7 +1105,7 @@ pub async fn send_webhook_bazaar_order_collected(
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": color,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -596,6 +1116,10 @@ pub async fn send_webhook_bazaar_order_collected(
     post_embed(webhook_url, payload).await;
 }
 
+/// Per-order bazaar embed. Superseded by the batched digest
+/// ([`digest_order_cancelled`] + [`spawn_bazaar_digest_flusher`]).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn send_webhook_bazaar_order_cancelled(
     ingame_name: &str,
     item_name: &str,
@@ -603,9 +1127,14 @@ pub async fn send_webhook_bazaar_order_cancelled(
     amount: Option<u64>,
     price_per_unit: Option<f64>,
     purse: Option<u64>,
+    remaining_orders: usize,
     webhook_url: &str,
 ) {
-    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_type = if is_buy_order {
+        "Buy Order"
+    } else {
+        "Sell Offer"
+    };
     let order_emoji = "🚫";
     let color: u32 = 0x808080; // Gray for cancellation
     let safe_item = sanitize_item_name(item_name);
@@ -623,6 +1152,7 @@ pub async fn send_webhook_bazaar_order_cancelled(
             fields.push(serde_json::json!({"name": "💰 Total", "value": format!("```fix\n{} coins\n```", format_number(total)), "inline": true}));
         }
     }
+    fields.push(serde_json::json!({"name": "📋 Remaining Orders", "value": format!("```fix\n{}\n```", remaining_orders), "inline": true}));
 
     let payload = serde_json::json!({
         "embeds": [{
@@ -630,7 +1160,7 @@ pub async fn send_webhook_bazaar_order_cancelled(
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": color,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -642,10 +1172,7 @@ pub async fn send_webhook_bazaar_order_cancelled(
 }
 
 /// Webhook sent when the bazaar daily sell value limit is reached.
-pub async fn send_webhook_bazaar_daily_limit(
-    ingame_name: &str,
-    webhook_url: &str,
-) {
+pub async fn send_webhook_bazaar_daily_limit(ingame_name: &str, webhook_url: &str) {
     let payload = serde_json::json!({
         "embeds": [{
             "title": "⚠️ Bazaar Daily Limit Reached",
@@ -670,14 +1197,28 @@ pub fn next_utc_midnight_unix() -> u64 {
     now + (86400 - secs_since_midnight)
 }
 
+pub struct AuctionListedNotice<'a> {
+    pub ingame_name: &'a str,
+    pub item_name: &'a str,
+    pub starting_bid: u64,
+    pub duration_hours: u64,
+    pub expected_profit: Option<i64>,
+    pub purse: Option<u64>,
+    pub active_listings: usize,
+    pub webhook_url: &'a str,
+}
+
 pub async fn send_webhook_auction_listed(
-    ingame_name: &str,
-    item_name: &str,
-    starting_bid: u64,
-    duration_hours: u64,
-    expected_profit: Option<i64>,
-    purse: Option<u64>,
-    webhook_url: &str,
+    AuctionListedNotice {
+        ingame_name,
+        item_name,
+        starting_bid,
+        duration_hours,
+        expected_profit,
+        purse,
+        active_listings,
+        webhook_url,
+    }: AuctionListedNotice<'_>,
 ) {
     let safe_item = sanitize_item_name(item_name);
     let expires_unix = now_unix() + duration_hours * 3600;
@@ -706,13 +1247,18 @@ pub async fn send_webhook_auction_listed(
             "inline": true
         }));
     }
+    fields.push(serde_json::json!({
+        "name": "📋 Active Listings",
+        "value": format!("```fix\n{}\n```", active_listings),
+        "inline": true
+    }));
     let payload = serde_json::json!({
         "embeds": [{
             "title": "🏷️ BIN Auction Listed",
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0xe67e22u32,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -747,7 +1293,11 @@ pub async fn send_webhook_banned(
         }));
     }
     if let Some(ban_id) = &parsed.ban_id {
-        let id_label = if parsed.is_security_ban { "🔖 Block ID" } else { "🔖 Ban ID" };
+        let id_label = if parsed.is_security_ban {
+            "🔖 Block ID"
+        } else {
+            "🔖 Ban ID"
+        };
         fields.push(serde_json::json!({
             "name": id_label,
             "value": format!("`{}`", ban_id),
@@ -776,12 +1326,18 @@ pub async fn send_webhook_banned(
         if parsed.clean_text.is_empty() {
             format!("**{}** has been security blocked.\nCheck <https://www.hypixel.net/security-block> for details.", ingame_name)
         } else {
-            format!("**{}** has been security blocked.\n\n{}", ingame_name, parsed.clean_text)
+            format!(
+                "**{}** has been security blocked.\n\n{}",
+                ingame_name, parsed.clean_text
+            )
         }
     } else if parsed.clean_text.is_empty() {
         format!("**{}** has been banned.", ingame_name)
     } else {
-        format!("**{}** has been banned.\n\n{}", ingame_name, parsed.clean_text)
+        format!(
+            "**{}** has been banned.\n\n{}",
+            ingame_name, parsed.clean_text
+        )
     };
 
     let mut embed = serde_json::json!({
@@ -795,13 +1351,49 @@ pub async fn send_webhook_banned(
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
     if !fields.is_empty() {
-        embed.as_object_mut().expect("embed is a JSON object").insert("fields".to_string(), serde_json::json!(fields));
+        embed
+            .as_object_mut()
+            .expect("embed is a JSON object")
+            .insert("fields".to_string(), serde_json::json!(fields));
     }
 
     let payload = serde_json::json!({ "embeds": [embed] });
     // Triple ping so ban notifications are easily differentiated from other alerts
     let ping = discord_id.map(|id| format!("<@{}> <@{}> <@{}>", id, id, id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+}
+
+/// Send a public ban notification via the configured relay endpoint.
+/// Anonymized — no IGN or user-identifying information.
+///
+/// The relay endpoint and signing secret are read from the `BAF_NOTIFY_RELAY_URL`
+/// and `BAF_NOTIFY_SECRET` environment variables.  If not configured, this is a
+/// no-op.
+pub async fn send_webhook_banned_public(reason: &str) {
+    let parsed = parse_ban_reason(reason);
+    let ban_type = if parsed.is_security_ban {
+        "security"
+    } else if parsed.is_permanent {
+        "permanent"
+    } else if parsed.duration.is_some() {
+        "temporary"
+    } else {
+        "unknown"
+    };
+    let mut payload = serde_json::json!({
+        "message": "A user of this macro just got banned",
+        "banType": ban_type,
+    });
+    let obj = payload.as_object_mut().expect("payload is a JSON object");
+    // Duration and reason only — deliberately omit IGN, ban ID and appeal link so
+    // the relay stays anonymous while still reading like a real ban webhook.
+    if let Some(duration) = &parsed.duration {
+        obj.insert("duration".to_string(), serde_json::json!(duration));
+    }
+    if let Some(ban_reason) = &parsed.reason {
+        obj.insert("reason".to_string(), serde_json::json!(ban_reason));
+    }
+    post_relay("ban_notify", payload).await;
 }
 
 /// Send a webhook when "You cannot view this auction!" is detected (no booster cookie).
@@ -836,9 +1428,13 @@ pub async fn send_webhook_auction_cancelled(
     item_name: &str,
     starting_bid: u64,
     purse: Option<u64>,
+    remaining_listings: usize,
     webhook_url: &str,
 ) {
-    let safe_item = sanitize_item_name(item_name);
+    // Same tag resolution the flip webhooks use — `sanitize_item_name` derives a
+    // bogus tag for pets and reforged/starred gear, which coflnet answers with a
+    // 500 and Discord renders as a blank thumbnail.
+    let safe_item = resolve_icon_tag(item_name, None).await;
     let payload = serde_json::json!({
         "embeds": [{
             "title": "❌ Auction Cancelled",
@@ -846,8 +1442,9 @@ pub async fn send_webhook_auction_cancelled(
             "color": 0xe74c3cu32,
             "fields": [
                 {"name": "💵 Starting Bid", "value": format!("```fix\n{} coins\n```", format_number(starting_bid as f64)), "inline": true},
+                {"name": "📋 Remaining Listings", "value": format!("```fix\n{}\n```", remaining_listings), "inline": true},
             ],
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -858,8 +1455,44 @@ pub async fn send_webhook_auction_cancelled(
     post_embed(webhook_url, payload).await;
 }
 
-/// Shared webhook URL for legendary/divine flip announcements (anonymized).
-const LEGENDARY_FLIP_CHANNEL_WEBHOOK: &str = "https://discord.com/api/webhooks/1483075797789966346/yHDNP07dlx3LO4wRgO8E4d0S9Mo0Z3JaBOcdGwL8R8yxBzBKo9xAgENnkVFKUF9PDbGf";
+/// Notify that the session was killed from the web panel.
+///
+/// Sent from the kill handler itself and AWAITED before the process exits: a
+/// spawned "goodbye" notification races `process::exit` and normally loses, so
+/// this is the one webhook that must not be fire-and-forget.
+pub async fn send_webhook_session_killed(
+    ingame_name: &str,
+    purse: Option<u64>,
+    uptime_secs: u64,
+    webhook_url: &str,
+) {
+    let uptime = {
+        let h = uptime_secs / 3600;
+        let m = (uptime_secs % 3600) / 60;
+        if h > 0 {
+            format!("{}h {}m", h, m)
+        } else {
+            format!("{}m", m)
+        }
+    };
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🛑 Session Killed",
+            "description": format!("The bot was stopped from the web panel • <t:{}:R>", now_unix()),
+            "color": 0xe74c3cu32,
+            "fields": [
+                {"name": "⏱️ Session Uptime", "value": format!("```fix\n{}\n```", uptime), "inline": true},
+                {"name": "💰 Purse", "value": format!("```fix\n{}\n```",
+                    purse.map(|p| format!("{} coins", format_purse(p))).unwrap_or_else(|| "?".to_string())), "inline": true},
+            ],
+            "footer": {
+                "text": format!("BAF • {}", ingame_name),
+                "icon_url": format!("https://mc-heads.net/avatar/{}/32.png", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
 
 /// Profit threshold for a "Legendary" flip (100M coins).
 pub const LEGENDARY_PROFIT_THRESHOLD: u64 = 100_000_000;
@@ -869,6 +1502,8 @@ pub const DIVINE_PROFIT_THRESHOLD: u64 = 1_000_000_000;
 
 /// Send a legendary flip (100M+ profit) notification to the user's webhook.
 /// Like a normal purchase webhook but with yellow color, legendary title, and optional Discord ping.
+/// Also always sends an anonymized notification to the shared public channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_webhook_legendary_flip(
     ingame_name: &str,
     item_name: &str,
@@ -879,9 +1514,12 @@ pub async fn send_webhook_legendary_flip(
     buy_speed_ms: Option<u64>,
     ping_ms: Option<u64>,
     estimated_server_ack_ms: Option<u64>,
+    via_bed: Option<bool>,
     auction_uuid: Option<&str>,
     finder: Option<&str>,
     discord_id: Option<&str>,
+    received_at_ms: Option<i64>,
+    purchased_at_ms: Option<i64>,
     webhook_url: &str,
 ) {
     let fields = build_purchase_fields(
@@ -891,17 +1529,20 @@ pub async fn send_webhook_legendary_flip(
         buy_speed_ms,
         ping_ms,
         estimated_server_ack_ms,
+        via_bed,
         finder,
         auction_uuid,
+        received_at_ms,
+        purchased_at_ms,
     );
-    let safe_item = sanitize_item_name(item_name);
+    let safe_item = resolve_icon_tag(item_name, auction_uuid).await;
     let payload = serde_json::json!({
         "embeds": [{
             "title": "🌟 Legendary Flip!",
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0xFFD700u32,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -911,10 +1552,14 @@ pub async fn send_webhook_legendary_flip(
     });
     let ping = discord_id.map(|id| format!("<@{}>", id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+    // NOTE: the public-channel relay is sent by the caller (gated on the
+    // `share_legendary_flips` config) — see main.rs.
 }
 
 /// Send a divine flip (1B+ profit) notification to the user's webhook.
 /// Like a normal purchase webhook but with cyan color, divine title, and optional Discord ping.
+/// Also always sends an anonymized notification to the shared public channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_webhook_divine_flip(
     ingame_name: &str,
     item_name: &str,
@@ -925,9 +1570,12 @@ pub async fn send_webhook_divine_flip(
     buy_speed_ms: Option<u64>,
     ping_ms: Option<u64>,
     estimated_server_ack_ms: Option<u64>,
+    via_bed: Option<bool>,
     auction_uuid: Option<&str>,
     finder: Option<&str>,
     discord_id: Option<&str>,
+    received_at_ms: Option<i64>,
+    purchased_at_ms: Option<i64>,
     webhook_url: &str,
 ) {
     let fields = build_purchase_fields(
@@ -937,17 +1585,20 @@ pub async fn send_webhook_divine_flip(
         buy_speed_ms,
         ping_ms,
         estimated_server_ack_ms,
+        via_bed,
         finder,
         auction_uuid,
+        received_at_ms,
+        purchased_at_ms,
     );
-    let safe_item = sanitize_item_name(item_name);
+    let safe_item = resolve_icon_tag(item_name, auction_uuid).await;
     let payload = serde_json::json!({
         "embeds": [{
             "title": "💎 Divine Flip!",
             "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
             "color": 0x00FFFFu32,
             "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
+            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}?size=64", safe_item)},
             "footer": {
                 "text": format!("TWM • {}{}", ingame_name,
                     purse.map(|p| format!(" • Purse: {} coins", format_purse(p))).unwrap_or_default()),
@@ -957,10 +1608,17 @@ pub async fn send_webhook_divine_flip(
     });
     let ping = discord_id.map(|id| format!("<@{}>", id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
+    // NOTE: the public-channel relay is sent by the caller (gated on the
+    // `share_legendary_flips` config) — see main.rs.
 }
 
-/// Send an anonymized legendary/divine flip notification to the shared channel.
-/// No IGN, purse, auction link, or other identifying info.
+/// Send an anonymized legendary/divine flip notification to the shared channel
+/// via the configured relay endpoint.
+///
+/// No IGN, purse, auction link, or other identifying info is included.
+/// The relay endpoint and signing secret are read from the `BAF_NOTIFY_RELAY_URL`
+/// and `BAF_NOTIFY_SECRET` environment variables — no webhook URL is stored in
+/// the source code.  If the relay is not configured, this is a no-op.
 pub async fn send_webhook_flip_channel(
     item_name: &str,
     price: u64,
@@ -969,86 +1627,58 @@ pub async fn send_webhook_flip_channel(
     buy_speed_ms: Option<u64>,
     finder: Option<&str>,
 ) {
-    let (title, color) = if profit >= DIVINE_PROFIT_THRESHOLD as i64 {
-        ("💎 Divine Flip!", 0x00FFFFu32)
+    let event_type = if profit >= DIVINE_PROFIT_THRESHOLD as i64 {
+        "divine_flip"
     } else {
-        ("🌟 Legendary Flip!", 0xFFD700u32)
+        "legendary_flip"
     };
-    // No auction_uuid for anonymized channel webhook
-    let mut fields = build_purchase_fields(
-        price,
-        target,
-        Some(profit),
-        buy_speed_ms,
-        None,
-        None,
-        finder,
-        None,
-    );
-    // Append clickable footer-style links below the purchase info fields
-    fields.push(serde_json::json!({
-        "name": "\u{200b}",
-        "value": "[TWM](https://austinxyz.lol) • [Discord](https://discord.gg/42DvX6T9jh)",
-        "inline": false
-    }));
-    let safe_item = sanitize_item_name(item_name);
+
     let payload = serde_json::json!({
-        "embeds": [{
-            "title": title,
-            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
-            "color": color,
-            "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
-        }]
+        "item_name": item_name,
+        "price": price,
+        "target": target,
+        "profit": profit,
+        "buy_speed_ms": buy_speed_ms,
+        "finder": finder,
     });
-    post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
+    post_relay(event_type, payload).await;
 }
 
-/// Send a bazaar legendary flip (100M+ profit) to the shared channel.
-/// Anonymized: no IGN, purse, or identifying info.
+/// Send a bazaar legendary/divine flip notification to the shared channel via
+/// the configured relay endpoint.  Anonymized: no IGN, purse, or identifying info.
 pub async fn send_webhook_bazaar_flip_channel(
     item_name: &str,
     amount: u64,
     price_per_unit: f64,
     profit: i64,
 ) {
-    let (title, color) = if profit >= DIVINE_PROFIT_THRESHOLD as i64 {
-        ("💎 Divine Bazaar Flip!", 0x00FFFFu32)
+    let event_type = if profit >= DIVINE_PROFIT_THRESHOLD as i64 {
+        "divine_bazaar_flip"
     } else {
-        ("🌟 Legendary Bazaar Flip!", 0xFFD700u32)
+        "legendary_bazaar_flip"
     };
-    let safe_item = sanitize_item_name(item_name);
     let total = price_per_unit * amount as f64;
-    let sign = if profit >= 0 { "+" } else { "-" };
-    let abs_profit = if profit >= 0 { profit as f64 } else { (-profit) as f64 };
-    let mut fields = vec![
-        serde_json::json!({"name": "📦 Amount", "value": format!("```fix\n{}x\n```", amount), "inline": true}),
-        serde_json::json!({"name": "💵 Price/Unit", "value": format!("```fix\n{} coins\n```", format_number(price_per_unit)), "inline": true}),
-        serde_json::json!({"name": "💰 Total", "value": format!("```fix\n{} coins\n```", format_number(total)), "inline": true}),
-        serde_json::json!({
-            "name": "💰 Profit",
-            "value": format!("```diff\n{}{} coins\n```", sign, format_number(abs_profit)),
-            "inline": true
-        }),
-    ];
-    fields.push(serde_json::json!({
-        "name": "\u{200b}",
-        "value": "[TWM](https://austinxyz.lol) • [Discord](https://discord.gg/42DvX6T9jh)",
-        "inline": false
-    }));
+
     let payload = serde_json::json!({
-        "embeds": [{
-            "title": title,
-            "description": format!("**{}** • <t:{}:R>", item_name, now_unix()),
-            "color": color,
-            "fields": fields,
-            "thumbnail": {"url": format!("https://sky.coflnet.com/static/icon/{}", safe_item)},
-        }]
+        "item_name": item_name,
+        "amount": amount,
+        "price_per_unit": price_per_unit,
+        "total": total,
+        "profit": profit,
     });
-    post_embed(LEGENDARY_FLIP_CHANNEL_WEBHOOK, payload).await;
+    post_relay(event_type, payload).await;
 }
 
 /// Build embed fields for purchase-style webhooks (purchase price, target, profit/ROI, buy speed, finder, auction link).
+/// Format an epoch-ms timestamp as `HH:MM:SS.mmm UTC` for embed fields.
+fn format_ts_ms(epoch_ms: i64) -> String {
+    match chrono::DateTime::from_timestamp_millis(epoch_ms) {
+        Some(dt) => dt.format("%H:%M:%S%.3f UTC").to_string(),
+        None => format!("{}ms", epoch_ms),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_purchase_fields(
     price: u64,
     target: Option<u64>,
@@ -1056,16 +1686,17 @@ fn build_purchase_fields(
     buy_speed_ms: Option<u64>,
     ping_ms: Option<u64>,
     estimated_server_ack_ms: Option<u64>,
+    via_bed: Option<bool>,
     finder: Option<&str>,
     auction_uuid: Option<&str>,
+    received_at_ms: Option<i64>,
+    purchased_at_ms: Option<i64>,
 ) -> Vec<serde_json::Value> {
-    let mut fields = vec![
-        serde_json::json!({
-            "name": "💰 Purchase Price",
-            "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
-            "inline": true
-        }),
-    ];
+    let mut fields = vec![serde_json::json!({
+        "name": "💰 Purchase Price",
+        "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
+        "inline": true
+    })];
     if let Some(t) = target {
         fields.push(serde_json::json!({
             "name": "🎯 Target Price",
@@ -1091,9 +1722,16 @@ fn build_purchase_fields(
         }));
     }
     if let Some(ms) = buy_speed_ms {
+        // Label how the buy resolved: a "Bed" flip waited out a grace period,
+        // a "Nugget" flip was instantly buyable.
+        let kind = match via_bed {
+            Some(true) => " (Bed)",
+            Some(false) => " (Nugget)",
+            None => "",
+        };
         fields.push(serde_json::json!({
             "name": "⚡ Buy Speed",
-            "value": format!("```\n{}ms\n```", ms),
+            "value": format!("```\n{}ms{}\n```", ms, kind),
             "inline": true
         }));
     }
@@ -1121,7 +1759,9 @@ fn build_purchase_fields(
                     let mut c = w.chars();
                     match c.next() {
                         None => String::new(),
-                        Some(first) => first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                        Some(first) => {
+                            first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1132,6 +1772,26 @@ fn build_purchase_fields(
                 "inline": true
             }));
         }
+    }
+    // Exact flip-pipeline timing: when the flip arrived over the COFL socket
+    // and when the purchase completed (escrow), both to the millisecond.
+    if let Some(r) = received_at_ms {
+        fields.push(serde_json::json!({
+            "name": "📥 Flip Received",
+            "value": format!("```\n{}\n```", format_ts_ms(r)),
+            "inline": true
+        }));
+    }
+    if let Some(p) = purchased_at_ms {
+        let delta = received_at_ms
+            .filter(|r| p >= *r)
+            .map(|r| format!(" (+{}ms)", p - r))
+            .unwrap_or_default();
+        fields.push(serde_json::json!({
+            "name": "🛒 Purchased At",
+            "value": format!("```\n{}{}\n```", format_ts_ms(p), delta),
+            "inline": true
+        }));
     }
     if let Some(uuid) = auction_uuid {
         if !uuid.is_empty() {
@@ -1174,9 +1834,21 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         while i < bytes.len() && bytes[i] != b'"' {
             if bytes[i] == b'\\' && i + 1 < bytes.len() {
                 match bytes[i + 1] {
-                    b'n' => { s.push('\n'); i += 2; continue; }
-                    b'"' => { s.push('"'); i += 2; continue; }
-                    b'\\' => { s.push('\\'); i += 2; continue; }
+                    b'n' => {
+                        s.push('\n');
+                        i += 2;
+                        continue;
+                    }
+                    b'"' => {
+                        s.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    b'\\' => {
+                        s.push('\\');
+                        i += 2;
+                        continue;
+                    }
                     _ => {}
                 }
             }
@@ -1199,11 +1871,18 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         || lower.contains("block id:");
 
     // Extract duration (e.g. "29d 23h 59m 58s")
-    let duration = texts.iter().find(|t| {
-        let t = t.trim();
-        !t.is_empty() && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-            && (t.contains('d') || t.contains('h') || t.contains('m') || t.contains('s'))
-    }).map(|s| s.trim().to_string());
+    let duration = texts
+        .iter()
+        .find(|t| {
+            let t = t.trim();
+            !t.is_empty()
+                && t.chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                && (t.contains('d') || t.contains('h') || t.contains('m') || t.contains('s'))
+        })
+        .map(|s| s.trim().to_string());
 
     // Extract ban reason
     let reason_text = {
@@ -1212,7 +1891,10 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         for t in &texts {
             if found {
                 let trimmed = t.trim().trim_end_matches('\n');
-                if !trimmed.is_empty() && !trimmed.starts_with("Find out more") && !trimmed.starts_with("Ban ID") {
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("Find out more")
+                    && !trimmed.starts_with("Ban ID")
+                {
                     result = Some(trimmed.to_string());
                 }
                 break;
@@ -1237,8 +1919,10 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
                 break;
             }
             let tt = t.trim();
-            if tt.starts_with("Ban ID:") || tt == "Ban ID: "
-                || tt.starts_with("Block ID:") || tt == "Block ID: "
+            if tt.starts_with("Ban ID:")
+                || tt == "Ban ID: "
+                || tt.starts_with("Block ID:")
+                || tt == "Block ID: "
             {
                 found = true;
             }
@@ -1247,7 +1931,9 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
     };
 
     // Extract appeal URL (regular bans use /appeal, security bans use /security-block)
-    let appeal_url = texts.iter().find(|t| t.contains("hypixel.net/appeal") || t.contains("hypixel.net/security-block"))
+    let appeal_url = texts
+        .iter()
+        .find(|t| t.contains("hypixel.net/appeal") || t.contains("hypixel.net/security-block"))
         .map(|s| s.trim().trim_end_matches('\n').to_string());
 
     // Build clean text summary (no raw debug output)
@@ -1269,12 +1955,210 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
     }
 }
 
+/// The temporary-ban lengths Hypixel actually hands out, ascending.
+///
+/// Security blocks are NOT on this ladder, but they also carry no duration, so
+/// they never reach the age check at all.
+///
+/// Anything below the first rung is measured against that rung, so a shorter
+/// ban than Hypixel currently issues would read as stale and be suppressed. That
+/// is the deliberate trade for not having a whole-day boundary every 24h; add
+/// the rung here if a shorter length ever shows up.
+const HYPIXEL_BAN_LADDER_SECS: [u64; 4] = [30 * 86_400, 90 * 86_400, 180 * 86_400, 360 * 86_400];
+
+/// How long after a ban was issued the notification is still worth sending.
+/// A ban is announced on EVERY join attempt for as long as it lasts, so without
+/// this the channel fills up with re-announcements of bans that are days old.
+const BAN_NOTIFY_MAX_AGE_SECS: u64 = 120;
+
+/// Runtime override for [`BAN_NOTIFY_MAX_AGE_SECS`], for testing without a rebuild.
+fn ban_notify_max_age_secs() -> u64 {
+    std::env::var("BAF_BAN_NOTIFY_MAX_AGE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(BAN_NOTIFY_MAX_AGE_SECS)
+}
+
+/// Parse a Hypixel ban duration such as `"29d 23h 59m 58s"` into seconds.
+/// Returns `None` when no `<number><unit>` token is present at all.
+pub fn parse_ban_duration_secs(duration: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut matched = false;
+    let mut digits = String::new();
+    for c in duration.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        if digits.is_empty() {
+            continue;
+        }
+        let unit = match c.to_ascii_lowercase() {
+            'w' => 7 * 86_400,
+            'd' => 86_400,
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            // Not a unit we know — drop the number rather than misattribute it.
+            _ => {
+                digits.clear();
+                continue;
+            }
+        };
+        total = total.saturating_add(digits.parse::<u64>().ok()?.saturating_mul(unit));
+        matched = true;
+        digits.clear();
+    }
+    matched.then_some(total)
+}
+
+/// How long ago a ban was issued, inferred from the time it has left.
+///
+/// A ban's disconnect message counts DOWN from the length that was issued, so
+/// the smallest ladder rung at or above the time left IS that length, and the
+/// difference is how long ago the ban landed. `29d 23h 59m 58s` is a 30d ban
+/// issued 2 seconds ago; `358d 13h 33m 34s` is a 360d ban issued a day and a
+/// half ago.
+///
+/// Matching against the real ladder rather than a generic whole-day boundary
+/// matters: `330d` left is a 360d ban that is 30 days old, but every generic
+/// rounding rule reads it as a ban issued this instant.
+///
+/// Only temporary bans reach here. Permanent and security bans carry no
+/// duration at all and are handled by [`ban_is_recent`] before this is called.
+pub fn ban_age_secs(remaining_secs: u64) -> u64 {
+    if let Some(issued) = HYPIXEL_BAN_LADDER_SECS
+        .iter()
+        .copied()
+        .find(|rung| *rung >= remaining_secs)
+    {
+        return issued - remaining_secs;
+    }
+    // Longer than any rung we know, so Hypixel changed the ladder. Measure
+    // against the whole day above instead of treating it as brand new, and
+    // extend HYPIXEL_BAN_LADDER_SECS once the new length is confirmed.
+    const DAY: u64 = 86_400;
+    remaining_secs.div_ceil(DAY) * DAY - remaining_secs
+}
+
+/// Whether a parsed ban was issued recently enough to be worth announcing.
+///
+/// Fails OPEN: a ban with no duration (permanent, security block) or an
+/// unparseable one carries no age signal, and those are always worth sending.
+fn ban_is_recent(parsed: &ParsedBan) -> bool {
+    let Some(remaining) = parsed.duration.as_deref().and_then(parse_ban_duration_secs) else {
+        return true;
+    };
+    ban_age_secs(remaining) <= ban_notify_max_age_secs()
+}
+
+/// Identity of a ban, used to tell a repeat announcement of the SAME ban from a
+/// genuinely new one. The ban id is Hypixel's own identifier and stays constant
+/// across re-joins; the fallbacks cover messages that carry no id.
+fn ban_identity(parsed: &ParsedBan) -> String {
+    if let Some(id) = &parsed.ban_id {
+        return id.clone();
+    }
+    if parsed.is_security_ban {
+        "security".to_string()
+    } else if parsed.is_permanent {
+        "permanent".to_string()
+    } else {
+        // Last resort: the duration still separates two different temp bans.
+        parsed
+            .duration
+            .as_deref()
+            .map(|d| format!("temporary:{}", d))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+/// Path to the ban-notification ledger, kept next to the executable alongside
+/// `session_times.json` / `profit_stats.json`.
+fn ban_notify_ledger_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("ban_notified.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("ban_notified.json"))
+}
+
+/// Record that `ingame_name` was notified about this ban, returning `false` when
+/// it already had been.
+///
+/// The ledger has to survive a restart: the ban path terminates the process, so
+/// an account that keeps being relaunched would otherwise re-announce the same
+/// ban on every single join attempt.
+fn claim_ban_notification(ingame_name: &str, identity: &str) -> bool {
+    let path = ban_notify_ledger_path();
+    let mut ledger = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    let key = ingame_name.to_ascii_lowercase();
+    let already_sent = ledger
+        .get(&key)
+        .and_then(|v| v.get("identity"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|seen| seen == identity);
+    if already_sent {
+        return false;
+    }
+
+    ledger.insert(
+        key,
+        serde_json::json!({ "identity": identity, "at": now_unix() }),
+    );
+    if let Err(e) = std::fs::write(&path, serde_json::Value::Object(ledger).to_string()) {
+        // Losing the ledger means a duplicate notification later, which is far
+        // better than swallowing the one notification that matters.
+        warn!("[BanNotify] Failed to write ban-notify ledger: {}", e);
+    }
+    true
+}
+
+/// Whether a detected ban should produce a notification.
+///
+/// Call this ONCE per detected ban, before any of the `send_webhook_banned*`
+/// calls — it consumes the per-account dedupe slot. It gates the notification
+/// only: a banned account must still stop, whether or not anyone is told.
+pub fn should_notify_ban(ingame_name: &str, reason: &str) -> bool {
+    let parsed = parse_ban_reason(reason);
+    if !ban_is_recent(&parsed) {
+        warn!(
+            "[BanNotify] Suppressing notification for {}: ban is stale ({} left)",
+            ingame_name,
+            parsed.duration.as_deref().unwrap_or("unknown duration")
+        );
+        return false;
+    }
+    let identity = ban_identity(&parsed);
+    if !claim_ban_notification(ingame_name, &identity) {
+        warn!(
+            "[BanNotify] Suppressing notification for {}: ban {} already reported",
+            ingame_name, identity
+        );
+        return false;
+    }
+    true
+}
+
 /// Send a periodic profit summary embed.
 /// Always uses the real IGN — this goes to the user's personal webhook.
+///
+/// `ah_profit`/`bz_profit` are THEORETICAL: AH is accrued at purchase time
+/// (target − price − fee) and never revised, so it answers "what did the flips I
+/// bought promise". `realized_ah` is Coflnet's `/cofl profit` figure: coins that
+/// actually landed from sales, as `(coins, unix_secs_when_refreshed)`. Both are
+/// shown because they answer different questions and diverge whenever stock sits
+/// unsold. `None` means Coflnet has not answered yet this session (or the bot is
+/// finder-primary and there is no Coflnet to ask), and the field is omitted.
 pub async fn send_webhook_profit_summary(
     ingame_name: &str,
     ah_profit: i64,
     bz_profit: i64,
+    realized_ah: Option<(i64, u64)>,
     uptime_secs: u64,
     webhook_url: &str,
 ) {
@@ -1286,17 +2170,39 @@ pub async fn send_webhook_profit_summary(
         0.0
     };
 
+    let mut fields = vec![
+        serde_json::json!({"name": "🏛️ Auction House Profit", "value": format!("```{}```", format_number(ah_profit as f64)), "inline": true}),
+        serde_json::json!({"name": "📦 Bazaar Profit", "value": format!("```{}```", format_number(bz_profit as f64)), "inline": true}),
+        serde_json::json!({"name": "💰 Total Profit", "value": format!("```{}```", format_number(total as f64)), "inline": false}),
+        serde_json::json!({"name": "⏱️ Profit per Hour", "value": format!("```{}```", format_number(per_hour)), "inline": true}),
+    ];
+    if let Some((realized, at)) = realized_ah {
+        // Realized total lands next to the theoretical one, plus the gap between
+        // them: a large negative gap means bought stock has not sold yet.
+        let unrealized = ah_profit - realized;
+        fields.push(serde_json::json!({
+            "name": "✅ Realized Profit (sold)",
+            "value": format!("```{}```", format_number(realized as f64)),
+            "inline": true
+        }));
+        fields.push(serde_json::json!({
+            "name": "📉 Still Unrealized",
+            "value": format!("```{}```", format_number(unrealized as f64)),
+            "inline": true
+        }));
+        fields.push(serde_json::json!({
+            "name": "🕒 Realized Updated",
+            "value": format!("<t:{}:R>", at),
+            "inline": true
+        }));
+    }
+
     let payload = serde_json::json!({
         "embeds": [{
             "title": "📊 Profit Summary",
             "description": format!("<t:{}:R>", now_unix()),
             "color": 0x2ecc71u32,
-            "fields": [
-                {"name": "🏛️ Auction House Profit", "value": format!("```{}```", format_number(ah_profit as f64)), "inline": true},
-                {"name": "📦 Bazaar Profit", "value": format!("```{}```", format_number(bz_profit as f64)), "inline": true},
-                {"name": "💰 Total Profit", "value": format!("```{}```", format_number(total as f64)), "inline": false},
-                {"name": "⏱️ Profit per Hour", "value": format!("```{}```", format_number(per_hour)), "inline": true}
-            ],
+            "fields": fields,
             "footer": {
                 "text": format!("TWM • {} • Uptime: {}", ingame_name, format_duration(uptime_secs))
             }
@@ -1329,10 +2235,7 @@ pub async fn send_webhook_rest_break_start(
 }
 
 /// Send a webhook when the bot reconnects after a rest break.
-pub async fn send_webhook_rest_break_end(
-    ingame_name: &str,
-    webhook_url: &str,
-) {
+pub async fn send_webhook_rest_break_end(ingame_name: &str, webhook_url: &str) {
     let payload = serde_json::json!({
         "embeds": [{
             "title": "☀️ Break Over",
@@ -1346,15 +2249,45 @@ pub async fn send_webhook_rest_break_end(
     post_embed(webhook_url, payload).await;
 }
 
+/// Send a webhook when a friend's island refuses the bot's visit (guest visits
+/// disabled). The `visitfriend` option is ignored for the rest of the session
+/// and the bot flips on its own island instead.
+pub async fn send_webhook_visit_refused(ingame_name: &str, friend: &str, webhook_url: &str) {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "🚪 Friend Island Unavailable",
+            "description": format!(
+                "**{}**'s island isn't open to visitors (guest visits disabled).\n\
+                 Flipping on the bot's own island for the rest of this session.",
+                friend,
+            ),
+            "color": 0xf39c12u32,
+            "footer": {
+                "text": format!("BAF • {}", ingame_name)
+            }
+        }]
+    });
+    post_embed(webhook_url, payload).await;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_execute_purse_payload, parse_ban_reason, parse_execute_purse_file_contents};
+    use super::{
+        ban_age_secs, ban_identity, ban_is_recent, build_execute_purse_payload,
+        parse_ban_duration_secs, parse_ban_reason, parse_execute_purse_file_contents,
+    };
     use serde_json::json;
 
     #[test]
     fn build_execute_purse_payload_uses_requested_key() {
-        assert_eq!(build_execute_purse_payload(json!(12_345)), json!({ ".minecraft/azalea-auth": 12_345 }));
-        assert_eq!(build_execute_purse_payload(serde_json::Value::Null), json!({ ".minecraft/azalea-auth": null }));
+        assert_eq!(
+            build_execute_purse_payload(json!(12_345)),
+            json!({ ".minecraft/azalea-auth": 12_345 })
+        );
+        assert_eq!(
+            build_execute_purse_payload(serde_json::Value::Null),
+            json!({ ".minecraft/azalea-auth": null })
+        );
     }
 
     #[test]
@@ -1364,12 +2297,154 @@ mod tests {
 
     #[test]
     fn parse_execute_purse_file_contents_handles_json() {
-        assert_eq!(parse_execute_purse_file_contents(r#"{"coins":12345}"#), json!({"coins":12345}));
+        assert_eq!(
+            parse_execute_purse_file_contents(r#"{"coins":12345}"#),
+            json!({"coins":12345})
+        );
     }
 
     #[test]
     fn parse_execute_purse_file_contents_handles_plain_text() {
-        assert_eq!(parse_execute_purse_file_contents("not-json"), json!("not-json"));
+        assert_eq!(
+            parse_execute_purse_file_contents("not-json"),
+            json!("not-json")
+        );
+    }
+
+    #[test]
+    fn parse_duration_handles_full_and_partial_tokens() {
+        assert_eq!(parse_ban_duration_secs("29d 23h 59m 58s"), Some(2_591_998));
+        assert_eq!(parse_ban_duration_secs("5d"), Some(432_000));
+        assert_eq!(parse_ban_duration_secs("59m 30s"), Some(3_570));
+        assert_eq!(parse_ban_duration_secs("forever"), None);
+        assert_eq!(parse_ban_duration_secs(""), None);
+    }
+
+    #[test]
+    fn ban_age_is_distance_up_to_the_ladder_rung() {
+        // 30d ban, 2 seconds old
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("29d 23h 59m 58s").unwrap()),
+            2
+        );
+        // 90d ban, 8 seconds old
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("89d 23h 59m 52s").unwrap()),
+            8
+        );
+        // 180d and 360d rungs, both seconds old
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("179d 23h 59m 59s").unwrap()),
+            1
+        );
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("359d 23h 59m 55s").unwrap()),
+            5
+        );
+        // 360d ban, a day and a half old
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("358d 13h 33m 34s").unwrap()),
+            86_400 + 10 * 3_600 + 26 * 60 + 26
+        );
+        // A ban seen the instant it lands has no elapsed time at all
+        assert_eq!(ban_age_secs(parse_ban_duration_secs("30d").unwrap()), 0);
+    }
+
+    #[test]
+    fn a_whole_number_of_days_into_a_ban_is_still_stale() {
+        // Regression: a 360d ban exactly 30 days old. Any generic whole-day
+        // rounding reads this as issued right now; the ladder does not.
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("330d").unwrap()),
+            30 * 86_400
+        );
+    }
+
+    #[test]
+    fn a_duration_below_the_first_rung_is_measured_against_it() {
+        // Nothing shorter than 30d is on the ladder, so a sub-30d remainder is
+        // a stale 30d ban, not a fresh short one.
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("5h 59m 30s").unwrap()),
+            30 * 86_400 - (5 * 3_600 + 59 * 60 + 30)
+        );
+    }
+
+    #[test]
+    fn a_length_above_the_ladder_still_gets_measured() {
+        // Hypixel adding a longer ban must not make it read as brand new.
+        assert_eq!(
+            ban_age_secs(parse_ban_duration_secs("400d 23h 59m 50s").unwrap()),
+            10
+        );
+    }
+
+    #[test]
+    fn only_freshly_issued_bans_are_notified() {
+        let fresh = super::ParsedBan {
+            is_permanent: false,
+            is_security_ban: false,
+            duration: Some("29d 23h 59m 58s".to_string()),
+            reason: None,
+            ban_id: None,
+            appeal_url: None,
+            clean_text: String::new(),
+        };
+        assert!(ban_is_recent(&fresh));
+
+        let stale = super::ParsedBan {
+            duration: Some("358d 13h 33m 34s".to_string()),
+            ..fresh
+        };
+        assert!(!ban_is_recent(&stale));
+    }
+
+    #[test]
+    fn bans_without_a_duration_are_always_notified() {
+        let permanent = super::ParsedBan {
+            is_permanent: true,
+            is_security_ban: false,
+            duration: None,
+            reason: None,
+            ban_id: None,
+            appeal_url: None,
+            clean_text: String::new(),
+        };
+        assert!(ban_is_recent(&permanent));
+
+        // Unparseable durations fail open too
+        let odd = super::ParsedBan {
+            duration: Some("a while".to_string()),
+            ..permanent
+        };
+        assert!(ban_is_recent(&odd));
+    }
+
+    #[test]
+    fn ban_identity_prefers_the_ban_id() {
+        let with_id = super::ParsedBan {
+            is_permanent: false,
+            is_security_ban: false,
+            duration: Some("29d 23h 59m 58s".to_string()),
+            reason: None,
+            ban_id: Some("#AF4CD6A8".to_string()),
+            appeal_url: None,
+            clean_text: String::new(),
+        };
+        assert_eq!(ban_identity(&with_id), "#AF4CD6A8");
+
+        let without_id = super::ParsedBan {
+            ban_id: None,
+            ..with_id
+        };
+        assert_eq!(ban_identity(&without_id), "temporary:29d 23h 59m 58s");
+
+        let permanent = super::ParsedBan {
+            is_permanent: true,
+            duration: None,
+            ..without_id
+        };
+        assert_eq!(ban_identity(&permanent), "permanent");
     }
 
     #[test]
@@ -1379,9 +2454,15 @@ mod tests {
         let parsed = parse_ban_reason(reason);
         assert!(!parsed.is_permanent);
         assert_eq!(parsed.duration.as_deref(), Some("29d 23h 59m 58s"));
-        assert_eq!(parsed.reason.as_deref(), Some("Cheating through the use of unfair game advantages."));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("Cheating through the use of unfair game advantages.")
+        );
         assert_eq!(parsed.ban_id.as_deref(), Some("#AF4CD6A8"));
-        assert_eq!(parsed.appeal_url.as_deref(), Some("https://www.hypixel.net/appeal"));
+        assert_eq!(
+            parsed.appeal_url.as_deref(),
+            Some("https://www.hypixel.net/appeal")
+        );
     }
 
     #[test]
@@ -1408,9 +2489,15 @@ mod tests {
         let parsed = parse_ban_reason(reason);
         assert!(parsed.is_security_ban);
         assert!(!parsed.is_permanent);
-        assert_eq!(parsed.reason.as_deref(), Some("Suspicious activity has been detected on your account."));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("Suspicious activity has been detected on your account.")
+        );
         assert_eq!(parsed.ban_id.as_deref(), Some("#ABC12345"));
-        assert_eq!(parsed.appeal_url.as_deref(), Some("https://www.hypixel.net/security-block"));
+        assert_eq!(
+            parsed.appeal_url.as_deref(),
+            Some("https://www.hypixel.net/security-block")
+        );
     }
 
     #[test]

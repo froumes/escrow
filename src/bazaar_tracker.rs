@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// File name for persisted orders (stored next to the executable / in the logs dir).
@@ -22,6 +22,8 @@ const BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
 const BAZAAR_PERSIST_DEBOUNCE: Duration = Duration::from_millis(0);
 #[cfg(not(test))]
 const BAZAAR_PERSIST_DEBOUNCE: Duration = Duration::from_millis(150);
+/// How long a requested cancellation suppresses an order from reconciliation.
+const CANCEL_SUPPRESS_SECS: u64 = 30;
 
 /// A single tracked bazaar order visible on the web panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,11 @@ pub struct BazaarOrderTracker {
     /// Maps normalized item name → (total_profit, flip_count).
     /// Used as a fallback when local buy-cost tracking has no data for a sell.
     bz_list_profits: Arc<RwLock<HashMap<String, (i64, u32)>>>,
+    /// Orders the user just asked to cancel, keyed by (normalized_name, is_buy)
+    /// → the instant the cancel was requested.  `reconcile_with_ingame` will not
+    /// re-add an order present in this map (within [`CANCEL_SUPPRESS_SECS`]) so a
+    /// just-cancelled order does not flicker back into the web panel.
+    pending_cancels: Arc<RwLock<HashMap<(String, bool), Instant>>>,
 }
 
 impl BazaarOrderTracker {
@@ -68,6 +75,7 @@ impl BazaarOrderTracker {
                 BAZAAR_PERSIST_DEBOUNCE,
             )),
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
+            pending_cancels: Arc::new(RwLock::new(HashMap::new())),
         };
         tracker.load_from_disk();
         tracker
@@ -83,7 +91,18 @@ impl BazaarOrderTracker {
             last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
             buy_costs_writer: None,
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
+            pending_cancels: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Mark an order as pending cancellation so `reconcile_with_ingame` does not
+    /// re-add it from an in-game snapshot taken before the cancel completes.
+    /// Call this right before queueing a ManageOrders cancel for the order.
+    pub fn mark_cancelling(&self, item_name: &str, is_buy_order: bool) {
+        self.pending_cancels.write().insert(
+            (normalize_for_match(item_name), is_buy_order),
+            Instant::now(),
+        );
     }
 
     /// Record a newly placed bazaar order.
@@ -127,15 +146,14 @@ impl BazaarOrderTracker {
     /// so the caller can use price/amount for profit calculation.
     pub fn remove_order(&self, item_name: &str, is_buy_order: bool) -> Option<TrackedBazaarOrder> {
         let mut orders = self.orders.write();
-        let result = if let Some(pos) = orders.iter().rposition(|o| {
-            (o.status == "open" || o.status == "filled")
-                && o.is_buy_order == is_buy_order
-                && normalize_for_match(&o.item_name) == normalize_for_match(item_name)
-        }) {
-            Some(orders.remove(pos))
-        } else {
-            None
-        };
+        let result = orders
+            .iter()
+            .rposition(|o| {
+                (o.status == "open" || o.status == "filled")
+                    && o.is_buy_order == is_buy_order
+                    && normalize_for_match(&o.item_name) == normalize_for_match(item_name)
+            })
+            .map(|pos| orders.remove(pos));
         drop(orders);
         self.save_orders_to_disk();
         result
@@ -146,11 +164,26 @@ impl BazaarOrderTracker {
         self.orders.read().clone()
     }
 
+    /// Returns the total number of currently tracked bazaar orders.
+    pub fn order_count(&self) -> usize {
+        self.orders.read().len()
+    }
+
     /// Remove all tracked orders and persist.  Used on startup to get a clean
     /// view since the in-game ManageOrders cycle will cancel everything.
     pub fn clear_all_orders(&self) -> usize {
         let mut orders = self.orders.write();
         let removed = orders.len();
+        // A full clear is also used by the "cancel all" web action, so suppress
+        // every cleared order from being re-added by the next reconcile. Capture
+        // the keys BEFORE clearing.
+        {
+            let now = Instant::now();
+            let mut pending = self.pending_cancels.write();
+            for o in orders.iter() {
+                pending.insert((normalize_for_match(&o.item_name), o.is_buy_order), now);
+            }
+        }
         orders.clear();
         drop(orders);
         self.save_orders_to_disk();
@@ -184,21 +217,25 @@ impl BazaarOrderTracker {
 
     /// Reconcile the tracker with the orders currently visible in-game.
     ///
-    /// `ingame_orders` is the list of `(item_name, is_buy_order)` tuples taken
-    /// from the Bazaar Orders window during a ManageOrders cycle.  Any tracked
-    /// order whose item+type does **not** appear in this list is removed so the
-    /// web panel stays in sync with the actual in-game state.
+    /// `ingame_orders` is the list of `(item_name, is_buy_order, amount, price_per_unit)`
+    /// tuples taken from the Bazaar Orders window during a ManageOrders cycle.
+    /// Any tracked order whose item+type does **not** appear in this list is
+    /// removed so the web panel stays in sync with the actual in-game state.
+    ///
+    /// Orders visible in-game but NOT yet tracked (e.g. placed before the bot
+    /// started, or placed manually) are added as new entries so the web panel
+    /// shows all active orders from startup.
     ///
     /// Duplicate same-item orders are handled by counting occurrences: if the
     /// in-game window shows 2 "Coal" buy orders, at most 2 tracked "Coal" buy
     /// orders are kept.
     ///
     /// Returns the number of stale tracker entries removed.
-    pub fn reconcile_with_ingame(&self, ingame_orders: &[(String, bool)]) -> usize {
+    pub fn reconcile_with_ingame(&self, ingame_orders: &[(String, bool, u64, f64)]) -> usize {
         // Build a count map: (normalized_name, is_buy) → how many in-game.
         let mut ingame_counts: std::collections::HashMap<(String, bool), usize> =
             std::collections::HashMap::new();
-        for (name, is_buy) in ingame_orders {
+        for (name, is_buy, _, _) in ingame_orders {
             *ingame_counts
                 .entry((normalize_for_match(name), *is_buy))
                 .or_insert(0) += 1;
@@ -221,8 +258,71 @@ impl BazaarOrderTracker {
             }
         });
         let removed = original_len - orders.len();
+
+        // Add in-game orders that aren't already tracked.
+        // Iterate over unique keys to avoid duplicate additions.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut added = 0usize;
+
+        // Prune expired cancel suppressions, then snapshot the still-active set
+        // so we don't re-add orders the user just cancelled (the in-game snapshot
+        // is taken before the targeted cancel completes).
+        let suppressed: std::collections::HashSet<(String, bool)> = {
+            let mut pending = self.pending_cancels.write();
+            pending.retain(|_, t| t.elapsed().as_secs() < CANCEL_SUPPRESS_SECS);
+            pending.keys().cloned().collect()
+        };
+
+        // Build a map from (normalized_name, is_buy) → Vec<(amount, price)>
+        // so we can pick the correct data for each missing order.
+        let mut ingame_data: std::collections::HashMap<(String, bool), Vec<(u64, f64)>> =
+            std::collections::HashMap::new();
+        for (name, is_buy, amount, price) in ingame_orders {
+            ingame_data
+                .entry((normalize_for_match(name), *is_buy))
+                .or_default()
+                .push((*amount, *price));
+        }
+
+        for (key, data_entries) in &ingame_data {
+            // Skip orders the user just requested to cancel — re-adding them
+            // here is what made cancelled orders flicker back in the web panel.
+            if suppressed.contains(key) {
+                continue;
+            }
+            let tracked = kept_counts.get(key).copied().unwrap_or(0);
+            let needed = data_entries.len();
+            for &(amount, price) in data_entries.iter().skip(tracked) {
+                // Use title case for the item name from the first matching ingame order
+                let display_name = ingame_orders
+                    .iter()
+                    .find(|(n, b, _, _)| normalize_for_match(n) == key.0 && *b == key.1)
+                    .map(|(n, _, _, _)| n.clone())
+                    .unwrap_or_else(|| key.0.clone());
+                orders.push(TrackedBazaarOrder {
+                    item_name: display_name,
+                    amount,
+                    price_per_unit: price,
+                    is_buy_order: key.1,
+                    status: "open".to_string(),
+                    placed_at: now,
+                });
+                added += 1;
+            }
+            *kept_counts.entry(key.clone()).or_insert(0) = needed;
+        }
+
         drop(orders);
-        if removed > 0 {
+        if removed > 0 || added > 0 {
+            if added > 0 {
+                debug!(
+                    "[BazaarTracker] Added {} in-game orders not previously tracked",
+                    added
+                );
+            }
             self.save_orders_to_disk();
         }
         removed
@@ -256,7 +356,8 @@ impl BazaarOrderTracker {
     /// Consume and return the stored buy cost for an item (if any).
     /// Used when a sell offer is collected to compute profit/loss.
     pub fn take_buy_cost(&self, item_name: &str) -> Option<(f64, u64)> {
-        let result = self.last_buy_costs
+        let result = self
+            .last_buy_costs
             .write()
             .remove(&normalize_for_match(item_name));
         self.save_buy_costs_to_disk();
@@ -290,14 +391,14 @@ impl BazaarOrderTracker {
 
     fn save_orders_to_disk(&self) {
         if let Some(writer) = &self.orders_writer {
-        let orders = self.orders.read().clone();
+            let orders = self.orders.read().clone();
             writer.schedule(orders);
         }
     }
 
     fn save_buy_costs_to_disk(&self) {
         if let Some(writer) = &self.buy_costs_writer {
-        let costs = self.last_buy_costs.read().clone();
+            let costs = self.last_buy_costs.read().clone();
             writer.schedule(costs);
         }
     }
@@ -311,9 +412,17 @@ impl BazaarOrderTracker {
                         debug!("[BazaarTracker] Loaded {} orders from disk", orders.len());
                         *self.orders.write() = orders;
                     }
-                    Err(e) => warn!("[BazaarTracker] Failed to parse {}: {}", orders_path.display(), e),
+                    Err(e) => warn!(
+                        "[BazaarTracker] Failed to parse {}: {}",
+                        orders_path.display(),
+                        e
+                    ),
                 },
-                Err(e) => warn!("[BazaarTracker] Failed to read {}: {}", orders_path.display(), e),
+                Err(e) => warn!(
+                    "[BazaarTracker] Failed to read {}: {}",
+                    orders_path.display(),
+                    e
+                ),
             }
         }
         let costs_path = Self::persistence_dir().join(BUY_COSTS_FILE);
@@ -324,16 +433,35 @@ impl BazaarOrderTracker {
                         debug!("[BazaarTracker] Loaded {} buy costs from disk", costs.len());
                         *self.last_buy_costs.write() = costs;
                     }
-                    Err(e) => warn!("[BazaarTracker] Failed to parse {}: {}", costs_path.display(), e),
+                    Err(e) => warn!(
+                        "[BazaarTracker] Failed to parse {}: {}",
+                        costs_path.display(),
+                        e
+                    ),
                 },
-                Err(e) => warn!("[BazaarTracker] Failed to read {}: {}", costs_path.display(), e),
+                Err(e) => warn!(
+                    "[BazaarTracker] Failed to read {}: {}",
+                    costs_path.display(),
+                    e
+                ),
             }
         }
     }
 }
 
+impl Default for BazaarOrderTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn normalize_for_match(name: &str) -> String {
     name.to_lowercase().trim().to_string()
+}
+
+/// Public wrapper for `normalize_for_match` — used by `ManageOrders` targeted cancel.
+pub fn normalize_for_match_pub(name: &str) -> String {
+    normalize_for_match(name)
 }
 
 #[cfg(test)]
@@ -436,8 +564,8 @@ mod tests {
 
         let buy = tracker.remove_order("Coal", true).unwrap();
         let sell = tracker.remove_order("Coal", false).unwrap();
-        let profit = (sell.price_per_unit * sell.amount as f64)
-            - (buy.price_per_unit * buy.amount as f64);
+        let profit =
+            (sell.price_per_unit * sell.amount as f64) - (buy.price_per_unit * buy.amount as f64);
         assert_eq!(profit, 1000.0);
     }
 
@@ -521,22 +649,38 @@ mod tests {
 
         // In-game only has Coal BUY and Diamond SELL — Iron Ingot is stale
         let ingame = vec![
-            ("Coal".to_string(), true),
-            ("Diamond".to_string(), false),
+            ("Coal".to_string(), true, 10, 500.0),
+            ("Diamond".to_string(), false, 5, 1000.0),
         ];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 1);
         let remaining = tracker.get_orders();
         assert_eq!(remaining.len(), 2);
-        assert!(remaining.iter().any(|o| o.item_name == "Coal" && o.is_buy_order));
-        assert!(remaining.iter().any(|o| o.item_name == "Diamond" && !o.is_buy_order));
+        assert!(remaining
+            .iter()
+            .any(|o| o.item_name == "Coal" && o.is_buy_order));
+        assert!(remaining
+            .iter()
+            .any(|o| o.item_name == "Diamond" && !o.is_buy_order));
+    }
+
+    #[test]
+    fn reconcile_skips_pending_cancel_orders() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // User just cancelled a Coal BUY order via the web panel.
+        tracker.mark_cancelling("Coal", true);
+        // The ManageOrders snapshot still shows it (cancel not yet processed).
+        let ingame = vec![("Coal".to_string(), true, 10, 500.0)];
+        tracker.reconcile_with_ingame(&ingame);
+        // It must NOT be re-added while the cancel is pending.
+        assert_eq!(tracker.get_orders().len(), 0);
     }
 
     #[test]
     fn reconcile_case_insensitive() {
         let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Enchanted Coal Block".into(), 4, 30100.0, false);
-        let ingame = vec![("enchanted coal block".to_string(), false)];
+        let ingame = vec![("enchanted coal block".to_string(), false, 4, 30100.0)];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 0);
         assert_eq!(tracker.get_orders().len(), 1);
@@ -552,7 +696,7 @@ mod tests {
         assert_eq!(tracker.get_orders().len(), 3);
 
         // In-game only has 1 "Coal" buy order (2 were cancelled externally)
-        let ingame = vec![("Coal".to_string(), true)];
+        let ingame = vec![("Coal".to_string(), true, 10, 500.0)];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 2);
         assert_eq!(tracker.get_orders().len(), 1);
@@ -569,13 +713,37 @@ mod tests {
 
         // In-game has 2 "Coal" buy orders and 1 "Diamond" sell order
         let ingame = vec![
-            ("Coal".to_string(), true),
-            ("Coal".to_string(), true),
-            ("Diamond".to_string(), false),
+            ("Coal".to_string(), true, 10, 500.0),
+            ("Coal".to_string(), true, 20, 510.0),
+            ("Diamond".to_string(), false, 5, 1000.0),
         ];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 0);
         assert_eq!(tracker.get_orders().len(), 3);
+    }
+
+    #[test]
+    fn reconcile_adds_new_orders_with_correct_data() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // Empty tracker, in-game has 2 orders
+        let ingame = vec![
+            ("Coal".to_string(), true, 64, 500.0),
+            ("Diamond".to_string(), false, 10, 1200.5),
+        ];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 2);
+
+        let coal = orders.iter().find(|o| o.item_name == "Coal").unwrap();
+        assert_eq!(coal.amount, 64);
+        assert!((coal.price_per_unit - 500.0).abs() < 0.01);
+        assert!(coal.is_buy_order);
+
+        let diamond = orders.iter().find(|o| o.item_name == "Diamond").unwrap();
+        assert_eq!(diamond.amount, 10);
+        assert!((diamond.price_per_unit - 1200.5).abs() < 0.01);
+        assert!(!diamond.is_buy_order);
     }
 
     #[test]
@@ -603,7 +771,10 @@ mod tests {
         let mut items = HashMap::new();
         items.insert("Enchanted Coal Block".to_string(), (50_000i64, 2u32));
         tracker.set_bz_list_profits(items);
-        assert_eq!(tracker.get_bz_list_profit("enchanted coal block"), Some(50_000));
+        assert_eq!(
+            tracker.get_bz_list_profit("enchanted coal block"),
+            Some(50_000)
+        );
     }
 
     #[test]

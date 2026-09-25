@@ -79,7 +79,10 @@ pub fn spawn(state: WebSharedState, config: SharePusherConfig) {
         {
             Ok(c) => c,
             Err(e) => {
-                warn!("[SharePusher] failed to build HTTP client: {} — pusher disabled", e);
+                warn!(
+                    "[SharePusher] failed to build HTTP client: {} — pusher disabled",
+                    e
+                );
                 return;
             }
         };
@@ -90,8 +93,7 @@ pub fn spawn(state: WebSharedState, config: SharePusherConfig) {
         // interval, skipping any missed ticks if the previous push happened
         // to take longer than the interval (rare, but possible).
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let mut ticker =
-            tokio::time::interval(Duration::from_secs(config.interval_secs));
+        let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // first tick fires immediately; consume it
 
@@ -102,11 +104,7 @@ pub fn spawn(state: WebSharedState, config: SharePusherConfig) {
     });
 }
 
-async fn push_once(
-    client: &reqwest::Client,
-    state: &WebSharedState,
-    config: &SharePusherConfig,
-) {
+async fn push_once(client: &reqwest::Client, state: &WebSharedState, config: &SharePusherConfig) {
     // Build the snapshot off-thread is unnecessary — it's a quick lock-and-clone
     // pattern, no heavy I/O — so we do it inline on the tokio task.
     let snapshot = build_public_share_stats(state);
@@ -172,32 +170,21 @@ mod tests {
     fn from_parts_disabled_when_url_missing() {
         assert!(SharePusherConfig::from_parts(None, Some("s".into()), 30).is_none());
         assert!(SharePusherConfig::from_parts(Some("".into()), Some("s".into()), 30).is_none());
-        assert!(
-            SharePusherConfig::from_parts(Some("   ".into()), Some("s".into()), 30).is_none()
-        );
+        assert!(SharePusherConfig::from_parts(Some("   ".into()), Some("s".into()), 30).is_none());
     }
 
     #[test]
     fn from_parts_disabled_when_secret_missing() {
+        assert!(SharePusherConfig::from_parts(Some("https://x".into()), None, 30).is_none());
         assert!(
-            SharePusherConfig::from_parts(Some("https://x".into()), None, 30).is_none()
+            SharePusherConfig::from_parts(Some("https://x".into()), Some("".into()), 30).is_none()
         );
-        assert!(SharePusherConfig::from_parts(
-            Some("https://x".into()),
-            Some("".into()),
-            30
-        )
-        .is_none());
     }
 
     #[test]
     fn from_parts_clamps_interval() {
-        let cfg = SharePusherConfig::from_parts(
-            Some("https://x".into()),
-            Some("s".into()),
-            1,
-        )
-        .unwrap();
+        let cfg =
+            SharePusherConfig::from_parts(Some("https://x".into()), Some("s".into()), 1).unwrap();
         assert_eq!(cfg.interval_secs, MIN_PUSH_INTERVAL_SECS);
     }
 
@@ -206,10 +193,7 @@ mod tests {
         // RFC 4231 test case 1.
         let key = vec![0x0bu8; 20];
         let data = b"Hi There";
-        let sig = sign_hmac_hex(
-            std::str::from_utf8(&key).unwrap_or(""),
-            data,
-        );
+        let sig = sign_hmac_hex(std::str::from_utf8(&key).unwrap_or(""), data);
         // The key isn't valid UTF-8 in some test cases, so we recompute via
         // a direct byte-level call to make sure the helper agrees with the
         // hmac crate end-to-end.

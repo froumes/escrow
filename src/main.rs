@@ -1,26 +1,27 @@
 use anyhow::Result;
-use dialoguer::{Input, Confirm};
-use rustyline;
+use dialoguer::{Confirm, Input};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    atomic::{AtomicBool, AtomicI64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Instant;
+use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
+use twm::utils::restart_process;
 use twm::{
+    bot::BotClient,
     config::ConfigLoader,
     logging::{init_logger, print_mc_chat},
     persistence::AsyncJsonWriter,
     release_channel::public_release_repo,
     state::CommandQueue,
-    websocket::CoflWebSocket,
-    bot::BotClient,
     types::Flip,
+    web::{FlipHistoryEntry, WebSharedState},
+    websocket::CoflWebSocket,
     CommandPriority,
-    web::{start_web_server, FlipHistoryEntry, WebSharedState},
 };
-use tracing::{debug, error, info, warn};
-use tokio::time::{sleep, Duration};
-use tokio::sync::broadcast;
-use serde_json;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
-use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
-use twm::utils::restart_process;
 
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
@@ -67,15 +68,93 @@ const BZ_PROFIT_QUERY_EXTRA_DELAY_SECS: u64 = 2;
 /// after the daily sell value limit reset — ensures the server-side reset
 /// has fully propagated.
 const DAILY_LIMIT_RESET_BUFFER_SECS: u64 = 5;
-/// Hold AH flips for a very short window when the bot is briefly busy
-/// (claiming/selling/open GUI) instead of dropping them immediately.
-const DEFERRED_AH_FLIP_TTL_MS: u64 = 1_500;
-/// Poll interval for retrying deferred AH flips.
-const DEFERRED_AH_FLIP_RETRY_MS: u64 = 75;
-/// Cap the number of deferred AH flips kept in memory at once.
-const MAX_DEFERRED_AH_FLIPS: usize = 3;
-const AH_FLIP_COUNTDOWN_PAUSE_SECS: u64 = 20;
 const JSON_PERSIST_DEBOUNCE_MS: u64 = 150;
+
+/// How long SkyBlock is treated as down after a "maintenance" line is seen in
+/// chat. While this window is active the island guard stops sending `/play sb`
+/// (which would just bounce), and the stall guard treats inactivity as expected
+/// rather than a frozen connection. It auto-clears so the bot resumes on its own
+/// once the server is back — no manual intervention needed.
+const MAINTENANCE_COOLDOWN_SECS: i64 = 5 * 60;
+
+/// No GUI window opening for this long is treated as a suspected stall. The bot
+/// opens windows constantly in normal operation (bazaar order management, flip
+/// purchases, sell/claim), so a long silence means the connection is very likely
+/// frozen or the bot was quietly booted to limbo.
+const STALL_THRESHOLD_SECS: i64 = 15 * 60; // 15 minutes
+/// How often the stall guard re-checks the activity heartbeat.
+const STALL_CHECK_INTERVAL_SECS: u64 = 60;
+/// Startup grace before the stall guard starts watching, so the initial
+/// join/startup workflow isn't mistaken for a stall.
+const STALL_GRACE_SECS: u64 = 120;
+/// After a soft rejoin recovery, wait this long before re-checking so a live
+/// session has time to open a window and clear the stall on its own.
+const STALL_RECOVERY_GRACE_SECS: u64 = 90;
+/// Consecutive stall detections before we give up on soft recovery and restart
+/// the whole process for a clean session.
+const STALL_MAX_ATTEMPTS: u32 = 3;
+
+/// Epoch-millis until which SkyBlock is considered under maintenance / down.
+/// Set from chat when a maintenance line appears; read by the island and stall
+/// guards. 0 = not in maintenance.
+static MAINTENANCE_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Epoch-millis of the last sign of life from the game connection (a window
+/// opening, spawn, or startup completing). Drives the stall guard. 0 = not yet
+/// seeded.
+static LAST_ACTIVITY_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Current wall-clock time in epoch-millis.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Record that SkyBlock looks down for maintenance. Returns `true` only on the
+/// transition from "up" to "down" so callers can notify exactly once per outage
+/// instead of on every repeated maintenance line.
+fn note_maintenance() -> bool {
+    let was_down = skyblock_in_maintenance();
+    MAINTENANCE_UNTIL_MS.store(
+        now_ms() + MAINTENANCE_COOLDOWN_SECS * 1000,
+        Ordering::Release,
+    );
+    !was_down
+}
+
+/// Whether SkyBlock is currently within a maintenance cooldown window.
+fn skyblock_in_maintenance() -> bool {
+    now_ms() < MAINTENANCE_UNTIL_MS.load(Ordering::Acquire)
+}
+
+/// Mark the game connection as alive right now (heartbeat for the stall guard).
+fn mark_activity() {
+    LAST_ACTIVITY_MS.store(now_ms(), Ordering::Release);
+}
+
+/// Seconds since the last sign of life. Returns 0 before the heartbeat is seeded
+/// so a fresh, not-yet-active bot is never flagged as stalled.
+fn secs_since_activity() -> i64 {
+    let last = LAST_ACTIVITY_MS.load(Ordering::Acquire);
+    if last == 0 {
+        0
+    } else {
+        (now_ms() - last) / 1000
+    }
+}
+
+/// Best-effort current SkyBlock area from the scoreboard (the line carrying the
+/// `⏣` area glyph, glyph stripped). Used to name the location in an irregular
+/// world-change notice. Returns `None` when the area line isn't present.
+fn current_skyblock_area(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .find(|l| l.contains('⏣'))
+        .map(|l| l.replace('⏣', "").trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// Calculate Hypixel AH fee based on price tier (matches TypeScript calculateAuctionHouseFee).
 /// - <10M  → 1%
@@ -105,7 +184,11 @@ fn format_coins(amount: i64) -> String {
         result.push(c);
     }
     let formatted: String = result.chars().rev().collect();
-    if negative { format!("-{}", formatted) } else { formatted }
+    if negative {
+        format!("-{}", formatted)
+    } else {
+        formatted
+    }
 }
 
 /// Format an f64 coin amount with comma separators, preserving one decimal
@@ -132,6 +215,53 @@ fn is_ban_disconnect(reason: &str) -> bool {
         || lower.contains("block id:")
 }
 
+/// Ban / security notice delivered as a CHAT line rather than a disconnect.
+/// Deliberately STRICTER than `is_ban_disconnect`: only tokens that appear in
+/// Hypixel's own ban/security notices (a ban/block id, a security-block, or the
+/// "account has been blocked" line), never a bare "banned", so a normal player's
+/// chat message cannot trigger a false process kill.
+fn is_ban_chat(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("ban id:")
+        || lower.contains("block id:")
+        || lower.contains("security-block")
+        || lower.contains("account has been blocked")
+}
+
+/// Check whether the web GUI port is allowed through UFW.
+/// Prints a prominent warning when UFW is active but the port is not listed.
+/// No-ops silently if UFW is not installed or the check fails.
+#[cfg(target_os = "linux")]
+fn check_ufw_port(port: u16) {
+    use std::process::Command;
+    // Run `ufw status` and capture stdout.
+    let output = match Command::new("ufw").arg("status").output() {
+        Ok(o) => o,
+        Err(_) => return, // UFW not installed — nothing to warn about.
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    // If UFW is inactive, the port will be reachable regardless — no warning needed.
+    if text.contains("Status: inactive") {
+        return;
+    }
+    // Check if the port appears in the UFW rules using exact token matching.
+    // UFW formats rules as "<port>" or "<port>/tcp" or "<port>/udp" at the start of a rule line.
+    // We split by whitespace to avoid e.g. port 80 matching "8080".
+    let port_str = port.to_string();
+    let port_tcp = format!("{}/tcp", port);
+    let port_udp = format!("{}/udp", port);
+    let allowed = text
+        .split_whitespace()
+        .any(|token| token == port_str || token == port_tcp || token == port_udp);
+    if !allowed {
+        warn!("========================================");
+        warn!("! WARNING: YOU HAVE SET A PORT FOR THE WEB APP BUT THE PORT ISN'T ALLOWED ON YOUR FIREWALL");
+        warn!("! PLEASE EXECUTE THE FOLLOWING COMMAND TO ACCESS IT VIA THE INTERNET:");
+        warn!("!   ufw allow {}", port);
+        warn!("========================================");
+    }
+}
+
 /// Parse a Coflnet `/cofl profit` response and return the total profit in coins.
 ///
 /// Expected format (color-stripped):
@@ -147,18 +277,170 @@ fn parse_cofl_profit_response(clean_msg: &str) -> Option<i64> {
     parse_short_number(amount_str)
 }
 
+/// Parse a SkyBlock "island visitor" chat line and return the bare visitor
+/// name. Matches Hypixel's `"[RANK] Name is visiting your island!"` (the rank
+/// tag is optional). Input must already be color-stripped.
+fn parse_island_visitor(clean: &str) -> Option<String> {
+    const MARKER: &str = "is visiting your island!";
+    // ASCII-lowercase preserves byte length, so `idx` stays aligned with `clean`.
+    let idx = clean.to_ascii_lowercase().find(MARKER)?;
+    let mut prefix = clean[..idx].trim();
+    // Strip any leading rank tag(s) like "[MVP+]".
+    while prefix.starts_with('[') {
+        match prefix.find(']') {
+            Some(close) => prefix = prefix[close + 1..].trim_start(),
+            None => break,
+        }
+    }
+    // The visitor name is the last whitespace-delimited token (drops any rank
+    // remnant). Minecraft names contain no spaces.
+    let name = prefix.split_whitespace().last()?;
+    if is_valid_minecraft_name(name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Returns true for a syntactically valid Minecraft name (1–16 chars of
+/// `[A-Za-z0-9_]`). Used to avoid treating stray chat tokens as player names.
+fn is_valid_minecraft_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 16
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Extract the sender's name from a player-chat header such as
+/// `"Guild > [MVP+] Someone"`, `"From [VIP] Someone"`, `"[MVP+] Someone"`, or
+/// `"Someone"`. Returns `None` when no valid player name can be identified
+/// (i.e. the line is almost certainly a system message, not player chat).
+fn extract_chat_sender(header: &str) -> Option<String> {
+    let mut s = header.trim();
+    // Channel prefix ("Guild >", "Party >", "Co-op >", "Officer >", ...).
+    if let Some(pos) = s.rfind('>') {
+        s = s[pos + 1..].trim();
+    }
+    // Direct-message "From " prefix.
+    if let Some(rest) = s.strip_prefix("From ") {
+        s = rest.trim();
+    }
+    // Leading rank tag(s).
+    while s.starts_with('[') {
+        match s.find(']') {
+            Some(close) => s = s[close + 1..].trim_start(),
+            None => break,
+        }
+    }
+    let token = s.split_whitespace().next()?;
+    if is_valid_minecraft_name(token) {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
+/// Case-insensitively test whether a chat `body` *directly addresses* `name`,
+/// rather than merely containing it somewhere. A direct address is either the
+/// name at the very start of the message (as a whole token) or written as
+/// `@name`. So "BafBot help" and "yo @BafBot" count, but "i think BafBot is
+/// afk" does not.
+fn is_direct_address(body: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let name_l = name.to_ascii_lowercase();
+    let body_l = body.trim_start().to_ascii_lowercase();
+    let boundary = |c: u8| !(c.is_ascii_alphanumeric() || c == b'_');
+
+    // Name at the start of the message, followed by a boundary (or end of line).
+    if let Some(rest) = body_l.strip_prefix(&name_l) {
+        if rest.as_bytes().first().is_none_or(|&c| boundary(c)) {
+            return true;
+        }
+    }
+
+    // "@name" anywhere, as a whole token. The '@' itself is a left boundary.
+    let at_name = format!("@{}", name_l);
+    let bytes = body_l.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = body_l[start..].find(&at_name) {
+        let end = start + pos + at_name.len();
+        if bytes.get(end).is_none_or(|&c| boundary(c)) {
+            return true;
+        }
+        start += pos + 1;
+        if start >= body_l.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Detect when another player is trying to reach the bot in chat. Returns the
+/// cleaned line for either:
+///   - an **incoming direct message / whisper** to the bot ("From <player>: …"),
+///     which always counts — someone is reaching out; or
+///   - a **public/guild/party/co-op** line that *directly addresses* the bot
+///     (name at the start of the message, or `@name`).
+///
+/// A name merely appearing mid-sentence in public chat is NOT a mention.
+/// Returns `None` for the bot's own messages, outgoing DMs, and system lines.
+/// Input must be color-stripped.
+fn parse_name_mention(clean: &str, own_name: &str) -> Option<String> {
+    if own_name.is_empty() {
+        return None;
+    }
+    // Player chat is "Header: body". Anything without this shape (most system
+    // messages) is ignored.
+    let (header, body) = clean.split_once(": ")?;
+    // A giant header means this is almost certainly a system line that merely
+    // happens to contain ": ".
+    if header.trim().len() > 48 {
+        return None;
+    }
+    let htrim = header.trim();
+    // Our own outgoing DMs ("To <player>: ...") are never a mention of us.
+    if htrim.starts_with("To ") {
+        return None;
+    }
+    // An incoming whisper straight to the bot.
+    let is_dm = htrim.starts_with("From ");
+    // Require a genuine player-chat marker so system lines that merely have a
+    // "Word: body" shape (e.g. "Reward: ...") don't false-trigger:
+    //   - a channel prefix ("Guild >", "Party >", "Co-op >", "Officer >", ...)
+    //   - a direct message ("From <player>")
+    //   - a rank tag on ranked public/island chat ("[MVP+] <player>")
+    let looks_like_player_chat = htrim.contains('>') || is_dm || htrim.contains('[');
+    if !looks_like_player_chat {
+        return None;
+    }
+    // Identify the sender; skip the bot's own messages and non-player lines.
+    let sender = extract_chat_sender(header)?;
+    if sender.eq_ignore_ascii_case(own_name) {
+        return None;
+    }
+    // A whisper always counts; public/guild/party chat only when the bot is
+    // directly addressed (not just name-dropped mid-sentence).
+    if is_dm || is_direct_address(body, own_name) {
+        Some(clean.to_string())
+    } else {
+        None
+    }
+}
+
 /// Parse a human-readable short number like `82.7M`, `1.5B`, `250K`, or `500`.
 fn parse_short_number(s: &str) -> Option<i64> {
     let s = s.replace(',', "");
-    let (num_part, multiplier) = if let Some(n) = s.strip_suffix('B').or_else(|| s.strip_suffix('b')) {
-        (n, 1_000_000_000f64)
-    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-        (n, 1_000_000f64)
-    } else if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
-        (n, 1_000f64)
-    } else {
-        (s.as_str(), 1f64)
-    };
+    let (num_part, multiplier) =
+        if let Some(n) = s.strip_suffix('B').or_else(|| s.strip_suffix('b')) {
+            (n, 1_000_000_000f64)
+        } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+            (n, 1_000_000f64)
+        } else if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+            (n, 1_000f64)
+        } else {
+            (s.as_str(), 1f64)
+        };
     let val: f64 = num_part.parse().ok()?;
     Some((val * multiplier) as i64)
 }
@@ -229,9 +511,7 @@ fn parse_cofl_bz_h_total_profit(clean_msg: &str) -> Option<i64> {
     let idx = clean_msg.find(prefix)?;
     let after = &clean_msg[idx + prefix.len()..];
     // Take until the next whitespace or end of string.
-    let value_str: String = after.chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
+    let value_str: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
     parse_short_number(&value_str)
 }
 
@@ -242,22 +522,115 @@ fn should_enqueue_periodic_auction_claim(
     bot_state.allows_commands() && queue_empty
 }
 
+/// Path to azalea's Microsoft-auth cache — the SAME file `Account::microsoft`
+/// writes to (`<.minecraft>/azalea-auth.json`). This is where the "it still
+/// remembers my previous login" tokens live; the file sits under `~/.minecraft`,
+/// NOT the app directory, which is why deleting program logs / redownloading the
+/// bot never clears it.
+fn azalea_auth_cache_path() -> Option<std::path::PathBuf> {
+    minecraft_folder_path::minecraft_dir().map(|d| d.join("azalea-auth.json"))
+}
+
+/// Remove cached Microsoft auth entries from azalea's auth cache so the next
+/// start prompts a fresh device-code sign-in (letting the user switch accounts).
+///
+/// `keys` are the account cache-keys to drop (the IGNs the bot logs in with).
+/// An empty `keys` slice clears the ENTIRE cache. Returns the number of entries
+/// removed (0 if the file is absent or nothing matched).
+fn clear_azalea_auth_cache(keys: &[String]) -> std::io::Result<usize> {
+    let Some(path) = azalea_auth_cache_path() else {
+        return Ok(0);
+    };
+    if !path.exists() {
+        return Ok(0);
+    }
+    // Wipe-all: drop the whole file.
+    if keys.is_empty() {
+        let count = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<Vec<serde_json::Value>>(&c).ok())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        std::fs::remove_file(&path)?;
+        return Ok(count);
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    let mut arr: Vec<serde_json::Value> = serde_json::from_str(&contents).unwrap_or_default();
+    let before = arr.len();
+    let key_set: std::collections::HashSet<String> =
+        keys.iter().map(|k| k.trim().to_lowercase()).collect();
+    // azalea serialises the key as `cache_key` (older caches used `email`).
+    arr.retain(|entry| {
+        let ck = entry
+            .get("cache_key")
+            .or_else(|| entry.get("email"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        !key_set.contains(&ck.trim().to_lowercase())
+    });
+    let removed = before - arr.len();
+    if removed > 0 {
+        if arr.is_empty() {
+            std::fs::remove_file(&path)?;
+        } else {
+            std::fs::write(&path, serde_json::to_string_pretty(&arr)?)?;
+        }
+    }
+    Ok(removed)
+}
+
 fn should_drop_bazaar_command_during_ah_pause(
     command_type: &twm::types::CommandType,
     bazaar_flips_paused: bool,
+    inventory_full: bool,
 ) -> bool {
-    bazaar_flips_paused
-        && matches!(
-            command_type,
-            twm::types::CommandType::BazaarBuyOrder { .. }
-            | twm::types::CommandType::ManageOrders { .. }
-        )
+    if !bazaar_flips_paused {
+        return false;
+    }
+    match command_type {
+        // Never place new bazaar BUY orders while AH flips are incoming.
+        twm::types::CommandType::BazaarBuyOrder { .. } => true,
+        // Defer ManageOrders during the AH flip window, except when inventory
+        // is full: collecting filled orders must still free space regardless
+        // of whether AH buying remains enabled for that account.
+        twm::types::CommandType::ManageOrders { .. } => !inventory_full,
+        _ => false,
+    }
 }
 
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
 type FlipTrackerMap = Arc<Mutex<HashMap<String, (Flip, u64, Instant, Instant)>>>;
+
+/// Recover a bought item's originating finder and expected profit (coins) from
+/// the flip tracker, for the do_not_relist blocklist. Key is the color-stripped
+/// lowercased item name (how flips are tracked). Profit = target − buy − AH fee,
+/// matching the purchase-webhook figure. Returns (None, None) when the flip is
+/// not tracked (e.g. bought in a previous session) — callers then gate on item
+/// id only. Applies to both COFL and finder flips.
+fn tracked_finder_profit(
+    tracker: &FlipTrackerMap,
+    item_name: &str,
+) -> (Option<String>, Option<i64>) {
+    let key = twm::utils::remove_minecraft_colors(item_name).to_lowercase();
+    match tracker.lock() {
+        Ok(t) => match t.get(&key) {
+            Some(entry) => {
+                let buy = entry.1;
+                let target = entry.0.target;
+                let profit = if buy > 0 && target > 0 {
+                    Some(target as i64 - buy as i64 - calculate_ah_fee(target) as i64)
+                } else {
+                    None
+                };
+                (entry.0.finder.clone(), profit)
+            }
+            None => (None, None),
+        },
+        Err(_) => (None, None),
+    }
+}
 
 /// GitHub release response (subset of fields).
 #[derive(serde::Deserialize)]
@@ -284,7 +657,10 @@ async fn check_version_outdated() {
         Ok(c) => c,
         Err(_) => return,
     };
-    let url = format!("https://api.github.com/repos/{}/releases/latest", github_repo);
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        github_repo
+    );
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return,
@@ -309,13 +685,17 @@ async fn check_version_outdated() {
     if latest_tag == local_version {
         return; // Up to date
     }
-    let date_info = release.published_at
+    let date_info = release
+        .published_at
         .as_deref()
         .and_then(|d| d.split('T').next())
         .unwrap_or("unknown date");
     warn!("========================================");
     warn!("YOU ARE USING AN OUTDATED CLIENT, BUG REPORTS ARE NOT VALID FOR OUTDATED CLIENTS");
-    warn!("Current version: {}  |  Latest release: {} ({})", local_version, latest_tag, date_info);
+    warn!(
+        "Current version: {}  |  Latest release: {} ({})",
+        local_version, latest_tag, date_info
+    );
     warn!("Download the latest release or use the TWM-loader for automatic updates.");
     warn!("========================================");
 }
@@ -327,6 +707,165 @@ struct SessionTimeEntry {
     secs: u64,
     /// Unix timestamp (seconds) when this entry was last saved.
     saved_at: u64,
+}
+
+/// Persisted profit totals for a single account in `profit_stats.json`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+struct ProfitStatsEntry {
+    /// Cumulative AH profit in coins.
+    ah_total: i64,
+    /// Cumulative Bazaar profit in coins.
+    bz_total: i64,
+    /// Unix seconds when this entry was last saved — profit follows the same
+    /// session rule as uptime: a quick restart (< MAX_SESSION_GAP_SECS) or a
+    /// humanization rest break of any length resumes it, any other gap starts a
+    /// fresh session at 0.
+    #[serde(default)]
+    saved_at: u64,
+}
+
+/// Load per-account profit stats from disk.
+fn load_profit_stats(path: &std::path::Path) -> HashMap<String, ProfitStatsEntry> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Persist the current profit totals for a given IGN.
+fn save_profit_stats(path: &std::path::Path, ign: &str, tracker: &twm::profit::ProfitTracker) {
+    let (ah, bz) = tracker.totals();
+    let mut map = load_profit_stats(path);
+    map.insert(
+        ign.to_string(),
+        ProfitStatsEntry {
+            ah_total: ah,
+            bz_total: bz,
+            saved_at: unix_now(),
+        },
+    );
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = std::fs::write(path, json) {
+            tracing::warn!("[Profit] Failed to save profit stats: {}", e);
+        }
+    }
+}
+
+/// How long a bought-but-unsold flip stays in the persisted tracker. Hypixel
+/// auctions run at most 6 days, so anything older than this can never produce a
+/// sale we would still want to attribute.
+const MAX_TRACKED_FLIP_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// A bought-but-unsold flip persisted in `flip_tracker.json`.
+///
+/// The in-memory tracker keys sell time off an `Instant`, which is monotonic and
+/// therefore meaningless once the process exits. Humanization rest breaks
+/// deliberately restart the process, so without this file every item bought
+/// before a break sold afterwards with no buy price, no profit, no ROI and no
+/// "Time to Sell": the sold webhook silently degraded to a bare price.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct TrackedFlipEntry {
+    flip: Flip,
+    buy_price: u64,
+    /// Unix seconds when the item was bought (wall clock, re-anchored on load).
+    purchased_at: u64,
+    /// Unix seconds when the flip was received from the finder/COFL socket.
+    received_at: u64,
+}
+
+/// Load every account's persisted flip tracker.
+fn load_flip_tracker_file(
+    path: &std::path::Path,
+) -> HashMap<String, HashMap<String, TrackedFlipEntry>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Restore this account's bought-but-unsold flips into an in-memory tracker map,
+/// converting persisted wall-clock stamps back into `Instant`s so `elapsed()`
+/// keeps counting from the real purchase, not from process start.
+fn restore_flip_tracker(
+    path: &std::path::Path,
+    ign: &str,
+) -> HashMap<String, (Flip, u64, Instant, Instant)> {
+    let now = unix_now();
+    let saved = load_flip_tracker_file(path);
+    let entries = match saved.get(ign) {
+        Some(e) => e,
+        None => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    let anchor = |ts: u64| -> Instant {
+        let age = Duration::from_secs(now.saturating_sub(ts));
+        Instant::now().checked_sub(age).unwrap_or_else(Instant::now)
+    };
+    for (key, entry) in entries {
+        if now.saturating_sub(entry.purchased_at) > MAX_TRACKED_FLIP_AGE_SECS {
+            continue;
+        }
+        out.insert(
+            key.clone(),
+            (
+                entry.flip.clone(),
+                entry.buy_price,
+                anchor(entry.purchased_at),
+                anchor(entry.received_at),
+            ),
+        );
+    }
+    if !out.is_empty() {
+        info!(
+            "[FlipTracker] Restored {} bought-but-unsold flip(s) for {}, so sell time and profit survive the restart",
+            out.len(),
+            ign
+        );
+    }
+    out
+}
+
+/// Persist this account's bought-but-unsold flips.
+///
+/// Only entries with a real buy price are written: an entry with `buy_price == 0`
+/// is a flip that was offered but never actually purchased, and keeping those
+/// would grow the file without ever producing a sale.
+fn save_flip_tracker(path: &std::path::Path, ign: &str, tracker: &FlipTrackerMap) {
+    let now = unix_now();
+    let snapshot: HashMap<String, TrackedFlipEntry> = match tracker.lock() {
+        Ok(t) => t
+            .iter()
+            .filter(|(_, (_, buy_price, _, _))| *buy_price > 0)
+            .map(|(key, (flip, buy_price, purchased, received))| {
+                (
+                    key.clone(),
+                    TrackedFlipEntry {
+                        flip: flip.clone(),
+                        buy_price: *buy_price,
+                        purchased_at: now.saturating_sub(purchased.elapsed().as_secs()),
+                        received_at: now.saturating_sub(received.elapsed().as_secs()),
+                    },
+                )
+            })
+            .collect(),
+        Err(e) => {
+            warn!("[FlipTracker] Lock failed while saving: {}", e);
+            return;
+        }
+    };
+    let mut map = load_flip_tracker_file(path);
+    if snapshot.is_empty() {
+        map.remove(ign);
+    } else {
+        map.insert(ign.to_string(), snapshot);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = std::fs::write(path, json) {
+            warn!("[FlipTracker] Failed to save flip tracker: {}", e);
+        }
+    }
 }
 
 /// Return the current Unix timestamp in seconds.
@@ -351,8 +890,16 @@ fn load_session_times(path: &std::path::Path) -> HashMap<String, SessionTimeEntr
     // Fallback: old `{ign: u64}` format — treat all entries as expired.
     if let Ok(old) = serde_json::from_str::<HashMap<String, u64>>(&raw) {
         return old
-            .into_iter()
-            .map(|(k, _)| (k, SessionTimeEntry { secs: 0, saved_at: 0 }))
+            .into_keys()
+            .map(|k| {
+                (
+                    k,
+                    SessionTimeEntry {
+                        secs: 0,
+                        saved_at: 0,
+                    },
+                )
+            })
             .collect();
     }
     HashMap::new()
@@ -410,6 +957,115 @@ fn save_ah_purchase_ledger(
     writer.schedule(ledger.clone());
 }
 
+/// Path to the rest-break marker sidecar (next to the executable).
+fn rest_break_marker_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("rest_break.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("rest_break.json"))
+}
+
+/// Persist a "resting until this UNIX time" marker so a humanization rest break
+/// is honored across the process restart that starts it. The bot stays FULLY
+/// offline (no Hypixel, no COFL) until the deadline instead of lingering
+/// in-process, where the ECS client / AFK handler / reconnect loop could drift
+/// it back into the lobby.
+fn write_rest_break_marker(ign: &str, until_unix: u64) {
+    let v = serde_json::json!({ "ign": ign, "until": until_unix });
+    if let Err(e) = std::fs::write(rest_break_marker_path(), v.to_string()) {
+        tracing::warn!("[Humanization] Failed to write rest-break marker: {}", e);
+    }
+}
+
+/// Remaining seconds to stay offline for a pending rest break for `ign`, if any.
+/// Returns `None` when there is no marker, it belongs to a different account, or
+/// the break has already elapsed.
+fn pending_rest_break_secs(ign: &str) -> Option<u64> {
+    let contents = std::fs::read_to_string(rest_break_marker_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    // Only honor a marker for THIS account — a different configured account must
+    // not inherit a leftover break.
+    if v.get("ign").and_then(|x| x.as_str()) != Some(ign) {
+        return None;
+    }
+    let until = v.get("until").and_then(|x| x.as_u64())?;
+    let now = unix_now();
+    (until > now).then(|| until - now)
+}
+
+/// Shared rest-break teardown: pause flip intake and the command queue, persist
+/// profit / flip tracker / session time so all three survive the restart, write
+/// the break-until marker and restart the process. The fresh process waits out
+/// the remaining break AFTER its web panel is up (see the "wait out the
+/// remaining rest break" block in main) and then reconnects. Used by BOTH the
+/// automatic humanization scheduler and the web panel's break-on-demand button.
+///
+/// Never returns: the process is replaced by `restart_process`.
+#[allow(clippy::too_many_arguments)]
+async fn take_rest_break_and_restart(
+    ign: &str,
+    break_secs: u64,
+    macro_paused: &AtomicBool,
+    flip_intake_paused: &AtomicBool,
+    command_queue: &twm::state::CommandQueue,
+    profit_tracker: &twm::profit::ProfitTracker,
+    profit_path: &std::path::Path,
+    flip_tracker: &FlipTrackerMap,
+    flip_tracker_path: &std::path::Path,
+    session_times_path: &std::path::Path,
+    total_secs: u64,
+) -> ! {
+    // A rest break must leave the account genuinely offline for the whole
+    // duration. Dropping the connection in-process and sleeping proved
+    // unreliable — the ECS client / AFK handler / reconnect loop could
+    // bring the bot back and leave it idling in the lobby (never actually
+    // "resting"). Instead we persist a break-until marker and restart NOW:
+    // the fresh process waits out the remaining break offline, with the web
+    // panel still up, before it reconnects.
+    flip_intake_paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    macro_paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    command_queue.clear();
+
+    // Save profit + session time so both survive the restart/break. Session
+    // time is saved right before restart so the gap is near-zero.
+    save_profit_stats(profit_path, ign, profit_tracker);
+    // Items bought before the break keep selling while we are offline
+    // (the auctions stay up), so their purchase baselines have to cross
+    // the restart or the sold webhook loses time-to-sell and ROI.
+    save_flip_tracker(flip_tracker_path, ign, flip_tracker);
+    save_session_time(session_times_path, ign, total_secs);
+
+    // Persist the break deadline, then restart. The next process start stays
+    // offline until this time and sends the "break over" webhook.
+    let until = unix_now() + break_secs;
+    write_rest_break_marker(ign, until);
+    info!(
+        "[Humanization] Rest break ({:.1}m) — saved session {}s, restarting offline until break ends",
+        break_secs as f64 / 60.0, total_secs
+    );
+    restart_process()
+}
+
+/// True when a rest-break marker exists for this account, i.e. the previous
+/// process exited to take a humanization break rather than being stopped by the
+/// user. Unlike `pending_rest_break_secs` this ignores whether the break window
+/// has already elapsed — it answers "was this restart our own break?", which is
+/// what decides whether uptime and profit carry over across the gap.
+fn resumed_from_rest_break(ign: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(rest_break_marker_path()) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .and_then(|v| v.get("ign").and_then(|x| x.as_str()).map(|s| s == ign))
+        .unwrap_or(false)
+}
+
+/// Delete the rest-break marker (break finished or no longer applicable).
+fn clear_rest_break_marker() {
+    let _ = std::fs::remove_file(rest_break_marker_path());
+}
+
 /// Clear the session time for a given IGN (reset to 0).
 /// Used on account switch so the outgoing account starts fresh next time.
 fn clear_session_time(path: &std::path::Path, ign: &str) {
@@ -420,10 +1076,38 @@ fn clear_session_time(path: &std::path::Path, ign: &str) {
     }
 }
 
+/// Print a colorful ANSI startup banner to the terminal.
+fn print_startup_banner() {
+    const C: &str = "\x1b[96m"; // aqua
+    const G: &str = "\x1b[93m"; // gold
+    const D: &str = "\x1b[90m"; // dim
+    const R: &str = "\x1b[0m";
+    println!("{C}╔════════════════════════════════════════════╗{R}");
+    println!("{C}║   {G}TWM{C}  —  Auction & Bazaar Flipper          ║{R}");
+    println!("{C}║   {D}Hypixel Skyblock bazaar + AH automation{C}   ║{R}");
+    println!("{C}╚════════════════════════════════════════════╝{R}");
+    println!("{D}   v{VERSION}{R}");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     init_logger()?;
+    // Managed VPS instances include owner identity in log prefixes.
+    if std::env::var("VPS_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        let user_id = std::env::var("USER_ID")
+            .or_else(|_| std::env::var("OWNER_ID"))
+            .unwrap_or_default();
+        let instance_id = std::env::var("INSTANCE_ID").unwrap_or_default();
+        if !user_id.is_empty() || !instance_id.is_empty() {
+            twm::logging::set_vps_log_prefix(&user_id, &instance_id);
+        }
+    }
+    print_startup_banner();
     info!("Starting TWM v{}", VERSION);
 
     // Check for outdated version (non-loader users).
@@ -434,12 +1118,25 @@ async fn main() -> Result<()> {
     let config_loader = Arc::new(ConfigLoader::new());
     let mut config = config_loader.load()?;
 
+    // A config that already has an ingame name is an existing install — never
+    // re-run first-run onboarding prompts (e.g. auto-cookie) on it, even when a
+    // newly-added field defaults to "not yet asked". Only a genuinely fresh
+    // config (no ingame name) gets the setup wizard.
+    let is_fresh_config = config.ingame_name.is_none();
+
     // Prompt for username if not set
     if config.ingame_name.is_none() {
         let name: String = Input::new()
             .with_prompt("Enter your ingame name(s) (comma-separated for multiple accounts)")
             .interact_text()?;
         config.ingame_name = Some(name);
+        config_loader.save(&config)?;
+    }
+
+    // Ensure a stable instance id so the central backend recognises this bot
+    // across reconnects.
+    if config.instance_id.is_none() {
+        config.instance_id = Some(uuid::Uuid::new_v4().to_string());
         config_loader.save(&config)?;
     }
 
@@ -450,7 +1147,7 @@ async fn main() -> Result<()> {
 
     // Prompt for webhook URL if not yet configured (matches TypeScript configHelper.ts pattern
     // of adding new default values to existing config on first run of newer version)
-    if config.webhook_url.is_none() {
+    if is_fresh_config && config.webhook_url.is_none() {
         let wants_webhook = Confirm::new()
             .with_prompt("Configure Discord webhook for notifications? (optional)")
             .default(false)
@@ -468,7 +1165,7 @@ async fn main() -> Result<()> {
     }
 
     // Prompt for Discord ID if not yet configured (for pinging on legendary/divine flips and bans)
-    if config.discord_id.is_none() {
+    if is_fresh_config && config.discord_id.is_none() {
         let wants_discord_id = Confirm::new()
             .with_prompt("Configure Discord user ID for ping notifications? (optional)")
             .default(false)
@@ -481,6 +1178,31 @@ async fn main() -> Result<()> {
         } else {
             config.discord_id = Some(String::new());
         }
+        config_loader.save(&config)?;
+    }
+
+    // Prompt for auto-cookie on first run ONLY. A Booster Cookie is REQUIRED to
+    // view auctions, so without automatic re-buying the bot stops flipping the
+    // moment the cookie runs out. Existing installs are never asked (they keep
+    // their current `auto_cookie` value, editable in config.toml) — gating on
+    // `is_fresh_config` avoids re-onboarding a bot that already has a config.
+    if is_fresh_config && !config.auto_cookie_prompted {
+        let wants_cookie = Confirm::new()
+            .with_prompt(
+                "Auto-buy Booster Cookies so the bot never runs out? (needed to keep flipping)",
+            )
+            .default(true)
+            .interact()?;
+        if wants_cookie {
+            let hours: u64 = Input::new()
+                .with_prompt("Re-buy when the remaining cookie time drops below this many hours")
+                .default(24u64)
+                .interact_text()?;
+            config.auto_cookie = hours;
+        } else {
+            config.auto_cookie = 0;
+        }
+        config.auto_cookie_prompted = true;
         config_loader.save(&config)?;
     }
 
@@ -497,7 +1219,10 @@ async fn main() -> Result<()> {
 
     // Read and advance the stored account index (wraps around the list).
     let account_index_path = match std::env::current_exe() {
-        Ok(p) => p.parent().map(|d| d.join("account_index")).unwrap_or_else(|| std::path::PathBuf::from("account_index")),
+        Ok(p) => p
+            .parent()
+            .map(|d| d.join("account_index"))
+            .unwrap_or_else(|| std::path::PathBuf::from("account_index")),
         Err(_) => std::path::PathBuf::from("account_index"),
     };
 
@@ -512,6 +1237,14 @@ async fn main() -> Result<()> {
 
     let ingame_name = ingame_names[current_account_index].clone();
 
+    // Parse and store the SOCKS5 proxy for every game-adjacent connection:
+    // Minecraft + Mojang session auth + Hypixel/Mojang HTTP. Must happen
+    // before anything connects, and AFTER the active account is known: a
+    // `account_proxies.<ign>` entry overrides the global `proxy_*` fields for
+    // this account. Account switches restart the process, so the next
+    // account's proxy resolves on the next launch.
+    twm::utils::proxy::init(&config, &ingame_name);
+
     // ---- Session time persistence ----
     // Load the accumulated running time for this account from a sidecar JSON file.
     // Only carry over previous time if the last save was recent (within
@@ -521,16 +1254,48 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("session_times.json")))
         .unwrap_or_else(|| std::path::PathBuf::from("session_times.json"));
+    // Sidecar file for persisting AH/BZ profit totals across restarts (e.g. rest breaks).
+    let profit_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("profit_stats.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("profit_stats.json"));
+    // Sidecar file for bought-but-unsold flips, so "Time to Sell" / profit / ROI
+    // on the sold webhook survive a rest-break restart (see save_flip_tracker).
+    let flip_tracker_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("flip_tracker.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("flip_tracker.json"));
+    // Did the previous process exit to take a humanization rest break? Those
+    // gaps are the SAME session deliberately paused, so uptime and profit both
+    // survive them however long they are. Read before `clear_rest_break_marker`
+    // below deletes the marker.
+    let after_rest_break = resumed_from_rest_break(&ingame_name);
+    // Was this restart triggered by an account switch (web panel button or the
+    // automatic rotation timer)? A switch starts a FRESH session for the
+    // incoming account — profit AND uptime reset to 0 — even when the restart
+    // lands inside the 5-minute quick-restart window that would otherwise carry
+    // them. Consumed once here (deletes the marker).
+    let switched_account = twm::session::take_account_switch(&ingame_name);
+    if switched_account {
+        info!(
+            "[AccountSwitch] Fresh session for {} — profit and uptime reset to 0",
+            ingame_name
+        );
+    }
     let previous_session_secs: u64 = {
         let times = load_session_times(&session_times_path);
-        if let Some(entry) = times.get(&ingame_name) {
+        if switched_account {
+            0
+        } else if let Some(entry) = times.get(&ingame_name) {
             let now = unix_now();
             let gap = now.saturating_sub(entry.saved_at);
-            if gap <= MAX_SESSION_GAP_SECS {
+            if gap <= MAX_SESSION_GAP_SECS || after_rest_break {
                 entry.secs
             } else {
-                info!("Session gap for {} is {}s (>{} max) — starting fresh session",
-                    ingame_name, gap, MAX_SESSION_GAP_SECS);
+                info!(
+                    "Session gap for {} is {}s (>{} max) — starting fresh session",
+                    ingame_name, gap, MAX_SESSION_GAP_SECS
+                );
                 0
             }
         } else {
@@ -538,8 +1303,12 @@ async fn main() -> Result<()> {
         }
     };
     if previous_session_secs > 0 {
-        info!("Resumed session for {} — previous accumulated time: {}s ({:.2}h)",
-            ingame_name, previous_session_secs, previous_session_secs as f64 / 3600.0);
+        info!(
+            "Resumed session for {} — previous accumulated time: {}s ({:.2}h)",
+            ingame_name,
+            previous_session_secs,
+            previous_session_secs as f64 / 3600.0
+        );
     }
 
     let ah_purchase_ledger_path = std::env::current_exe()
@@ -550,22 +1319,97 @@ async fn main() -> Result<()> {
         ah_purchase_ledger_path.clone(),
         Duration::from_millis(JSON_PERSIST_DEBOUNCE_MS),
     );
-    let ah_purchase_ledger: Arc<Mutex<HashMap<String, AhPurchaseEntry>>> =
-        Arc::new(Mutex::new(load_ah_purchase_ledger(&ah_purchase_ledger_path)));
+    let ah_purchase_ledger: Arc<Mutex<HashMap<String, AhPurchaseEntry>>> = Arc::new(Mutex::new(
+        load_ah_purchase_ledger(&ah_purchase_ledger_path),
+    ));
     if let Ok(ledger) = ah_purchase_ledger.lock() {
         if !ledger.is_empty() {
-            info!("Loaded {} persisted AH purchase entries for sold-profit recovery", ledger.len());
+            info!(
+                "Loaded {} persisted AH purchase entries for sold-profit recovery",
+                ledger.len()
+            );
         }
     }
 
-    info!("Configuration loaded for player: {} (account {}/{})", ingame_name, current_account_index + 1, ingame_names.len());
-    info!("AH Flips: {}", if config.enable_ah_flips { "ENABLED" } else { "DISABLED" });
-    info!("Bazaar Flips: {}", if config.enable_bazaar_flips { "ENABLED" } else { "DISABLED" });
+    info!(
+        "Configuration loaded for player: {} (account {}/{})",
+        ingame_name,
+        current_account_index + 1,
+        ingame_names.len()
+    );
+    info!(
+        "AH Flips: {}",
+        if config.enable_ah_flips {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+    info!(
+        "Bazaar Flips: {}",
+        if config.enable_bazaar_flips {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+    // ── Pending humanization rest break ─────────────────────────────────────
+    // The actual WAIT happens further down, right after the web control panel
+    // has started (search for "wait out the remaining rest break"). The panel
+    // must stay reachable for the whole break: the break is a full process
+    // restart, and a panel that dies for hours with the bot is exactly what it
+    // exists to prevent. Here we only read how long is left (before deleting
+    // the marker) and clear the marker.
+    let pending_break_secs = pending_rest_break_secs(&ingame_name);
+    clear_rest_break_marker();
+
+    info!(
+        "Configuration loaded for player: {} (account {}/{})",
+        ingame_name,
+        current_account_index + 1,
+        ingame_names.len()
+    );
+    info!(
+        "AH Flips: {}",
+        if config.enable_ah_flips {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+    info!(
+        "Bazaar Flips: {}",
+        if config.enable_bazaar_flips {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+    info!(
+        "Remove Drill Parts: {}",
+        if config.remove_drill_parts {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+    twm::bot::set_remove_drill_parts(config.remove_drill_parts);
+    match &config.visitfriend {
+        Some(friend) if !friend.trim().is_empty() => {
+            info!("Visit Friend: flipping on {}'s island", friend.trim())
+        }
+        _ => info!("Visit Friend: DISABLED (flipping on own island)"),
+    }
+    twm::visitfriend::configure(config.visitfriend.clone());
     info!("Web GUI Port: {}", config.web_gui_port);
 
-    if config.proxy_enabled {
-        info!("Proxy: ENABLED — address: {:?}", config.proxy_address);
-    }
+    // Check whether the web GUI port is allowed through UFW (Linux firewall).
+    // Only warn on Linux where UFW is commonly used.
+    #[cfg(target_os = "linux")]
+    check_ufw_port(config.web_gui_port);
+
+    // Proxy state was parsed and logged by `utils::proxy::init` right after
+    // the active account was resolved (per-account overrides keyed on it).
 
     // Initialize command queue
     let command_queue = CommandQueue::new();
@@ -573,19 +1417,30 @@ async fn main() -> Result<()> {
     // Bazaar-flip pause flag (matches TypeScript bazaarFlipPauser.ts).
     // Set to true for 20 seconds when a `countdown` message arrives (AH flips incoming).
     let bazaar_flips_paused = Arc::new(AtomicBool::new(false));
-    let bazaar_pause_generation = Arc::new(AtomicU64::new(0));
+    // Unix-millis deadline until which the bazaar stays paused. Repeated rapid
+    // `countdown` messages just extend this deadline instead of each spawning a
+    // resume task (which spammed "Bazaar flips resumed" and churned pause state).
+    let bazaar_pause_until = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Master macro pause — web panel can set this to pause all command processing.
     let macro_paused = Arc::new(AtomicBool::new(false));
 
-    // COFL now handles AH/Bazaar flip selection automatically based on user
-    // settings — these flags are always true for backward compatibility with
-    // internal code paths that check them.
-    let enable_ah_flips = Arc::new(AtomicBool::new(true));
+    // Honor configured flip toggles, while allowing the web panel to change them live.
+    let enable_ah_flips = Arc::new(AtomicBool::new(config.enable_ah_flips));
     let enable_bazaar_flips = Arc::new(AtomicBool::new(config.enable_bazaar_flips));
     let skip_flips_when_inventory_full =
         Arc::new(AtomicBool::new(config.skip_flips_when_inventory_full));
-    let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
+    let flip_intake_paused = Arc::new(AtomicBool::new(false));
+    let anonymize_webhook_name = Arc::new(AtomicBool::new(config.anonymize_webhook_name));
+    // Flip-intake diagnostics — records why incoming flips are dropped so the
+    // panel and `/ping` can answer "why am I not getting flips?".
+    let flip_diag = Arc::new(twm::state::FlipDiagnostics::new());
+
+    // Break-on-demand requests from the web panel: rest-break duration in
+    // minutes (0 = pick a random length from the humanization config range).
+    // Consumed by the always-on break executor spawned near the humanization
+    // scheduler, so an on-demand break works even with humanization disabled.
+    let (rest_break_tx, mut rest_break_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
     // Broadcast channel for chat messages → web panel clients.
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
@@ -593,7 +1448,13 @@ async fn main() -> Result<()> {
     // Flip tracker: stores pending/active AH flips for profit reporting in webhooks.
     // Key = clean item_name (lowercase), value = (flip, actual_buy_price, purchase_time).
     // buy_price starts at 0 until ItemPurchased fires and sets it to the real price.
-    let flip_tracker: FlipTrackerMap = Arc::new(Mutex::new(HashMap::new()));
+    // Bought-but-unsold flips are restored from disk: an item bought before a
+    // humanization rest break still sells after it, and the sell time is measured
+    // from the real purchase rather than from this process starting.
+    let flip_tracker: FlipTrackerMap = Arc::new(Mutex::new(restore_flip_tracker(
+        &flip_tracker_path,
+        &ingame_name,
+    )));
 
     // Coflnet connection ID — parsed from "Your connection id is XXXX" chat message.
     // Included in startup webhooks (matches TypeScript getCoflnetPremiumInfo().connectionId).
@@ -615,14 +1476,29 @@ async fn main() -> Result<()> {
     let cofl_authenticated = Arc::new(AtomicBool::new(false));
 
     // Set once after auto-sending `/cofl license default <ign>` to prevent repeat attempts.
-    let license_default_sent = Arc::new(AtomicBool::new(false));
+    // For single-account setups, skip license management entirely (not needed).
+    let license_default_sent = Arc::new(AtomicBool::new(ingame_names.len() == 1));
+
+    // Whether this account already has a valid (non-expired) COFL session. A
+    // resumed/authenticated session does NOT trigger a sign-in link (and may not
+    // re-send `loggedIn`), so the "sign into COFL first" gate below must only
+    // block when there is NO valid session yet — otherwise a returning bot hangs
+    // forever waiting for a sign-in that never happens.
+    let had_valid_session = config
+        .sessions
+        .get(&ingame_name)
+        .map(|s| s.expires >= chrono::Utc::now())
+        .unwrap_or(false);
 
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
         // Check if session is expired
         if session.expires < chrono::Utc::now() {
             // Session expired, generate new one
-            info!("Session expired for {}, generating new session ID", ingame_name);
+            info!(
+                "Session expired for {}, generating new session ID",
+                ingame_name
+            );
             let new_id = uuid::Uuid::new_v4().to_string();
             let new_session = twm::config::types::CoflSession {
                 id: new_id.clone(),
@@ -638,7 +1514,10 @@ async fn main() -> Result<()> {
         }
     } else {
         // No session exists, create new one
-        info!("No session found for {}, generating new session ID", ingame_name);
+        info!(
+            "No session found for {}, generating new session ID",
+            ingame_name
+        );
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_session = twm::config::types::CoflSession {
             id: new_id.clone(),
@@ -650,34 +1529,271 @@ async fn main() -> Result<()> {
     };
 
     info!("Connecting to Coflnet WebSocket...");
-    
+
     // Connect to Coflnet WebSocket
-    let (ws_client, mut ws_rx) = CoflWebSocket::connect(
+    let (ws_client, ws_rx_primary) = CoflWebSocket::connect(
         config.websocket_url.clone(),
         ingame_name.clone(),
         VERSION.to_string(),
         session_id.clone(),
-    ).await?;
+    )
+    .await?;
 
     info!("WebSocket connected successfully");
 
-    // Send "initialized" webhook notification
-    if let Some(webhook_url) = config.active_webhook_url() {
-        let url = webhook_url.to_string();
-        let name = ingame_name.clone();
-        let ah = config.enable_ah_flips;
-        let bz = config.enable_bazaar_flips;
-        // Connection ID and premium may not be available yet at startup (COFL sends them shortly
-        // after WS connect), so we delay 3s to give COFL time to send those messages first.
-        let conn_id_init = cofl_connection_id.clone();
-        let premium_init = cofl_premium.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            let conn_id = conn_id_init.lock().ok().and_then(|g| g.clone());
-            let premium = premium_init.lock().ok().and_then(|g| g.clone());
-            twm::webhook::send_webhook_initialized(&name, ah, bz, conn_id.as_deref(), premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())), &url).await;
-        });
-    }
+    // ── Multisocket ─────────────────────────────────────────────────────────
+    // Merge the primary socket with any extra modsocket connections from
+    // `multisocket_urls`. Auction flips from ALL sockets are deduped by UUID so
+    // the first socket to deliver wins; later duplicates are dropped before
+    // they reach the flip handler. Secondary sockets contribute ONLY auction
+    // flips — chat, commands, auth and bazaar flips stay primary-only so
+    // nothing else doubles up. With an empty `multisocket_urls` this is a
+    // plain pass-through of the primary socket.
+    // Latest account-status JSON pushed to finder feeds (never COFL) when
+    // `finder_report_purse` is on, so the finder can size flips to this account
+    // and avoid overfilling it. Populated by a task spawned once bot_client
+    // exists; each finder-feed writer relays whatever is current. Declared out
+    // here so it outlives the ws_rx setup block below and is visible when the
+    // updater task is spawned later.
+    let finder_status: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let mut ws_rx = {
+        use twm::websocket::CoflEvent;
+
+        // Bounded FIFO of recently-seen flip UUIDs shared by all forwarders.
+        type SeenFlips = std::sync::Mutex<(
+            std::collections::HashSet<String>,
+            std::collections::VecDeque<String>,
+        )>;
+        const SEEN_FLIPS_CAP: usize = 512;
+        fn flip_already_seen(seen: &SeenFlips, uuid: &str) -> bool {
+            let Ok(mut g) = seen.lock() else { return false };
+            let (set, order) = &mut *g;
+            if !set.insert(uuid.to_string()) {
+                return true;
+            }
+            order.push_back(uuid.to_string());
+            if order.len() > SEEN_FLIPS_CAP {
+                if let Some(old) = order.pop_front() {
+                    set.remove(&old);
+                }
+            }
+            false
+        }
+
+        let (agg_tx, agg_rx) = tokio::sync::mpsc::unbounded_channel::<CoflEvent>();
+        let seen: Arc<SeenFlips> = Arc::new(std::sync::Mutex::new((
+            std::collections::HashSet::new(),
+            std::collections::VecDeque::new(),
+        )));
+
+        // Primary: forward everything, deduping auction flips.
+        {
+            let agg_tx = agg_tx.clone();
+            let seen = seen.clone();
+            let mut rx = ws_rx_primary;
+            tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    if let CoflEvent::AuctionFlip(ref f) = ev {
+                        if let Some(u) = f.uuid.as_deref() {
+                            if flip_already_seen(&seen, u) {
+                                debug!("[Multisocket] Duplicate flip {} (primary) — dropped", u);
+                                continue;
+                            }
+                        }
+                    }
+                    if agg_tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Secondary sockets: auction flips only. Entries that are NOT Coflnet
+        // modsockets (no "coflnet"/"/modsocket" in the URL) are treated as
+        // baf-flip-finder feeds — so the private finder can simply be added to
+        // `multisocket_urls` next to COFL (e.g. "ws://127.0.0.1:15101").
+        let mut finder_feed_urls: Vec<String> = Vec::new();
+        for url in config.multisocket_urls.clone() {
+            let url_trim = url.trim().to_string();
+            if url_trim.is_empty() || url_trim == config.websocket_url {
+                continue;
+            }
+            if !url_trim.contains("coflnet") && !url_trim.contains("/modsocket") {
+                finder_feed_urls.push(url_trim);
+                continue;
+            }
+            match CoflWebSocket::connect(
+                url_trim.clone(),
+                ingame_name.clone(),
+                VERSION.to_string(),
+                session_id.clone(),
+            )
+            .await
+            {
+                Ok((_extra_client, mut rx)) => {
+                    info!("[Multisocket] Connected extra COFL socket: {}", url_trim);
+                    let agg_tx = agg_tx.clone();
+                    let seen = seen.clone();
+                    let url_log = url_trim.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = rx.recv().await {
+                            match ev {
+                                CoflEvent::AuctionFlip(ref f) => {
+                                    if let Some(u) = f.uuid.as_deref() {
+                                        if flip_already_seen(&seen, u) {
+                                            debug!(
+                                                "[Multisocket] Duplicate flip {} ({}) — dropped",
+                                                u, url_log
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    info!("[Multisocket] Flip won by {}", url_log);
+                                    if agg_tx.send(ev).is_err() {
+                                        break;
+                                    }
+                                }
+                                // Auth is a SESSION property, not a socket property: all
+                                // sockets share the global COFL_LOGGED_IN flag, and the
+                                // swap-guards in note_authenticated_traffic / the loggedIn
+                                // handler mean whichever socket observes auth FIRST is the
+                                // only one that ever emits this event. If that socket is a
+                                // secondary and the event died here, the primary never
+                                // re-emits it and every COFL flip was dropped as
+                                // "Coflnet is not authenticated yet" for the whole run —
+                                // with the drop's own diagnostic line proving
+                                // cofl_logged_in=true. Forward it so the main loop latches
+                                // no matter which socket saw auth first.
+                                CoflEvent::Authenticated => {
+                                    let _ = agg_tx.send(ev);
+                                }
+                                // Everything else from secondary sockets is dropped.
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("[Multisocket] Failed to connect extra socket {}: {} — continuing without it", url_trim, e);
+                }
+            }
+        }
+
+        // ── baf-flip-finder feeds ────────────────────────────────────────
+        // Our own finder pushes flips over a plain websocket the instant it
+        // finds them. They enter the same pipeline as COFL flips (identical
+        // Flip struct, same UUID dedupe — whichever source is first wins),
+        // so purchasing, tracking, target-based listing and webhooks all
+        // work unchanged. Auto-reconnects with backoff. Sources: non-COFL
+        // `multisocket_urls` entries and/or the explicit `finder_ws_url`.
+        if let Some(u) = config
+            .finder_ws_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+        {
+            if !finder_feed_urls.contains(&u) {
+                finder_feed_urls.push(u);
+            }
+        }
+        for finder_url in finder_feed_urls {
+            let agg_tx = agg_tx.clone();
+            let seen = seen.clone();
+            let token = config.finder_ws_token.clone().unwrap_or_default();
+            let finder_status = finder_status.clone();
+            let report_purse = config.finder_report_purse;
+            tokio::spawn(async move {
+                use futures::{SinkExt, StreamExt};
+                let mut backoff = 5u64;
+                loop {
+                    let full_url = if token.is_empty() {
+                        finder_url.clone()
+                    } else {
+                        format!("{}?token={}", finder_url.trim_end_matches('/'), token)
+                    };
+                    match tokio_tungstenite::connect_async(&full_url).await {
+                        Ok((stream, _)) => {
+                            info!("[FinderWS] Connected to flip finder: {}", finder_url);
+                            backoff = 5;
+                            let (mut write, mut read) = stream.split();
+                            // Push account status to the finder on a cadence (only
+                            // what changed) so it can size flips to this account.
+                            // Finder feeds only — this loop never runs on COFL.
+                            let mut status_tick =
+                                tokio::time::interval(std::time::Duration::from_secs(5));
+                            let mut last_status_sent: Option<String> = None;
+                            loop {
+                                tokio::select! {
+                                    _ = status_tick.tick(), if report_purse => {
+                                        let cur = finder_status.lock().ok().and_then(|g| g.clone());
+                                        if let Some(json) = cur {
+                                            if last_status_sent.as_ref() != Some(&json) {
+                                                if write.send(tokio_tungstenite::tungstenite::Message::Text(json.clone())).await.is_err() {
+                                                    break;
+                                                }
+                                                last_status_sent = Some(json);
+                                            }
+                                        }
+                                    }
+                                    msg = read.next() => {
+                                        let Some(msg) = msg else { break };
+                                        let txt = match msg {
+                                            Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                                            Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
+                                            _ => continue,
+                                        };
+                                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+                                        if v.get("type").and_then(|t| t.as_str()) != Some("flip") {
+                                            continue;
+                                        }
+                                        let Some(f) = v.get("flip") else { continue };
+                                        let uuid = f.get("uuid").and_then(|u| u.as_str()).map(String::from);
+                                        let Some(u) = uuid.as_deref() else { continue };
+                                        if flip_already_seen(&seen, u) {
+                                            debug!("[FinderWS] Duplicate flip {} — dropped (COFL was first)", u);
+                                            continue;
+                                        }
+                                        let flip = twm::types::Flip {
+                                            item_name: f.get("itemName").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                                            starting_bid: f.get("price").and_then(|x| x.as_u64()).unwrap_or(0),
+                                            target: f.get("target").and_then(|x| x.as_u64()).unwrap_or(0),
+                                            finder: Some("BAF_FINDER".to_string()),
+                                            profit_perc: f.get("roiPct").and_then(|x| x.as_f64()),
+                                            purchase_at_ms: twm::types::purchase_at_from_json(f),
+                                            uuid,
+                                            list_at: f.get("listAt").and_then(|x| x.as_u64()),
+                                        };
+                                        if flip.starting_bid == 0 || flip.target == 0 {
+                                            continue;
+                                        }
+                                        info!(
+                                            "[FinderWS] Flip: {} for {} (target {}, conf {})",
+                                            flip.item_name,
+                                            flip.starting_bid,
+                                            flip.target,
+                                            f.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0)
+                                        );
+                                        if agg_tx.send(CoflEvent::AuctionFlip(flip)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            warn!("[FinderWS] Disconnected — reconnecting...");
+                        }
+                        Err(e) => {
+                            warn!("[FinderWS] Connect failed: {} (retry in {}s)", e, backoff);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
+                }
+            });
+        }
+
+        agg_rx
+    };
 
     // When multi-account is enabled, request the COFL licenses list at startup
     // searching by the current account's IGN so we get its global license index.
@@ -692,11 +1808,15 @@ async fn main() -> Result<()> {
             let message = serde_json::json!({
                 "type": "licenses",
                 "data": data_json
-            }).to_string();
+            })
+            .to_string();
             if let Err(e) = ws_license.send_message(&message).await {
                 warn!("[LicenseDetect] Failed to request licenses list: {}", e);
             } else {
-                info!("[LicenseDetect] Requested COFL licenses list for '{}'", current_ign);
+                info!(
+                    "[LicenseDetect] Requested COFL licenses list for '{}'",
+                    current_ign
+                );
             }
         });
     }
@@ -705,22 +1825,95 @@ async fn main() -> Result<()> {
     // the chat GUI is available during Microsoft auth)
     let mut bot_client = BotClient::new();
     bot_client.set_auto_cookie_hours(config.auto_cookie);
-    bot_client.freemoney = config.freemoney_enabled();
-    bot_client.fastbuy = config.fastbuy_enabled();
+    bot_client.bedtiming = config.bedtiming_enabled();
+    bot_client.skip = config.skip_enabled();
     bot_client.bed_spam_click_delay = config.bed_spam_click_delay;
     bot_client.bed_pre_click_ms = config.bed_pre_click_ms;
-    bot_client.bazaar_order_cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
+    bot_client.bazaar_order_cancel_minutes_per_million =
+        config.bazaar_order_cancel_minutes_per_million;
     bot_client.bazaar_flips_paused = bazaar_flips_paused.clone();
     bot_client.enable_bazaar_flips = enable_bazaar_flips.clone();
     bot_client.set_command_queue(command_queue.clone());
     *bot_client.ingame_name.write() = ingame_name.clone();
 
+    // Co-op claim guard: load the persisted "we listed this" history and arm the
+    // option. The history is recorded regardless of the setting so switching it
+    // on later has something to work with straight away.
+    twm::auction_ownership::load_own_listings();
+    twm::auction_ownership::set_enabled(config.only_claim_own_auctions);
+
+    // Account-status reporter for the finder feeds. Every 5s it snapshots the
+    // live purse, coins locked in active listings, free inventory slots and
+    // active-auction count into `finder_status`; the finder-feed writers relay
+    // it. Only runs when finder_report_purse is on, and it only reaches finder
+    // sockets — the purse never goes to COFL. Skips ticks where the purse can't
+    // be read yet (scoreboard not parsed) so a bogus 0 never looks "broke".
+    if config.finder_report_purse {
+        let bc = bot_client.clone();
+        let status_holder = finder_status.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let Some(purse) = bc.get_purse() else {
+                    continue;
+                };
+                let (locked, auctions) = bc.active_listing_value_and_count();
+                let inv_free = bc.empty_slot_count();
+                // Backlog signals for the finder's congestion throttle: items sitting
+                // in the 36-slot player inventory (bought but not yet listed) and
+                // whether the AH is at its per-account slot cap. Together they mean
+                // the AH can't drain what we're buying (see finder client_ineligibility).
+                let inv_used = 36u8.saturating_sub(inv_free);
+                let auction_at_limit = bc.is_auction_at_limit();
+                let worth = purse.saturating_add(locked);
+                let json = format!(
+                    "{{\"type\":\"purse\",\"purse\":{},\"locked\":{},\"worth\":{},\"invFree\":{},\"auctions\":{},\"invUsed\":{},\"auctionAtLimit\":{}}}",
+                    purse, locked, worth, inv_free, auctions, inv_used, auction_at_limit
+                );
+                if let Ok(mut g) = status_holder.lock() {
+                    *g = Some(json);
+                }
+            }
+        });
+    }
+
+    // Finder-PRIMARY purse relay. When the primary `websocket_url` IS the private
+    // finder (not a COFL modsocket), the finder feed arrives through `ws_client`
+    // and the `finder_feed_urls` loop above never runs — so nothing relays the
+    // status JSON the reporter task writes into `finder_status`. Relay it over the
+    // primary socket here on the same 5s cadence, deduped like the secondary path.
+    // Without this, finder-only bots (websocket_url = ws://127.0.0.1:15101, empty
+    // multisocket_urls) never report purse, so purse-adaptive / broke-mode routing
+    // and the affordability + overflow guards get no data. Guarded on the primary
+    // being a finder URL, so COFL-primary deployments (which relay via
+    // finder_feed_urls) are unaffected and COFL never receives the purse.
+    if config.finder_report_purse
+        && !config.websocket_url.contains("coflnet")
+        && !config.websocket_url.contains("/modsocket")
+    {
+        let ws_primary = ws_client.clone();
+        let status_holder = finder_status.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut last_sent: Option<String> = None;
+            loop {
+                tick.tick().await;
+                let cur = status_holder.lock().ok().and_then(|g| g.clone());
+                if let Some(json) = cur {
+                    if last_sent.as_ref() != Some(&json) {
+                        if let Err(e) = ws_primary.send_message(&json).await {
+                            warn!("[FinderWS] primary-socket purse relay failed: {}", e);
+                        } else {
+                            last_sent = Some(json);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Shared profit tracker for AH and Bazaar realized profits.
-    let profit_tracker_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("profit_history.json")))
-        .unwrap_or_else(|| std::path::PathBuf::from("profit_history.json"));
-    let profit_tracker = Arc::new(twm::profit::ProfitTracker::load_or_new(profit_tracker_path));
 
     // Recent realized AH flips for the flip-history panel.  Persisted so
     // a flip whose purchase was in one session and sale in another (or one
@@ -749,6 +1942,57 @@ async fn main() -> Result<()> {
         Arc::new(Mutex::new(VecDeque::from(loaded)))
     };
 
+    // Restore persisted totals from disk so profit statistics survive rest breaks.
+    let profit_tracker = {
+        let tracker = Arc::new(twm::profit::ProfitTracker::new());
+        let saved = load_profit_stats(&profit_path);
+        // Profit is a SESSION total and must move in lockstep with uptime —
+        // every "profit per hour" figure divides one by the other, so carrying
+        // profit across a restart that zeroes uptime reports a wildly inflated
+        // rate. Same rule as uptime: carry across a quick restart (crash, manual
+        // relaunch) or a humanization rest break of any length; start at 0 on a
+        // genuine cold start. Restoring unconditionally (the previous fix for
+        // "profit resets every ~30 min") over-corrected into profit that never
+        // resets at all. `saved_at == 0` is a pre-`saved_at` file: carry it
+        // rather than wipe totals on upgrade.
+        let carry_profit = !switched_account
+            && saved
+                .get(&ingame_name)
+                .map(|e| {
+                    e.saved_at == 0
+                        || after_rest_break
+                        || unix_now().saturating_sub(e.saved_at) <= MAX_SESSION_GAP_SECS
+                })
+                .unwrap_or(false);
+        if !carry_profit {
+            if let Some(e) = saved.get(&ingame_name) {
+                if e.ah_total != 0 || e.bz_total != 0 {
+                    info!(
+                        "[Profit] New session for {} — starting profit at 0 (discarded {} AH / {} BZ from the previous session)",
+                        ingame_name, e.ah_total, e.bz_total
+                    );
+                }
+            }
+        }
+        if let Some(entry) = saved.get(&ingame_name).filter(|_| carry_profit) {
+            if entry.ah_total != 0 {
+                tracker.set_ah_total(entry.ah_total);
+                info!(
+                    "[Profit] Restored AH profit from disk: {} coins",
+                    entry.ah_total
+                );
+            }
+            if entry.bz_total != 0 {
+                tracker.set_bz_total(entry.bz_total);
+                info!(
+                    "[Profit] Restored BZ profit from disk: {} coins",
+                    entry.bz_total
+                );
+            }
+        }
+        tracker
+    };
+
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(twm::bazaar_tracker::BazaarOrderTracker::new());
 
@@ -756,6 +2000,103 @@ async fn main() -> Result<()> {
     // the process — state lives in `SellerRunner` (start/stop, logs, counts).
     let seller_runner = twm::seller::SellerRunner::new(bot_client.clone());
     let seller_config_path = twm::seller::SellerConfig::default_path();
+
+    // ── Central backend (baf-backend) gateway ───────────────────────────────
+    // Dial out to the shared backend for remote control + profit tracking and
+    // show the one-time Discord link code. A no-op when disabled/unconfigured.
+    let backend_handle = if config.backend_enabled {
+        // Already-owned (discord_id set in config) → no link needed; otherwise the
+        // terminal re-prints the code so it isn't lost in the startup scroll.
+        let already_linked = config.active_discord_id().is_some();
+        // Only mint a link code when this instance is NOT yet linked. Sending a
+        // fresh code on every startup of an already-linked bot makes the backend
+        // register a brand-new pending/unlinked row per reconnect — that's what
+        // produces the pile of duplicate `unlinked` rows for the same IGN. The
+        // stable `instance_id` already identifies the bot across reconnects, so a
+        // linked instance announces no code at all (`linkCode: null`).
+        let link_code = if already_linked {
+            String::new()
+        } else {
+            let raw = uuid::Uuid::new_v4().simple().to_string();
+            raw[..6].to_uppercase()
+        };
+        let linked = Arc::new(AtomicBool::new(already_linked));
+        let handle = twm::backend::spawn(twm::backend::BackendDeps {
+            url: config.backend_url.clone(),
+            instance_id: config.instance_id.clone().unwrap_or_default(),
+            cofl_owner_id: None,
+            ingame_names: ingame_names.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            link_code: link_code.clone(),
+            discord_id: config.active_discord_id().map(|s| s.to_string()),
+            allowed_ids: config.backend_allowed_ids_list(),
+            macro_paused: macro_paused.clone(),
+            command_queue: command_queue.clone(),
+            bot_client: bot_client.clone(),
+            profit_tracker: profit_tracker.clone(),
+            config_loader: config_loader.clone(),
+            linked: linked.clone(),
+            enable_ah_flips: enable_ah_flips.clone(),
+            enable_bazaar_flips: enable_bazaar_flips.clone(),
+        });
+        if !already_linked {
+            // Prominent boxed banner so the code stands out, then re-print it
+            // periodically until the bot is linked.
+            let chat_tx_link = chat_tx.clone();
+            tokio::spawn(async move {
+                let mut first = true;
+                loop {
+                    if linked.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let banner = format!(
+                        "§f[§4BAF§f]: §b╔══════════════════════════════════════╗\n\
+                         §f[§4BAF§f]: §b║  §eDISCORD LINK CODE: §6§l{:<8}§r§b       ║\n\
+                         §f[§4BAF§f]: §b║  §7Run §f/link {}§7 in Discord{}║\n\
+                         §f[§4BAF§f]: §b╚══════════════════════════════════════╝",
+                        link_code,
+                        link_code,
+                        " ".repeat(11usize.saturating_sub(link_code.len()))
+                    );
+                    print_mc_chat(&banner);
+                    let _ = chat_tx_link.send(banner);
+                    info!(
+                        "[Backend] Discord link code: {} (run /link {} in Discord)",
+                        link_code, link_code
+                    );
+                    // Re-show sooner the first time (right after startup scroll), then every 2 min.
+                    let wait = if first { 20 } else { 120 };
+                    first = false;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+                }
+            });
+        }
+        handle
+    } else {
+        twm::backend::BackendHandle::disabled()
+    };
+
+    // Occasional friendly "stay hydrated" reminder at a random 1min–2h interval.
+    {
+        let chat_tx_hydrate = chat_tx.clone();
+        tokio::spawn(async move {
+            use rand::Rng;
+            const MESSAGES: [&str; 4] = [
+                "§b💧 Stay hydrated — take a sip of water!",
+                "§b💧 Hydration check: go drink some water 🚰",
+                "§b💧 Quick reminder: water break! 💙",
+                "§b💧 Don't forget to drink water while you flip.",
+            ];
+            loop {
+                let secs = rand::rng().random_range(60..=7200);
+                tokio::time::sleep(tokio::time::Duration::from_secs(secs)).await;
+                let pick = MESSAGES[rand::rng().random_range(0..MESSAGES.len())];
+                let msg = format!("§f[§4BAF§f]: {}", pick);
+                print_mc_chat(&msg);
+                let _ = chat_tx_hydrate.send(msg);
+            }
+        });
+    }
 
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
@@ -769,17 +2110,17 @@ async fn main() -> Result<()> {
             enable_ah_flips: enable_ah_flips.clone(),
             enable_bazaar_flips: enable_bazaar_flips.clone(),
             skip_flips_when_inventory_full: skip_flips_when_inventory_full.clone(),
+            flip_intake_paused: flip_intake_paused.clone(),
             ingame_names: ingame_names.clone(),
             current_account_index,
             account_index_path: account_index_path.clone(),
             chat_tx: chat_tx.clone(),
-            web_gui_password: config.web_gui_password.clone(),
-            web_gui_cookie_secure: config.web_gui_cookie_secure,
+            panel_port: config.web_gui_port,
+            web_gui_password: Arc::new(std::sync::RwLock::new(config.web_gui_password.clone())),
             web_share_token: config.web_share_token.clone(),
             share_public_url: config.share_public_url.clone(),
-            valid_sessions: std::sync::Arc::new(std::sync::Mutex::new(
-                twm::web::SessionStore::new(),
-            )),
+            web_tls_cert_path: config.web_tls_cert_path.clone(),
+            web_tls_key_path: config.web_tls_key_path.clone(),
             player_uuid: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             started_at: std::time::Instant::now(),
             previous_session_secs,
@@ -792,13 +2133,14 @@ async fn main() -> Result<()> {
             config_loader: config_loader.clone(),
             seller_runner: seller_runner.clone(),
             seller_config_path: seller_config_path.clone(),
+            flip_diag: flip_diag.clone(),
+            rest_break_tx: rest_break_tx.clone(),
         };
         let web_port = config.web_gui_port;
         let pusher_state = web_state.clone();
         tokio::spawn(async move {
-            start_web_server(web_state, web_port).await;
+            twm::web::start_web_server(web_state, web_port).await;
         });
-
         // Optional outbound stats pusher.  When `share_push_url` and
         // `share_push_secret` are both set, snapshots of the same anonymized
         // public-stats payload are POSTed to that URL on a fixed cadence so
@@ -813,6 +2155,80 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Wait out the remaining rest break ───────────────────────────────────
+    // A rest break restarts the process with a break-until marker; on this
+    // fresh start we wait out the remaining break BEFORE connecting to Hypixel
+    // so the account is genuinely offline for the whole duration (rather than
+    // lingering in-process where it could drift back into the lobby). The wait
+    // sits AFTER the web panel startup so the panel stays reachable for the
+    // whole break. The flip websocket may be up during the wait, but nothing
+    // consumes its events yet — the backlog is drained below so no stale flip
+    // from before the break is ever acted on.
+    if let Some(remaining) = pending_break_secs {
+        info!(
+            "[Humanization] Resuming rest break — staying offline for {:.1}m before connecting",
+            remaining as f64 / 60.0
+        );
+        tokio::time::sleep(Duration::from_secs(remaining)).await;
+        info!("[Humanization] Rest break over — connecting");
+        if let Some(url) = config.active_webhook_url() {
+            twm::webhook::send_webhook_rest_break_end(&ingame_name, url).await;
+        }
+    }
+
+    // Drop flips that piled up while the process was offline for a rest break.
+    // Without this, hours of stale flips would sit in the unbounded event
+    // queue and be evaluated the moment the event loop starts.
+    if pending_break_secs.is_some() {
+        let mut stale = 0usize;
+        while ws_rx.try_recv().is_ok() {
+            stale += 1;
+        }
+        if stale > 0 {
+            info!(
+                "[Humanization] Discarded {} flips that arrived during the rest break",
+                stale
+            );
+        }
+    }
+
+    // Send "initialized" webhook notification (after any rest-break wait: the
+    // bot only counts as initialized once it is actually coming up).
+    if let Some(webhook_url) = config.active_webhook_url() {
+        let url = webhook_url.to_string();
+        let name = ingame_name.clone();
+        let ah = config.enable_ah_flips;
+        let bz = config.enable_bazaar_flips;
+        // Connection ID and premium may not be available yet at startup (COFL sends them shortly
+        // after WS connect), so we delay 3s to give COFL time to send those messages first.
+        let conn_id_init = cofl_connection_id.clone();
+        let premium_init = cofl_premium.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let conn_id = conn_id_init.lock().ok().and_then(|g| g.clone());
+            let premium = premium_init.lock().ok().and_then(|g| g.clone());
+            twm::webhook::send_webhook_initialized(
+                &name,
+                ah,
+                bz,
+                conn_id.as_deref(),
+                premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+                &url,
+            )
+            .await;
+        });
+    }
+
+    // If a VPS_SECRET environment variable is present, connect to the managed
+    // hosting backend at wss://sky.coflnet.com/instances.  This allows the
+    // SkyCofl backend to orchestrate instances running on this host.
+    if let Some(vps_socket) = twm::vps::VpsSocket::from_env() {
+        info!("[VPS] VPS_SECRET detected — starting managed hosting socket");
+        tokio::spawn(async move {
+            vps_socket.run().await;
+        });
+    }
+
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
     // is printed to the terminal; the Coflnet auth link is sent via chat_tx and
     // appears in the web panel automatically).
@@ -821,6 +2237,83 @@ async fn main() -> Result<()> {
     // Minecraft connection is useless (no flips, no bazaar, nothing to do),
     // so after exhausting retries we restart the process to re-run the full
     // startup sequence (config reload, fresh WebSocket, etc.).
+    // ── Sign into COFL FIRST, then Hypixel ──────────────────────────────────
+    // The COFL sign-in link is printed the instant COFL sends it (see
+    // CoflWebSocket::send_auth_prompt). Hold the Minecraft/Microsoft login here
+    // until COFL reports the session authenticated, so a first-time user completes
+    // COFL sign-in first and its link is never lost behind the Hypixel auth output.
+    //
+    // ONLY block when there is no valid session yet (`!had_valid_session`). A bot
+    // that has run before resumes an authenticated session: COFL shows no sign-in
+    // link and may never re-send `loggedIn`, so waiting on it would hang startup
+    // forever. Those bots skip the wait entirely and go straight to Minecraft.
+    //
+    // Also skipped entirely in finder-only mode (`websocket_url` points at our own
+    // baf-flip-finder rather than Coflnet). There is no COFL in that setup: nothing
+    // sends a sign-in link and nothing ever sends `loggedIn`, so this wait could
+    // only ever burn the full timeout while telling the user to open a link that
+    // was never printed. Own-finder flips already bypass the COFL auth gate when
+    // buying, so nothing downstream needs this either.
+    //
+    // Also skipped on managed VPS instances and when console input is disabled; a
+    // generous timeout means even a first-time user can never hang startup.
+    {
+        let is_vps = std::env::var("VPS_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
+        if !is_vps
+            && !ws_client.is_finder()
+            && config.enable_console_input
+            && !had_valid_session
+            && !twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed)
+        {
+            info!("Waiting for COFL sign-in before starting Minecraft login...");
+            // COFL pushes the authmod link only for a session id it considers
+            // unauthenticated; on every other path nothing is ever printed and the
+            // old "link above" wording pointed at empty terminal. `conId` in that
+            // link IS the `SId` we generated and sent on connect, so build and show
+            // it ourselves whenever COFL hasn't already shown one.
+            let baf_msg = if twm::websocket::COFL_AUTH_LINK_SHOWN.load(Ordering::Relaxed) {
+                "§f[§4BAF§f]: §eSign into COFL first (link above). Minecraft login starts once COFL is authenticated.".to_string()
+            } else {
+                format!(
+                    "§f[§4BAF§f]: §eSign into COFL first — open: §f{}\n\
+                     §f[§4BAF§f]: §eMinecraft login starts once COFL is authenticated.",
+                    twm::websocket::cofl_auth_url(&session_id)
+                )
+            };
+            print_mc_chat(&baf_msg);
+            let _ = chat_tx.send(baf_msg);
+
+            const COFL_SIGNIN_TIMEOUT: Duration = Duration::from_secs(300);
+            let started = Instant::now();
+            let mut last_reminder = Instant::now();
+            while !twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
+                if started.elapsed() >= COFL_SIGNIN_TIMEOUT {
+                    warn!(
+                        "COFL sign-in not confirmed within {}s — continuing to Minecraft login anyway (buying stays disabled until COFL authenticates)",
+                        COFL_SIGNIN_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if last_reminder.elapsed() >= Duration::from_secs(20) {
+                    let m = format!(
+                        "§f[§4BAF§f]: §eStill waiting for COFL sign-in — open §f{}§e and log in.",
+                        twm::websocket::cofl_auth_url(&session_id)
+                    );
+                    print_mc_chat(&m);
+                    let _ = chat_tx.send(m);
+                    last_reminder = Instant::now();
+                }
+            }
+            if twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
+                info!("COFL authenticated — proceeding to Minecraft login");
+            }
+        }
+    }
+
     info!("Initializing Minecraft bot...");
     info!("Authenticating with Microsoft account...");
     info!("A browser window will open for you to log in");
@@ -830,14 +2323,18 @@ async fn main() -> Result<()> {
 
         let mut last_err: Option<String> = None;
         for attempt in 1..=AUTH_MAX_RETRIES {
-            match bot_client.connect(ingame_name.clone(), Some(ws_client.clone())).await {
+            match bot_client
+                .connect(ingame_name.clone(), Some(ws_client.clone()))
+                .await
+            {
                 Ok(_) => {
                     info!("Bot connection initiated successfully");
                     last_err = None;
                     break;
                 }
                 Err(e) => {
-                    let backoff = AUTH_INITIAL_BACKOFF_SECS.saturating_mul(1u64 << (attempt - 1).min(5)); // 10s, 20s, 40s for 3 retries; .min(5) caps shift for safety
+                    let backoff =
+                        AUTH_INITIAL_BACKOFF_SECS.saturating_mul(1u64 << (attempt - 1).min(5)); // 10s, 20s, 40s for 3 retries; .min(5) caps shift for safety
                     warn!(
                         "Failed to connect bot (attempt {}/{}): {} — retrying in {}s",
                         attempt, AUTH_MAX_RETRIES, e, backoff
@@ -853,9 +2350,14 @@ async fn main() -> Result<()> {
                     if let Some(webhook_url) = config.active_webhook_url() {
                         let err_str = format!("{}", e);
                         twm::webhook::send_webhook_auth_failed(
-                            &ingame_name, attempt, AUTH_MAX_RETRIES, &err_str,
-                            config.active_discord_id(), webhook_url,
-                        ).await;
+                            &ingame_name,
+                            attempt,
+                            AUTH_MAX_RETRIES,
+                            &err_str,
+                            config.active_discord_id(),
+                            webhook_url,
+                        )
+                        .await;
                     }
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
@@ -869,9 +2371,14 @@ async fn main() -> Result<()> {
             // Send final "all attempts failed" webhook before restarting
             if let Some(webhook_url) = config.active_webhook_url() {
                 twm::webhook::send_webhook_auth_failed(
-                    &ingame_name, AUTH_MAX_RETRIES, AUTH_MAX_RETRIES, &err,
-                    config.active_discord_id(), webhook_url,
-                ).await;
+                    &ingame_name,
+                    AUTH_MAX_RETRIES,
+                    AUTH_MAX_RETRIES,
+                    &err,
+                    config.active_discord_id(),
+                    webhook_url,
+                )
+                .await;
             }
             let baf_msg = format!(
                 "§f[§4BAF§f]: §cAll {} auth attempts failed — restarting...",
@@ -903,6 +2410,7 @@ async fn main() -> Result<()> {
     let bazaar_tracker_events = bazaar_tracker.clone();
     let ah_purchase_ledger_events = ah_purchase_ledger.clone();
     let ah_purchase_ledger_writer_events = ah_purchase_ledger_writer.clone();
+    let backend_handle_events = backend_handle.clone();
     // Tracks when the last AH auction was listed; the idle-inventory timer uses
     // this to detect 30-minute stalls and force `/cofl sellinventory`.
     let last_auction_listed_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
@@ -910,6 +2418,20 @@ async fn main() -> Result<()> {
     let session_start = std::time::Instant::now();
     let prev_secs_events = previous_session_secs;
     tokio::spawn(async move {
+        // Rate-limiting for presence notifications so a repeated Hypixel line or
+        // a chat flood can't spam the webhook: per-visitor cooldown for island
+        // visits, and a single global cooldown between name-mention pings.
+        let mut last_visitor_ping: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        let mut last_mention_ping: Option<std::time::Instant> = None;
+        const VISITOR_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+        const MENTION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+        // Stacked-listing refusals: the finder/COFL keep re-instructing the same
+        // stacked slot, so chat gets one warning per item per 15 minutes while
+        // the bot log records every refusal.
+        let mut last_stacked_warn: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        const STACKED_WARN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(900);
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
                 twm::bot::BotEvent::Login => {
@@ -917,6 +2439,7 @@ async fn main() -> Result<()> {
                 }
                 twm::bot::BotEvent::Spawn => {
                     info!("✓ Bot spawned in world and ready");
+                    mark_activity();
                 }
                 twm::bot::BotEvent::ChatMessage(msg) => {
                     // Print Minecraft chat with color codes converted to ANSI
@@ -927,16 +2450,113 @@ async fn main() -> Result<()> {
                     // Parse Coflnet profit response:
                     // "According to our data <ign> made <amount> in the last <days> days across <N> auctions"
                     let clean = twm::utils::remove_minecraft_colors(&msg);
+
+                    // Ban / security notice that arrived as a chat line (not a
+                    // disconnect). Terminate the process exactly like the
+                    // Disconnected ban path so a banned account stops immediately
+                    // instead of idling until the next reconnect or manual kill.
+                    if is_ban_chat(&clean) {
+                        // Only the NOTIFICATION is gated (stale bans, and bans
+                        // already reported for this account). The exit below is
+                        // not: a banned account stops either way.
+                        if twm::webhook::should_notify_ban(&ingame_name_for_events, &clean) {
+                            error!("Ban detected in chat: {} (sending webhook and terminating process)", clean);
+                            if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                                twm::webhook::send_webhook_banned(
+                                    &ingame_name_for_events,
+                                    &clean,
+                                    config_for_events.active_discord_id(),
+                                    webhook_url,
+                                )
+                                .await;
+                            }
+                            twm::webhook::send_webhook_banned_public(&clean).await;
+                        } else {
+                            error!("Ban detected in chat: {} (notification suppressed, terminating process)", clean);
+                        }
+                        std::process::exit(1);
+                    }
+
+                    // SkyBlock maintenance / downtime. When Hypixel is restarting
+                    // SkyBlock, a join attempt is answered with a "maintenance"
+                    // line — the server is temporarily down. Note it so the island
+                    // guard stops bouncing off `/play sb` and the stall guard treats
+                    // the quiet as expected. The window auto-clears, so the bot
+                    // resumes on its own once SkyBlock is back.
+                    if clean.to_lowercase().contains("maintenance") && note_maintenance() {
+                        warn!(
+                                "[Maintenance] SkyBlock appears to be down for maintenance — pausing rejoin for {}m",
+                                MAINTENANCE_COOLDOWN_SECS / 60
+                            );
+                        let baf_msg = "§f[§4BAF§f]: §eSkyBlock is under maintenance — pausing rejoin until it's back up".to_string();
+                        print_mc_chat(&baf_msg);
+                        let _ = chat_tx_events.send(baf_msg);
+                    }
+
+                    // Friend-island visit refused. After we click the "Visit
+                    // player island" ender-eye, a friend who has guest visits
+                    // disabled answers with "Couldn't warp you!" /
+                    // "This island doesn't allow everyone to guest!". Only react
+                    // when we actually attempted a visit recently (so an
+                    // unrelated warp failure can't disable the feature), and only
+                    // while it's still active. Fall back to our own island for the
+                    // rest of the session and notify.
+                    if let Some(friend) = twm::visitfriend::active_friend() {
+                        // Only react to a warp failure that follows a visit WE
+                        // initiated in the last 20s, so an unrelated
+                        // "Couldn't warp you!" can't disable the feature.
+                        let is_visit_refusal = twm::visitfriend::recently_attempted(20)
+                            && (clean.contains("doesn't allow everyone to guest")
+                                || clean.contains("Couldn't warp you"));
+                        if is_visit_refusal {
+                            warn!(
+                                "[VisitFriend] {}'s island refused the bot — falling back to our own island for this session",
+                                friend
+                            );
+                            twm::visitfriend::disable_for_session();
+                            let baf_msg = format!(
+                                "§f[§4BAF§f]: §e{}'s island isn't open to visitors — flipping on our own island this session",
+                                friend
+                            );
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx_events.send(baf_msg);
+                            if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                                twm::webhook::send_webhook_visit_refused(
+                                    &ingame_name_for_events,
+                                    &friend,
+                                    webhook_url,
+                                )
+                                .await;
+                            }
+                            // Head to our own island now.
+                            command_queue_clone.enqueue(
+                                twm::types::CommandType::GoToIsland,
+                                twm::types::CommandPriority::High,
+                                false,
+                            );
+                        }
+                    }
                     if let Some(profit) = parse_cofl_profit_response(&clean) {
-                        profit_tracker_events.set_ah_total(profit);
-                        tracing::info!("[CoflProfit] Updated AH total from Coflnet: {} coins", profit);
+                        // `/cofl profit` is the REALIZED total. The panel shows
+                        // THEORETICAL AH profit (accumulated at purchase), so this
+                        // must NOT overwrite the theoretical total. It is kept
+                        // alongside it and reported as its own figure in the
+                        // periodic profit summary webhook.
+                        profit_tracker_events.set_realized_ah_total(profit);
+                        tracing::info!(
+                            "[CoflProfit] Realized AH total from Coflnet: {} coins",
+                            profit
+                        );
                     }
 
                     // Parse `/cofl bz h` response for authoritative BZ session profit.
                     // "Total Profit: -234M" (inside "Bazaar Profit History for <ign> ...")
                     if let Some(bz_profit) = parse_cofl_bz_h_total_profit(&clean) {
                         profit_tracker_events.set_bz_total(bz_profit);
-                        tracing::info!("[CoflBzH] Updated BZ total from /cofl bz h: {} coins", bz_profit);
+                        tracing::info!(
+                            "[CoflBzH] Updated BZ total from /cofl bz h: {} coins",
+                            bz_profit
+                        );
                     }
 
                     // Detect bazaar daily sell value limit
@@ -960,10 +2580,18 @@ async fn main() -> Result<()> {
                                 .unwrap_or_default()
                                 .as_secs();
                             let secs_until_midnight = midnight.saturating_sub(now);
-                            tracing::info!("[Bazaar] Scheduling daily-limit reset in {}s (0:00 UTC)", secs_until_midnight);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_midnight + DAILY_LIMIT_RESET_BUFFER_SECS)).await;
+                            tracing::info!(
+                                "[Bazaar] Scheduling daily-limit reset in {}s (0:00 UTC)",
+                                secs_until_midnight
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                secs_until_midnight + DAILY_LIMIT_RESET_BUFFER_SECS,
+                            ))
+                            .await;
                             bot_for_reset.clear_bazaar_daily_limit();
-                            let reset_msg = "§f[§4BAF§f]: §aBazaar daily limit reset — flips re-enabled".to_string();
+                            let reset_msg =
+                                "§f[§4BAF§f]: §aBazaar daily limit reset — flips re-enabled"
+                                    .to_string();
                             twm::logging::print_mc_chat(&reset_msg);
                             let _ = chat_tx_dl.send(reset_msg);
                             tracing::info!("[Bazaar] Daily limit reset — bazaar flips re-enabled");
@@ -972,24 +2600,155 @@ async fn main() -> Result<()> {
                         twm::logging::print_mc_chat(&baf_msg);
                         let _ = chat_tx_events.send(baf_msg);
                     }
+
+                    // ── Presence notifications (island visitors / name mentions) ──
+                    // Someone visiting the bot's island: "[RANK] Name is visiting your island!"
+                    if config_for_events.notify_island_visitors {
+                        if let Some(visitor) = parse_island_visitor(&clean) {
+                            let now = std::time::Instant::now();
+                            let fresh = last_visitor_ping
+                                .get(&visitor)
+                                .map(|t| now.duration_since(*t) >= VISITOR_COOLDOWN)
+                                .unwrap_or(true);
+                            if fresh {
+                                last_visitor_ping.insert(visitor.clone(), now);
+                                info!("[Presence] {} is visiting the island", visitor);
+                                if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                                    let url = webhook_url.to_string();
+                                    let name = ingame_name_for_events.clone();
+                                    let did = config_for_events
+                                        .active_discord_id()
+                                        .map(|s| s.to_string());
+                                    tokio::spawn(async move {
+                                        twm::webhook::send_webhook_island_visitor(
+                                            &name,
+                                            &visitor,
+                                            did.as_deref(),
+                                            &url,
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Bot's own Minecraft name mentioned by another player in chat.
+                    if config_for_events.notify_name_mentions {
+                        if let Some(line) = parse_name_mention(&clean, &ingame_name_for_events) {
+                            let now = std::time::Instant::now();
+                            let fresh = last_mention_ping
+                                .map(|t| now.duration_since(t) >= MENTION_COOLDOWN)
+                                .unwrap_or(true);
+                            if fresh {
+                                last_mention_ping = Some(now);
+                                info!("[Presence] Name mentioned in chat: {}", line);
+                                if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                                    let url = webhook_url.to_string();
+                                    let name = ingame_name_for_events.clone();
+                                    let did = config_for_events
+                                        .active_discord_id()
+                                        .map(|s| s.to_string());
+                                    tokio::spawn(async move {
+                                        twm::webhook::send_webhook_name_mention(
+                                            &name,
+                                            &line,
+                                            did.as_deref(),
+                                            &url,
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
                 twm::bot::BotEvent::WindowOpen(id, window_type, title) => {
-                    debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
+                    debug!(
+                        "Window opened: {} (ID: {}, Type: {})",
+                        title, id, window_type
+                    );
+                    // Heartbeat for the stall guard: an opening GUI window is the
+                    // clearest proof the game connection is alive and working.
+                    mark_activity();
+
+                    // When the "Bazaar Orders" or "Co-op Bazaar Orders" window
+                    // opens, send the full window NBT data to COFL so bazaar
+                    // order state stays in sync with the SkyCofl backend.
+                    let title_lower = title.to_lowercase();
+                    if title_lower.contains("bazaar orders")
+                        || title_lower.contains("co-op bazaar orders")
+                    {
+                        let ws_upload = ws_client_for_events.clone();
+                        let bot_upload = bot_client_clone.clone();
+                        tokio::spawn(async move {
+                            // Wait for ContainerSetContent to populate all slots.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Some(window_json) = bot_upload.get_cached_window_json() {
+                                // Verify the cached window is still the Bazaar Orders window.
+                                // The macro may have clicked an order which opens "Order Options",
+                                // overwriting the cached window JSON. Only upload if the title
+                                // still matches "Bazaar Orders" (not "Order Options" or other windows).
+                                let is_bazaar_orders =
+                                    serde_json::from_str::<serde_json::Value>(&window_json)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("title")
+                                                .and_then(|t| t.as_str())
+                                                .map(|s| s.to_lowercase())
+                                        })
+                                        .map(|t| t.contains("bazaar orders"))
+                                        .unwrap_or(false);
+
+                                if !is_bazaar_orders {
+                                    tracing::debug!("[UploadBazaarOrders] Skipping upload — window changed from Bazaar Orders");
+                                    return;
+                                }
+
+                                let msg = serde_json::json!({
+                                    "type": "UploadBazaarOrders",
+                                    "data": window_json
+                                })
+                                .to_string();
+                                if let Err(e) = ws_upload.send_message(&msg).await {
+                                    tracing::warn!("[UploadBazaarOrders] Failed to send bazaar window data: {}", e);
+                                } else {
+                                    tracing::info!(
+                                        "[UploadBazaarOrders] Sent bazaar window data to COFL"
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "[UploadBazaarOrders] No cached window JSON available"
+                                );
+                            }
+                        });
+                    }
                 }
                 twm::bot::BotEvent::WindowClose => {
                     debug!("Window closed");
+                    mark_activity();
                 }
                 twm::bot::BotEvent::Disconnected(reason) => {
                     warn!("Bot disconnected: {}", reason);
                     if is_ban_disconnect(&reason) {
-                        error!("Ban detected — sending webhook and terminating process");
-                        if let Some(webhook_url) = config_for_events.active_webhook_url() {
-                            twm::webhook::send_webhook_banned(
-                                &ingame_name_for_events,
-                                &reason,
-                                config_for_events.active_discord_id(),
-                                webhook_url,
-                            ).await;
+                        // Only the NOTIFICATION is gated (stale bans, and bans
+                        // already reported for this account). The exit below is
+                        // not: a banned account stops either way.
+                        if twm::webhook::should_notify_ban(&ingame_name_for_events, &reason) {
+                            error!("Ban detected — sending webhook and terminating process");
+                            if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                                twm::webhook::send_webhook_banned(
+                                    &ingame_name_for_events,
+                                    &reason,
+                                    config_for_events.active_discord_id(),
+                                    webhook_url,
+                                )
+                                .await;
+                            }
+                            twm::webhook::send_webhook_banned_public(&reason).await;
+                        } else {
+                            error!("Ban detected (notification suppressed) — terminating process");
                         }
                         // Terminate immediately so we don't reconnect and re-send the webhook
                         std::process::exit(1);
@@ -1005,7 +2764,8 @@ async fn main() -> Result<()> {
                             &ingame_name_for_events,
                             config_for_events.active_discord_id(),
                             webhook_url,
-                        ).await;
+                        )
+                        .await;
                     }
                     let baf_msg = "§f[§4BAF§f]: §c⚠ No booster cookie — please log in manually and buy one, then start the bot again.".to_string();
                     print_mc_chat(&baf_msg);
@@ -1015,12 +2775,20 @@ async fn main() -> Result<()> {
                 }
                 twm::bot::BotEvent::StartupComplete { orders_cancelled } => {
                     info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
-                    // Clear the bazaar order tracker for a clean slate — the startup
-                    // ManageOrders cycle cancelled all in-game orders already.
-                    {
+                    mark_activity();
+                    // Clear the bazaar order tracker for a clean slate ONLY when the
+                    // startup ManageOrders cycle actually cancelled all in-game orders
+                    // (i.e. bazaar flips are enabled).  When bazaar flips are disabled
+                    // the startup pass is skipped entirely and the user's open orders
+                    // are still in-game — clearing the tracker would wrongly empty the
+                    // web panel, so we keep whatever the tracker already holds.
+                    if enable_bazaar_flips_events.load(Ordering::Relaxed) {
                         let removed = bazaar_tracker_events.clear_all_orders();
                         if removed > 0 {
-                            info!("[Startup] Cleared {} stale order(s) from bazaar tracker", removed);
+                            info!(
+                                "[Startup] Cleared {} stale order(s) from bazaar tracker",
+                                removed
+                            );
                         }
                     }
                     // Also clear the auction slot blocked flag on startup
@@ -1030,14 +2798,24 @@ async fn main() -> Result<()> {
                         let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
                         let ws = ws_client_for_events.clone();
                         tokio::spawn(async move {
-                            let data_json = serde_json::to_string(&scoreboard_lines).unwrap_or_else(|_| "[]".to_string());
-                            let scoreboard_msg = serde_json::json!({"type": "uploadScoreboard", "data": data_json}).to_string();
-                            let tab_msg = serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
-                            debug!("[Startup] Sending uploadScoreboard to COFL: {:?}", scoreboard_lines);
+                            let data_json = serde_json::to_string(&scoreboard_lines)
+                                .unwrap_or_else(|_| "[]".to_string());
+                            let scoreboard_msg =
+                                serde_json::json!({"type": "uploadScoreboard", "data": data_json})
+                                    .to_string();
+                            let tab_msg =
+                                serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
+                            debug!(
+                                "[Startup] Sending uploadScoreboard to COFL: {:?}",
+                                scoreboard_lines
+                            );
                             let _ = ws.send_message(&scoreboard_msg).await;
                             debug!("[Startup] Sending uploadTab to COFL (empty)");
                             let _ = ws.send_message(&tab_msg).await;
-                            debug!("[Startup] Uploaded scoreboard ({} lines)", scoreboard_lines.len());
+                            debug!(
+                                "[Startup] Uploaded scoreboard ({} lines)",
+                                scoreboard_lines.len()
+                            );
                         });
                     }
                     // COFL now automatically sends bazaar flip recommendations based
@@ -1047,6 +2825,7 @@ async fn main() -> Result<()> {
                     {
                         let ws = ws_client_for_events.clone();
                         let max_items = config_for_events.max_items_in_inventory;
+                        let list_hours = config_for_events.auction_duration_hours;
                         tokio::spawn(async move {
                             // Small delay to let the socket settle after startup commands
                             sleep(Duration::from_secs(2)).await;
@@ -1055,11 +2834,25 @@ async fn main() -> Result<()> {
                             let msg = serde_json::json!({
                                 "type": "set",
                                 "data": data_json
-                            }).to_string();
+                            })
+                            .to_string();
                             if let Err(e) = ws.send_message(&msg).await {
-                                error!("[Startup] Failed to send /cofl set maxitemsininventory {}: {}", max_items, e);
+                                error!(
+                                    "[Startup] Failed to send /cofl set maxitemsininventory {}: {}",
+                                    max_items, e
+                                );
                             } else {
                                 info!("[Startup] Sent /cofl set maxitemsininventory {}", max_items);
+                            }
+                            // Push the configured listing duration to COFL so its
+                            // own listings (createAuction) use it. No-op on a
+                            // finder socket (set_list_hours checks is_finder).
+                            sleep(Duration::from_secs(1)).await;
+                            if let Err(e) = ws.set_list_hours(list_hours).await {
+                                error!(
+                                    "[Startup] Failed to send /cofl set listhours {}: {}",
+                                    list_hours, e
+                                );
                             }
                         });
                     }
@@ -1069,10 +2862,22 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let ah = config_for_events.enable_ah_flips;
                         let bz = config_for_events.enable_bazaar_flips;
-                        let conn_id = cofl_connection_id_events.lock().ok().and_then(|g| g.clone());
+                        let conn_id = cofl_connection_id_events
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone());
                         let premium = cofl_premium_events.lock().ok().and_then(|g| g.clone());
                         tokio::spawn(async move {
-                            twm::webhook::send_webhook_startup_complete(&name, orders_cancelled, ah, bz, conn_id.as_deref(), premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())), &url).await;
+                            twm::webhook::send_webhook_startup_complete(
+                                &name,
+                                orders_cancelled,
+                                ah,
+                                bz,
+                                conn_id.as_deref(),
+                                premium.as_ref().map(|(t, e)| (t.as_str(), e.as_str())),
+                                &url,
+                            )
+                            .await;
                         });
                     }
                     if config_for_events.execute_purse_webhook_enabled {
@@ -1087,15 +2892,23 @@ async fn main() -> Result<()> {
                     buy_speed_ms: event_buy_speed_ms,
                     ping_ms: event_ping_ms,
                     estimated_server_ack_ms: event_estimated_server_ack_ms,
+                    via_bed: event_via_bed,
                 } => {
                     // Send uploadScoreboard (with real data) and uploadTab to COFL
                     let ws = ws_client_for_events.clone();
                     let scoreboard_lines = bot_client_clone.get_scoreboard_lines();
                     tokio::spawn(async move {
-                        let data_json = serde_json::to_string(&scoreboard_lines).unwrap_or_else(|_| "[]".to_string());
-                        let scoreboard_msg = serde_json::json!({"type": "uploadScoreboard", "data": data_json}).to_string();
-                        let tab_msg = serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
-                        debug!("[ItemPurchased] Sending uploadScoreboard to COFL: {:?}", scoreboard_lines);
+                        let data_json = serde_json::to_string(&scoreboard_lines)
+                            .unwrap_or_else(|_| "[]".to_string());
+                        let scoreboard_msg =
+                            serde_json::json!({"type": "uploadScoreboard", "data": data_json})
+                                .to_string();
+                        let tab_msg =
+                            serde_json::json!({"type": "uploadTab", "data": "[]"}).to_string();
+                        debug!(
+                            "[ItemPurchased] Sending uploadScoreboard to COFL: {:?}",
+                            scoreboard_lines
+                        );
                         let _ = ws.send_message(&scoreboard_msg).await;
                         debug!("[ItemPurchased] Sending uploadTab to COFL (empty)");
                         let _ = ws.send_message(&tab_msg).await;
@@ -1118,26 +2931,50 @@ async fn main() -> Result<()> {
                     // Look up stored flip data and update with real buy price + purchase time.
                     // Also grab the color-coded item name from the flip for colorful output.
                     // Buy speed comes from the event (flip received → escrow message).
-                    let (opt_target, opt_profit, colored_name, opt_auction_uuid, opt_finder) = {
+                    // Exact pipeline timestamps (epoch ms): when the flip arrived over
+                    // the COFL socket and when the purchase completed (this event).
+                    let purchased_at_ms = chrono::Utc::now().timestamp_millis();
+                    let (
+                        opt_target,
+                        opt_profit,
+                        colored_name,
+                        opt_auction_uuid,
+                        opt_finder,
+                        opt_received_at_ms,
+                        opt_list_at,
+                    ) = {
                         let key = twm::utils::remove_minecraft_colors(&item_name).to_lowercase();
                         match flip_tracker_events.lock() {
                             Ok(mut tracker) => {
                                 if let Some(entry) = tracker.get_mut(&key) {
                                     entry.1 = price; // actual buy price
+                                                     // Receive time: entry.3 is the never-updated receive
+                                                     // Instant; convert to epoch by subtracting its age.
+                                    let received_at_ms =
+                                        purchased_at_ms - entry.3.elapsed().as_millis() as i64;
                                     entry.2 = Instant::now(); // purchase time
                                     let target = entry.0.target;
                                     let ah_fee = calculate_ah_fee(target);
-                                    let expected_profit = target as i64 - price as i64 - ah_fee as i64;
+                                    let expected_profit =
+                                        target as i64 - price as i64 - ah_fee as i64;
                                     let uuid = entry.0.uuid.clone();
                                     let finder = entry.0.finder.clone();
-                                    (Some(target), Some(expected_profit), entry.0.item_name.clone(), uuid, finder)
+                                    (
+                                        Some(target),
+                                        Some(expected_profit),
+                                        entry.0.item_name.clone(),
+                                        uuid,
+                                        finder,
+                                        Some(received_at_ms),
+                                        entry.0.list_at,
+                                    )
                                 } else {
-                                    (None, None, item_name.clone(), None, None)
+                                    (None, None, item_name.clone(), None, None, None, None)
                                 }
                             }
                             Err(e) => {
                                 warn!("Flip tracker lock failed at ItemPurchased: {}", e);
-                                (None, None, item_name.clone(), None, None)
+                                (None, None, item_name.clone(), None, None, None, None)
                             }
                         }
                     };
@@ -1155,70 +2992,234 @@ async fn main() -> Result<()> {
                             save_ah_purchase_ledger(&ah_purchase_ledger_writer_events, &ledger);
                         }
                     }
+                    // Finder-bought items: if COFL doesn't list the item itself (e.g.
+                    // running finder-only, or COFL has no data for it), request FRESH
+                    // pricing from the finder's inventory RPC and list from those
+                    // instructions — the flip's target-scaled listAt is deliberately
+                    // NOT used (the buy target is a conservative estimate; the sell
+                    // price is decided at listing time with live references, real
+                    // competition and the cost-basis floor — the single listing
+                    // logic). Only acts if the item is STILL in inventory after the
+                    // grace window; `opt_list_at` presence is just the "finder
+                    // listing enabled" signal (ws-config listingRecommendations).
+                    if opt_finder.as_deref() == Some("BAF_FINDER")
+                        && opt_list_at.filter(|&v| v > 0).is_some()
+                    {
+                        const COFL_LISTING_GRACE_SECS: u64 = 150;
+                        let bc = bot_client_clone.clone();
+                        let item = item_name.clone();
+                        let ws = ws_client_for_events.clone();
+                        let chat = chat_tx_events.clone();
+                        tokio::spawn(async move {
+                            sleep(Duration::from_secs(COFL_LISTING_GRACE_SECS)).await;
+                            // Listed already (by COFL or manually) → gone from inventory.
+                            let needle = twm::utils::remove_minecraft_colors(&item).to_lowercase();
+                            let still_held = bc
+                                .get_cached_inventory_json()
+                                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                                .and_then(|inv| {
+                                    inv.get("slots").and_then(|s| s.as_array()).map(|slots| {
+                                        slots.iter().any(|it| {
+                                            it.get("displayName")
+                                                .and_then(|v| v.as_str())
+                                                .map(|n| {
+                                                    twm::utils::remove_minecraft_colors(n)
+                                                        .to_lowercase()
+                                                        .contains(&needle)
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                })
+                                .unwrap_or(false);
+                            if !still_held {
+                                return;
+                            }
+                            info!("[FinderListing] \"{}\" still in inventory after {}s — requesting fresh finder pricing (inventory RPC)", item, COFL_LISTING_GRACE_SECS);
+                            let msg = format!(
+                                    "§f[§4BAF§f]: §b📋 §r{}§r §7still held — asking finder for a fresh listing price",
+                                    item
+                                );
+                            print_mc_chat(&msg);
+                            let _ = chat.send(msg);
+                            if let Some(inv) = bc.get_cached_inventory_json() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&inv) {
+                                    let items =
+                                        v.get("slots").cloned().unwrap_or(serde_json::json!([]));
+                                    if let Err(e) = ws.send_inventory(&items, true).await {
+                                        warn!("[FinderListing] inventory upload for pricing failed: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    // Report the buy to the backend with full purchase detail (the
+                    // all-flips channel renders it as a normal purchase webhook).
+                    backend_handle_events.report_purchase(
+                        &ingame_name_for_events,
+                        &item_name,
+                        price as i64,
+                        opt_target.map(|t| t as i64),
+                        opt_profit,
+                        event_buy_speed_ms,
+                        opt_finder.as_deref(),
+                        bot_client_clone.get_purse(),
+                        opt_auction_uuid.as_deref(),
+                        event_via_bed,
+                        opt_received_at_ms,
+                        Some(purchased_at_ms),
+                        // Opting out of sharing legendary flips also opts out of
+                        // the public cool-flips channel — both are public feeds.
+                        config_for_events.share_legendary_flips,
+                    );
+                    // Accumulate THEORETICAL AH profit at purchase time (target −
+                    // price − AH fee), i.e. what you'd net if it sold at the COFL
+                    // target. The panel/terminal/webhook show this instead of the
+                    // realized `/cofl profit` figure, matching the backend's
+                    // theoretical profit definition.
+                    if let Some(p) = opt_profit {
+                        profit_tracker_events.record_ah_profit(p);
+                    }
                     // Print colorful purchase announcement (item rarity shown via color code)
-                    let profit_str = opt_profit.map(|p| {
-                        let color = if p >= 0 { "§a" } else { "§c" };
-                        format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
-                    }).unwrap_or_default();
-                    let speed_str = event_buy_speed_ms
-                        .map(|ms| format!(" \u{00A7}7| Buy speed: \u{00A7}e{}ms\u{00A7}r", ms))
+                    let profit_str = opt_profit
+                        .map(|p| {
+                            let color = if p >= 0 { "§a" } else { "§c" };
+                            format!(" §7| Expected profit: {}{}§r", color, format_coins(p))
+                        })
                         .unwrap_or_default();
-                    let est_server_str = event_estimated_server_ack_ms
-                        .map(|ms| format!(" \u{00A7}7| Est. server: \u{00A7}b{}ms\u{00A7}r", ms))
+                    let kind_label = match event_via_bed {
+                        Some(true) => " §7(§dBed§7)§r",
+                        Some(false) => " §7(§6Nugget§7)§r",
+                        None => "",
+                    };
+                    let speed_str = event_buy_speed_ms
+                        .map(|ms| format!(" §7| Buy speed: §e{}ms{}§r", ms, kind_label))
                         .unwrap_or_default();
                     let baf_msg = format!(
-                        "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: \u{00A7}a\u{2726} PURCHASED \u{00A7}r{}\u{00A7}r \u{00A7}7for \u{00A7}6{}\u{00A7}7 coins!{}{}{}",
-                        colored_name, format_coins(price as i64), profit_str, speed_str, est_server_str
+                        "§f[§4BAF§f]: §a✦ PURCHASED §r{}§r §7for §6{}§7 coins!{}{}",
+                        colored_name,
+                        format_coins(price as i64),
+                        profit_str,
+                        speed_str
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
                     // Send webhook: for legendary/divine flips, send the styled
                     // webhook (with ping + color) instead of the regular purchase one.
-                    let is_legendary_flip = opt_profit.map_or(false, |p| p >= twm::webhook::LEGENDARY_PROFIT_THRESHOLD as i64);
+                    let is_legendary_flip = opt_profit
+                        .is_some_and(|p| p >= twm::webhook::LEGENDARY_PROFIT_THRESHOLD as i64);
+                    // No flip was tracked for this buy: no finder, no target, so
+                    // nothing to compute a profit from. That is what a hand-made
+                    // `/viewauction` purchase looks like from here.
+                    let is_unattributed_buy = opt_target.is_none() && opt_finder.is_none();
+                    if is_unattributed_buy {
+                        info!(
+                            "[ItemPurchased] \"{}\" for {} coins has no flip data — treating as a manual purchase",
+                            item_name, price
+                        );
+                    }
                     let opt_finder_for_flip = opt_finder.clone();
                     if is_legendary_flip {
-                        // Send to shared anonymous channel (if not opted out)
                         if let Some(profit) = opt_profit {
-                            if config_for_events.share_legendary_flips {
-                                let item_for_channel = item_name.clone();
-                                let finder_for_channel = opt_finder_for_flip.clone();
-                                tokio::spawn(async move {
-                                    twm::webhook::send_webhook_flip_channel(
-                                        &item_for_channel, price, opt_target, profit,
-                                        event_buy_speed_ms, finder_for_channel.as_deref(),
-                                    ).await;
-                                });
-                            }
-
-                            // Send legendary/divine styled webhook to user (replaces regular purchase webhook)
+                            // Send the legendary/divine styled webhook to the user's
+                            // personal webhook (if configured).
                             if let Some(webhook_url) = config_for_events.active_webhook_url() {
                                 let url = webhook_url.to_string();
                                 let name = ingame_name_for_events.clone();
                                 let item = item_name.clone();
-                                let did = config_for_events.active_discord_id().map(|s| s.to_string());
+                                let did =
+                                    config_for_events.active_discord_id().map(|s| s.to_string());
                                 let purse = bot_client_clone.get_purse();
                                 let uuid_str = opt_auction_uuid.clone();
                                 let finder = opt_finder_for_flip.clone();
                                 if profit >= twm::webhook::DIVINE_PROFIT_THRESHOLD as i64 {
                                     tokio::spawn(async move {
                                         twm::webhook::send_webhook_divine_flip(
-                                            &name, &item, price, opt_target, profit, purse,
-                                            event_buy_speed_ms, event_ping_ms, event_estimated_server_ack_ms,
-                                            uuid_str.as_deref(), finder.as_deref(),
-                                            did.as_deref(), &url,
-                                        ).await;
+                                            &name,
+                                            &item,
+                                            price,
+                                            opt_target,
+                                            profit,
+                                            purse,
+                                            event_buy_speed_ms,
+                                            event_ping_ms,
+                                            event_estimated_server_ack_ms,
+                                            event_via_bed,
+                                            uuid_str.as_deref(),
+                                            finder.as_deref(),
+                                            did.as_deref(),
+                                            opt_received_at_ms,
+                                            Some(purchased_at_ms),
+                                            &url,
+                                        )
+                                        .await;
                                     });
                                 } else {
                                     tokio::spawn(async move {
                                         twm::webhook::send_webhook_legendary_flip(
-                                            &name, &item, price, opt_target, profit, purse,
-                                            event_buy_speed_ms, event_ping_ms, event_estimated_server_ack_ms,
-                                            uuid_str.as_deref(), finder.as_deref(),
-                                            did.as_deref(), &url,
-                                        ).await;
+                                            &name,
+                                            &item,
+                                            price,
+                                            opt_target,
+                                            profit,
+                                            purse,
+                                            event_buy_speed_ms,
+                                            event_ping_ms,
+                                            event_estimated_server_ack_ms,
+                                            event_via_bed,
+                                            uuid_str.as_deref(),
+                                            finder.as_deref(),
+                                            did.as_deref(),
+                                            opt_received_at_ms,
+                                            Some(purchased_at_ms),
+                                            &url,
+                                        )
+                                        .await;
                                     });
                                 }
                             }
+                            // Notify the shared public channel only if the user opted
+                            // in via `share_legendary_flips` (honoured here rather than
+                            // always-on inside the webhook helper).
+                            if config_for_events.share_legendary_flips {
+                                let item_for_channel = item_name.clone();
+                                let finder_for_channel = opt_finder_for_flip.clone();
+                                tokio::spawn(async move {
+                                    twm::webhook::send_webhook_flip_channel(
+                                        &item_for_channel,
+                                        price,
+                                        opt_target,
+                                        profit,
+                                        event_buy_speed_ms,
+                                        finder_for_channel.as_deref(),
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                    } else if is_unattributed_buy {
+                        // Bought outside the flip pipeline — a `/viewauction`
+                        // purchase done by hand is the usual case. The ordinary
+                        // purchase embed would render it as a flip with every
+                        // field blank, so it gets its own one.
+                        if let Some(webhook_url) = config_for_events.active_webhook_url() {
+                            let url = webhook_url.to_string();
+                            let name = ingame_name_for_events.clone();
+                            let item = item_name.clone();
+                            let purse = bot_client_clone.get_purse();
+                            let uuid_str = opt_auction_uuid.clone();
+                            tokio::spawn(async move {
+                                twm::webhook::send_webhook_manual_purchase(
+                                    &name,
+                                    &item,
+                                    price,
+                                    purse,
+                                    event_buy_speed_ms,
+                                    uuid_str.as_deref(),
+                                    &url,
+                                )
+                                .await;
+                            });
                         }
                     } else {
                         // Regular purchase webhook for non-legendary flips
@@ -1230,15 +3231,33 @@ async fn main() -> Result<()> {
                             let uuid_str = opt_auction_uuid.clone();
                             tokio::spawn(async move {
                                 twm::webhook::send_webhook_item_purchased(
-                                    &name, &item, price, opt_target, opt_profit, purse,
-                                    event_buy_speed_ms, event_ping_ms, event_estimated_server_ack_ms,
-                                    uuid_str.as_deref(), opt_finder.as_deref(), &url,
-                                ).await;
+                                    &name,
+                                    &item,
+                                    price,
+                                    opt_target,
+                                    opt_profit,
+                                    purse,
+                                    event_buy_speed_ms,
+                                    event_ping_ms,
+                                    event_estimated_server_ack_ms,
+                                    event_via_bed,
+                                    uuid_str.as_deref(),
+                                    opt_finder.as_deref(),
+                                    opt_received_at_ms,
+                                    Some(purchased_at_ms),
+                                    &url,
+                                )
+                                .await;
                             });
                         }
                     }
                 }
-                twm::bot::BotEvent::ItemSold { item_name, price, buyer, auction_uuid } => {
+                twm::bot::BotEvent::ItemSold {
+                    item_name,
+                    price,
+                    buyer,
+                    auction_uuid,
+                } => {
                     command_queue_clone.enqueue(
                         twm::types::CommandType::ClaimSoldItem,
                         twm::types::CommandPriority::High,
@@ -1253,7 +3272,8 @@ async fn main() -> Result<()> {
                                     let (flip, buy_price, purchase_time, _receive_time) = entry;
                                     if buy_price > 0 {
                                         let ah_fee = calculate_ah_fee(price);
-                                        let profit = price as i64 - buy_price as i64 - ah_fee as i64;
+                                        let profit =
+                                            price as i64 - buy_price as i64 - ah_fee as i64;
                                         let time_secs = purchase_time.elapsed().as_secs();
                                         (Some(profit), Some(buy_price), Some(time_secs), flip.uuid)
                                     } else {
@@ -1262,27 +3282,43 @@ async fn main() -> Result<()> {
                                 } else {
                                     match ah_purchase_ledger_events.lock() {
                                         Ok(mut ledger) => {
-                                            let ledger_key = ah_purchase_ledger_key(&item_name, auction_uuid.as_deref());
-                                            let fallback_name_key = ah_purchase_ledger_key(&item_name, None);
-                                            if let Some(entry) = ledger.remove(&ledger_key).or_else(|| {
-                                                if ledger_key != fallback_name_key {
-                                                    ledger.remove(&fallback_name_key)
-                                                } else {
-                                                    None
-                                                }
-                                            }) {
-                                                if let Some(original_uuid) = entry.auction_uuid.as_deref() {
-                                                    let original_uuid_key =
-                                                        ah_purchase_ledger_key(&item_name, Some(original_uuid));
+                                            let ledger_key = ah_purchase_ledger_key(
+                                                &item_name,
+                                                auction_uuid.as_deref(),
+                                            );
+                                            let fallback_name_key =
+                                                ah_purchase_ledger_key(&item_name, None);
+                                            if let Some(entry) =
+                                                ledger.remove(&ledger_key).or_else(|| {
+                                                    if ledger_key != fallback_name_key {
+                                                        ledger.remove(&fallback_name_key)
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                            {
+                                                if let Some(original_uuid) =
+                                                    entry.auction_uuid.as_deref()
+                                                {
+                                                    let original_uuid_key = ah_purchase_ledger_key(
+                                                        &item_name,
+                                                        Some(original_uuid),
+                                                    );
                                                     if original_uuid_key != ledger_key {
                                                         ledger.remove(&original_uuid_key);
                                                     }
                                                 }
                                                 ledger.remove(&fallback_name_key);
-                                                save_ah_purchase_ledger(&ah_purchase_ledger_writer_events, &ledger);
+                                                save_ah_purchase_ledger(
+                                                    &ah_purchase_ledger_writer_events,
+                                                    &ledger,
+                                                );
                                                 let ah_fee = calculate_ah_fee(price);
-                                                let profit = price as i64 - entry.buy_price as i64 - ah_fee as i64;
-                                                let time_secs = unix_now().saturating_sub(entry.purchased_at_unix);
+                                                let profit = price as i64
+                                                    - entry.buy_price as i64
+                                                    - ah_fee as i64;
+                                                let time_secs = unix_now()
+                                                    .saturating_sub(entry.purchased_at_unix);
                                                 (
                                                     Some(profit),
                                                     Some(entry.buy_price),
@@ -1294,7 +3330,10 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("AH purchase ledger lock failed at ItemSold: {}", e);
+                                            warn!(
+                                                "AH purchase ledger lock failed at ItemSold: {}",
+                                                e
+                                            );
                                             (None, None, None, None)
                                         }
                                     }
@@ -1311,15 +3350,12 @@ async fn main() -> Result<()> {
                         let fallback_name_key = ah_purchase_ledger_key(&item_name, None);
                         if let Ok(mut ledger) = ah_purchase_ledger_events.lock() {
                             let removed = ledger.remove(&key).is_some()
-                                || (key != fallback_name_key && ledger.remove(&fallback_name_key).is_some());
+                                || (key != fallback_name_key
+                                    && ledger.remove(&fallback_name_key).is_some());
                             if removed {
                                 save_ah_purchase_ledger(&ah_purchase_ledger_writer_events, &ledger);
                             }
                         }
-                    }
-                    // Record realized AH profit
-                    if let Some(profit) = opt_profit {
-                        profit_tracker_events.record_ah_profit(profit);
                     }
                     // Append to in-memory flip history for the web panel.
                     if let (Some(profit), Some(buy_price), Some(time_secs)) =
@@ -1342,19 +3378,35 @@ async fn main() -> Result<()> {
                             }
                             // Persist after every change so the panel survives a
                             // restart with the full set of realised flips intact.
-                            let snapshot: Vec<FlipHistoryEntry> =
-                                history.iter().cloned().collect();
+                            let snapshot: Vec<FlipHistoryEntry> = history.iter().cloned().collect();
                             flip_history_writer_events.schedule(snapshot);
                         }
                     }
+                    // NOTE: AH profit is now accumulated as THEORETICAL at purchase
+                    // time (see ItemPurchased), so we no longer add realized profit
+                    // here — doing so would double-count each flip.
+                    backend_handle_events.report_event(
+                        "sell",
+                        &ingame_name_for_events,
+                        Some(&item_name),
+                        None,
+                        Some(price as i64),
+                        opt_profit,
+                        false,
+                    );
                     // Print colorful sold announcement
-                    let profit_str = opt_profit.map(|p| {
-                        let color = if p >= 0 { "§a" } else { "§c" };
-                        format!(" §7| Profit: {}{}§r", color, format_coins(p))
-                    }).unwrap_or_default();
+                    let profit_str = opt_profit
+                        .map(|p| {
+                            let color = if p >= 0 { "§a" } else { "§c" };
+                            format!(" §7| Profit: {}{}§r", color, format_coins(p))
+                        })
+                        .unwrap_or_default();
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6⚡ SOLD §r{} §7to §e{}§7 for §6{}§7 coins!{}",
-                        item_name, buyer, format_coins(price as i64), profit_str
+                        item_name,
+                        buyer,
+                        format_coins(price as i64),
+                        profit_str
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -1371,9 +3423,18 @@ async fn main() -> Result<()> {
                             let uuid_str = opt_auction_uuid.clone();
                             tokio::spawn(async move {
                                 twm::webhook::send_webhook_item_sold(
-                                    &name, &item, price, &b, opt_profit, opt_buy_price,
-                                    opt_time_secs, purse, uuid_str.as_deref(), &url,
-                                ).await;
+                                    &name,
+                                    &item,
+                                    price,
+                                    &b,
+                                    opt_profit,
+                                    opt_buy_price,
+                                    opt_time_secs,
+                                    purse,
+                                    uuid_str.as_deref(),
+                                    &url,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -1382,7 +3443,9 @@ async fn main() -> Result<()> {
                     // the session window so the tracker stays in sync with Coflnet.
                     // Skip if session is too short for meaningful data (< ~15 min).
                     {
-                        let days = (prev_secs_events as f64 + session_start.elapsed().as_secs_f64()) / SECS_PER_DAY;
+                        let days = (prev_secs_events as f64
+                            + session_start.elapsed().as_secs_f64())
+                            / SECS_PER_DAY;
                         if days >= 0.01 {
                             let ign = ingame_name_for_events.clone();
                             let args = format!("{} {:.4}", ign, days);
@@ -1390,11 +3453,15 @@ async fn main() -> Result<()> {
                             let message = serde_json::json!({
                                 "type": "profit",
                                 "data": data_json
-                            }).to_string();
+                            })
+                            .to_string();
                             let ws = ws_client_for_events.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = ws.send_message(&message).await {
-                                    tracing::warn!("[CoflProfit] Failed to send /cofl profit: {}", e);
+                                    tracing::warn!(
+                                        "[CoflProfit] Failed to send /cofl profit: {}",
+                                        e
+                                    );
                                 }
                             });
                         }
@@ -1414,13 +3481,17 @@ async fn main() -> Result<()> {
                                 let upload_msg = serde_json::json!({
                                     "type": "uploadInventory",
                                     "data": inv_json
-                                }).to_string();
+                                })
+                                .to_string();
                                 let _ = ws_si.send_message(&upload_msg).await;
+                                // Let COFL ingest the uploaded inventory before selling.
+                                tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
                             }
                             let msg = serde_json::json!({
                                 "type": "sellinventory",
                                 "data": serde_json::to_string("").unwrap_or_default()
-                            }).to_string();
+                            })
+                            .to_string();
                             if let Err(e) = ws_si.send_message(&msg).await {
                                 tracing::warn!("[SellInventory] Failed to auto-request sellinventory after auction sale: {}", e);
                             } else {
@@ -1429,27 +3500,50 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                twm::bot::BotEvent::BazaarOrderPlaced { item_name, amount, price_per_unit, is_buy_order } => {
+                twm::bot::BotEvent::BazaarOrderPlaced {
+                    item_name,
+                    amount,
+                    price_per_unit,
+                    is_buy_order,
+                } => {
+                    backend_handle_events.report_event(
+                        "order_placed",
+                        &ingame_name_for_events,
+                        Some(&item_name),
+                        Some(amount),
+                        Some(price_per_unit as i64),
+                        None,
+                        true,
+                    );
                     // Track the order for the web panel and profit calculation on collect.
-                    bazaar_tracker_events.add_order(item_name.clone(), amount, price_per_unit, is_buy_order);
-                    let (order_color, order_type) = if is_buy_order { ("§a", "BUY") } else { ("§c", "SELL") };
+                    bazaar_tracker_events.add_order(
+                        item_name.clone(),
+                        amount,
+                        price_per_unit,
+                        is_buy_order,
+                    );
+                    let (order_color, order_type) = if is_buy_order {
+                        ("§a", "BUY")
+                    } else {
+                        ("§c", "SELL")
+                    };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order placed: {}x {} @ §6{}§7 coins/unit",
-                        order_color, order_type, amount, item_name, format_coins_f64(price_per_unit)
+                        order_color,
+                        order_type,
+                        amount,
+                        item_name,
+                        format_coins_f64(price_per_unit)
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
-                        let url = webhook_url.to_string();
-                        let name = ingame_name_for_events.clone();
-                        let item = item_name.clone();
-                        let total = price_per_unit * amount as f64;
-                        let purse = bot_client_clone.get_purse();
-                        tokio::spawn(async move {
-                            twm::webhook::send_webhook_bazaar_order_placed(
-                                &name, &item, amount, price_per_unit, total, is_buy_order, purse, &url,
-                            ).await;
-                        });
+                    if config_for_events.active_bazaar_webhook_url().is_some() {
+                        // Batched into the periodic bazaar digest (see
+                        // spawn_bazaar_digest_flusher) instead of one embed per order.
+                        twm::webhook::digest_order_placed(
+                            is_buy_order,
+                            bot_client_clone.get_purse(),
+                        );
                     }
                 }
                 twm::bot::BotEvent::AuctionListed {
@@ -1458,12 +3552,23 @@ async fn main() -> Result<()> {
                     duration_hours,
                     expected_profit,
                 } => {
+                    backend_handle_events.report_event(
+                        "list",
+                        &ingame_name_for_events,
+                        Some(&item_name),
+                        None,
+                        Some(starting_bid as i64),
+                        None,
+                        false,
+                    );
                     // Reset the idle-inventory timer so the 30-minute failsafe doesn't fire
                     // while items are being actively listed.
                     *last_auction_listed_at_events.lock().unwrap() = Instant::now();
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §a🏷️ BIN listed: §r{} §7@ §6{}§7 coins for §e{}h",
-                        item_name, format_coins(starting_bid as i64), duration_hours
+                        item_name,
+                        format_coins(starting_bid as i64),
+                        duration_hours
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -1472,17 +3577,32 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
+                        let active_listings = bot_client_clone.active_auction_count();
                         tokio::spawn(async move {
                             twm::webhook::send_webhook_auction_listed(
-                                &name, &item, starting_bid, duration_hours, expected_profit, purse, &url,
-                            ).await;
+                                twm::webhook::AuctionListedNotice {
+                                    ingame_name: &name,
+                                    item_name: &item,
+                                    starting_bid,
+                                    duration_hours,
+                                    expected_profit,
+                                    purse,
+                                    active_listings,
+                                    webhook_url: &url,
+                                },
+                            )
+                            .await;
                         });
                     }
                 }
-                twm::bot::BotEvent::AuctionCancelled { item_name, starting_bid } => {
+                twm::bot::BotEvent::AuctionCancelled {
+                    item_name,
+                    starting_bid,
+                } => {
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §c❌ Auction cancelled: §r{} §7@ §6{}§7 coins",
-                        item_name, format_coins(starting_bid as i64)
+                        item_name,
+                        format_coins(starting_bid as i64)
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
@@ -1491,14 +3611,49 @@ async fn main() -> Result<()> {
                         let name = ingame_name_for_events.clone();
                         let item = item_name.clone();
                         let purse = bot_client_clone.get_purse();
+                        let remaining_listings = bot_client_clone.active_auction_count();
                         tokio::spawn(async move {
                             twm::webhook::send_webhook_auction_cancelled(
-                                &name, &item, starting_bid, purse, &url,
-                            ).await;
+                                &name,
+                                &item,
+                                starting_bid,
+                                purse,
+                                remaining_listings,
+                                &url,
+                            )
+                            .await;
                         });
                     }
                 }
-                twm::bot::BotEvent::BazaarOrderCollected { item_name, is_buy_order, claimed_amount } => {
+                twm::bot::BotEvent::AuctionRefusedStacked { item_name, count } => {
+                    let now = std::time::Instant::now();
+                    let due = !last_stacked_warn
+                        .get(&item_name)
+                        .is_some_and(|t| now.duration_since(*t) < STACKED_WARN_COOLDOWN);
+                    if due {
+                        last_stacked_warn.insert(item_name.clone(), now);
+                        let baf_msg = format!(
+                            "§f[§4BAF§f]: §eWon't list §f{}§e — {}x stacked in one slot, price is for 1. Unstack it.",
+                            item_name, count
+                        );
+                        print_mc_chat(&baf_msg);
+                        let _ = chat_tx_events.send(baf_msg);
+                    }
+                }
+                twm::bot::BotEvent::BazaarOrderCollected {
+                    item_name,
+                    is_buy_order,
+                    claimed_amount,
+                } => {
+                    backend_handle_events.report_event(
+                        "order_collected",
+                        &ingame_name_for_events,
+                        Some(&item_name),
+                        claimed_amount,
+                        None,
+                        None,
+                        true,
+                    );
                     // Remove from tracker.
                     let order_data = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
                     // Determine the actual quantity collected.  `claimed_amount` is
@@ -1513,9 +3668,15 @@ async fn main() -> Result<()> {
                         // Only record cost for the actually claimed quantity — a partial fill
                         // should not inflate the buy cost with the unfilled remainder.
                         if is_buy_order {
-                            bazaar_tracker_events.record_buy_cost(&item_name, order.price_per_unit, actual_amount);
-                            info!("[BazaarProfit] Recorded buy cost for {} — {} x {:.0} coins/unit",
-                                item_name, actual_amount, order.price_per_unit);
+                            bazaar_tracker_events.record_buy_cost(
+                                &item_name,
+                                order.price_per_unit,
+                                actual_amount,
+                            );
+                            info!(
+                                "[BazaarProfit] Recorded buy cost for {} — {} x {:.0} coins/unit",
+                                item_name, actual_amount, order.price_per_unit
+                            );
                         }
                     } else {
                         debug!("[BazaarProfit] No tracked order for collected {} {} (may be from a previous session)",
@@ -1536,7 +3697,9 @@ async fn main() -> Result<()> {
                             let sell_total = sell_order.price_per_unit * actual_amount as f64;
                             let tax = sell_total * (bazaar_tax_rate / 100.0);
                             let sell_after_tax = sell_total - tax;
-                            if let Some((buy_ppu, _buy_amt)) = bazaar_tracker_events.take_buy_cost(&item_name) {
+                            if let Some((buy_ppu, _buy_amt)) =
+                                bazaar_tracker_events.take_buy_cost(&item_name)
+                            {
                                 // Use per-unit buy cost × actual sold quantity, NOT
                                 // buy_ppu × total_buy_amount.  This correctly handles
                                 // partial sells (e.g. sold 21 of 64 bought).
@@ -1547,7 +3710,9 @@ async fn main() -> Result<()> {
                                 info!("[BazaarProfit] SELL {} — {} units, sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0} ({:.0}/ea), profit: {}",
                                     item_name, actual_amount, sell_total, tax, bazaar_tax_rate, buy_total, buy_ppu, profit);
                                 Some(profit)
-                            } else if let Some(bz_list_profit) = bazaar_tracker_events.get_bz_list_profit(&item_name) {
+                            } else if let Some(bz_list_profit) =
+                                bazaar_tracker_events.get_bz_list_profit(&item_name)
+                            {
                                 // Fallback: use profit from /cofl bz l for this item
                                 info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no local buy cost, using /cofl bz l profit: {}",
                                     item_name, sell_total, tax, bz_list_profit);
@@ -1567,37 +3732,48 @@ async fn main() -> Result<()> {
                         None
                     };
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
-                    info!("[BazaarOrders] Order collected: {} ({}) x{}", item_name, order_type, actual_amount);
+                    info!(
+                        "[BazaarOrders] Order collected: {} ({}) x{}",
+                        item_name, order_type, actual_amount
+                    );
                     // Build the collection message with prices and optional profit.
                     // Use actual_amount (from lore) instead of the tracker's original
                     // order amount so partial fills display correctly (e.g. "1x" not "4x").
                     let price_info = if let Some(ref order) = order_data {
                         let total = order.price_per_unit * actual_amount as f64;
-                        format!(" §7({}x @ §6{}§7 = §6{}§7 coins)",
+                        format!(
+                            " §7({}x @ §6{}§7 = §6{}§7 coins)",
                             actual_amount,
                             format_coins_f64(order.price_per_unit),
-                            format_coins_f64(total))
+                            format_coins_f64(total)
+                        )
                     } else {
                         String::new()
                     };
                     let profit_info = if let Some(profit) = opt_profit {
-                        let (color, sign) = if profit >= 0 { ("§a", "+") } else { ("§c", "") };
+                        let (color, sign) = if profit >= 0 {
+                            ("§a", "+")
+                        } else {
+                            ("§c", "")
+                        };
                         format!(" §7→ {}{}{}§7 profit", color, sign, format_coins(profit))
                     } else {
                         String::new()
                     };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §a✅ [BZ] {}§7 order collected: §r{}{}{}",
-                        if is_buy_order { "BUY" } else { "SELL" }, item_name, price_info, profit_info
+                        if is_buy_order { "BUY" } else { "SELL" },
+                        item_name,
+                        price_info,
+                        profit_info
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    // Send bazaar legendary flip to public channel (100M+ profit on SELL)
-                    if !is_buy_order {
+                    // Send bazaar legendary flip to public channel (100M+ profit on SELL),
+                    // only if the user opted in via `share_legendary_flips`.
+                    if !is_buy_order && config_for_events.share_legendary_flips {
                         if let Some(profit) = opt_profit {
-                            if profit >= twm::webhook::LEGENDARY_PROFIT_THRESHOLD as i64
-                                && config_for_events.share_legendary_flips
-                            {
+                            if profit >= twm::webhook::LEGENDARY_PROFIT_THRESHOLD as i64 {
                                 let item_for_channel = item_name.clone();
                                 let channel_amount = actual_amount;
                                 let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
@@ -1607,31 +3783,19 @@ async fn main() -> Result<()> {
                                         channel_amount,
                                         opt_ppu.unwrap_or(0.0),
                                         profit,
-                                    ).await;
+                                    )
+                                    .await;
                                 });
                             }
                         }
                     }
-                    if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
-                        let url = webhook_url.to_string();
-                        let name = ingame_name_for_events.clone();
-                        let item = item_name.clone();
-                        let purse = bot_client_clone.get_purse();
-                        // Use actual_amount (from lore) so the webhook reflects
-                        // the real claimed quantity, not the original order size.
-                        // actual_amount is 0 only when both claimed_amount (lore
-                        // parsing) and the tracker had no data — fall back to the
-                        // tracker's original order amount so the webhook still
-                        // shows *something* rather than "0x".
-                        let webhook_amount = if actual_amount > 0 { Some(actual_amount) } else { order_data.as_ref().map(|o| o.amount) };
-                        let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
-                        tokio::spawn(async move {
-                            twm::webhook::send_webhook_bazaar_order_collected(
-                                &name, &item, is_buy_order,
-                                webhook_amount, opt_ppu,
-                                opt_profit, purse, &url,
-                            ).await;
-                        });
+                    if config_for_events.active_bazaar_webhook_url().is_some() {
+                        // Batched into the periodic bazaar digest (net profit is
+                        // summed there) instead of one embed per collected order.
+                        twm::webhook::digest_order_collected(
+                            opt_profit,
+                            bot_client_clone.get_purse(),
+                        );
                     }
                     // After collecting a SELL order, request `/cofl bz h` for
                     // authoritative BZ session profit.  A few seconds' delay gives
@@ -1642,15 +3806,20 @@ async fn main() -> Result<()> {
                         let ss_bz_h = session_start;
                         let prev_bz_h = prev_secs_events;
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS + BZ_PROFIT_QUERY_EXTRA_DELAY_SECS)).await;
-                            let days = (prev_bz_h as f64 + ss_bz_h.elapsed().as_secs_f64()) / SECS_PER_DAY;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                BZ_LIST_REQUEST_DELAY_SECS + BZ_PROFIT_QUERY_EXTRA_DELAY_SECS,
+                            ))
+                            .await;
+                            let days =
+                                (prev_bz_h as f64 + ss_bz_h.elapsed().as_secs_f64()) / SECS_PER_DAY;
                             if days >= 0.01 {
                                 let args = format!("h {} {:.4}", ign_bz_h, days);
                                 let data_json = serde_json::json!(args).to_string();
                                 let message = serde_json::json!({
                                     "type": "bz",
                                     "data": data_json
-                                }).to_string();
+                                })
+                                .to_string();
                                 if let Err(e) = ws_bz_h.send_message(&message).await {
                                     tracing::warn!("[CoflBzH] Failed to send /cofl bz h after SELL collect: {}", e);
                                 } else {
@@ -1660,7 +3829,11 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
-                twm::bot::BotEvent::BazaarOrderCancelled { item_name, is_buy_order, already_collected } => {
+                twm::bot::BotEvent::BazaarOrderCancelled {
+                    item_name,
+                    is_buy_order,
+                    already_collected,
+                } => {
                     // When already_collected is true, a BazaarOrderCollected event
                     // already removed this order from the tracker (partial collect
                     // followed by cancel of the unfilled remainder).  Calling
@@ -1672,39 +3845,41 @@ async fn main() -> Result<()> {
                         None
                     };
                     let order_type = if is_buy_order { "BUY" } else { "SELL" };
-                    info!("[BazaarOrders] Order cancelled: {} ({})", item_name, order_type);
+                    info!(
+                        "[BazaarOrders] Order cancelled: {} ({})",
+                        item_name, order_type
+                    );
                     // Include amount and price in the cancel message so the user knows
                     // exactly which order was cancelled, not just the item name.
                     let detail_str = if let Some(ref order) = order_data {
                         let total = order.price_per_unit * order.amount as f64;
-                        format!(" §7({}x @ §6{}§7 = §6{}§7 coins)",
+                        format!(
+                            " §7({}x @ §6{}§7 = §6{}§7 coins)",
                             order.amount,
                             format_coins_f64(order.price_per_unit),
-                            format_coins_f64(total))
+                            format_coins_f64(total)
+                        )
                     } else {
                         String::new()
                     };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §c🚫 [BZ] {}§7 order cancelled: §r{}{}",
-                        if is_buy_order { "BUY" } else { "SELL" }, item_name, detail_str
+                        if is_buy_order { "BUY" } else { "SELL" },
+                        item_name,
+                        detail_str
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_events.send(baf_msg);
-                    if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
-                        let url = webhook_url.to_string();
-                        let name = ingame_name_for_events.clone();
-                        let item = item_name.clone();
-                        let purse = bot_client_clone.get_purse();
-                        let opt_amount = order_data.as_ref().map(|o| o.amount);
-                        let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
-                        tokio::spawn(async move {
-                            twm::webhook::send_webhook_bazaar_order_cancelled(
-                                &name, &item, is_buy_order, opt_amount, opt_ppu, purse, &url,
-                            ).await;
-                        });
+                    if config_for_events.active_bazaar_webhook_url().is_some() {
+                        // Batched into the periodic bazaar digest instead of one
+                        // embed per cancelled order.
+                        twm::webhook::digest_order_cancelled(bot_client_clone.get_purse());
                     }
                 }
-                twm::bot::BotEvent::BazaarOrderFilled { item_name, is_buy_order } => {
+                twm::bot::BotEvent::BazaarOrderFilled {
+                    item_name,
+                    is_buy_order,
+                } => {
                     // Mark the order as filled in the tracker so the periodic timer
                     // can skip ManageOrders when nothing needs collection.
                     if !item_name.is_empty() {
@@ -1722,31 +3897,43 @@ async fn main() -> Result<()> {
                         let prev_secs = prev_secs_events;
                         tokio::spawn(async move {
                             // Small delay to let Coflnet register the completed flip.
-                            tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_REQUEST_DELAY_SECS)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                BZ_LIST_REQUEST_DELAY_SECS,
+                            ))
+                            .await;
                             let data_json = serde_json::json!("l").to_string();
                             let message = serde_json::json!({
                                 "type": "bz",
                                 "data": data_json
-                            }).to_string();
+                            })
+                            .to_string();
                             if let Err(e) = ws.send_message(&message).await {
                                 tracing::warn!("[BZList] Failed to send /cofl bz l: {}", e);
                             } else {
-                                tracing::info!("[BZList] Auto-requested /cofl bz l after SELL fill");
+                                tracing::info!(
+                                    "[BZList] Auto-requested /cofl bz l after SELL fill"
+                                );
                             }
                             // Also request `/cofl bz h <ign> <days>` for authoritative
                             // BZ session profit (same as AH `/cofl profit`).
-                            let days = (prev_secs as f64 + ss.elapsed().as_secs_f64()) / SECS_PER_DAY;
+                            let days =
+                                (prev_secs as f64 + ss.elapsed().as_secs_f64()) / SECS_PER_DAY;
                             if days >= 0.01 {
                                 let args = format!("h {} {:.4}", ign, days);
                                 let data_json = serde_json::json!(args).to_string();
                                 let message = serde_json::json!({
                                     "type": "bz",
                                     "data": data_json
-                                }).to_string();
+                                })
+                                .to_string();
                                 if let Err(e) = ws2.send_message(&message).await {
                                     tracing::warn!("[CoflBzH] Failed to send /cofl bz h: {}", e);
                                 } else {
-                                    tracing::info!("[CoflBzH] Auto-requested /cofl bz h {} {:.4}", ign, days);
+                                    tracing::info!(
+                                        "[CoflBzH] Auto-requested /cofl bz h {} {:.4}",
+                                        ign,
+                                        days
+                                    );
                                 }
                             }
                         });
@@ -1770,7 +3957,10 @@ async fn main() -> Result<()> {
                         } else {
                             info!("[BazaarOrders] Order filled — queuing ManageOrders");
                             command_queue_clone.enqueue(
-                                twm::types::CommandType::ManageOrders { cancel_open: false },
+                                twm::types::CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: None,
+                                },
                                 twm::types::CommandPriority::High,
                                 true,
                             );
@@ -1795,13 +3985,15 @@ async fn main() -> Result<()> {
     let ws_client_clone = ws_client.clone();
     let bot_client_for_ws = bot_client.clone();
     let bazaar_flips_paused_ws = bazaar_flips_paused.clone();
-    let bazaar_pause_generation_ws = bazaar_pause_generation.clone();
+    let bazaar_pause_until_ws = bazaar_pause_until.clone();
     let flip_tracker_ws = flip_tracker.clone();
     let cofl_connection_id_ws = cofl_connection_id.clone();
     let cofl_premium_ws = cofl_premium.clone();
     let enable_ah_flips_ws = enable_ah_flips.clone();
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
     let skip_flips_when_inv_full_ws = skip_flips_when_inventory_full.clone();
+    let flip_intake_paused_ws = flip_intake_paused.clone();
+    let flip_diag_ws = flip_diag.clone();
     let chat_tx_ws = chat_tx.clone();
     let detected_cofl_license_ws = detected_cofl_license.clone();
     let cofl_authenticated_ws = cofl_authenticated.clone();
@@ -1810,8 +4002,6 @@ async fn main() -> Result<()> {
     let ingame_name_ws = ingame_name.clone();
     let bazaar_tracker_ws = bazaar_tracker.clone();
     let profit_tracker_ws = profit_tracker.clone();
-    let deferred_ah_flips_ws: Arc<Mutex<VecDeque<(Instant, Flip)>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
     // Accumulator for `/cofl bz l` output: (total_profit, flip_count, last_update).
     // Reset when "Last Completed Bazaar Flips" header is seen; each parsed flip
     // line adds to the total.  A debounce task displays the summary after 2s idle.
@@ -1821,81 +4011,91 @@ async fn main() -> Result<()> {
     // for per-order profit when local buy-cost tracking has no data.
     let bz_list_items: Arc<std::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let deferred_ah_flips_retry = deferred_ah_flips_ws.clone();
-    let command_queue_deferred = command_queue.clone();
-    let bot_client_deferred = bot_client.clone();
-    let enable_ah_flips_deferred = enable_ah_flips.clone();
-    let skip_flips_when_inv_full_deferred = skip_flips_when_inventory_full.clone();
-    let cofl_authenticated_deferred = cofl_authenticated.clone();
-    let chat_tx_deferred = chat_tx.clone();
     tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_millis(DEFERRED_AH_FLIP_RETRY_MS)).await;
-
-            if !enable_ah_flips_deferred.load(Ordering::Relaxed)
-                || !cofl_authenticated_deferred.load(Ordering::Relaxed)
-                || bot_client_deferred.is_startup_in_progress()
-                || !bot_client_deferred.state().allows_commands()
-                || (skip_flips_when_inv_full_deferred.load(Ordering::Relaxed)
-                    && bot_client_deferred.is_inventory_full())
-                || command_queue_deferred.has_purchase_auction()
-            {
-                continue;
-            }
-
-            let maybe_flip = {
-                let mut held = deferred_ah_flips_retry.lock().unwrap();
-                let now = Instant::now();
-                while let Some((queued_at, _)) = held.front() {
-                    if now.duration_since(*queued_at).as_millis() as u64 > DEFERRED_AH_FLIP_TTL_MS {
-                        held.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                held.pop_front().map(|(_, flip)| flip)
-            };
-
-            if let Some(flip) = maybe_flip {
-                let item_name = flip.item_name.clone();
-                command_queue_deferred.enqueue(
-                    twm::types::CommandType::PurchaseAuction { flip },
-                    twm::types::CommandPriority::Critical,
-                    false,
-                );
-                let baf_msg = format!(
-                    "Â§f[Â§4BAFÂ§f]: Â§bRe-queued held flip after busy window: Â§r{}",
-                    item_name
-                );
-                print_mc_chat(&baf_msg);
-                let _ = chat_tx_deferred.send(baf_msg);
-            }
-        }
-    });
-    
-    tokio::spawn(async move {
+        use twm::types::{CommandPriority, CommandType};
         use twm::websocket::CoflEvent;
-        use twm::types::{CommandType, CommandPriority};
 
         while let Some(event) = ws_rx.recv().await {
+            // Self-heal the auth latch. COFL_LOGGED_IN is the global truth and is
+            // stored BEFORE the Authenticated event is queued, so if it is set the
+            // session IS authenticated even if the event never reached this loop
+            // (e.g. emitted by a multisocket secondary whose forwarder dropped it).
+            // Latch here so a lost event can never wedge the bot into dropping
+            // every COFL flip while the drop's own diagnostic line reports
+            // cofl_logged_in=true. Runs before dispatch, so every gate below (AH
+            // flips, bazaar, orders) sees a healed latch within one event. Never
+            // bypasses a region-switch reset: it only fires while the flag is set.
+            if !cofl_authenticated_ws.load(Ordering::Relaxed)
+                && twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed)
+            {
+                cofl_authenticated_ws.store(true, Ordering::Relaxed);
+                info!("[Coflnet] Authentication confirmed (global COFL state) — flips enabled");
+                let baf_msg =
+                    "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_ws.send(baf_msg);
+            }
             match event {
-                CoflEvent::LoggedIn => {
+                CoflEvent::Authenticated => {
+                    // COFL confirmed the session is authenticated (loggedIn).
+                    // This is the reliable signal that enables flip/order buying.
                     if !cofl_authenticated_ws.swap(true, Ordering::Relaxed) {
-                        info!("[Coflnet] loggedIn received — flips enabled");
-                        let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
+                        info!("[Coflnet] Authentication confirmed (loggedIn) — flips enabled");
+                        let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled"
+                            .to_string();
                         print_mc_chat(&baf_msg);
                         let _ = chat_tx_ws.send(baf_msg);
                     }
                 }
                 CoflEvent::AuctionFlip(flip) => {
-                    // Skip if AH flips are disabled
+                    // Finder flip feed: EVERY flip the private finder finds is
+                    // queued for the feed webhook (opt-in via config), bought
+                    // or not, before any gating. COFL flips never go there.
+                    if flip.finder.as_deref() == Some("BAF_FINDER") {
+                        twm::webhook::note_found_flip(&flip);
+                    }
+
+                    // Skip if AH flips are disabled. This gate used to `continue`
+                    // with no log at all, so a bot with AH flips toggled off
+                    // silently dropped every flip and looked perfectly healthy.
                     if !enable_ah_flips_ws.load(Ordering::Relaxed) {
+                        flip_diag_ws
+                            .record_drop(twm::state::FlipDropReason::AhDisabled, &flip.item_name);
                         continue;
                     }
 
-                    // Block flips until Coflnet auth is confirmed
-                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping flip — Coflnet not yet authenticated: {}", flip.item_name);
+                    // Skip if the web panel's Disconnect button paused intake.
+                    if flip_intake_paused_ws.load(Ordering::Relaxed) {
+                        flip_diag_ws
+                            .record_drop(twm::state::FlipDropReason::IntakePaused, &flip.item_name);
+                        continue;
+                    }
+
+                    // Block COFL flips until Coflnet auth is confirmed. Flips from our
+                    // OWN finder don't depend on COFL at all — they must buy fine in
+                    // finder-only mode (no COFL license/auth), so they bypass this gate.
+                    let from_own_finder = flip.finder.as_deref() == Some("BAF_FINDER");
+                    if !from_own_finder && !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        // Say WHY it counts as unauthenticated. `signin_link_shown`
+                        // is the discriminator that matters: true means COFL
+                        // really did reject the session and the user must open
+                        // the link; false means COFL is pushing flips to a
+                        // session it never challenged. The loop latches auth from
+                        // the global COFL_LOGGED_IN before every event, so reaching
+                        // this branch with cofl_logged_in=true means the flag was
+                        // stored after this event was already queued (transient,
+                        // next flip passes) — it can no longer persist for a run.
+                        let detail = format!(
+                            "signin_link_shown={} cofl_logged_in={} finder_tag={}",
+                            twm::websocket::COFL_AUTH_LINK_SHOWN.load(Ordering::Relaxed),
+                            twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed),
+                            flip.finder.as_deref().unwrap_or("<none>"),
+                        );
+                        flip_diag_ws.record_drop_detailed(
+                            twm::state::FlipDropReason::CoflUnauthenticated,
+                            &flip.item_name,
+                            Some(&detail),
+                        );
                         continue;
                     }
 
@@ -1903,44 +4103,35 @@ async fn main() -> Result<()> {
                     // state can briefly be Idle between queued startup commands,
                     // so checking is_startup_in_progress() covers that gap.
                     if bot_client_for_ws.is_startup_in_progress() {
-                        debug!("Skipping AH flip during startup: {}", flip.item_name);
+                        flip_diag_ws.record_drop(
+                            twm::state::FlipDropReason::StartupInProgress,
+                            &flip.item_name,
+                        );
                         continue;
                     }
 
-                    // Briefly hold AH flips while the bot is busy instead of dropping
-                    // them immediately. This helps flips survive short claim/sell GUIs.
-                    if !bot_client_for_ws.state().allows_commands() {
-                        warn!("Deferring flip — bot busy ({:?}): {}", bot_client_for_ws.state(), flip.item_name);
-                        let mut held = deferred_ah_flips_ws.lock().unwrap();
-                        let key = flip
-                            .uuid
-                            .clone()
-                            .unwrap_or_else(|| twm::utils::remove_minecraft_colors(&flip.item_name).to_lowercase());
-                        if let Some(existing_idx) = held.iter().position(|(_, queued_flip)| {
-                            queued_flip
-                                .uuid
-                                .clone()
-                                .unwrap_or_else(|| {
-                                    twm::utils::remove_minecraft_colors(&queued_flip.item_name).to_lowercase()
-                                })
-                                == key
-                        }) {
-                            held.remove(existing_idx);
-                        }
-                        held.push_back((Instant::now(), flip.clone()));
-                        while held.len() > MAX_DEFERRED_AH_FLIPS {
-                            held.pop_front();
-                        }
+                    // Allow flips even when bot is busy — the command queue
+                    // uses Critical priority for PurchaseAuction which will
+                    // preempt lower-priority commands.  Previously this gate
+                    // silently dropped cofl flips whenever the bot was in
+                    // ANY non-idle state (Purchasing, ManagingOrders, Bazaar,
+                    // etc.), causing flips to be missed entirely.
+                    // Only hard-block during Startup which indicates the bot
+                    // is not yet ready to interact with Hypixel at all.
+                    if bot_client_for_ws.state() == twm::types::BotState::Startup {
+                        flip_diag_ws
+                            .record_drop(twm::state::FlipDropReason::StartupState, &flip.item_name);
                         continue;
                     }
 
-                    // Skip AH flips when inventory is full — selling mode.  Opt-in via
-                    // `skip_flips_when_inventory_full` config; defaults to false so
-                    // flips are always attempted regardless of inventory state.
+                    // Operators can choose whether full inventory blocks AH flips.
                     if skip_flips_when_inv_full_ws.load(Ordering::Relaxed)
                         && bot_client_for_ws.is_inventory_full()
                     {
-                        warn!("Skipping AH flip — inventory full (selling mode): {}", flip.item_name);
+                        flip_diag_ws.record_drop(
+                            twm::state::FlipDropReason::InventoryFull,
+                            &flip.item_name,
+                        );
                         continue;
                     }
 
@@ -1958,7 +4149,8 @@ async fn main() -> Result<()> {
 
                     // Store flip in tracker so ItemPurchased / ItemSold webhooks can include profit
                     {
-                        let key = twm::utils::remove_minecraft_colors(&flip.item_name).to_lowercase();
+                        let key =
+                            twm::utils::remove_minecraft_colors(&flip.item_name).to_lowercase();
                         if let Ok(mut tracker) = flip_tracker_ws.lock() {
                             let now = Instant::now();
                             tracker.insert(key, (flip.clone(), 0, now, now));
@@ -1969,6 +4161,7 @@ async fn main() -> Result<()> {
                     // Buy-speed start time is now set in execute_command when
                     // /viewauction is sent, so the measurement covers the
                     // relevant path: command-send → coins-in-escrow.
+                    flip_diag_ws.record_accepted();
                     command_queue_clone.enqueue(
                         CommandType::PurchaseAuction { flip },
                         CommandPriority::Critical,
@@ -1981,9 +4174,21 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Skip if the web panel's Disconnect button paused intake.
+                    if flip_intake_paused_ws.load(Ordering::Relaxed) {
+                        debug!(
+                            "Skipping bazaar flip — intake paused (Disconnect): {}",
+                            bazaar_flip.item_name
+                        );
+                        continue;
+                    }
+
                     // Block flips until Coflnet auth is confirmed
                     if !cofl_authenticated_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping bazaar flip — Coflnet not yet authenticated: {}", bazaar_flip.item_name);
+                        debug!(
+                            "Skipping bazaar flip — Coflnet not yet authenticated: {}",
+                            bazaar_flip.item_name
+                        );
                         continue;
                     }
 
@@ -1994,7 +4199,10 @@ async fn main() -> Result<()> {
                     if matches!(bot_state, twm::types::BotState::Startup)
                         || bot_client_for_ws.is_startup_in_progress()
                     {
-                        debug!("Skipping bazaar flip during startup ({:?}): {}", bot_state, bazaar_flip.item_name);
+                        debug!(
+                            "Skipping bazaar flip during startup ({:?}): {}",
+                            bot_state, bazaar_flip.item_name
+                        );
                         continue;
                     }
 
@@ -2008,13 +4216,19 @@ async fn main() -> Result<()> {
                     // ManageOrders run is triggered to free a slot before the
                     // sell order reaches the command processor.
                     if bot_client_for_ws.is_bazaar_at_limit() && effective_is_buy {
-                        debug!("Skipping BUY bazaar flip — at order limit: {}", bazaar_flip.item_name);
+                        debug!(
+                            "Skipping BUY bazaar flip — at order limit: {}",
+                            bazaar_flip.item_name
+                        );
                         continue;
                     }
 
                     // Skip if daily sell value limit reached
                     if bot_client_for_ws.is_bazaar_daily_limit() {
-                        debug!("Skipping bazaar flip — daily sell value limit reached: {}", bazaar_flip.item_name);
+                        debug!(
+                            "Skipping bazaar flip — daily sell value limit reached: {}",
+                            bazaar_flip.item_name
+                        );
                         continue;
                     }
 
@@ -2023,13 +4237,19 @@ async fn main() -> Result<()> {
                     // collects them.  SELL flips are always accepted because
                     // placing a sell order does not require a free slot.
                     if effective_is_buy && bazaar_tracker_ws.has_filled_orders() {
-                        debug!("Skipping BUY bazaar flip — filled orders pending collection: {}", bazaar_flip.item_name);
+                        debug!(
+                            "Skipping BUY bazaar flip — filled orders pending collection: {}",
+                            bazaar_flip.item_name
+                        );
                         continue;
                     }
 
                     // Skip if bazaar flips are paused due to incoming AH flip (matching bazaarFlipPauser.ts)
                     if bazaar_flips_paused_ws.load(Ordering::Relaxed) {
-                        debug!("Bazaar flips paused (AH flip incoming), skipping: {}", bazaar_flip.item_name);
+                        debug!(
+                            "Bazaar flips paused (AH flip incoming), skipping: {}",
+                            bazaar_flip.item_name
+                        );
                         continue;
                     }
 
@@ -2037,24 +4257,32 @@ async fn main() -> Result<()> {
                     // collected from the bazaar without free inventory space.
                     // SELL orders are still accepted because they remove items
                     // from inventory, freeing space.
-                    if effective_is_buy && bot_client_for_ws.is_inventory_full() {
-                        debug!("Skipping BUY bazaar flip — inventory full: {}", bazaar_flip.item_name);
+                    //
+                    // Prevention: stop placing new BUY orders once the inventory is
+                    // NEAR full (not just at 0), so the bot keeps headroom to claim
+                    // already-filled buy orders and place sell orders instead of
+                    // filling completely and deadlocking. SELL orders still flow.
+                    if effective_is_buy && bot_client_for_ws.is_inventory_near_full() {
+                        debug!(
+                            "Skipping BUY bazaar flip — inventory near full: {}",
+                            bazaar_flip.item_name
+                        );
                         continue;
                     }
 
+                    // Cap BUY amounts for unstackable items (e.g. Enchanted Books)
+                    // to available inventory slots so the bot doesn't order more
+                    // than it can hold.  Each unstackable unit occupies one slot.
                     let order_amount = if effective_is_buy
                         && twm::utils::is_unstackable_item(
                             &bazaar_flip.item_name,
                             bazaar_flip.item_tag.as_deref(),
-                        )
-                    {
+                        ) {
                         let empty = bot_client_for_ws.empty_slot_count() as u64;
+                        // Keep at least 2 slots free for AH/sell operations.
                         let max_buy = empty.saturating_sub(2);
                         if max_buy == 0 {
-                            debug!(
-                                "Skipping unstackable BUY — not enough inventory space ({} empty): {}",
-                                empty, bazaar_flip.item_name
-                            );
+                            debug!("Skipping unstackable BUY — not enough inventory space ({} empty): {}", empty, bazaar_flip.item_name);
                             continue;
                         }
                         let capped = bazaar_flip.amount.min(max_buy);
@@ -2069,10 +4297,15 @@ async fn main() -> Result<()> {
                         bazaar_flip.amount
                     };
 
-                    let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
+                    let (order_color, order_label) = if effective_is_buy {
+                        ("§a", "BUY")
+                    } else {
+                        ("§c", "SELL")
+                    };
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
-                        order_color, order_label,
+                        order_color,
+                        order_label,
                         bazaar_flip.item_name,
                         order_amount,
                         format_coins_f64(bazaar_flip.price_per_unit)
@@ -2115,22 +4348,102 @@ async fn main() -> Result<()> {
                     // order, pre-queue a ManageOrders run so a filled/stale
                     // order gets collected or cancelled, freeing a slot before
                     // the sell order reaches the command processor.
-                    if bot_client_for_ws.is_bazaar_at_limit() && !effective_is_buy && !command_queue_clone.has_manage_orders() {
+                    if bot_client_for_ws.is_bazaar_at_limit()
+                        && !effective_is_buy
+                        && !command_queue_clone.has_manage_orders()
+                    {
                         info!("[BazaarFlips] At order limit with SELL queued — pre-queuing ManageOrders to free a slot");
                         command_queue_clone.enqueue(
-                            CommandType::ManageOrders { cancel_open: false },
+                            CommandType::ManageOrders {
+                                cancel_open: false,
+                                target_item: None,
+                            },
                             CommandPriority::High,
                             false,
                         );
                     }
                 }
+                CoflEvent::CancelBazaarOrder(order) => {
+                    // COFL asked us to cancel a specific open bazaar order,
+                    // identified by item name + side (+ price to disambiguate
+                    // multiple same-side orders for the same item).
+                    let is_buy = order.effective_is_buy_order();
+                    let side = if is_buy { "BUY" } else { "SELL" };
+
+                    // Bazaar flips off → COFL does not get to drive the orders
+                    // window either.  This is automatic management, same class
+                    // as the periodic check; only the web panel's own cancel
+                    // button (user-initiated) still goes through.
+                    if !enable_bazaar_flips_ws.load(Ordering::Relaxed) {
+                        debug!(
+                            "Skipping cancelOrder — bazaar flips disabled: {}",
+                            order.item_name
+                        );
+                        continue;
+                    }
+
+                    // Only act once Coflnet auth is confirmed — the order-cancel
+                    // GUI flow is gated the same way flip buying is.
+                    if !cofl_authenticated_ws.load(Ordering::Relaxed) {
+                        debug!(
+                            "Skipping cancelOrder — Coflnet not yet authenticated: {}",
+                            order.item_name
+                        );
+                        continue;
+                    }
+
+                    let price = if order.price_per_unit > 0.0 {
+                        Some(order.price_per_unit)
+                    } else {
+                        None
+                    };
+
+                    let msg = match price {
+                        Some(p) => format!(
+                            "§f[§4BAF§f]: §c🚫 [BZ] COFL cancel {} order: §r{} §7@ §6{:.1}",
+                            side, order.item_name, p
+                        ),
+                        None => format!(
+                            "§f[§4BAF§f]: §c🚫 [BZ] COFL cancel {} order: §r{}",
+                            side, order.item_name
+                        ),
+                    };
+                    info!(
+                        "[COFL] cancelOrder requested: '{}' ({}){}",
+                        order.item_name,
+                        side,
+                        price.map(|p| format!(" @ {:.1}", p)).unwrap_or_default()
+                    );
+                    print_mc_chat(&msg);
+                    let _ = chat_tx_ws.send(msg);
+
+                    // Reflect the intent in the tracker immediately: mark the
+                    // order pending-cancel (so the ManageOrders reconcile pass
+                    // doesn't re-add it from the pre-cancel window snapshot) and
+                    // remove it from the panel. The in-game cancel happens
+                    // asynchronously via the targeted ManageOrders run below.
+                    bazaar_tracker_ws.mark_cancelling(&order.item_name, is_buy);
+                    bazaar_tracker_ws.remove_order(&order.item_name, is_buy);
+
+                    command_queue_clone.enqueue(
+                        CommandType::ManageOrders {
+                            cancel_open: true,
+                            target_item: Some(twm::types::BazaarOrderTarget {
+                                item_name: order.item_name.clone(),
+                                is_buy,
+                                price_per_unit: price,
+                            }),
+                        },
+                        CommandPriority::Critical,
+                        false,
+                    );
+                }
                 CoflEvent::ChatMessage(msg) => {
                     // Parse "Your connection id is XXXX" (from chatMessage, matches TypeScript BAF.ts)
                     if let Some(cap) = msg.find("Your connection id is ") {
                         let rest = &msg[cap + "Your connection id is ".len()..];
-                        let conn_id: String = rest.chars()
-                            .take_while(|c| c.is_ascii_hexdigit())
-                            .collect();
+                        let conn_id: String =
+                            rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
                         if conn_id.len() == 32 {
                             info!("[Coflnet] Connection ID: {}", conn_id);
                             if let Ok(mut g) = cofl_connection_id_ws.lock() {
@@ -2148,14 +4461,17 @@ async fn main() -> Result<()> {
                         if let Some(hello_pos) = msg.find("Hello ") {
                             let after_hello = &msg[hello_pos..];
                             // Expect "(…@…)" somewhere after "Hello "
-                            if let (Some(open), Some(close)) = (after_hello.find('('), after_hello.find(')')) {
-                                if open < close && after_hello[open..close].contains('@') {
-                                    if !cofl_authenticated_ws.swap(true, Ordering::Relaxed) {
-                                        info!("[Coflnet] Authentication confirmed via chat — flips enabled");
-                                        let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
-                                        print_mc_chat(&baf_msg);
-                                        let _ = chat_tx_ws.send(baf_msg);
-                                    }
+                            if let (Some(open), Some(close)) =
+                                (after_hello.find('('), after_hello.find(')'))
+                            {
+                                if open < close
+                                    && after_hello[open..close].contains('@')
+                                    && !cofl_authenticated_ws.swap(true, Ordering::Relaxed)
+                                {
+                                    info!("[Coflnet] Authentication confirmed via chat — flips enabled");
+                                    let baf_msg = "§f[§4BAF§f]: §aCoflnet authenticated — flip buying enabled".to_string();
+                                    print_mc_chat(&baf_msg);
+                                    let _ = chat_tx_ws.send(baf_msg);
                                 }
                             }
                         }
@@ -2167,7 +4483,8 @@ async fn main() -> Result<()> {
                         if let Some(until_pos) = rest.find(" until ") {
                             let tier = rest[..until_pos].trim().to_string();
                             let expires_raw = &rest[until_pos + " until ".len()..];
-                            let expires: String = expires_raw.chars()
+                            let expires: String = expires_raw
+                                .chars()
                                 .take_while(|&c| c != '\n' && c != '\\')
                                 .collect();
                             let expires = expires.trim().to_string();
@@ -2224,7 +4541,9 @@ async fn main() -> Result<()> {
                             }
                         } else if let Some(profit) = parse_bz_list_flip_profit(&clean) {
                             // Also parse per-item detail for fallback profit lookup.
-                            if let Some((item_name, item_profit, flip_count)) = parse_bz_list_flip_detail(&clean) {
+                            if let Some((item_name, item_profit, flip_count)) =
+                                parse_bz_list_flip_detail(&clean)
+                            {
                                 if let Ok(mut items) = bz_list_items.lock() {
                                     let entry = items.entry(item_name).or_insert((0, 0));
                                     entry.0 += item_profit;
@@ -2251,7 +4570,10 @@ async fn main() -> Result<()> {
                                 let pt = profit_tracker_ws.clone();
                                 tokio::spawn(async move {
                                     // Wait for the full list to arrive.
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(BZ_LIST_DEBOUNCE_SECS)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(
+                                        BZ_LIST_DEBOUNCE_SECS,
+                                    ))
+                                    .await;
                                     if let Ok(acc) = accum.lock() {
                                         let (total, count, _) = *acc;
                                         if count > 0 {
@@ -2259,7 +4581,11 @@ async fn main() -> Result<()> {
                                             // BZ session profit (replaces local calculation).
                                             pt.set_bz_total(total);
                                             tracing::info!("[BZList] Updated BZ profit from /cofl bz l: {} coins ({} flips)", total, count);
-                                            let (color, sign) = if total >= 0 { ("§a", "+") } else { ("§c", "") };
+                                            let (color, sign) = if total >= 0 {
+                                                ("§a", "+")
+                                            } else {
+                                                ("§c", "")
+                                            };
                                             let summary = format!(
                                                 "§f[§4BAF§f]: §6[BZ List] §7{} flips, total profit: {}{}{}",
                                                 count, color, sign, format_coins(total)
@@ -2273,7 +4599,10 @@ async fn main() -> Result<()> {
                                     if let Ok(items) = items_clone.lock() {
                                         if !items.is_empty() {
                                             tracker.set_bz_list_profits(items.clone());
-                                            tracing::debug!("[BZList] Stored per-item profits for {} items", items.len());
+                                            tracing::debug!(
+                                                "[BZList] Stored per-item profits for {} items",
+                                                items.len()
+                                            );
                                         }
                                     }
                                 });
@@ -2287,8 +4616,11 @@ async fn main() -> Result<()> {
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed)
                         && cofl_authenticated_ws.load(Ordering::Relaxed)
                         && !bazaar_flips_paused_ws.load(Ordering::Relaxed)
+                        && !flip_intake_paused_ws.load(Ordering::Relaxed)
                     {
-                        if let Ok(Some(rec)) = twm::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
+                        if let Ok(Some(rec)) =
+                            twm::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg)
+                        {
                             let bot_state = bot_client_for_ws.state();
                             if !matches!(bot_state, twm::types::BotState::Startup) {
                                 let effective_is_buy = rec.effective_is_buy_order();
@@ -2297,86 +4629,99 @@ async fn main() -> Result<()> {
                                 // SELL orders bypass these because they empty
                                 // inventory and must not be silently dropped.
                                 if effective_is_buy && bot_client_for_ws.is_bazaar_at_limit() {
-                                    debug!("Skipping BUY bazaar flip from chat — at order limit: {}", rec.item_name);
+                                    debug!(
+                                        "Skipping BUY bazaar flip from chat — at order limit: {}",
+                                        rec.item_name
+                                    );
                                 } else if bot_client_for_ws.is_bazaar_daily_limit() {
                                     debug!("Skipping bazaar flip from chat — daily sell value limit reached: {}", rec.item_name);
-                                } else if effective_is_buy && bot_client_for_ws.is_inventory_full() {
-                                    debug!("Skipping BUY bazaar flip from chat — inventory full: {}", rec.item_name);
-                                } else if effective_is_buy && bazaar_tracker_ws.has_filled_orders() {
+                                } else if effective_is_buy
+                                    && bot_client_for_ws.is_inventory_near_full()
+                                {
+                                    debug!("Skipping BUY bazaar flip from chat — inventory near full: {}", rec.item_name);
+                                } else if effective_is_buy && bazaar_tracker_ws.has_filled_orders()
+                                {
                                     debug!("Skipping BUY bazaar flip from chat — filled orders pending: {}", rec.item_name);
                                 } else {
-                                let order_amount = if effective_is_buy
-                                    && twm::utils::is_unstackable_item(
-                                        &rec.item_name,
-                                        rec.item_tag.as_deref(),
-                                    )
-                                {
-                                    let empty = bot_client_for_ws.empty_slot_count() as u64;
-                                    let max_buy = empty.saturating_sub(2);
-                                    if max_buy == 0 {
-                                        debug!(
-                                            "Skipping unstackable BUY from chat — not enough space ({} empty): {}",
-                                            empty, rec.item_name
-                                        );
-                                        continue;
-                                    }
-                                    let capped = rec.amount.min(max_buy);
-                                    if capped < rec.amount {
-                                        info!(
+                                    // Cap BUY amounts for unstackable items (e.g. Enchanted Books)
+                                    let order_amount = if effective_is_buy
+                                        && twm::utils::is_unstackable_item(
+                                            &rec.item_name,
+                                            rec.item_tag.as_deref(),
+                                        ) {
+                                        let empty = bot_client_for_ws.empty_slot_count() as u64;
+                                        let max_buy = empty.saturating_sub(2);
+                                        if max_buy == 0 {
+                                            debug!("Skipping unstackable BUY from chat — not enough space ({} empty): {}", empty, rec.item_name);
+                                            continue;
+                                        }
+                                        let capped = rec.amount.min(max_buy);
+                                        if capped < rec.amount {
+                                            info!(
                                             "[BazaarFlips] Capping unstackable BUY amount {} → {} (chat): {}",
                                             rec.amount, capped, rec.item_name
                                         );
-                                    }
-                                    capped
-                                } else {
-                                    rec.amount
-                                };
+                                        }
+                                        capped
+                                    } else {
+                                        rec.amount
+                                    };
 
-                                let (order_color, order_label) = if effective_is_buy { ("§a", "BUY") } else { ("§c", "SELL") };
-                                let baf_msg = format!(
+                                    let (order_color, order_label) = if effective_is_buy {
+                                        ("§a", "BUY")
+                                    } else {
+                                        ("§c", "SELL")
+                                    };
+                                    let baf_msg = format!(
                                     "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
                                     order_color, order_label,
                                     rec.item_name,
                                     order_amount,
                                     format_coins_f64(rec.price_per_unit)
                                 );
-                                print_mc_chat(&baf_msg);
-                                let _ = chat_tx_ws.send(baf_msg);
+                                    print_mc_chat(&baf_msg);
+                                    let _ = chat_tx_ws.send(baf_msg);
 
-                                let priority = if effective_is_buy {
-                                    CommandPriority::Normal
-                                } else {
-                                    CommandPriority::Critical
-                                };
-                                let command_type = if effective_is_buy {
-                                    CommandType::BazaarBuyOrder {
-                                        item_name: rec.item_name.clone(),
-                                        item_tag: rec.item_tag.clone(),
-                                        amount: order_amount,
-                                        price_per_unit: rec.price_per_unit,
-                                    }
-                                } else {
-                                    CommandType::BazaarSellOrder {
-                                        item_name: rec.item_name.clone(),
-                                        item_tag: rec.item_tag.clone(),
-                                        amount: order_amount,
-                                        price_per_unit: rec.price_per_unit,
-                                    }
-                                };
-                                command_queue_clone.enqueue(command_type, priority, true);
-                                info!("[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
-                                    order_label, rec.item_name, order_amount, rec.price_per_unit);
+                                    let priority = if effective_is_buy {
+                                        CommandPriority::Normal
+                                    } else {
+                                        CommandPriority::Critical
+                                    };
+                                    let command_type = if effective_is_buy {
+                                        CommandType::BazaarBuyOrder {
+                                            item_name: rec.item_name.clone(),
+                                            item_tag: rec.item_tag.clone(),
+                                            amount: order_amount,
+                                            price_per_unit: rec.price_per_unit,
+                                        }
+                                    } else {
+                                        CommandType::BazaarSellOrder {
+                                            item_name: rec.item_name.clone(),
+                                            item_tag: rec.item_tag.clone(),
+                                            amount: order_amount,
+                                            price_per_unit: rec.price_per_unit,
+                                        }
+                                    };
+                                    command_queue_clone.enqueue(command_type, priority, true);
+                                    info!("[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
+                                    order_label, rec.item_name, rec.amount, rec.price_per_unit);
 
-                                // When at the bazaar order limit and we just queued a SELL
-                                // order, pre-queue a ManageOrders run to free a slot.
-                                if bot_client_for_ws.is_bazaar_at_limit() && !effective_is_buy && !command_queue_clone.has_manage_orders() {
-                                    info!("[BazaarFlips] At order limit with SELL queued (chat) — pre-queuing ManageOrders to free a slot");
-                                    command_queue_clone.enqueue(
-                                        CommandType::ManageOrders { cancel_open: false },
-                                        CommandPriority::High,
-                                        false,
-                                    );
-                                }
+                                    // When at the bazaar order limit and we just queued a SELL
+                                    // order, pre-queue a ManageOrders run to free a slot.
+                                    if bot_client_for_ws.is_bazaar_at_limit()
+                                        && !effective_is_buy
+                                        && !command_queue_clone.has_manage_orders()
+                                    {
+                                        info!("[BazaarFlips] At order limit with SELL queued (chat) — pre-queuing ManageOrders to free a slot");
+                                        command_queue_clone.enqueue(
+                                            CommandType::ManageOrders {
+                                                cancel_open: false,
+                                                target_item: None,
+                                            },
+                                            CommandPriority::High,
+                                            false,
+                                        );
+                                    }
                                 } // end gate checks
                             }
                         }
@@ -2400,17 +4745,70 @@ async fn main() -> Result<()> {
                             twm::webhook::send_execute_purse_webhook().await;
                         });
                     }
-                    
+
                     // Check if this is a /cofl or /baf command that should be sent back to websocket
                     // Match TypeScript consoleHandler.ts - parse and route commands properly
                     let lowercase_cmd = cmd.trim().to_lowercase();
                     if lowercase_cmd.starts_with("/cofl") || lowercase_cmd.starts_with("/baf") {
                         // Parse /cofl command like the console handler does
-                        let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+                        let parts: Vec<&str> = cmd.split_whitespace().collect();
                         if parts.len() > 1 {
                             let command = parts[1].to_string(); // Clone to own the data
                             let args = parts[2..].join(" ");
-                            
+
+                            // Region switch: COFL's `/cofl switchregion` asks the bot to
+                            // reconnect to a different modsocket via a `connect <url>`
+                            // command. This must be executed locally — repoint the live
+                            // socket — NOT echoed back over the socket (which silently
+                            // failed and left the bot on an unreachable regional host,
+                            // e.g. an unresolvable us.sky.coflnet.com).
+                            //
+                            // Deliberately NOT written to config.toml. COFL redirects
+                            // every user to their nearest modsocket on its own, so the
+                            // plain `sky.coflnet.com` default is right for all regions
+                            // and nobody has to set a regional host by hand. Persisting
+                            // the target pinned the config to one region forever, and
+                            // re-running the redirect on the next start would only
+                            // arrive at the same place anyway.
+                            if command == "connect" && !args.is_empty() {
+                                // COFL fully switched to TLS. It may hand us a
+                                // scheme-less host ("us-sky.coflnet.com/modsocket")
+                                // or, on older paths, a plaintext "ws://" URL. Force
+                                // the secure scheme either way so a region switch
+                                // never downgrades the bot to a plaintext socket the
+                                // regional server now refuses.
+                                let raw = args.trim();
+                                let host = raw
+                                    .strip_prefix("wss://")
+                                    .or_else(|| raw.strip_prefix("ws://"))
+                                    .unwrap_or(raw);
+                                let new_url = format!("wss://{}", host);
+                                info!("[RegionSwitch] /cofl connect → reconnecting to {}", new_url);
+                                let _ = chat_tx_ws.send(format!(
+                                    "§f[§4BAF§f]: §bSwitching server → §e{}§7 (reconnecting)…",
+                                    new_url
+                                ));
+                                // The regional host may not recognise the carried-over
+                                // session, so don't let the ongoing buy/order gates keep
+                                // trusting the connection being replaced — CoflWebSocket
+                                // resets its own auth statics, this is the mirror on the
+                                // main-loop side.
+                                cofl_authenticated_ws.store(false, Ordering::Relaxed);
+                                let ws = ws_client_clone.clone();
+                                tokio::spawn(async move {
+                                    ws.switch_region(&new_url).await;
+                                });
+                                // NOT `return`: this arm is inside the `while let Some(event) =
+                                // ws_rx.recv().await` loop that drains every COFL event (flips,
+                                // chat, auth) for the rest of the process — `return` here would
+                                // exit that whole task, not just this command, so the FIRST
+                                // region switch would silently kill flip intake forever (the bot
+                                // prints "Switching server…" and then never processes another
+                                // event). `continue` skips only the "echo command back to
+                                // websocket" fallthrough below, which is the actual intent.
+                                continue;
+                            }
+
                             // Send to websocket with command as type (JSON-stringified data)
                             let ws = ws_client_clone.clone();
                             let inv_client = bot_client_for_ws.clone();
@@ -2424,21 +4822,31 @@ async fn main() -> Result<()> {
                                         let upload_msg = serde_json::json!({
                                             "type": "uploadInventory",
                                             "data": inv_json
-                                        }).to_string();
+                                        })
+                                        .to_string();
                                         if let Err(e) = ws.send_message(&upload_msg).await {
                                             error!("[Inventory] sellinventory: failed to pre-upload inventory: {}", e);
+                                        } else {
+                                            // Give COFL a moment to ingest the uploaded inventory
+                                            // before it processes the sellinventory request.
+                                            // Without this the sell command frequently arrives
+                                            // before the new inventory is stored, so COFL sells
+                                            // against stale/empty data and "does nothing".
+                                            sleep(Duration::from_millis(600)).await;
                                         }
                                     } else {
                                         warn!("[Inventory] sellinventory: no cached inventory to upload");
                                     }
                                 }
 
-                                let data_json = serde_json::to_string(&args).unwrap_or_else(|_| "\"\"".to_string());
+                                let data_json = serde_json::to_string(&args)
+                                    .unwrap_or_else(|_| "\"\"".to_string());
                                 let message = serde_json::json!({
                                     "type": command,
                                     "data": data_json
-                                }).to_string();
-                                
+                                })
+                                .to_string();
+
                                 if let Err(e) = ws.send_message(&message).await {
                                     error!("Failed to send /cofl command to websocket: {}", e);
                                 } else {
@@ -2465,12 +4873,16 @@ async fn main() -> Result<()> {
                     info!("COFL requested getInventory — sending cached inventory");
                     if let Some(inv_json) = bot_client_for_ws.get_cached_inventory_json() {
                         let payload_bytes = inv_json.len();
-                        debug!("[Inventory] Uploading to COFL: payload {} bytes", payload_bytes);
+                        debug!(
+                            "[Inventory] Uploading to COFL: payload {} bytes",
+                            payload_bytes
+                        );
                         info!("[Inventory] uploadInventory payload: {}", inv_json);
                         let message = serde_json::json!({
                             "type": "uploadInventory",
                             "data": inv_json
-                        }).to_string();
+                        })
+                        .to_string();
                         let ws = ws_client_clone.clone();
                         tokio::spawn(async move {
                             if let Err(e) = ws.send_message(&message).await {
@@ -2516,7 +4928,10 @@ async fn main() -> Result<()> {
                             let duration = auction_data.get("duration").and_then(|v| v.as_u64());
                             // Also extract slot (mineflayer inventory slot 9-44) and id
                             let item_slot = auction_data.get("slot").and_then(|v| v.as_u64());
-                            let item_id = auction_data.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let item_id = auction_data
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
 
                             // If itemName is null/absent, fall back to looking up the display
                             // name from the bot's cached inventory at the given slot.
@@ -2574,7 +4989,9 @@ async fn main() -> Result<()> {
                                                     let target = entry.0.target;
                                                     if buy_price > 0 && target > 0 {
                                                         let ah_fee = calculate_ah_fee(target);
-                                                        let expected_profit = target as i64 - buy_price as i64 - ah_fee as i64;
+                                                        let expected_profit = target as i64
+                                                            - buy_price as i64
+                                                            - ah_fee as i64;
                                                         if expected_profit < 0 {
                                                             let loss_amount = expected_profit.abs();
                                                             warn!("[createAuction] Skipping originally-unprofitable flip: {} — target {} - buy {} - fee {} = {} coins",
@@ -2612,7 +5029,11 @@ async fn main() -> Result<()> {
                                                 let buy_price = entry.1;
                                                 if buy_price > 0 && price > 0 {
                                                     let ah_fee = calculate_ah_fee(price);
-                                                    Some(price as i64 - buy_price as i64 - ah_fee as i64)
+                                                    Some(
+                                                        price as i64
+                                                            - buy_price as i64
+                                                            - ah_fee as i64,
+                                                    )
                                                 } else {
                                                     None
                                                 }
@@ -2620,6 +5041,28 @@ async fn main() -> Result<()> {
                                             Err(_) => None,
                                         }
                                     };
+                                    // do_not_relist blocklist (COFL + finder): hold the item
+                                    // instead of auto-relisting when its item id, originating
+                                    // finder, or expected profit matches the configured rules.
+                                    let (blk_finder, blk_profit) =
+                                        tracked_finder_profit(&flip_tracker_ws, &item_name);
+                                    if let Some(reason) = config_clone.relist_block_reason(
+                                        item_id.as_deref(),
+                                        blk_finder.as_deref(),
+                                        blk_profit,
+                                    ) {
+                                        info!(
+                                            "[Relist] Won't relist \"{}\" — {}",
+                                            item_name, reason
+                                        );
+                                        let baf_msg = format!(
+                                            "§f[§4BAF§f]: §e🛑 Won't relist §r{}§r §7— {}",
+                                            item_name, reason
+                                        );
+                                        print_mc_chat(&baf_msg);
+                                        let _ = chat_tx_ws.send(baf_msg);
+                                        continue;
+                                    }
 
                                     let cmd = CommandType::SellToAuction {
                                         item_name,
@@ -2651,7 +5094,11 @@ async fn main() -> Result<()> {
                                             queue.enqueue(cmd, CommandPriority::High, false);
                                         });
                                     } else {
-                                        command_queue_clone.enqueue(cmd, CommandPriority::High, false);
+                                        command_queue_clone.enqueue(
+                                            cmd,
+                                            CommandPriority::High,
+                                            false,
+                                        );
                                     }
                                 }
                                 _ => {
@@ -2668,7 +5115,8 @@ async fn main() -> Result<()> {
                     debug!("Processing trade request");
                     // Parse trade data to get player name
                     if let Ok(trade_data) = serde_json::from_str::<serde_json::Value>(&data) {
-                        if let Some(player) = trade_data.get("playerName").and_then(|v| v.as_str()) {
+                        if let Some(player) = trade_data.get("playerName").and_then(|v| v.as_str())
+                        {
                             command_queue_clone.enqueue(
                                 CommandType::AcceptTrade {
                                     player_name: player.to_string(),
@@ -2691,58 +5139,93 @@ async fn main() -> Result<()> {
                     // when both AH flips and bazaar flips are enabled.
                     // Relaxed ordering is fine here — these are simple toggle flags where
                     // eventual visibility across threads is sufficient.
-                    if enable_bazaar_flips_ws.load(Ordering::Relaxed) && enable_ah_flips_ws.load(Ordering::Relaxed) {
+                    // Only relevant when BOTH AH and bazaar flips are enabled — if
+                    // bazaar is off there's nothing to pause, so don't print/churn.
+                    if enable_bazaar_flips_ws.load(Ordering::Relaxed)
+                        && enable_ah_flips_ws.load(Ordering::Relaxed)
+                    {
+                        // Always (re)extend the pause window to now+20s. Rapid repeated
+                        // countdowns just push the deadline out.
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let deadline = now_ms + 20_000;
+                        bazaar_pause_until_ws.fetch_max(deadline, Ordering::Relaxed);
+
                         let flag = bazaar_flips_paused_ws.clone();
-                        let generation = bazaar_pause_generation_ws.fetch_add(1, Ordering::Relaxed) + 1;
-                        let already_paused = flag.swap(true, Ordering::Relaxed);
-
-                        if !already_paused {
-                            let baf_msg = "§f[§4BAF§f]: §c⚡ AH Flips incoming in ~10s — closing windows, pausing bazaar".to_string();
-                            print_mc_chat(&baf_msg);
-                            let _ = chat_tx_ws.send(baf_msg);
-
-                            // Close any open window so the bot is free for AH flips.
-                            // Also force state to Idle if it's in an interruptible state
-                            // so the AH flip can be processed immediately.
-                            bot_client_for_ws.close_current_window();
-                            let current_state = bot_client_for_ws.state();
-                            if current_state != twm::types::BotState::Purchasing
-                                && current_state != twm::types::BotState::Startup
-                            {
-                                bot_client_for_ws.set_state(twm::types::BotState::Idle);
-                            }
-                        } else {
-                            debug!("[BazaarFlips] Countdown refreshed while already paused");
+                        // Close any open window so the bot is free for AH flips, and
+                        // drop out of interruptible states immediately.
+                        bot_client_for_ws.close_current_window();
+                        let current_state = bot_client_for_ws.state();
+                        if current_state != twm::types::BotState::Purchasing
+                            && current_state != twm::types::BotState::Startup
+                        {
+                            bot_client_for_ws.set_state(twm::types::BotState::Idle);
                         }
 
-                        let chat_tx_resume = chat_tx_ws.clone();
-                        let command_queue_resume = command_queue_clone.clone();
-                        let pause_generation_resume = bazaar_pause_generation_ws.clone();
-                        tokio::spawn(async move {
-                            sleep(Duration::from_secs(AH_FLIP_COUNTDOWN_PAUSE_SECS)).await;
-                            if pause_generation_resume.load(Ordering::Relaxed) != generation {
-                                debug!("[BazaarFlips] Ignoring stale resume task for superseded countdown");
-                                return;
-                            }
-                            flag.store(false, Ordering::Relaxed);
-                            // Notify user that bazaar flips are resuming (matching TypeScript bazaarFlipPauser.ts)
-                            let baf_msg = "§f[§4BAF§f]: §aBazaar flips resumed".to_string();
+                        // Only the unpaused→paused transition prints and spawns the
+                        // single resume watcher; later countdowns are silent no-ops
+                        // that merely extended the deadline above.
+                        if flag
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            let baf_msg =
+                                "§f[§4BAF§f]: §c⚡ AH Flips incoming — pausing bazaar".to_string();
                             print_mc_chat(&baf_msg);
-                            let _ = chat_tx_resume.send(baf_msg);
-                            info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
-                            // Queue a ManageOrders run to handle any deferred order
-                            // management (filled orders that need collecting, etc.).
-                            if !command_queue_resume.has_manage_orders() {
-                                info!("[BazaarFlips] Queuing deferred ManageOrders after AH flip window");
-                                command_queue_resume.enqueue(
-                                    CommandType::ManageOrders { cancel_open: false },
-                                    CommandPriority::Normal,
-                                    false,
-                                );
-                            }
-                            // COFL now automatically sends bazaar flip recommendations —
-                            // no need to request getbazaarflips here.
-                        });
+                            let _ = chat_tx_ws.send(baf_msg);
+                            let chat_tx_resume = chat_tx_ws.clone();
+                            let command_queue_resume = command_queue_clone.clone();
+                            let enable_bz_resume = enable_bazaar_flips_ws.clone();
+                            let pause_until = bazaar_pause_until_ws.clone();
+                            tokio::spawn(async move {
+                                // Sleep until the (possibly-extended) deadline passes.
+                                loop {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+                                    let until = pause_until.load(Ordering::Relaxed);
+                                    if now >= until {
+                                        break;
+                                    }
+                                    sleep(Duration::from_millis((until - now).min(20_000))).await;
+                                }
+                                flag.store(false, Ordering::Relaxed);
+                                let baf_msg = "§f[§4BAF§f]: §aBazaar flips resumed".to_string();
+                                print_mc_chat(&baf_msg);
+                                let _ = chat_tx_resume.send(baf_msg);
+                                info!("[BazaarFlips] Bazaar flips resumed after AH flip window");
+                                if !enable_bz_resume.load(Ordering::Relaxed) {
+                                    info!("[BazaarFlips] Not queuing deferred ManageOrders — bazaar flips disabled");
+                                } else if !command_queue_resume.has_manage_orders() {
+                                    info!("[BazaarFlips] Queuing deferred ManageOrders after AH flip window");
+                                    command_queue_resume.enqueue(
+                                        CommandType::ManageOrders {
+                                            cancel_open: false,
+                                            target_item: None,
+                                        },
+                                        CommandPriority::Normal,
+                                        false,
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+                CoflEvent::CollectAuctions => {
+                    // COFL detected sold/expired auctions to collect. Claim them
+                    // proactively so AH slots free up (→ can list → frees inventory
+                    // → keeps buying) instead of waiting for the periodic sweep.
+                    if !command_queue_clone.has_claim_sold() {
+                        info!("[CollectAuctions] COFL signalled sold auctions — queuing ClaimSold");
+                        command_queue_clone.enqueue(
+                            CommandType::ClaimSoldItem,
+                            CommandPriority::High,
+                            true,
+                        );
                     }
                 }
                 CoflEvent::LicenseList { entries, page: _ } => {
@@ -2752,19 +5235,35 @@ async fn main() -> Result<()> {
                     // Look for any non-NONE license matching the current IGN first,
                     // then fall back to any known IGN.
                     let current_ign = &ingame_name_ws;
-                    if let Some((found_ign, global_idx, tier)) = entries.iter().find(|(name, _, tier)| {
-                        name.eq_ignore_ascii_case(current_ign) && !tier.eq_ignore_ascii_case("NONE")
-                    }) {
-                        info!("[LicenseDetect] Found {} license index {} for '{}' ", tier, global_idx, found_ign);
+                    if let Some((found_ign, global_idx, tier)) =
+                        entries.iter().find(|(name, _, tier)| {
+                            name.eq_ignore_ascii_case(current_ign)
+                                && !tier.eq_ignore_ascii_case("NONE")
+                        })
+                    {
+                        info!(
+                            "[LicenseDetect] Found {} license index {} for '{}' ",
+                            tier, global_idx, found_ign
+                        );
                         detected_cofl_license_ws.store(*global_idx, Ordering::Relaxed);
-                    } else if let Some((found_ign, global_idx, tier)) = entries.iter().find(|(name, _, tier)| {
-                        // Check all configured IGNs as a fallback
-                        ingame_names_ws.iter().any(|ign| name.eq_ignore_ascii_case(ign))
-                            && !tier.eq_ignore_ascii_case("NONE")
-                    }) {
-                        info!("[LicenseDetect] Found {} license index {} for '{}' (other account)", tier, global_idx, found_ign);
+                    } else if let Some((found_ign, global_idx, tier)) =
+                        entries.iter().find(|(name, _, tier)| {
+                            // Check all configured IGNs as a fallback
+                            ingame_names_ws
+                                .iter()
+                                .any(|ign| name.eq_ignore_ascii_case(ign))
+                                && !tier.eq_ignore_ascii_case("NONE")
+                        })
+                    {
+                        info!(
+                            "[LicenseDetect] Found {} license index {} for '{}' (other account)",
+                            tier, global_idx, found_ign
+                        );
                         detected_cofl_license_ws.store(*global_idx, Ordering::Relaxed);
-                    } else if let Some((found_ign, _, _)) = entries.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(current_ign)) {
+                    } else if let Some((found_ign, _, _)) = entries
+                        .iter()
+                        .find(|(name, _, _)| name.eq_ignore_ascii_case(current_ign))
+                    {
                         info!("[LicenseDetect] Found '{}' but only has NONE licenses — no transfer needed", found_ign);
                     } else {
                         // No active license found for any configured IGN — set the
@@ -2791,6 +5290,88 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                CoflEvent::ListInstructions(v) => {
+                    if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
+                        if !items.is_empty() {
+                            print_mc_chat("§f[§4BAF§f]: §a--- Items to list ---");
+                            for it in items {
+                                let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                                let item_id = it.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                let clean = twm::utils::remove_minecraft_colors(name);
+                                let (blk_finder, blk_profit) =
+                                    tracked_finder_profit(&flip_tracker_ws, name);
+                                if let Some(reason) = config_clone.relist_block_reason(
+                                    (!item_id.is_empty()).then_some(item_id),
+                                    blk_finder.as_deref(),
+                                    blk_profit,
+                                ) {
+                                    print_mc_chat(&format!(
+                                        "§f[§4BAF§f]: §eWon't list §f{}§e — {}",
+                                        clean, reason
+                                    ));
+                                    continue;
+                                }
+                                let list_at =
+                                    it.get("listAt").and_then(|x| x.as_u64()).unwrap_or(0);
+                                print_mc_chat(&format!(
+                                    "§f[§4BAF§f]: §e{} §7→ §a{} coins",
+                                    clean, list_at
+                                ));
+                            }
+                            print_mc_chat("§f[§4BAF§f]: §a--- Listing now ---");
+                        }
+                        let queue_clone = command_queue_clone.clone();
+                        let dur = config_clone.auction_duration_hours;
+                        for it in items {
+                            let name = match it.get("name").and_then(|x| x.as_str()) {
+                                Some(n) => n.to_string(),
+                                None => continue,
+                            };
+                            let item_id = it.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                            let (blk_finder, blk_profit) =
+                                tracked_finder_profit(&flip_tracker_ws, &name);
+                            if let Some(reason) = config_clone.relist_block_reason(
+                                (!item_id.is_empty()).then_some(item_id),
+                                blk_finder.as_deref(),
+                                blk_profit,
+                            ) {
+                                info!("[FinderList] Skipping \"{}\" — {}", name, reason);
+                                continue;
+                            }
+                            let list_at = it.get("listAt").and_then(|x| x.as_u64()).unwrap_or(0);
+                            if list_at == 0 {
+                                continue;
+                            }
+                            let clean = twm::utils::remove_minecraft_colors(&name);
+                            queue_clone.enqueue(
+                                twm::types::CommandType::SellToAuction {
+                                    item_name: clean,
+                                    starting_bid: list_at,
+                                    duration_hours: dur,
+                                    expected_profit: None,
+                                    item_slot: None,
+                                    item_id: None,
+                                },
+                                twm::types::CommandPriority::Normal,
+                                false,
+                            );
+                        }
+                    }
+                    if let Some(skipped) = v.get("skipped").and_then(|s| s.as_array()) {
+                        for s in skipped {
+                            let name = s.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                            let reason = s
+                                .get("reason")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("unpriceable");
+                            let clean = twm::utils::remove_minecraft_colors(name);
+                            print_mc_chat(&format!(
+                                "§f[§4BAF§f]: §cWon't list §f{}§c — {}",
+                                clean, reason
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -2812,6 +5393,17 @@ async fn main() -> Result<()> {
         use twm::types::BotState;
         // Debounce: avoid requesting sellinventory too frequently when inventory is full
         let mut last_sellinventory_request = Instant::now() - Duration::from_secs(300);
+        // Debounce: as a last resort when the inventory stays full (typically with
+        // bazaar-bought items the bot can't re-list), force a bazaar
+        // "Sell Inventory Now" to instantly sell everything sellable and free
+        // space, breaking the full-inventory deadlock.
+        let mut last_instasell_clear = Instant::now() - Duration::from_secs(300);
+        const FORCE_INSTASELL_SECS: u64 = 90;
+        // Track how long the bot has been continuously in selling mode so we can
+        // periodically force-clear the inventory_full flag (it may be stale if no
+        // ContainerSetContent packets arrive while the bot is idle).
+        let mut selling_mode_since: Option<Instant> = None;
+        const SELLING_MODE_RECHECK_SECS: u64 = 30;
         loop {
             // When macro is paused via web panel, skip command processing entirely.
             if macro_paused_proc.load(Ordering::Relaxed) {
@@ -2838,12 +5430,15 @@ async fn main() -> Result<()> {
                     let is_startup_cmd = matches!(
                         cmd.command_type,
                         twm::types::CommandType::CheckCookie
-                        | twm::types::CommandType::ManageOrders { .. }
-                        | twm::types::CommandType::ClaimSoldItem
-                        | twm::types::CommandType::ClaimPurchasedItem
+                            | twm::types::CommandType::ManageOrders { .. }
+                            | twm::types::CommandType::ClaimSoldItem
+                            | twm::types::CommandType::ClaimPurchasedItem
                     );
                     if !is_startup_cmd {
-                        debug!("[Queue] Deferring non-startup command during startup: {:?}", cmd.command_type);
+                        debug!(
+                            "[Queue] Deferring non-startup command during startup: {:?}",
+                            cmd.command_type
+                        );
                         command_queue_processor.complete_current();
                         sleep(Duration::from_millis(250)).await;
                         continue;
@@ -2855,14 +5450,21 @@ async fn main() -> Result<()> {
                 if should_drop_bazaar_command_during_ah_pause(
                     &cmd.command_type,
                     bazaar_flips_paused_proc.load(Ordering::Relaxed),
+                    bot_client_clone.is_inventory_full(),
                 ) {
-                    if matches!(cmd.command_type, twm::types::CommandType::ManageOrders { .. }) {
+                    if matches!(
+                        cmd.command_type,
+                        twm::types::CommandType::ManageOrders { .. }
+                    ) {
                         info!("[Queue] Deferring ManageOrders — AH flip window active, will re-queue on resume");
                         let baf_msg = "§f[§4BAF§f]: §e⏸ Order management deferred — AH flips incoming, will resume after".to_string();
                         print_mc_chat(&baf_msg);
                         let _ = chat_tx_proc.send(baf_msg);
                     } else {
-                        debug!("[Queue] Dropping bazaar command {:?} — AH flip window active", cmd.command_type);
+                        debug!(
+                            "[Queue] Dropping bazaar command {:?} — AH flip window active",
+                            cmd.command_type
+                        );
                     }
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
@@ -2872,37 +5474,69 @@ async fn main() -> Result<()> {
                 // Skip SellToAuction commands when the auction house is at the
                 // listing limit — avoids the repeated /ah → "Maximum auction count
                 // reached" → idle → next SellToAuction spam loop.
-                if matches!(cmd.command_type, twm::types::CommandType::SellToAuction { .. })
-                    && bot_client_clone.is_auction_at_limit()
+                if matches!(
+                    cmd.command_type,
+                    twm::types::CommandType::SellToAuction { .. }
+                ) && bot_client_clone.is_auction_at_limit()
                 {
-                    debug!("[Queue] Dropping SellToAuction — auction limit reached: {:?}", cmd.command_type);
+                    debug!(
+                        "[Queue] Dropping SellToAuction — auction limit reached: {:?}",
+                        cmd.command_type
+                    );
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
                 }
 
-                // Full inventory "selling mode": when inventory is full, only
-                // allow commands that free up space (AH listings, bazaar sells,
-                // order management, claims of SOLD items).  Everything else —
-                // including ClaimPurchasedItem (which adds items) — is dropped so
-                // the bot focuses exclusively on selling until there's space again.
-                if skip_flips_when_inv_full_proc.load(Ordering::Relaxed)
-                    && bot_client_clone.is_inventory_full()
-                {
+                // Full inventory normally enters selling mode. Operators who
+                // disable skip_flips_when_inventory_full can still attempt AH buys;
+                // other commands that cannot free space remain blocked.
+                if bot_client_clone.is_inventory_full() {
+                    // Track how long we've been in selling mode.  If the
+                    // inventory_full flag has been set for > SELLING_MODE_RECHECK_SECS
+                    // without any sell command executing, force-clear it so the
+                    // bot rechecks actual inventory state instead of staying
+                    // stuck dropping commands indefinitely.
+                    let since = selling_mode_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > Duration::from_secs(SELLING_MODE_RECHECK_SECS) {
+                        info!("[SellingMode] Inventory full for >{}s — force-clearing flag to recheck", SELLING_MODE_RECHECK_SECS);
+                        bot_client_clone.clear_inventory_full();
+                        selling_mode_since = None;
+                        // Re-check immediately — if inventory is truly full the
+                        // cached slot count in is_inventory_full() will re-confirm.
+                        if bot_client_clone.is_inventory_full() {
+                            // Still full after recheck — restart the timer
+                            selling_mode_since = Some(Instant::now());
+                        }
+                    }
+                } else {
+                    // Not in selling mode — reset the timer
+                    selling_mode_since = None;
+                }
+                if bot_client_clone.is_inventory_full() {
                     let is_selling_cmd = matches!(
                         cmd.command_type,
                         twm::types::CommandType::SellToAuction { .. }
-                        | twm::types::CommandType::BazaarSellOrder { .. }
-                        | twm::types::CommandType::ManageOrders { .. }
-                        | twm::types::CommandType::ClaimSoldItem
-                        | twm::types::CommandType::SellInventoryBz
-                        | twm::types::CommandType::CancelAuction { .. }
+                            | twm::types::CommandType::BazaarSellOrder { .. }
+                            | twm::types::CommandType::ManageOrders { .. }
+                            | twm::types::CommandType::ClaimSoldItem
+                            | twm::types::CommandType::SellInventoryBz
+                            | twm::types::CommandType::CancelAuction { .. }
                     );
-                    if !is_selling_cmd {
-                        warn!("[Queue] Dropping {:?} — inventory full (selling mode)", cmd.command_type);
+                    if !is_selling_cmd
+                        && !(!skip_flips_when_inv_full_proc.load(Ordering::Relaxed)
+                            && matches!(
+                                cmd.command_type,
+                                twm::types::CommandType::PurchaseAuction { .. }
+                            ))
+                    {
+                        debug!(
+                            "[Queue] Dropping {:?} — inventory full (selling mode)",
+                            cmd.command_type
+                        );
                         // Proactively request /cofl sellinventory to get sell
                         // recommendations (especially bazaar) when inventory is full.
-                        // Debounce to avoid spamming COFL.
+                        // Debounce to avoid spamming COFL — 60s between requests.
                         if last_sellinventory_request.elapsed() > Duration::from_secs(60) {
                             last_sellinventory_request = Instant::now();
                             let ws = ws_client_proc.clone();
@@ -2913,24 +5547,57 @@ async fn main() -> Result<()> {
                                     let upload_msg = serde_json::json!({
                                         "type": "uploadInventory",
                                         "data": inv_json
-                                    }).to_string();
+                                    })
+                                    .to_string();
                                     let _ = ws.send_message(&upload_msg).await;
+                                    // Let COFL ingest the uploaded inventory before selling.
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(600))
+                                        .await;
                                 }
                                 let msg = serde_json::json!({
                                     "type": "sellinventory",
                                     "data": serde_json::to_string("").unwrap_or_default()
-                                }).to_string();
+                                })
+                                .to_string();
                                 if let Err(e) = ws.send_message(&msg).await {
-                                    tracing::warn!("[SellingMode] Failed to request sellinventory: {}", e);
+                                    tracing::warn!(
+                                        "[SellingMode] Failed to request sellinventory: {}",
+                                        e
+                                    );
                                 } else {
                                     tracing::info!("[SellingMode] Auto-requested sellinventory (inventory full)");
                                 }
                             });
                         }
                         command_queue_processor.complete_current();
+                        // When inventory is full, also ensure ManageOrders is queued
+                        // to collect filled SELL orders (which yield coins, not items)
+                        // and free up bazaar order slots.
                         if !command_queue_processor.has_manage_orders() {
                             command_queue_processor.enqueue(
-                                twm::types::CommandType::ManageOrders { cancel_open: false },
+                                twm::types::CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: None,
+                                },
+                                twm::types::CommandPriority::High,
+                                false,
+                            );
+                        }
+                        // Last-resort space recovery: if the inventory has stayed
+                        // full (the COFL sellinventory / sell-order route isn't
+                        // clearing it — common with bazaar-bought items the bot
+                        // can't re-list), force a bazaar "Sell Inventory Now" to
+                        // instantly sell everything sellable and free space.
+                        if last_instasell_clear.elapsed()
+                            > Duration::from_secs(FORCE_INSTASELL_SECS)
+                        {
+                            last_instasell_clear = Instant::now();
+                            warn!("[SellingMode] Inventory still full — forcing bazaar Sell-Inventory-Now to free space");
+                            let baf_msg = "§f[§4BAF§f]: §e📦 Inventory full — instantly selling inventory on bazaar to free space".to_string();
+                            print_mc_chat(&baf_msg);
+                            let _ = chat_tx_proc.send(baf_msg);
+                            command_queue_processor.enqueue(
+                                twm::types::CommandType::SellInventoryBz,
                                 twm::types::CommandPriority::High,
                                 false,
                             );
@@ -2944,8 +5611,10 @@ async fn main() -> Result<()> {
                 // purchased items to keep space available for selling.  The
                 // purchases are safe in the AH collect bin and will be claimed
                 // once inventory drains.
-                if matches!(cmd.command_type, twm::types::CommandType::ClaimPurchasedItem)
-                    && bot_client_clone.is_inventory_near_full()
+                if matches!(
+                    cmd.command_type,
+                    twm::types::CommandType::ClaimPurchasedItem
+                ) && bot_client_clone.is_inventory_near_full()
                 {
                     debug!("[Queue] Deferring ClaimPurchasedItem — inventory near full, prioritizing selling");
                     command_queue_processor.complete_current();
@@ -2958,10 +5627,15 @@ async fn main() -> Result<()> {
                 // inventory.  The send_command handler will attempt them anyway;
                 // if the server rejects them the at_limit flag stays set and
                 // a ManageOrders run (already queued at intake) will free a slot.
-                if matches!(cmd.command_type, twm::types::CommandType::BazaarBuyOrder { .. })
-                    && bot_client_clone.is_bazaar_at_limit()
+                if matches!(
+                    cmd.command_type,
+                    twm::types::CommandType::BazaarBuyOrder { .. }
+                ) && bot_client_clone.is_bazaar_at_limit()
                 {
-                    debug!("[Queue] Dropping BUY bazaar order — bazaar limit reached: {:?}", cmd.command_type);
+                    debug!(
+                        "[Queue] Dropping BUY bazaar order — bazaar limit reached: {:?}",
+                        cmd.command_type
+                    );
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
@@ -2969,10 +5643,15 @@ async fn main() -> Result<()> {
 
                 // Skip SellToAuction when the auction slot is blocked (stuck item).
                 // A ClaimSold / ManageOrders cycle will clear the flag.
-                if matches!(cmd.command_type, twm::types::CommandType::SellToAuction { .. })
-                    && bot_client_clone.is_auction_slot_blocked()
+                if matches!(
+                    cmd.command_type,
+                    twm::types::CommandType::SellToAuction { .. }
+                ) && bot_client_clone.is_auction_slot_blocked()
                 {
-                    warn!("[Queue] Dropping SellToAuction — auction slot blocked (stuck item): {:?}", cmd.command_type);
+                    warn!(
+                        "[Queue] Dropping SellToAuction — auction slot blocked (stuck item): {:?}",
+                        cmd.command_type
+                    );
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
@@ -3000,8 +5679,8 @@ async fn main() -> Result<()> {
 
                 // Poll until the bot returns to an allows_commands() state or we hit the
                 // per-type timeout. A single loop replaces the previous per-type if/else chain.
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(timeout_secs);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 let mut interrupted = false;
                 loop {
                     sleep(Duration::from_millis(250)).await;
@@ -3047,7 +5726,10 @@ async fn main() -> Result<()> {
                 // AH flip so it is picked up immediately.
                 // Use a longer delay after auction listings to prevent "Sending packets too fast" kicks.
                 if !interrupted {
-                    let delay = if matches!(cmd.command_type, twm::types::CommandType::SellToAuction { .. }) {
+                    let delay = if matches!(
+                        cmd.command_type,
+                        twm::types::CommandType::SellToAuction { .. }
+                    ) {
                         std::cmp::max(command_delay_ms, auction_listing_delay_ms)
                     } else {
                         command_delay_ms
@@ -3056,8 +5738,10 @@ async fn main() -> Result<()> {
                     let next_is_critical_purchase = command_queue_processor
                         .peek_queued()
                         .map(|next| {
-                            matches!(next.command_type, twm::types::CommandType::PurchaseAuction { .. })
-                                && next.priority == CommandPriority::Critical
+                            matches!(
+                                next.command_type,
+                                twm::types::CommandType::PurchaseAuction { .. }
+                            ) && next.priority == CommandPriority::Critical
                         })
                         .unwrap_or(false);
 
@@ -3074,10 +5758,7 @@ async fn main() -> Result<()> {
                 // Queue is empty — wait for a notification instead of busy-polling.
                 // Times out after 500 ms so paused-state and other periodic checks
                 // still run promptly even when no commands arrive.
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    &mut notified,
-                ).await;
+                let _ = tokio::time::timeout(Duration::from_millis(500), &mut notified).await;
             }
         }
     });
@@ -3090,13 +5771,29 @@ async fn main() -> Result<()> {
     info!("Console interface ready - type commands and press Enter:");
     info!("  /cofl <command> - Send command to COFL websocket");
     info!("  /<command> - Send command to Minecraft");
+    info!("  /trex sellinv - Force-list the whole inventory at finder prices");
+    info!("  /trex logout [all] - Clear cached Microsoft login (restart to switch account)");
     info!("  <text> - Send chat message to COFL websocket");
-    
-    // Spawn console input handler
+
+    // `/trex sellinv` → wake the finder auto-lister for an immediate FORCED
+    // inventory upload (finder ignores its confidence filter, still refuses
+    // items without enough sold samples and reports those back).
+    let force_list_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // Spawn console input handler (only when enabled in config).  When disabled,
+    // stdin is left untouched — useful when running headless / as a service.
     let ws_client_for_console = ws_client.clone();
     let command_queue_for_console = command_queue.clone();
-    
+    let bot_client_for_console = bot_client.clone();
+    let force_list_notify_console = force_list_notify.clone();
+    let ingame_names_for_console = ingame_names.clone();
+    let console_input_enabled = config.enable_console_input;
+
     tokio::spawn(async move {
+        if !console_input_enabled {
+            info!("[Console] Console input disabled (enable_console_input = false)");
+            return;
+        }
         // Rustyline provides readline with history (up/down arrow key navigation) and
         // proper terminal handling. Since it's a blocking API we drive it in a
         // dedicated blocking task and send each line over an mpsc channel.
@@ -3143,16 +5840,110 @@ async fn main() -> Result<()> {
             if input.is_empty() {
                 continue;
             }
-            
+
             let lowercase_input = input.to_lowercase();
-            
+
+            // `/hypixel ping` (alias `/ping`): report the TRUE game-connection RTT.
+            //
+            // The live figure comes from the vanilla F3+3 play-ping
+            // (ServerboundPingRequest/ClientboundPongResponse) that the bot sends
+            // on its actual game socket every few seconds — so it travels the
+            // exact path gameplay does, INCLUDING any SOCKS proxy hop. The SLP
+            // probe (measure()) opens a separate status connection straight to
+            // mc.hypixel.net, which Cloudflare answers at its nearest edge and
+            // which skips the proxy entirely — that's why it reads absurdly low
+            // (e.g. 3ms) and must not be treated as the real latency.
+            if lowercase_input == "/hypixel ping" || lowercase_input == "/ping" {
+                info!("[Ping] Reporting live game-connection RTT (F3+3) + SLP edge probe …");
+                tokio::spawn(async move {
+                    // Live in-connection RTT — the number that actually matters.
+                    match twm::hypixel_ping::latest_live_ping_ms() {
+                        Some(live) => print_mc_chat(&format!(
+                            "§f[§4BAF§f]: §bPing §7→ §agame connection {}ms §7(live, via proxy path)",
+                            live
+                        )),
+                        None => print_mc_chat(
+                            "§f[§4BAF§f]: §eLive game ping not measured yet §7(F3+3 pinger warms up ~15s after login) — showing edge probe only",
+                        ),
+                    }
+                    // SLP edge probe for comparison — explicitly labelled so it is
+                    // never mistaken for the real latency.
+                    match twm::hypixel_ping::measure(4, std::time::Duration::from_millis(200)).await {
+                        Ok(s) => print_mc_chat(&format!(
+                            "§f[§4BAF§f]: §7edge/SLP probe → avg {}ms (min {}ms, max {}ms) — skips proxy, hits Cloudflare edge",
+                            s.avg.as_millis(), s.min.as_millis(), s.max.as_millis()
+                        )),
+                        Err(e) => print_mc_chat(&format!("§f[§4BAF§f]: §7edge/SLP probe failed: {}", e)),
+                    }
+                });
+                continue;
+            }
+
+            // `/trex sellinv` — force-list the whole inventory at finder prices.
+            //
+            // The finder is reached one of two ways depending on the deployment:
+            //   • COFL-primary (websocket_url = coflnet): the dedicated finder
+            //     lister socket (role=lister) does the forced upload — poke it
+            //     via force_list_notify. Sending inventory over the primary
+            //     socket here would just spam COFL, which can't price it, so
+            //     send_inventory() is a no-op in that mode.
+            //   • finder-only (websocket_url = finder): send_inventory() uploads
+            //     directly over the primary socket.
+            // We do both; each is inert in the mode it doesn't apply to.
+            if lowercase_input == "/trex sellinv" || lowercase_input == "trex sellinv" {
+                print_mc_chat("§f[§4BAF§f]: §bForce-selling inventory via finder...");
+                force_list_notify_console.notify_one();
+                if let Some(inv) = bot_client_for_console.get_cached_inventory_json() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&inv) {
+                        let items = v.get("slots").cloned().unwrap_or(serde_json::json!([]));
+                        if let Err(e) = ws_client_for_console.send_inventory(&items, true).await {
+                            print_mc_chat(&format!(
+                                "§f[§4BAF§f]: §cFailed to upload inventory: {}",
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    print_mc_chat("§f[§4BAF§f]: §cNo cached inventory yet");
+                }
+                continue;
+            }
+
+            // `/trex logout [all]` — clear azalea's cached Microsoft login so the
+            // next start prompts a fresh sign-in. Without this, tokens cached in
+            // ~/.minecraft/azalea-auth.json survive log-deletion and redownload,
+            // so the bot keeps reusing the previous account and never offers a
+            // sign-in for a different one. `/trex logout all` wipes every cached
+            // account; plain `/trex logout` clears only this bot's configured IGNs.
+            if lowercase_input == "/trex logout"
+                || lowercase_input == "trex logout"
+                || lowercase_input == "/trex logout all"
+                || lowercase_input == "trex logout all"
+            {
+                let wipe_all = lowercase_input.ends_with("all");
+                let keys: Vec<String> = if wipe_all {
+                    Vec::new()
+                } else {
+                    ingame_names_for_console.clone()
+                };
+                match clear_azalea_auth_cache(&keys) {
+                    Ok(0) => print_mc_chat("§f[§4BAF§f]: §eNo cached login found to clear (already logged out)."),
+                    Ok(n) => print_mc_chat(&format!(
+                        "§f[§4BAF§f]: §aCleared {} cached login{}. §7Restart the bot to sign in with a different account.",
+                        n, if n == 1 { "" } else { "s" }
+                    )),
+                    Err(e) => print_mc_chat(&format!("§f[§4BAF§f]: §cFailed to clear cached login: {}", e)),
+                }
+                continue;
+            }
+
             // Handle /cofl and /baf commands (matching TypeScript consoleHandler.ts)
             if lowercase_input.starts_with("/cofl") || lowercase_input.starts_with("/baf") {
                 let parts: Vec<&str> = input.split_whitespace().collect();
                 if parts.len() > 1 {
                     let command = parts[1];
                     let args = parts[2..].join(" ");
-                    
+
                     // Handle locally-processed commands (matching TypeScript consoleHandler.ts)
                     match command.to_lowercase().as_str() {
                         "queue" => {
@@ -3169,12 +5960,15 @@ async fn main() -> Result<()> {
                             info!("Command queue cleared");
                             continue;
                         }
+                        // `/cofl ping` is handled server-side by Coflnet (a ping-pong
+                        // round-trip measured over the modsocket); we forward it like
+                        // any other command rather than intercepting it.
                         // TODO: Add other local commands like forceClaim, connect, sellbz when implemented
                         _ => {
                             // Fall through to send to websocket
                         }
                     }
-                    
+
                     // Send to websocket with command as type
                     // Match TypeScript: data field must be JSON-stringified (double-encoded)
                     let data_json = match serde_json::to_string(&args) {
@@ -3187,8 +5981,9 @@ async fn main() -> Result<()> {
                     let message = serde_json::json!({
                         "type": command,
                         "data": data_json  // JSON-stringified to match TypeScript JSON.stringify()
-                    }).to_string();
-                    
+                    })
+                    .to_string();
+
                     if let Err(e) = ws_client_for_console.send_message(&message).await {
                         error!("Failed to send command to websocket: {}", e);
                     } else {
@@ -3200,18 +5995,19 @@ async fn main() -> Result<()> {
                     let message = serde_json::json!({
                         "type": "chat",
                         "data": data_json
-                    }).to_string();
-                    
+                    })
+                    .to_string();
+
                     if let Err(e) = ws_client_for_console.send_message(&message).await {
                         error!("Failed to send bare /cofl command to websocket: {}", e);
                     }
                 }
-            } 
+            }
             // Handle other slash commands - send to Minecraft
             else if input.starts_with('/') {
                 command_queue_for_console.enqueue(
-                    twm::types::CommandType::SendChat { 
-                        message: input.to_string() 
+                    twm::types::CommandType::SendChat {
+                        message: input.to_string(),
                     },
                     twm::types::CommandPriority::High,
                     false,
@@ -3231,8 +6027,9 @@ async fn main() -> Result<()> {
                 let message = serde_json::json!({
                     "type": "chat",
                     "data": data_json  // JSON-stringified to match TypeScript JSON.stringify()
-                }).to_string();
-                
+                })
+                .to_string();
+
                 if let Err(e) = ws_client_for_console.send_message(&message).await {
                     error!("Failed to send chat to websocket: {}", e);
                 } else {
@@ -3241,7 +6038,7 @@ async fn main() -> Result<()> {
             }
         }
     });
-    
+
     // COFL now automatically sends bazaar flip recommendations — no periodic
     // request needed (previously sent getbazaarflips every 5 minutes).
 
@@ -3255,8 +6052,11 @@ async fn main() -> Result<()> {
                 if bot_client_scoreboard.state().allows_commands() {
                     let scoreboard_lines = bot_client_scoreboard.get_scoreboard_lines();
                     if !scoreboard_lines.is_empty() {
-                        let data_json = serde_json::to_string(&scoreboard_lines).unwrap_or_else(|_| "[]".to_string());
-                        let msg = serde_json::json!({"type": "uploadScoreboard", "data": data_json}).to_string();
+                        let data_json = serde_json::to_string(&scoreboard_lines)
+                            .unwrap_or_else(|_| "[]".to_string());
+                        let msg =
+                            serde_json::json!({"type": "uploadScoreboard", "data": data_json})
+                                .to_string();
                         if let Err(e) = ws_client_scoreboard.send_message(&msg).await {
                             debug!("Failed to send periodic scoreboard upload: {}", e);
                         } else {
@@ -3268,8 +6068,35 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Periodic inventory upload to finder (every 60s)
+    {
+        let bc = bot_client.clone();
+        let ws = ws_client.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if bc.is_auction_at_limit() {
+                    continue;
+                }
+                if let Some(inv) = bc.get_cached_inventory_json() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&inv) {
+                        let items = v.get("slots").cloned().unwrap_or(serde_json::json!([]));
+                        let _ = ws.send_inventory(&items, false).await;
+                    }
+                }
+            }
+        });
+    }
+
     // Periodic bazaar order check — collect filled orders and cancel stale ones.
     // Driven by config.bazaar_order_check_interval_seconds (default 30s).
+    //
+    // Always spawned, then gated on the LIVE `enable_bazaar_flips` atomic each
+    // tick: the web panel can toggle bazaar flips at runtime, and a boot-time
+    // snapshot of the config would leave this timer claiming the user's orders
+    // for the rest of the session after they switched the finder off.
     {
         let bot_client_orders = bot_client.clone();
         let command_queue_orders = command_queue.clone();
@@ -3277,14 +6104,18 @@ async fn main() -> Result<()> {
         let bazaar_tracker_orders = bazaar_tracker.clone();
         let enable_bazaar_flips_orders = enable_bazaar_flips.clone();
         let order_interval = config.bazaar_order_check_interval_seconds;
+        let cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
         tokio::spawn(async move {
-            use twm::types::{CommandType, CommandPriority};
+            use twm::types::{CommandPriority, CommandType};
             // Give startup workflow time to complete before starting periodic checks
             sleep(Duration::from_secs(120)).await;
             loop {
                 sleep(Duration::from_secs(order_interval)).await;
+                // Bazaar flips off (config or live web-panel toggle) → do not
+                // manage orders at all: no cancelling, no claiming.  The user's
+                // own / co-op orders are theirs to collect.
                 if !enable_bazaar_flips_orders.load(Ordering::Relaxed) {
-                    debug!("[BazaarOrders] Skipping periodic order check — Bazaar flips disabled");
+                    debug!("[BazaarOrders] Skipping periodic order check — bazaar flips disabled");
                     continue;
                 }
                 // Skip during AH pause — ManageOrders would be deferred anyway
@@ -3293,13 +6124,13 @@ async fn main() -> Result<()> {
                     debug!("[BazaarOrders] Skipping periodic order check — AH flips incoming");
                     continue;
                 }
-                // Skip when the tracker has no filled orders to collect.
-                // The BazaarOrderFilled event already triggers an immediate
-                // ManageOrders run, so the periodic timer only needs to fire
-                // when a fill notification was missed or on startup.  This
-                // avoids constant GUI cycling that generates packet spam and
-                // slows down the macro.
-                if !bazaar_tracker_orders.has_filled_orders() {
+                // Skip when the tracker has no filled orders AND age-based
+                // cancellation is disabled.  When cancel_minutes_per_million > 0
+                // the periodic run is the only mechanism that cancels stale
+                // unfilled orders, so we must not skip it even when nothing
+                // appears filled — the ManageOrders handler will close
+                // immediately if it finds nothing actionable.
+                if !bazaar_tracker_orders.has_filled_orders() && cancel_minutes_per_million == 0 {
                     debug!("[BazaarOrders] No filled orders in tracker — skipping periodic ManageOrders");
                     continue;
                 }
@@ -3311,15 +6142,27 @@ async fn main() -> Result<()> {
                 // is still full, the flag will be re-set on the next failed
                 // claim attempt.
                 if bot_client_orders.is_inventory_full() {
-                    debug!("[BazaarOrders] Inventory full — waiting extra 90s before next order check");
+                    debug!(
+                        "[BazaarOrders] Inventory full — waiting extra 90s before next order check"
+                    );
                     sleep(Duration::from_secs(90)).await;
                     bot_client_orders.clear_inventory_full();
-                    debug!("[BazaarOrders] Inventory full cooldown elapsed — clearing flag for retry");
+                    debug!(
+                        "[BazaarOrders] Inventory full cooldown elapsed — clearing flag for retry"
+                    );
                 }
-                if bot_client_orders.state().allows_commands() && !command_queue_orders.has_manage_orders() {
-                    debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
+                if bot_client_orders.state().allows_commands()
+                    && !command_queue_orders.has_manage_orders()
+                {
+                    debug!(
+                        "[BazaarOrders] Periodic order check triggered (every {}s)",
+                        order_interval
+                    );
                     command_queue_orders.enqueue(
-                        CommandType::ManageOrders { cancel_open: false },
+                        CommandType::ManageOrders {
+                            cancel_open: false,
+                            target_item: None,
+                        },
                         CommandPriority::Normal,
                         false,
                     );
@@ -3341,7 +6184,11 @@ async fn main() -> Result<()> {
                 sleep(Duration::from_secs(60)).await;
                 let removed = bazaar_tracker_cleanup.remove_stale_orders(max_age_secs);
                 if removed > 0 {
-                    info!("[BazaarTracker] Cleaned up {} stale order(s) older than {}m", removed, max_age_secs / 60);
+                    info!(
+                        "[BazaarTracker] Cleaned up {} stale order(s) older than {}m",
+                        removed,
+                        max_age_secs / 60
+                    );
                 }
             }
         });
@@ -3366,12 +6213,37 @@ async fn main() -> Result<()> {
                 let msg = serde_json::json!({
                     "type": "chatBatch",
                     "data": data_json
-                }).to_string();
+                })
+                .to_string();
                 if let Err(e) = ws_client_chat_batch.send_message(&msg).await {
                     debug!("[ChatBatch] Failed to send chatBatch to Coflnet: {}", e);
                 } else {
                     debug!("[ChatBatch] Sent {} message(s) to Coflnet", batch.len());
                 }
+            }
+        });
+    }
+
+    // Keep the API-side view of this account's own auctions warm, so the claim
+    // sweep can tell our sold auctions from a co-op member's without ever
+    // blocking on HTTP with a GUI window open. Spawned unconditionally and idle
+    // while the option is off, so toggling it from the web panel takes effect
+    // immediately instead of at the next restart.
+    {
+        let bot_client_own = bot_client.clone();
+        let api_key_own = config.hypixel_api_key.clone();
+        tokio::spawn(async move {
+            loop {
+                if twm::auction_ownership::enabled() {
+                    let name = bot_client_own.ingame_name.read().clone();
+                    if !name.is_empty() {
+                        twm::auction_ownership::refresh_remote(&name, api_key_own.as_deref()).await;
+                    }
+                }
+                sleep(Duration::from_secs(
+                    twm::auction_ownership::REFRESH_INTERVAL_SECS,
+                ))
+                .await;
             }
         });
     }
@@ -3476,17 +6348,24 @@ async fn main() -> Result<()> {
                         let upload_msg = serde_json::json!({
                             "type": "uploadInventory",
                             "data": inv_json
-                        }).to_string();
+                        })
+                        .to_string();
                         let _ = ws.send_message(&upload_msg).await;
+                        // Let COFL ingest the uploaded inventory before selling.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
                     }
                     let msg = serde_json::json!({
                         "type": "sellinventory",
                         "data": serde_json::to_string("").unwrap_or_default()
-                    }).to_string();
+                    })
+                    .to_string();
                     if let Err(e) = ws.send_message(&msg).await {
                         tracing::warn!("[IdleInventory] Failed to send sellinventory: {}", e);
                     } else {
-                        tracing::info!("[IdleInventory] Forced sellinventory after {}m idle", elapsed / 60);
+                        tracing::info!(
+                            "[IdleInventory] Forced sellinventory after {}m idle",
+                            elapsed / 60
+                        );
                     }
                 });
                 // Reset the timer so we don't spam every minute.
@@ -3498,6 +6377,10 @@ async fn main() -> Result<()> {
     // Periodic log cleanup — delete archived logs older than 7 days once a day.
     twm::logging::spawn_periodic_log_cleanup();
 
+    // Keep a fresh Hypixel ping figure so bed timing can lead clicks by the real
+    // connection latency (refreshed every 60s; also updated by `/hypixel ping`).
+    twm::hypixel_ping::spawn_background_refresher(std::time::Duration::from_secs(60));
+
     // Island guard: if "Your Island" is not in the scoreboard, send
     // /lobby → /play sb → /is to return to the island.
     // Matching TypeScript AFKHandler.ts tryToTeleportToIsland() logic.
@@ -3506,7 +6389,7 @@ async fn main() -> Result<()> {
         let command_queue_island = command_queue.clone();
         let chat_tx_island = chat_tx.clone();
         tokio::spawn(async move {
-            use twm::types::{CommandType, CommandPriority, BotState};
+            use twm::types::{BotState, CommandPriority, CommandType};
 
             // Give the startup workflow time to complete before we start checking.
             sleep(Duration::from_secs(60)).await;
@@ -3516,6 +6399,24 @@ async fn main() -> Result<()> {
 
             loop {
                 sleep(Duration::from_secs(10)).await;
+
+                // A manual (web GUI) or rest-break disconnect wants the bot to
+                // stay OFFLINE. state() is Idle in that case, which would
+                // otherwise make us treat the bot as "free" and spam rejoin
+                // commands / "returning to island" chat every 10s. Respect the
+                // deliberate disconnect and do nothing until a restart clears it.
+                if bot_client_island.is_disconnect_requested() {
+                    consecutive_rejoin_attempts = 0;
+                    continue;
+                }
+
+                // SkyBlock is down for maintenance — a `/play sb` right now would
+                // just bounce. Hold off (the flag auto-clears) instead of spamming
+                // the rejoin sequence into a closed server.
+                if skyblock_in_maintenance() {
+                    consecutive_rejoin_attempts = 0;
+                    continue;
+                }
 
                 // Don't interfere while the bot is actively doing work.
                 // Any non-Idle state means the bot is in a GUI workflow (bazaar,
@@ -3539,6 +6440,20 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // When flipping on a friend's island, the sidebar shows the
+                // friend's island ("⏣ <name>'s Island"), not "Your Island". Treat
+                // being on ANY island as home so the guard doesn't yank the bot
+                // back to its own island. Only applies while visitfriend is active
+                // (configured and not disabled for this session).
+                if twm::visitfriend::active_friend().is_some()
+                    && current_skyblock_area(&lines)
+                        .map(|a| a.contains("Island"))
+                        .unwrap_or(false)
+                {
+                    consecutive_rejoin_attempts = 0;
+                    continue;
+                }
+
                 consecutive_rejoin_attempts += 1;
 
                 // Safety cap: after REJOIN_MAX_ATTEMPTS consecutive failures,
@@ -3554,29 +6469,46 @@ async fn main() -> Result<()> {
                 // Exponential backoff: after repeated failures, wait longer to avoid
                 // infinite transfer cooldown when kicked from SkyBlock.
                 if consecutive_rejoin_attempts > 1 {
-                    let backoff_secs = std::cmp::min(REJOIN_BACKOFF_BASE_SECS * consecutive_rejoin_attempts as u64, REJOIN_MAX_BACKOFF_SECS);
+                    let backoff_secs = std::cmp::min(
+                        REJOIN_BACKOFF_BASE_SECS * consecutive_rejoin_attempts as u64,
+                        REJOIN_MAX_BACKOFF_SECS,
+                    );
                     let baf_msg = format!(
                         "§f[§4BAF§f]: §cRejoin attempt #{} — waiting {}s before retry...",
                         consecutive_rejoin_attempts, backoff_secs
                     );
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_island.send(baf_msg);
-                    warn!("[AFKHandler] Consecutive rejoin attempt #{} — backing off {}s", consecutive_rejoin_attempts, backoff_secs);
+                    warn!(
+                        "[AFKHandler] Consecutive rejoin attempt #{} — backing off {}s",
+                        consecutive_rejoin_attempts, backoff_secs
+                    );
                     sleep(Duration::from_secs(backoff_secs)).await;
                 }
 
-                // Not on island — send the return sequence.
-                let baf_msg = "§f[§4BAF§f]: §eNot detected on island — returning to island...".to_string();
+                // Not on island — send the return sequence. Name the current area
+                // when we can read it (e.g. Hypixel evacuated us to the Hub on a
+                // server restart) so an irregular world change is visible rather
+                // than a bare "not on island".
+                let baf_msg = match current_skyblock_area(&lines) {
+                    Some(area) => format!(
+                        "§f[§4BAF§f]: §eIrregular world change — now in §f{}§e, returning to island...",
+                        area
+                    ),
+                    None => "§f[§4BAF§f]: §eNot detected on island — returning to island...".to_string(),
+                };
                 print_mc_chat(&baf_msg);
                 let _ = chat_tx_island.send(baf_msg);
-                info!("[AFKHandler] Not on island — sending /lobby → /play sb → /is");
+                info!("[AFKHandler] Off island — sending /lobby → /play sb → /is");
 
                 // Send commands with delays between them so each server
                 // transfer has time to complete before the next fires.
                 // Check bot state between steps: if the bot left Idle (e.g.
                 // a flip arrived), abort the sequence so we don't interfere.
                 command_queue_island.enqueue(
-                    CommandType::SendChat { message: "/lobby".to_string() },
+                    CommandType::SendChat {
+                        message: "/lobby".to_string(),
+                    },
                     CommandPriority::High,
                     false,
                 );
@@ -3587,7 +6519,9 @@ async fn main() -> Result<()> {
                 }
 
                 command_queue_island.enqueue(
-                    CommandType::SendChat { message: "/play sb".to_string() },
+                    CommandType::SendChat {
+                        message: "/play sb".to_string(),
+                    },
                     CommandPriority::High,
                     false,
                 );
@@ -3597,14 +6531,115 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                command_queue_island.enqueue(
-                    CommandType::SendChat { message: "/is".to_string() },
-                    CommandPriority::High,
-                    false,
-                );
+                // Go home: friend's island (/visit + slot 11) when visitfriend is
+                // active, else the bot's own island (/is).
+                command_queue_island.enqueue(CommandType::GoToIsland, CommandPriority::High, false);
 
                 // Wait for the island teleport to finish before checking again.
                 sleep(Duration::from_secs(15)).await;
+            }
+        });
+    }
+
+    // Heartbeat / stall guard: the bot opens GUI windows constantly during
+    // normal operation (bazaar order management, flip purchases, sells, claims).
+    // If NOTHING opens a window for STALL_THRESHOLD_SECS the connection is very
+    // likely frozen or the bot was silently booted to limbo — the island guard
+    // above can't see it because the (stale) scoreboard may still show the
+    // island. First try to shake it loose with a rejoin; if the silence persists
+    // across STALL_MAX_ATTEMPTS checks, restart the process for a clean session.
+    {
+        let bot_client_hb = bot_client.clone();
+        let command_queue_hb = command_queue.clone();
+        let chat_tx_hb = chat_tx.clone();
+        tokio::spawn(async move {
+            use twm::types::{CommandPriority, CommandType};
+
+            // Seed the heartbeat and let the join/startup workflow finish before
+            // we start watching, so startup is never mistaken for a stall.
+            mark_activity();
+            sleep(Duration::from_secs(STALL_GRACE_SECS)).await;
+
+            let mut attempts: u32 = 0;
+            loop {
+                sleep(Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
+
+                // A deliberate offline state (web disconnect / rest break) is not
+                // a stall — the bot is meant to be idle.
+                if bot_client_hb.is_disconnect_requested() {
+                    attempts = 0;
+                    continue;
+                }
+
+                // SkyBlock down for maintenance explains the quiet; the island
+                // guard owns that case and it auto-clears.
+                if skyblock_in_maintenance() {
+                    attempts = 0;
+                    continue;
+                }
+
+                let idle_secs = secs_since_activity();
+                if idle_secs < STALL_THRESHOLD_SECS {
+                    attempts = 0;
+                    continue;
+                }
+
+                attempts += 1;
+                let idle_min = idle_secs / 60;
+                warn!(
+                    "[Heartbeat] No window activity for {}m — stall suspected (attempt {}/{})",
+                    idle_min, attempts, STALL_MAX_ATTEMPTS
+                );
+                let baf_msg = format!(
+                    "§f[§4BAF§f]: §cStall suspected — no activity for {}m (attempt {}/{})",
+                    idle_min, attempts, STALL_MAX_ATTEMPTS
+                );
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_hb.send(baf_msg);
+
+                // Soft recovery exhausted — restart the whole process so a fresh
+                // session takes over. restart_process() re-execs and never returns.
+                if attempts >= STALL_MAX_ATTEMPTS {
+                    let baf_msg =
+                        "§f[§4BAF§f]: §cRestarting bot — heartbeat detected a period of inactivity"
+                            .to_string();
+                    print_mc_chat(&baf_msg);
+                    let _ = chat_tx_hb.send(baf_msg);
+                    error!(
+                        "[Heartbeat] Stall unrecovered after {} attempts — restarting process",
+                        STALL_MAX_ATTEMPTS
+                    );
+                    // Give the messages a moment to flush to the panel/log first.
+                    sleep(Duration::from_secs(2)).await;
+                    restart_process();
+                }
+
+                // Soft recovery: force a rejoin. If the connection is alive this
+                // reopens windows, which ticks the heartbeat and clears the stall.
+                let baf_msg = format!(
+                    "§f[§4BAF§f]: §eBot connection restarting — reason: heartbeat inactivity (attempt {}/{})",
+                    attempts, STALL_MAX_ATTEMPTS
+                );
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_hb.send(baf_msg);
+                // /lobby → /play sb, then "go home" (friend's island via /visit +
+                // slot 11 when visitfriend is active, else /is).
+                for (cmd, delay) in [("/lobby", 5u64), ("/play sb", 10)] {
+                    command_queue_hb.enqueue(
+                        CommandType::SendChat {
+                            message: cmd.to_string(),
+                        },
+                        CommandPriority::High,
+                        false,
+                    );
+                    sleep(Duration::from_secs(delay)).await;
+                }
+                command_queue_hb.enqueue(CommandType::GoToIsland, CommandPriority::High, false);
+                sleep(Duration::from_secs(15)).await;
+
+                // Give a live session time to open a window (which resets the
+                // heartbeat) before the next check, so we don't escalate too fast.
+                sleep(Duration::from_secs(STALL_RECOVERY_GRACE_SECS)).await;
             }
         });
     }
@@ -3613,6 +6648,8 @@ async fn main() -> Result<()> {
     // When multiple accounts are configured and `multi_switch_time` is set, switch to the
     // next account after the specified number of hours by persisting the next account index
     // and restarting the process.
+    // Subtract previously accumulated session time so the timer continues from where
+    // it left off after a restart (e.g. humanization break, manual restart, crash).
     if ingame_names.len() > 1 {
         if let Some(switch_hours) = config.multi_switch_time {
             let switch_secs = (switch_hours * 3600.0) as u64;
@@ -3628,30 +6665,38 @@ async fn main() -> Result<()> {
             if remaining_secs == 0 {
                 info!(
                     "[AccountSwitch] Session time ({:.1}h) already exceeds switch threshold ({:.1}h) — will switch after 30s startup grace",
-                    previous_session_secs as f64 / 3600.0,
-                    switch_hours
+                    previous_session_secs as f64 / 3600.0, switch_hours
                 );
             } else {
                 info!(
                     "[AccountSwitch] Will switch from {} to {} in {:.1}h (total {:.1}h, already {:.1}h)",
-                    ingame_name,
-                    next_name,
-                    remaining_secs as f64 / 3600.0,
-                    switch_hours,
-                    previous_session_secs as f64 / 3600.0
+                    ingame_name, next_name, remaining_secs as f64 / 3600.0,
+                    switch_hours, previous_session_secs as f64 / 3600.0
                 );
             }
             tokio::spawn(async move {
-                let delay = if remaining_secs == 0 { 30 } else { remaining_secs };
+                // When remaining_secs is 0 (threshold already exceeded), wait
+                // 30s to allow the bot to connect and transfer the license.
+                let delay = if remaining_secs == 0 {
+                    30
+                } else {
+                    remaining_secs
+                };
                 sleep(Duration::from_secs(delay)).await;
                 info!(
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
-                    next_index + 1, next_name
+                    next_index + 1,
+                    next_name
                 );
                 // Clear session time for the outgoing account so it starts
                 // fresh when this account is used again.
                 clear_session_time(&session_times_path_switch, &ign_switch);
                 info!("[AccountSwitch] Cleared session time for {}", ign_switch);
+                // Mark the incoming account so the next process start begins a
+                // fresh session (profit + uptime reset to 0) instead of resuming
+                // stale totals when the restart lands inside the quick-restart
+                // window.
+                twm::session::write_account_switch_marker(&next_name);
                 // Transfer the COFL license to the next account before restarting.
                 let license_index = detected_license_switch.load(Ordering::Relaxed);
                 if license_index > 0 {
@@ -3665,10 +6710,7 @@ async fn main() -> Result<()> {
                 if let Err(e) = std::fs::write(&index_path, next_index.to_string()) {
                     warn!("[AccountSwitch] Failed to write account index: {}", e);
                 }
-                let baf_msg = format!(
-                    "§f[§4BAF§f]: §eSwitching to account §b{}§e...",
-                    next_name
-                );
+                let baf_msg = format!("§f[§4BAF§f]: §eSwitching to account §b{}§e...", next_name);
                 print_mc_chat(&baf_msg);
                 let _ = chat_tx_switch.send(baf_msg);
                 info!("[AccountSwitch] Restarting process with next account...");
@@ -3677,20 +6719,97 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Periodic profit summary webhook every 30 minutes
+    if let Some(webhook_url) = config.active_webhook_url() {
+        let profit_tracker_webhook = profit_tracker.clone();
+        let webhook_url = webhook_url.to_string();
+        let name = ingame_name.clone();
+        let started = std::time::Instant::now();
+        let prev_secs_summary = previous_session_secs;
+        let ws_client_summary = ws_client.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(30 * 60)).await;
+                let uptime = prev_secs_summary + started.elapsed().as_secs();
+
+                // Refresh Coflnet's REALIZED total before reporting. It is
+                // otherwise only requested after a sale, so a quiet half-hour
+                // would report a stale number next to live theoretical totals.
+                // Finder-primary setups have no Coflnet to ask, so the realized
+                // field is simply omitted there.
+                if !ws_client_summary.is_finder() {
+                    let days = uptime as f64 / SECS_PER_DAY;
+                    if days >= 0.01 {
+                        let args = format!("{} {:.4}", name, days);
+                        let message = serde_json::json!({
+                            "type": "profit",
+                            "data": serde_json::json!(args).to_string(),
+                        })
+                        .to_string();
+                        if let Err(e) = ws_client_summary.send_message(&message).await {
+                            tracing::warn!("[CoflProfit] Summary refresh failed: {}", e);
+                        } else {
+                            // The reply arrives as a chat message on the event
+                            // loop; give it a moment to land before reading.
+                            sleep(Duration::from_secs(8)).await;
+                        }
+                    }
+                }
+
+                let (ah, bz) = profit_tracker_webhook.totals();
+                let realized = profit_tracker_webhook.realized_ah();
+                twm::webhook::send_webhook_profit_summary(
+                    &name,
+                    ah,
+                    bz,
+                    realized,
+                    uptime,
+                    &webhook_url,
+                )
+                .await;
+            }
+        });
+    }
     // Periodic session-time persistence — save the accumulated running time for
     // this account every 60 seconds so a crash or kill preserves most of the data.
+    // Profit totals are saved in the same tick: previously they were only written
+    // on humanization rest breaks, so any other restart reset profit to 0 while
+    // uptime survived.
     {
         let session_times_path_save = session_times_path.clone();
         let ign_save = ingame_name.clone();
         let started_save = std::time::Instant::now();
         let prev_secs_save = previous_session_secs;
+        let profit_tracker_save = profit_tracker.clone();
+        let profit_path_save = profit_path.clone();
+        let flip_tracker_save = flip_tracker.clone();
+        let flip_tracker_path_save = flip_tracker_path.clone();
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(60)).await;
                 let total_secs = prev_secs_save + started_save.elapsed().as_secs();
                 save_session_time(&session_times_path_save, &ign_save, total_secs);
+                save_profit_stats(&profit_path_save, &ign_save, &profit_tracker_save);
+                // Same tick as profit: a kill -9 must not cost the sell-time
+                // baselines of everything currently listed.
+                save_flip_tracker(&flip_tracker_path_save, &ign_save, &flip_tracker_save);
             }
         });
+    }
+
+    // ── Bazaar webhook digest flusher ─────────────────────────────
+    // Consolidate placed/collected/cancelled bazaar order webhooks into ONE
+    // embed per minute instead of one embed per order action (less spammy).
+    if let Some(url) = config.active_bazaar_webhook_url() {
+        twm::webhook::spawn_bazaar_digest_flusher(url.to_string(), ingame_name.clone(), 60);
+    }
+
+    // ── Finder flip-feed webhook flusher ──────────────────────────
+    // Opt-in: when `finder_flip_webhook_url` is set, EVERY flip the private
+    // finder finds is posted there in batches (bought or not, before any
+    // gating). Empty = feature off, nothing is queued or posted.
+    if let Some(url) = config.active_finder_flip_webhook_url() {
+        twm::webhook::spawn_found_flip_flusher(url.to_string());
     }
 
     // ── Human-like rest breaks ───────────────────────────────────
@@ -3699,7 +6818,6 @@ async fn main() -> Result<()> {
     // Session time is saved right before restart so it is preserved across
     // the break — the account-switching timer is NOT reset.
     if config.humanization_enabled {
-        let command_queue_human = command_queue.clone();
         let chat_tx_human = chat_tx.clone();
         let ign_human = ingame_name.clone();
         let webhook_url_human = config.active_webhook_url().map(|s| s.to_string());
@@ -3707,8 +6825,19 @@ async fn main() -> Result<()> {
         let prev_secs_human = previous_session_secs;
         let started_human = std::time::Instant::now();
         let macro_paused_human = macro_paused.clone();
+        // For a real break we must also stop *flips* coming in, not just drop the
+        // Minecraft connection: pause flip intake and clear the queue so nothing
+        // is dispatched before the process restarts into its offline break wait.
+        let flip_intake_paused_human = flip_intake_paused.clone();
+        let command_queue_human = command_queue.clone();
+        let profit_tracker_human = profit_tracker.clone();
+        let profit_path_human = profit_path.clone();
+        let flip_tracker_human = flip_tracker.clone();
+        let flip_tracker_path_human = flip_tracker_path.clone();
         let min_interval = config.humanization_min_interval_minutes.max(5); // floor at 5 min
-        let max_interval = config.humanization_max_interval_minutes.max(min_interval + 1);
+        let max_interval = config
+            .humanization_max_interval_minutes
+            .max(min_interval + 1);
         let min_break = config.humanization_min_break_minutes.max(1); // floor at 1 min
         let max_break = config.humanization_max_break_minutes.max(min_break + 1);
         info!(
@@ -3717,7 +6846,6 @@ async fn main() -> Result<()> {
         );
         tokio::spawn(async move {
             use rand::Rng;
-            use twm::types::{CommandType, CommandPriority};
 
             // Sleep for a random interval between min and max
             let interval_secs = {
@@ -3730,11 +6858,14 @@ async fn main() -> Result<()> {
             );
             sleep(Duration::from_secs(interval_secs)).await;
 
-            if macro_paused_human.load(Ordering::Relaxed) {
+            // If the macro is paused by the user, wait until it's unpaused
+            // before starting the rest break.  This prevents the scheduler
+            // from overriding the user's manual pause.
+            if macro_paused_human.load(std::sync::atomic::Ordering::Relaxed) {
                 info!("[Humanization] Macro is paused — deferring rest break until resumed");
                 loop {
                     sleep(Duration::from_secs(5)).await;
-                    if !macro_paused_human.load(Ordering::Relaxed) {
+                    if !macro_paused_human.load(std::sync::atomic::Ordering::Relaxed) {
                         info!("[Humanization] Macro resumed — proceeding with rest break");
                         break;
                     }
@@ -3753,12 +6884,7 @@ async fn main() -> Result<()> {
 
             // Notify via webhook
             if let Some(ref url) = webhook_url_human {
-                twm::webhook::send_webhook_rest_break_start(
-                    &ign_human,
-                    break_secs,
-                    url,
-                )
-                .await;
+                twm::webhook::send_webhook_rest_break_start(&ign_human, break_secs, url).await;
             }
 
             // Notify chat
@@ -3769,62 +6895,441 @@ async fn main() -> Result<()> {
             print_mc_chat(&baf_msg);
             let _ = chat_tx_human.send(baf_msg);
 
-            // Disconnect from the server via /quit
-            command_queue_human.enqueue(
-                CommandType::SendChat { message: "/quit".to_string() },
-                CommandPriority::Critical,
-                false,
-            );
-            // Give the command processor time to process /quit
-            sleep(Duration::from_secs(3)).await;
-
-            info!("[Humanization] Disconnected — sleeping for {:.1}m", break_secs as f64 / 60.0);
-
-            // Sleep for the break duration (fully disconnected)
-            sleep(Duration::from_secs(break_secs)).await;
-
-            info!("[Humanization] Rest break over — saving session time and restarting");
-
-            // Send "break over" webhook before restart
-            if let Some(ref url) = webhook_url_human {
-                twm::webhook::send_webhook_rest_break_end(&ign_human, url).await;
-            }
-
-            // Save session time right before restart so the gap is near-zero
-            // and session time is preserved across the break.
             let total_secs = prev_secs_human + started_human.elapsed().as_secs();
-            save_session_time(&session_times_path_human, &ign_human, total_secs);
-            info!(
-                "[Humanization] Saved session time: {}s ({:.2}h) — restarting process",
-                total_secs, total_secs as f64 / 3600.0
-            );
-
-            // Restart the process to reconnect
-            restart_process();
+            take_rest_break_and_restart(
+                &ign_human,
+                break_secs,
+                &macro_paused_human,
+                &flip_intake_paused_human,
+                &command_queue_human,
+                &profit_tracker_human,
+                &profit_path_human,
+                &flip_tracker_human,
+                &flip_tracker_path_human,
+                &session_times_path_human,
+                total_secs,
+            )
+            .await;
         });
     }
 
+    // ── Break on demand (web panel button) ──────────────────────────────────
+    // Always-on executor for break requests from the panel's Rest Break
+    // button, so a manual break works even with scheduled humanization
+    // breaks disabled. `minutes == 0` picks a random length from the
+    // humanization config range. Unlike the scheduler it does NOT defer
+    // while the macro is paused: an explicit request starts the break now.
+    {
+        let chat_tx_break = chat_tx.clone();
+        let ign_break = ingame_name.clone();
+        let webhook_url_break = config.active_webhook_url().map(|s| s.to_string());
+        let session_times_path_break = session_times_path.clone();
+        let prev_secs_break = previous_session_secs;
+        let started_break = std::time::Instant::now();
+        let macro_paused_break = macro_paused.clone();
+        let flip_intake_paused_break = flip_intake_paused.clone();
+        let command_queue_break = command_queue.clone();
+        let profit_tracker_break = profit_tracker.clone();
+        let profit_path_break = profit_path.clone();
+        let flip_tracker_break = flip_tracker.clone();
+        let flip_tracker_path_break = flip_tracker_path.clone();
+        let min_break_demand = config.humanization_min_break_minutes.max(1);
+        let max_break_demand = config
+            .humanization_max_break_minutes
+            .max(min_break_demand + 1);
+        tokio::spawn(async move {
+            use rand::Rng;
+            // The restart path diverges, so this channel handles exactly one request.
+            if let Some(minutes) = rest_break_rx.recv().await {
+                let break_secs = if minutes > 0 {
+                    minutes.saturating_mul(60)
+                } else {
+                    let mut rng = rand::rng();
+                    rng.random_range(min_break_demand * 60..=max_break_demand * 60)
+                };
+                info!(
+                    "[Humanization] Rest break requested from the web panel ({:.1}m)",
+                    break_secs as f64 / 60.0
+                );
+                if let Some(ref url) = webhook_url_break {
+                    twm::webhook::send_webhook_rest_break_start(&ign_break, break_secs, url).await;
+                }
+                let baf_msg = format!(
+                    "§f[§4BAF§f]: §e😴 Rest break from the panel ({:.0}m). Disconnecting...",
+                    break_secs as f64 / 60.0
+                );
+                print_mc_chat(&baf_msg);
+                let _ = chat_tx_break.send(baf_msg);
+                let total_secs = prev_secs_break + started_break.elapsed().as_secs();
+                take_rest_break_and_restart(
+                    &ign_break,
+                    break_secs,
+                    &macro_paused_break,
+                    &flip_intake_paused_break,
+                    &command_queue_break,
+                    &profit_tracker_break,
+                    &profit_path_break,
+                    &flip_tracker_break,
+                    &flip_tracker_path_break,
+                    &session_times_path_break,
+                    total_secs,
+                )
+                .await;
+            }
+        });
+    }
+
+    // ── Finder auto-lister ───────────────────────────────────────────────────
+    // Finder-only mode: COFL never sends createAuction, so upload our inventory
+    // to the finder every minute and list whatever it prices (its listing
+    // recommendation). Covers freshly-bought items AND reclaimed expired
+    // auctions (both land back in inventory). Own role=lister connection so the
+    // finder never routes flips here.
+    {
+        let finder_list_url = config
+            .finder_ws_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| {
+                config
+                    .multisocket_urls
+                    .iter()
+                    .map(|u| u.trim().to_string())
+                    .find(|u| !u.is_empty() && !u.contains("coflnet") && !u.contains("/modsocket"))
+            });
+        if config.finder_auto_list {
+            if let Some(url) = finder_list_url {
+                let token = config.finder_ws_token.clone().unwrap_or_default();
+                let bc = bot_client.clone();
+                let queue = command_queue.clone();
+                let dur = config.auction_duration_hours;
+                let config_relist = config.clone();
+                let force_notify = force_list_notify.clone();
+                let flip_tracker_list = flip_tracker.clone();
+                tokio::spawn(async move {
+                    use futures::{SinkExt, StreamExt};
+                    // Per item-name cooldown so we don't re-instruct while a
+                    // listing is still in flight (item leaves inventory once listed).
+                    let mut listed_recently: std::collections::HashMap<String, std::time::Instant> =
+                        std::collections::HashMap::new();
+                    let mut backoff = 5u64;
+                    loop {
+                        // Explicit "/" path: a bare-authority ws URL makes the
+                        // handshake line "GET ?role=… HTTP/1.1", which strict
+                        // HTTP parsers (the finder's Node server) reject as 400.
+                        let full = if token.is_empty() {
+                            format!("{}/?role=lister", url.trim_end_matches('/'))
+                        } else {
+                            format!("{}/?role=lister&token={}", url.trim_end_matches('/'), token)
+                        };
+                        match tokio_tungstenite::connect_async(&full).await {
+                            Ok((mut stream, _)) => {
+                                info!("[FinderList] Connected to finder for auto-listing: {}", url);
+                                backoff = 5;
+                                // Event-driven: upload the moment an AH slot frees
+                                // (sold auction claimed / expired reclaim) or the
+                                // inventory content changes (new buy landed), with a
+                                // 60s fallback. 10s tick keeps reactions prompt
+                                // without hammering the finder.
+                                let mut upload =
+                                    tokio::time::interval(std::time::Duration::from_secs(10));
+                                let mut last_auction_count = usize::MAX;
+                                let mut last_inv_hash = 0u64;
+                                let mut last_upload = std::time::Instant::now()
+                                    - std::time::Duration::from_secs(3600);
+                                loop {
+                                    tokio::select! {
+                                        _ = upload.tick() => {
+                                            // No point pricing when nothing can be listed.
+                                            if bc.is_auction_at_limit() || bc.is_auction_slot_blocked() { continue; }
+                                            let Some(inv) = bc.get_cached_inventory_json() else { continue };
+                                            let count = bc.active_auction_count();
+                                            let slot_freed = count < last_auction_count;
+                                            last_auction_count = count;
+                                            let inv_hash = {
+                                                use std::hash::{Hash, Hasher};
+                                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                                inv.hash(&mut h);
+                                                h.finish()
+                                            };
+                                            let inv_changed = inv_hash != last_inv_hash;
+                                            let stale = last_upload.elapsed() >= std::time::Duration::from_secs(60);
+                                            // Debounce content-only changes a little.
+                                            if !(slot_freed || stale || (inv_changed && last_upload.elapsed() >= std::time::Duration::from_secs(15))) {
+                                                continue;
+                                            }
+                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&inv) {
+                                                let items = v.get("slots").cloned().unwrap_or(serde_json::json!([]));
+                                                let msg = serde_json::json!({ "type": "inventory", "items": items }).to_string();
+                                                if stream.send(tokio_tungstenite::tungstenite::Message::Text(msg)).await.is_err() {
+                                                    break;
+                                                }
+                                                last_inv_hash = inv_hash;
+                                                last_upload = std::time::Instant::now();
+                                                if slot_freed && !stale {
+                                                    info!("[FinderList] AH slot freed ({} active) — asking finder for listing suggestions", count);
+                                                } else if inv_changed && !stale {
+                                                    info!("[FinderList] Inventory changed — asking finder for listing suggestions");
+                                                }
+                                            }
+                                        }
+                                        _ = force_notify.notified() => {
+                                            // `/trex sellinv`: immediate forced upload — the finder
+                                            // drops its confidence gate and reports unlistable items.
+                                            if let Some(inv) = bc.get_cached_inventory_json() {
+                                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&inv) {
+                                                    let items = v.get("slots").cloned().unwrap_or(serde_json::json!([]));
+                                                    let msg = serde_json::json!({ "type": "inventory", "items": items, "force": true }).to_string();
+                                                    info!("[FinderList] Force-sell: uploading inventory to finder");
+                                                    listed_recently.clear(); // force = re-instruct everything
+                                                    if stream.send(tokio_tungstenite::tungstenite::Message::Text(msg)).await.is_err() {
+                                                        break;
+                                                    }
+                                                    last_upload = std::time::Instant::now();
+                                                }
+                                            } else {
+                                                warn!("[FinderList] Force-sell requested but no cached inventory yet");
+                                            }
+                                        }
+                                        m = stream.next() => {
+                                            let txt = match m {
+                                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => t,
+                                                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | Some(Err(_)) | None => break,
+                                                _ => continue,
+                                            };
+                                            let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+                                            if v.get("type").and_then(|t| t.as_str()) != Some("listInstructions") { continue; }
+                                            // Force responses explain every skipped item — surface that.
+                                            if let Some(sk) = v.get("skipped").and_then(|s| s.as_array()) {
+                                                for s in sk {
+                                                    let name = s.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                                                    let reason = s.get("reason").and_then(|x| x.as_str()).unwrap_or("unpriceable");
+                                                    let clean = twm::utils::remove_minecraft_colors(name);
+                                                    twm::logging::print_mc_chat(&format!("§f[§4BAF§f]: §eWon't list §f{}§e — {}", clean, reason));
+                                                    info!("[FinderList] Won't list \"{}\" — {}", clean, reason);
+                                                }
+                                            }
+                                            let Some(items) = v.get("items").and_then(|i| i.as_array()) else { continue };
+                                            listed_recently.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(300));
+                                            for it in items {
+                                                let name = match it.get("name").and_then(|x| x.as_str()) { Some(n) => n.to_string(), None => continue };
+                                                let item_id = it.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                                let clean = twm::utils::remove_minecraft_colors(&name);
+                                                let (blk_finder, blk_profit) = tracked_finder_profit(&flip_tracker_list, &name);
+                                                if let Some(reason) = config_relist.relist_block_reason(
+                                                    (!item_id.is_empty()).then_some(item_id),
+                                                    blk_finder.as_deref(),
+                                                    blk_profit,
+                                                ) {
+                                                    info!("[FinderList] Won't list \"{}\" — {}", clean, reason);
+                                                    twm::logging::print_mc_chat(&format!(
+                                                        "§f[§4BAF§f]: §eWon't list §f{}§e — {}",
+                                                        clean, reason
+                                                    ));
+                                                    continue;
+                                                }
+                                                let list_at = it.get("listAt").and_then(|x| x.as_u64()).unwrap_or(0);
+                                                if list_at == 0 { continue; }
+                                                if listed_recently.contains_key(&clean) { continue; }
+                                                listed_recently.insert(clean.clone(), std::time::Instant::now());
+                                                info!("[FinderList] Listing \"{}\" at finder price {}", clean, list_at);
+                                                queue.enqueue(
+                                                    twm::types::CommandType::SellToAuction {
+                                                        item_name: clean.clone(),
+                                                        starting_bid: list_at,
+                                                        duration_hours: dur,
+                                                        expected_profit: None,
+                                                        item_slot: None,
+                                                        item_id: None,
+                                                    },
+                                                    twm::types::CommandPriority::Normal,
+                                                    false,
+                                                );
+                                                // -- Report listing to finder ---------------------
+                                                // Send itemUuid and flipUuid so the finder can
+                                                // update its self-listing guard and listing UUIDs.
+                                                let item_uuid = it.get("uuid").and_then(|x| x.as_str()).map(String::from);
+                                                let flip_uuid = {
+                                                    let needle = clean.to_lowercase();
+                                                    // Access the entry while the guard is alive and clone the
+                                                    // uuid out — a reference into the map can't outlive the lock.
+                                                    flip_tracker_list.lock().ok()
+                                                        .and_then(|ft| ft.get(&needle).and_then(|entry| entry.0.uuid.clone()))
+                                                };
+                                                let listed_msg = serde_json::json!({
+                                                    "type": "listed",
+                                                    "auctionUuid": null,
+                                                    "itemUuid": item_uuid,
+                                                    "flipUuid": flip_uuid,
+                                                    "itemName": &clean,
+                                                }).to_string();
+                                                let _ = stream.send(tokio_tungstenite::tungstenite::Message::Text(listed_msg)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                warn!("[FinderList] Disconnected — reconnecting...");
+                            }
+                            Err(e) => {
+                                warn!("[FinderList] Connect failed: {} (retry {}s)", e, backoff)
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(60);
+                    }
+                });
+            }
+        }
+    }
+
     // Keep the application running
-    info!("TWM is now running. Type commands below or press Ctrl+C to exit.");
-    
+    info!("BAF is now running. Type commands below or press Ctrl+C to exit.");
+
     // Wait until Ctrl+C (SIGINT) is received
     tokio::signal::ctrl_c().await?;
-    info!("Received Ctrl+C — shutting down TWM...");
-    // Save final session time before exit.
+    info!("Received Ctrl+C — shutting down BAF...");
+    // Save final session time and profit before exit.
     let total_secs = previous_session_secs + session_start.elapsed().as_secs();
     save_session_time(&session_times_path, &ingame_name, total_secs);
-    info!("[SessionTime] Saved final session time for {}: {}s ({:.2}h)", ingame_name, total_secs, total_secs as f64 / 3600.0);
+    save_profit_stats(&profit_path, &ingame_name, &profit_tracker);
+    info!(
+        "[SessionTime] Saved final session time for {}: {}s ({:.2}h)",
+        ingame_name,
+        total_secs,
+        total_secs as f64 / 3600.0
+    );
     std::process::exit(0);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ban_disconnect, parse_cofl_profit_response, parse_cofl_bz_h_total_profit, parse_short_number, parse_bz_list_flip_detail, should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim};
+    use super::{
+        current_skyblock_area, is_ban_disconnect, is_direct_address, mark_activity,
+        note_maintenance, parse_bz_list_flip_detail, parse_cofl_bz_h_total_profit,
+        parse_cofl_profit_response, parse_island_visitor, parse_name_mention, parse_short_number,
+        restore_flip_tracker, save_flip_tracker, secs_since_activity,
+        should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim,
+        skyblock_in_maintenance, FlipTrackerMap, MAX_TRACKED_FLIP_AGE_SECS,
+    };
     use twm::types::{BotState, CommandType};
 
     #[test]
+    fn skyblock_area_from_scoreboard() {
+        let lines = vec![
+            "SKYBLOCK".to_string(),
+            " ⏣ Hub".to_string(),
+            "Purse: 1,000".to_string(),
+        ];
+        assert_eq!(current_skyblock_area(&lines), Some("Hub".to_string()));
+        // No area glyph → no area (fall back to the generic notice).
+        let no_area = vec!["SKYBLOCK".to_string(), "Purse: 1,000".to_string()];
+        assert_eq!(current_skyblock_area(&no_area), None);
+    }
+
+    #[test]
+    fn maintenance_flag_sets_and_transitions_once() {
+        // First maintenance line transitions up→down (should notify).
+        assert!(note_maintenance());
+        assert!(skyblock_in_maintenance());
+        // A repeat while still down does NOT re-transition (no duplicate notify).
+        assert!(!note_maintenance());
+        assert!(skyblock_in_maintenance());
+    }
+
+    #[test]
+    fn activity_heartbeat_seeds_and_stays_fresh() {
+        // Before seeding, 0 elapsed means "never stalled".
+        // After marking, elapsed is small (well under the stall threshold).
+        mark_activity();
+        assert!(secs_since_activity() < super::STALL_THRESHOLD_SECS);
+    }
+
+    #[test]
+    fn island_visitor_with_rank() {
+        assert_eq!(
+            parse_island_visitor("[MVP+] CoolGuy123 is visiting your island!"),
+            Some("CoolGuy123".to_string())
+        );
+    }
+
+    #[test]
+    fn island_visitor_without_rank() {
+        assert_eq!(
+            parse_island_visitor("Steve is visiting your island!"),
+            Some("Steve".to_string())
+        );
+    }
+
+    #[test]
+    fn island_visitor_ignores_unrelated_lines() {
+        assert_eq!(parse_island_visitor("You are visiting Bob's island"), None);
+        assert_eq!(parse_island_visitor("Someone joined the lobby"), None);
+    }
+
+    #[test]
+    fn name_mention_fires_on_dms_and_direct_address() {
+        // Any incoming whisper counts — someone is reaching out.
+        assert_eq!(
+            parse_name_mention("From [VIP] Friend: yo BafBot", "BafBot"),
+            Some("From [VIP] Friend: yo BafBot".to_string())
+        );
+        assert_eq!(
+            parse_name_mention("From Steve: anything at all", "BafBot"),
+            Some("From Steve: anything at all".to_string())
+        );
+        // Public/guild chat: only when directly addressed.
+        assert_eq!(
+            parse_name_mention("Guild > [MVP+] Steve: BafBot help please", "BafBot"),
+            Some("Guild > [MVP+] Steve: BafBot help please".to_string())
+        );
+        assert_eq!(
+            parse_name_mention("Party > Steve: @BafBot come here", "BafBot"),
+            Some("Party > Steve: @BafBot come here".to_string())
+        );
+    }
+
+    #[test]
+    fn name_mention_ignores_midsentence_and_noise() {
+        // Name mid-sentence in public/guild chat is NOT a mention.
+        assert_eq!(
+            parse_name_mention("Guild > [MVP+] Steve: i think BafBot is afk", "BafBot"),
+            None
+        );
+        assert_eq!(
+            parse_name_mention("[MVP+] Steve: lol BafBot", "BafBot"),
+            None
+        );
+        // Bot's own guild message must not ping.
+        assert_eq!(
+            parse_name_mention("Guild > [MVP+] BafBot: BafBot online", "BafBot"),
+            None
+        );
+        // Outgoing DM ("To ...") must not ping even if it contains the name.
+        assert_eq!(
+            parse_name_mention("To [VIP] Friend: this is BafBot", "BafBot"),
+            None
+        );
+        // System line without a valid player sender must not ping.
+        assert_eq!(
+            parse_name_mention("Reward: BafBot got 5 coins", "BafBot"),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_address_only_at_start_or_at_handle() {
+        assert!(is_direct_address("BafBot help", "BafBot"));
+        assert!(is_direct_address("  BafBot, come here", "bafbot")); // leading space + case
+        assert!(is_direct_address("yo @BafBot please", "BafBot"));
+        assert!(!is_direct_address("i think BafBot is afk", "BafBot")); // mid-sentence
+        assert!(!is_direct_address("BafBotter is cool", "BafBot")); // not a whole token
+    }
+
+    #[test]
     fn detects_temporary_ban_disconnect() {
-        assert!(is_ban_disconnect("You are temporarily banned for 29d from this server!"));
+        assert!(is_ban_disconnect(
+            "You are temporarily banned for 29d from this server!"
+        ));
     }
 
     #[test]
@@ -3834,7 +7339,9 @@ mod tests {
 
     #[test]
     fn detects_permanent_ban_disconnect() {
-        assert!(is_ban_disconnect("You are permanently banned from this server!"));
+        assert!(is_ban_disconnect(
+            "You are permanently banned from this server!"
+        ));
     }
 
     #[test]
@@ -3845,28 +7352,107 @@ mod tests {
     #[test]
     fn detects_security_ban_disconnect() {
         assert!(is_ban_disconnect("Your account has been blocked."));
-        assert!(is_ban_disconnect("Find out more: https://www.hypixel.net/security-block"));
+        assert!(is_ban_disconnect(
+            "Find out more: https://www.hypixel.net/security-block"
+        ));
         assert!(is_ban_disconnect("Block ID: #ABC123"));
+    }
+
+    /// A rest break restarts the process, so the purchase baseline behind
+    /// "Time to Sell" / profit / ROI has to reach the next process through disk.
+    #[test]
+    fn flip_tracker_survives_a_restart_with_its_sell_time() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("baf-fliptracker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("flip_tracker.json");
+        let _ = std::fs::remove_file(&path);
+
+        let flip = twm::types::Flip {
+            item_name: "Hyperion".to_string(),
+            starting_bid: 100,
+            target: 1_000,
+            finder: Some("finder".to_string()),
+            profit_perc: None,
+            purchase_at_ms: None,
+            uuid: Some("uuid-1".to_string()),
+            list_at: None,
+        };
+        // Bought 90 minutes ago and still unsold; plus an offered-but-never-bought
+        // flip, which must not be written.
+        let bought_ago = Duration::from_secs(90 * 60);
+        let then = Instant::now()
+            .checked_sub(bought_ago)
+            .expect("monotonic room");
+        let mut map = HashMap::new();
+        map.insert("hyperion".to_string(), (flip.clone(), 800u64, then, then));
+        map.insert(
+            "never bought".to_string(),
+            (flip.clone(), 0u64, Instant::now(), Instant::now()),
+        );
+        let tracker: FlipTrackerMap = Arc::new(Mutex::new(map));
+
+        save_flip_tracker(&path, "tester", &tracker);
+        let restored = restore_flip_tracker(&path, "tester");
+
+        assert_eq!(restored.len(), 1, "only bought flips are persisted");
+        let (rflip, buy_price, purchased, _received) =
+            restored.get("hyperion").expect("bought flip restored");
+        assert_eq!(*buy_price, 800);
+        assert_eq!(rflip.uuid.as_deref(), Some("uuid-1"));
+        // The sell clock keeps running from the real purchase, not from now.
+        let elapsed = purchased.elapsed().as_secs();
+        assert!(
+            (90 * 60 - 5..=90 * 60 + 5).contains(&elapsed),
+            "restored purchase time drifted: {elapsed}s"
+        );
+
+        // Another account's flips must not leak into this one.
+        assert!(restore_flip_tracker(&path, "someone-else").is_empty());
+
+        // Anything older than an auction can possibly live is dropped.
+        let stale = format!(
+            r#"{{"tester":{{"old":{{"flip":{},"buy_price":5,"purchased_at":1,"received_at":1}}}}}}"#,
+            serde_json::to_string(&flip).expect("flip json")
+        );
+        std::fs::write(&path, stale).expect("write stale");
+        assert!(restore_flip_tracker(&path, "tester").is_empty());
+        const { assert!(MAX_TRACKED_FLIP_AGE_SECS >= 6 * 24 * 60 * 60) };
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn periodic_auction_claim_requires_idle_and_empty_queue() {
         assert!(should_enqueue_periodic_auction_claim(BotState::Idle, true));
-        assert!(!should_enqueue_periodic_auction_claim(BotState::ClaimingSold, true));
-        assert!(!should_enqueue_periodic_auction_claim(BotState::Idle, false));
+        assert!(!should_enqueue_periodic_auction_claim(
+            BotState::ClaimingSold,
+            true
+        ));
+        assert!(!should_enqueue_periodic_auction_claim(
+            BotState::Idle,
+            false
+        ));
     }
 
     #[test]
     fn ah_pause_drops_bazaar_and_manage_orders_commands() {
         let paused = true;
+        let buy = CommandType::BazaarBuyOrder {
+            item_name: "Booster Cookie".into(),
+            item_tag: None,
+            amount: 1,
+            price_per_unit: 1.0,
+        };
+        // BUY orders are always dropped during the AH pause, full or not.
         assert!(should_drop_bazaar_command_during_ah_pause(
-            &CommandType::BazaarBuyOrder {
-                item_name: "Booster Cookie".into(),
-                item_tag: None,
-                amount: 1,
-                price_per_unit: 1.0,
-            },
-            paused,
+            &buy, paused, false
+        ));
+        assert!(should_drop_bazaar_command_during_ah_pause(
+            &buy, paused, true
         ));
         // BazaarSellOrder should NOT be dropped during AH pause (only buy orders are dropped)
         assert!(!should_drop_bazaar_command_during_ah_pause(
@@ -3877,32 +7463,44 @@ mod tests {
                 price_per_unit: 1.0,
             },
             paused,
+            false,
         ));
         assert!(!should_drop_bazaar_command_during_ah_pause(
             &CommandType::ClaimSoldItem,
             paused,
+            false,
         ));
-        // ManageOrders IS deferred during AH pause — it would block the AH
-        // flip purchase.  A new ManageOrders is re-queued when flips resume.
+        // ManageOrders IS deferred during AH pause when inventory is NOT full —
+        // it would block the AH flip purchase.
+        let manage = CommandType::ManageOrders {
+            cancel_open: false,
+            target_item: None,
+        };
         assert!(should_drop_bazaar_command_during_ah_pause(
-            &CommandType::ManageOrders { cancel_open: false },
-            paused,
+            &manage, paused, false
         ));
-        assert!(should_drop_bazaar_command_during_ah_pause(
-            &CommandType::ManageOrders { cancel_open: true },
-            paused,
+        // ...but when the inventory IS full it must NOT be deferred, so the bot
+        // can keep managing orders to free space and escape the deadlock.
+        assert!(!should_drop_bazaar_command_during_ah_pause(
+            &manage, paused, true
+        ));
+        // Nothing is dropped when not paused.
+        assert!(!should_drop_bazaar_command_during_ah_pause(
+            &manage, false, true
         ));
     }
 
     #[test]
     fn parse_cofl_profit_response_82m() {
-        let msg = "According to our data TestUser made 82.7M in the last 0.05 days across 6 auctions";
+        let msg =
+            "According to our data TestUser made 82.7M in the last 0.05 days across 6 auctions";
         assert_eq!(parse_cofl_profit_response(msg), Some(82_700_000));
     }
 
     #[test]
     fn parse_cofl_profit_response_1b() {
-        let msg = "According to our data Player123 made 1.5B in the last 2.3 days across 142 auctions";
+        let msg =
+            "According to our data Player123 made 1.5B in the last 2.3 days across 142 auctions";
         assert_eq!(parse_cofl_profit_response(msg), Some(1_500_000_000));
     }
 

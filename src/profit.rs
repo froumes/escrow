@@ -26,6 +26,29 @@ pub struct ProfitSnapshot {
     pub session_started_at_unix: u64,
 }
 
+/// Maximum number of points kept per series. Periodic profit polls would
+/// otherwise grow these vectors for the lifetime of the process.
+const MAX_POINTS: usize = 5000;
+
+/// Append a point while bounding memory and preserving the chart endpoints.
+fn push_point(points: &mut Vec<ProfitPoint>, point: ProfitPoint) {
+    points.push(point);
+    if points.len() <= MAX_POINTS {
+        return;
+    }
+    let first = points[0];
+    let last = *points.last().expect("points is non-empty after push");
+    let mut decimated = Vec::with_capacity(points.len() / 2 + 2);
+    decimated.push(first);
+    let mut i = 1;
+    while i + 1 < points.len() {
+        decimated.push(points[i]);
+        i += 2;
+    }
+    decimated.push(last);
+    *points = decimated;
+}
+
 /// Thread-safe profit tracker for AH and Bazaar realized profits.
 pub struct ProfitTracker {
     inner: Mutex<ProfitTrackerInner>,
@@ -41,6 +64,17 @@ struct ProfitTrackerInner {
     bz_points: Vec<ProfitPoint>,
     ah_total: i64,
     bz_total: i64,
+    /// Coflnet's REALIZED AH total for the session window (`/cofl profit`), i.e.
+    /// what actually landed in the purse from sales. `ah_total` above is the
+    /// THEORETICAL figure accrued at purchase time (target − price − fee), so
+    /// the two are deliberately separate: the realized number is only known
+    /// once Coflnet answers, and is `None` until it does.
+    #[serde(default)]
+    realized_ah: Option<i64>,
+    /// Unix seconds when `realized_ah` was last refreshed, so consumers can say
+    /// how stale the figure is instead of presenting it as live.
+    #[serde(default)]
+    realized_ah_at: u64,
 }
 
 fn now_unix() -> u64 {
@@ -63,9 +97,10 @@ impl ProfitTracker {
                 bz_points: vec![(now, 0)],
                 ah_total: 0,
                 bz_total: 0,
+                realized_ah: None,
+                realized_ah_at: 0,
             }),
-            writer: storage_path
-                .map(|path| AsyncJsonWriter::new(path, PROFIT_PERSIST_DEBOUNCE)),
+            writer: storage_path.map(|path| AsyncJsonWriter::new(path, PROFIT_PERSIST_DEBOUNCE)),
             session_started_at_unix: now,
             session_ah_baseline: 0,
             session_bz_baseline: 0,
@@ -97,7 +132,7 @@ impl ProfitTracker {
         if let Ok(mut inner) = self.inner.lock() {
             inner.ah_total += profit;
             let total = inner.ah_total;
-            inner.ah_points.push((now_unix(), total));
+            push_point(&mut inner.ah_points, (now_unix(), total));
             self.persist_locked(&inner);
         }
     }
@@ -107,7 +142,7 @@ impl ProfitTracker {
     pub fn set_ah_total(&self, total: i64) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.ah_total = total;
-            inner.ah_points.push((now_unix(), total));
+            push_point(&mut inner.ah_points, (now_unix(), total));
             self.persist_locked(&inner);
         }
     }
@@ -117,7 +152,7 @@ impl ProfitTracker {
         if let Ok(mut inner) = self.inner.lock() {
             inner.bz_total += profit;
             let total = inner.bz_total;
-            inner.bz_points.push((now_unix(), total));
+            push_point(&mut inner.bz_points, (now_unix(), total));
             self.persist_locked(&inner);
         }
     }
@@ -127,7 +162,7 @@ impl ProfitTracker {
     pub fn set_bz_total(&self, total: i64) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.bz_total = total;
-            inner.bz_points.push((now_unix(), total));
+            push_point(&mut inner.bz_points, (now_unix(), total));
             self.persist_locked(&inner);
         }
     }
@@ -146,6 +181,25 @@ impl ProfitTracker {
             .lock()
             .map(|i| i.bz_points.clone())
             .unwrap_or_default()
+    }
+
+    /// Record Coflnet's realized AH profit for the session window, as parsed
+    /// from a `/cofl profit <ign> <days>` reply.
+    pub fn set_realized_ah_total(&self, total: i64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.realized_ah = Some(total);
+            inner.realized_ah_at = now_unix();
+        }
+    }
+
+    /// Realized AH profit and the unix time it was last refreshed, or `None`
+    /// when Coflnet has not answered a `/cofl profit` query yet this session
+    /// (finder-primary setups never get one).
+    pub fn realized_ah(&self) -> Option<(i64, u64)> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|i| i.realized_ah.map(|v| (v, i.realized_ah_at)))
     }
 
     /// Get totals: (ah_total, bz_total)
@@ -210,6 +264,8 @@ impl ProfitTracker {
             bz_points: vec![(now, 0)],
             ah_total: 0,
             bz_total: 0,
+            realized_ah: None,
+            realized_ah_at: 0,
         }
     }
 
@@ -226,7 +282,11 @@ impl ProfitTracker {
     }
 }
 
-fn build_session_points(points: &[ProfitPoint], session_started_at_unix: u64, baseline: i64) -> Vec<ProfitPoint> {
+fn build_session_points(
+    points: &[ProfitPoint],
+    session_started_at_unix: u64,
+    baseline: i64,
+) -> Vec<ProfitPoint> {
     let mut session_points = vec![(session_started_at_unix, 0)];
     for &(ts, value) in points {
         if ts >= session_started_at_unix {
@@ -266,7 +326,8 @@ mod tests {
 
     #[test]
     fn session_snapshot_uses_startup_baseline() {
-        let path = std::env::temp_dir().join(format!("twm-profit-session-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("twm-profit-session-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
 
         let seeded = ProfitTracker::load_or_new(path.clone());
@@ -282,9 +343,54 @@ mod tests {
         assert_eq!(snapshot.all_time_bz_total, 20_700);
         assert_eq!(snapshot.session_ah_total, 500);
         assert_eq!(snapshot.session_bz_total, 700);
-        assert_eq!(snapshot.session_ah_points.last().map(|(_, v)| *v), Some(500));
-        assert_eq!(snapshot.session_bz_points.last().map(|(_, v)| *v), Some(700));
+        assert_eq!(
+            snapshot.session_ah_points.last().map(|(_, v)| *v),
+            Some(500)
+        );
+        assert_eq!(
+            snapshot.session_bz_points.last().map(|(_, v)| *v),
+            Some(700)
+        );
 
         let _ = fs::remove_file(path);
+    }
+}
+
+impl Default for ProfitTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn points_are_bounded() {
+        let tracker = ProfitTracker::new();
+        // Far exceed the cap to force multiple downsampling passes.
+        for _ in 0..(MAX_POINTS * 3) {
+            tracker.record_ah_profit(1);
+        }
+        let points = tracker.ah_points();
+        assert!(
+            points.len() <= MAX_POINTS,
+            "points should stay bounded, got {}",
+            points.len()
+        );
+        // The running total must remain correct despite downsampling.
+        assert_eq!(tracker.totals().0, (MAX_POINTS * 3) as i64);
+    }
+
+    #[test]
+    fn push_point_keeps_first_and_last() {
+        let mut pts: Vec<ProfitPoint> = Vec::new();
+        for i in 0..(MAX_POINTS + 10) {
+            push_point(&mut pts, (i as u64, i as i64));
+        }
+        assert!(pts.len() <= MAX_POINTS);
+        assert_eq!(pts.first().unwrap().0, 0);
+        assert_eq!(pts.last().unwrap().0, (MAX_POINTS + 9) as u64);
     }
 }

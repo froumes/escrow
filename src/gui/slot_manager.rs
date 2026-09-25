@@ -1,9 +1,8 @@
 /// Slot manager for handling GUI slot positions and translations
-/// 
+///
 /// This module defines standard slot positions used across different window types
 /// in the Hypixel SkyBlock GUI system. Slot numbers are preserved exactly from
 /// the TypeScript implementation to ensure packet compatibility.
-
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -73,9 +72,9 @@ impl WindowKind {
         };
 
         match clean_title {
-            t if t == "BIN Auction View" => WindowKind::BinAuctionView,
-            t if t == "Confirm Purchase" => WindowKind::ConfirmPurchase,
-            t if t == "Auction View" => WindowKind::AuctionView,
+            "BIN Auction View" => WindowKind::BinAuctionView,
+            "Confirm Purchase" => WindowKind::ConfirmPurchase,
+            "Auction View" => WindowKind::AuctionView,
             t if t.starts_with("Bazaar") => WindowKind::Bazaar,
             t if t.contains("Manage") && t.contains("Orders") => WindowKind::ManageOrders,
             _ => WindowKind::Unknown(clean_title.to_string()),
@@ -98,16 +97,16 @@ impl SlotManager {
     }
 
     /// Get the physical slot number for a logical slot name in a given window
-    /// 
+    ///
     /// # Arguments
     /// * `window_kind` - The type of window
     /// * `slot_name` - Logical name of the slot (e.g., "purchase", "confirm")
-    /// 
+    ///
     /// # Returns
     /// Physical slot number, or None if mapping doesn't exist
     pub fn get_slot(&self, window_kind: &WindowKind, slot_name: &str) -> Option<usize> {
         let window_key = format!("{:?}", window_kind);
-        
+
         // Check if we have a cached mapping
         if let Some(window_map) = self.mappings.get(&window_key) {
             return window_map.get(slot_name).copied();
@@ -120,7 +119,10 @@ impl SlotManager {
             (WindowKind::Bazaar, "confirm") => Some(StandardSlot::CenterSlot.slot()),
             (_, "close") => Some(StandardSlot::CloseButton.slot()),
             _ => {
-                warn!("No slot mapping for window {:?}, slot name: {}", window_kind, slot_name);
+                warn!(
+                    "No slot mapping for window {:?}, slot name: {}",
+                    window_kind, slot_name
+                );
                 None
             }
         }
@@ -136,7 +138,7 @@ impl SlotManager {
         let window_key = format!("{:?}", window_kind);
         self.mappings
             .entry(window_key)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(slot_name, physical_slot);
     }
 }
@@ -165,7 +167,9 @@ mod tests {
             WindowKind::BinAuctionView
         );
         assert_eq!(
-            WindowKind::from_title("{\"italic\":false,\"extra\":[{\"text\":\"BIN Auction View\"}],\"text\":\"\"}"),
+            WindowKind::from_title(
+                "{\"italic\":false,\"extra\":[{\"text\":\"BIN Auction View\"}],\"text\":\"\"}"
+            ),
             WindowKind::BinAuctionView
         );
         assert_eq!(
@@ -177,7 +181,7 @@ mod tests {
     #[test]
     fn test_slot_manager_mappings() {
         let manager = SlotManager::new();
-        
+
         assert_eq!(
             manager.get_slot(&WindowKind::BinAuctionView, "purchase"),
             Some(31)
@@ -186,9 +190,6 @@ mod tests {
             manager.get_slot(&WindowKind::ConfirmPurchase, "confirm"),
             Some(11)
         );
-        assert_eq!(
-            manager.get_slot(&WindowKind::Bazaar, "confirm"),
-            Some(13)
-        );
+        assert_eq!(manager.get_slot(&WindowKind::Bazaar, "confirm"), Some(13));
     }
 }

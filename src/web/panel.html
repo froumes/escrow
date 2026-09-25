@@ -1834,6 +1834,14 @@ const API = {
     cancelBz: "/api/cancel_bz_order",
     chatSend: "/api/chat/send",
     logsLatest: "/api/logs/latest",
+    disconnect: "/api/disconnect",
+    connect: "/api/connect",
+    restart: "/api/restart",
+    restBreak: "/api/rest_break",
+    update: "/api/update",
+    killSession: "/api/kill_session",
+    listItem: "/api/list_item",
+    configJson: "/api/config.json",
     sellerConfig: "/api/seller/config",
     sellerStatus: "/api/seller/status",
     sellerStart: "/api/seller/start",
@@ -1845,9 +1853,8 @@ const API = {
     sellerAvailable: "/api/seller/available_items",
     sellerPriceEstimate: "/api/seller/price_estimate",
     shareLink: "/api/share/link",
-    // Migration note: `?token=` URL auth is no longer accepted by the backend.
-    // Chat WS auth now relies on the twm_session cookie (login flow) or an
-    // Authorization header for non-browser clients.
+    // Browser chat authentication uses the HTTPS panel's port-scoped signed
+    // session cookie; non-browser clients may send the same token as Bearer auth.
     chatWs: () => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/chat/ws`
 };
 
@@ -2119,9 +2126,9 @@ function setThemePreference(theme) {
 }
 
 const FLIP_PATTERNS = {
-    ahBuy:  /\[BAF\].*?PURCHASED\s+(.+?)(?:\s+for\s+)/i,
-    ahSell: /\[BAF\].*?SOLD\s+(.+?)(?:\s+to\s+.+?\s+for\s+)/i,
-    bzOrder:/\[BAF\].*?\[BZ\]\s*(BUY|SELL)\s*order:\s*(.+?)\s+x/i,
+    ahBuy:  /\[(?:TWM|BAF)\].*?PURCHASED\s+(.+?)(?:\s+for\s+)/i,
+    ahSell: /\[(?:TWM|BAF)\].*?SOLD\s+(.+?)(?:\s+to\s+.+?\s+for\s+)/i,
+    bzOrder:/\[(?:TWM|BAF)\].*?\[BZ\]\s*(BUY|SELL)\s*order:\s*(.+?)\s+x/i,
 };
 
 function detectFlipEvent(rawText) {
@@ -3730,7 +3737,7 @@ function App() {
                 if (!closed && !warnedAuthMigration) {
                     warnedAuthMigration = true;
                     console.warn(
-                        "[WebGUI] Chat websocket closed. If you use a custom client, remove '?token=' from the WS URL and authenticate via twm_session cookie or Authorization header."
+                        "[WebGUI] Chat websocket closed. Custom clients must authenticate with the port-scoped panel session cookie or an Authorization header."
                     );
                 }
                 if (!closed) {
@@ -4122,6 +4129,28 @@ function App() {
                                             <h3>Claim Filled BZ</h3>
                                             <p>Claim filled Bazaar orders directly from the maintenance surface.</p>
                                             <${Button} kind="secondary" onClick=${() => post(API.claimBz, null, "Claim bazaar orders queued")}>Claim Filled</${Button}>
+                                        </div>
+                                        <div className="actionCard">
+                                            <h3>Connection</h3>
+                                            <p>Stop accepting new Coflnet flips without changing your saved AH/Bazaar preferences.</p>
+                                            <div className="heroActions">
+                                                <${Button} kind="warn" onClick=${() => post(API.disconnect, null, "Flip intake disconnected")}>Disconnect</${Button}>
+                                                <${Button} kind="success" onClick=${() => post(API.connect, null, "Reconnect requested")}>Connect</${Button}>
+                                            </div>
+                                        </div>
+                                        <div className="actionCard">
+                                            <h3>Humanized break</h3>
+                                            <p>Start a break now using the configured random duration, then restart automatically.</p>
+                                            <${Button} kind="secondary" onClick=${() => post(API.restBreak, { minutes: 0 }, "Rest break requested")}>Take Break</${Button}>
+                                        </div>
+                                        <div className="actionCard">
+                                            <h3>Process controls</h3>
+                                            <p>Restart the current session, check the public release mirror for an update, or stop the process.</p>
+                                            <div className="heroActions">
+                                                <${Button} kind="secondary" onClick=${() => window.confirm("Restart TWM now?") && post(API.restart, null, "Restart requested")}>Restart</${Button}>
+                                                <${Button} kind="primary" onClick=${() => post(API.update, null, "Update check started")}>Check for Update</${Button}>
+                                                <${Button} kind="danger" onClick=${() => window.confirm("Stop the TWM process? You will need to start it again outside the panel.") && post(API.killSession, null, "Shutdown requested")}>Stop Process</${Button}>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>

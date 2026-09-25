@@ -1,14 +1,12 @@
-/// String utility functions
+//! String utility functions
 
 /// Items that cannot stack in Minecraft/Hypixel SkyBlock (max stack size = 1).
-const UNSTACKABLE_ITEM_NAMES: &[&str] = &[
-    "enchanted book",
-];
+/// When buying these items, the order amount must be capped to available
+/// inventory slots since each unit occupies one slot.
+const UNSTACKABLE_ITEM_NAMES: &[&str] = &["enchanted book"];
 
 /// Item tag prefixes that indicate unstackable items.
-const UNSTACKABLE_TAG_PREFIXES: &[&str] = &[
-    "ENCHANTMENT_",
-];
+const UNSTACKABLE_TAG_PREFIXES: &[&str] = &["ENCHANTMENT_"];
 
 /// Returns true if the given bazaar item is unstackable (max stack size = 1).
 /// Checks both the item name and the optional item tag.
@@ -18,7 +16,10 @@ pub fn is_unstackable_item(item_name: &str, item_tag: Option<&str>) -> bool {
         return true;
     }
     if let Some(tag) = item_tag {
-        if UNSTACKABLE_TAG_PREFIXES.iter().any(|&prefix| tag.starts_with(prefix)) {
+        if UNSTACKABLE_TAG_PREFIXES
+            .iter()
+            .any(|&prefix| tag.starts_with(prefix))
+        {
             return true;
         }
     }
@@ -30,14 +31,14 @@ pub fn format_number_with_separators(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::new();
     let chars: Vec<char> = s.chars().collect();
-    
+
     for (i, ch) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 {
+        if i > 0 && (chars.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(*ch);
     }
-    
+
     result
 }
 
@@ -46,7 +47,7 @@ pub fn format_number_with_separators(n: u64) -> String {
 pub fn remove_minecraft_colors(text: &str) -> String {
     let mut result = String::new();
     let mut chars = text.chars();
-    
+
     while let Some(ch) = chars.next() {
         if ch == '§' || ch == '┬' {
             // Skip the next character (color code)
@@ -55,7 +56,7 @@ pub fn remove_minecraft_colors(text: &str) -> String {
             result.push(ch);
         }
     }
-    
+
     result
 }
 
@@ -95,8 +96,12 @@ mod tests {
         assert!(is_twm_baf_synthetic_chat_line(
             "\u{00A7}f[\u{00A7}4BAF\u{00A7}f]: test"
         ));
-        assert!(!is_twm_baf_synthetic_chat_line("§aYou purchased something for 1 coins!"));
-        assert!(!is_twm_baf_synthetic_chat_line("[Auction] Steve bought dirt for 1 coins"));
+        assert!(!is_twm_baf_synthetic_chat_line(
+            "§aYou purchased something for 1 coins!"
+        ));
+        assert!(!is_twm_baf_synthetic_chat_line(
+            "[Auction] Steve bought dirt for 1 coins"
+        ));
     }
 
     #[test]
@@ -108,10 +113,7 @@ mod tests {
 
     #[test]
     fn test_remove_minecraft_colors() {
-        assert_eq!(
-            remove_minecraft_colors("§aGreen§r Text"),
-            "Green Text"
-        );
+        assert_eq!(remove_minecraft_colors("§aGreen§r Text"), "Green Text");
         assert_eq!(
             remove_minecraft_colors("§6Buy Item Right Now"),
             "Buy Item Right Now"
@@ -134,14 +136,28 @@ mod tests {
 
     #[test]
     fn test_is_unstackable_item_enchantment_tag() {
-        assert!(is_unstackable_item("Enchanted Book", Some("ENCHANTMENT_ICE_COLD_1")));
-        assert!(is_unstackable_item("Some Item", Some("ENCHANTMENT_SHARPNESS_6")));
+        assert!(is_unstackable_item(
+            "Enchanted Book",
+            Some("ENCHANTMENT_ICE_COLD_1")
+        ));
+        assert!(is_unstackable_item(
+            "Enchanted Book",
+            Some("ENCHANTMENT_BLAST_PROTECTION_7")
+        ));
+        // Even with a non-book name, the tag prefix should match
+        assert!(is_unstackable_item(
+            "Some Item",
+            Some("ENCHANTMENT_SHARPNESS_6")
+        ));
     }
 
     #[test]
     fn test_is_unstackable_item_stackable() {
         assert!(!is_unstackable_item("Enchanted Diamond", None));
-        assert!(!is_unstackable_item("Enchanted Raw Salmon", Some("ENCHANTED_RAW_SALMON")));
+        assert!(!is_unstackable_item(
+            "Enchanted Raw Salmon",
+            Some("ENCHANTED_RAW_SALMON")
+        ));
         assert!(!is_unstackable_item("Rough Peridot Gemstone", None));
     }
 }

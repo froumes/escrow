@@ -16,8 +16,7 @@ pub const DISCORD_API: &str = "https://discord.com/api/v9";
 /// Shared UA string — the official web client's UA has too many moving parts
 /// to replicate exactly, so we use a generic Chrome-like value that has
 /// worked reliably in practice.
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 fn build_client() -> Result<reqwest::Client, String> {
