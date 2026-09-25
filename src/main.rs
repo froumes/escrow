@@ -598,6 +598,23 @@ fn should_drop_bazaar_command_during_ah_pause(
     }
 }
 
+/// COFL may accept a new socket without sending loggedIn. Only hold Minecraft
+/// login when an actual sign-in challenge arrives during this grace period.
+async fn wait_for_cofl_challenge(
+    link_shown: &AtomicBool,
+    authenticated: &AtomicBool,
+    grace: Duration,
+) -> bool {
+    let deadline = Instant::now() + grace;
+    while !link_shown.load(Ordering::Relaxed)
+        && !authenticated.load(Ordering::Relaxed)
+        && Instant::now() < deadline
+    {
+        sleep(Duration::from_millis(100)).await;
+    }
+    link_shown.load(Ordering::Relaxed) && !authenticated.load(Ordering::Relaxed)
+}
+
 /// Flip tracker entry: (flip, actual_buy_price, purchase_instant, flip_receive_instant)
 /// buy_price is 0 until ItemPurchased fires and updates it.
 /// flip_receive_instant is set when the flip is received and never changed (used for buy-speed).
@@ -2237,16 +2254,14 @@ async fn main() -> Result<()> {
     // Minecraft connection is useless (no flips, no bazaar, nothing to do),
     // so after exhausting retries we restart the process to re-run the full
     // startup sequence (config reload, fresh WebSocket, etc.).
-    // ── Sign into COFL FIRST, then Hypixel ──────────────────────────────────
-    // The COFL sign-in link is printed the instant COFL sends it (see
-    // CoflWebSocket::send_auth_prompt). Hold the Minecraft/Microsoft login here
-    // until COFL reports the session authenticated, so a first-time user completes
-    // COFL sign-in first and its link is never lost behind the Hypixel auth output.
-    //
-    // ONLY block when there is no valid session yet (`!had_valid_session`). A bot
-    // that has run before resumes an authenticated session: COFL shows no sign-in
-    // link and may never re-send `loggedIn`, so waiting on it would hang startup
-    // forever. Those bots skip the wait entirely and go straight to Minecraft.
+    // ── COFL challenge, then Minecraft login ───────────────────────────────
+    // The socket reader prints COFL's actual sign-in link when it sends one.
+    // Give a new session a brief chance to receive that challenge and, only
+    // then, wait for verification before starting Microsoft login. An accepted
+    // socket may never receive either an authmod link or loggedIn; in that case
+    // the user still needs Minecraft login and unverified flips remain gated.
+    // A reused session ID also need not receive loggedIn on every connection,
+    // so do not hold Minecraft login on that basis alone.
     //
     // Also skipped entirely in finder-only mode (`websocket_url` points at our own
     // baf-flip-finder rather than Coflnet). There is no COFL in that setup: nothing
@@ -2255,8 +2270,8 @@ async fn main() -> Result<()> {
     // was never printed. Own-finder flips already bypass the COFL auth gate when
     // buying, so nothing downstream needs this either.
     //
-    // Also skipped on managed VPS instances and when console input is disabled; a
-    // generous timeout means even a first-time user can never hang startup.
+    // Managed VPS instances and non-interactive sessions also proceed without
+    // waiting; flip buying remains gated until Coflnet confirms authentication.
     {
         let is_vps = std::env::var("VPS_SECRET")
             .ok()
@@ -2268,48 +2283,45 @@ async fn main() -> Result<()> {
             && !had_valid_session
             && !twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed)
         {
-            info!("Waiting for COFL sign-in before starting Minecraft login...");
-            // COFL pushes the authmod link only for a session id it considers
-            // unauthenticated; on every other path nothing is ever printed and the
-            // old "link above" wording pointed at empty terminal. `conId` in that
-            // link IS the `SId` we generated and sent on connect, so build and show
-            // it ourselves whenever COFL hasn't already shown one.
-            let baf_msg = if twm::websocket::COFL_AUTH_LINK_SHOWN.load(Ordering::Relaxed) {
-                "§f[§4BAF§f]: §eSign into COFL first (link above). Minecraft login starts once COFL is authenticated.".to_string()
-            } else {
-                format!(
-                    "§f[§4BAF§f]: §eSign into COFL first — open: §f{}\n\
-                     §f[§4BAF§f]: §eMinecraft login starts once COFL is authenticated.",
-                    twm::websocket::cofl_auth_url(&session_id)
-                )
-            };
-            print_mc_chat(&baf_msg);
-            let _ = chat_tx.send(baf_msg);
+            let challenged = wait_for_cofl_challenge(
+                &twm::websocket::COFL_AUTH_LINK_SHOWN,
+                &twm::websocket::COFL_LOGGED_IN,
+                Duration::from_secs(3),
+            )
+            .await;
 
-            const COFL_SIGNIN_TIMEOUT: Duration = Duration::from_secs(300);
-            let started = Instant::now();
-            let mut last_reminder = Instant::now();
-            while !twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
-                if started.elapsed() >= COFL_SIGNIN_TIMEOUT {
-                    warn!(
-                        "COFL sign-in not confirmed within {}s — continuing to Minecraft login anyway (buying stays disabled until COFL authenticates)",
-                        COFL_SIGNIN_TIMEOUT.as_secs()
-                    );
-                    break;
+            if challenged {
+                info!("COFL requested sign-in; waiting before Minecraft login...");
+                let prompt = "§f[§4BAF§f]: §eSign into COFL with the link above; Minecraft login follows authentication.".to_string();
+                print_mc_chat(&prompt);
+                let _ = chat_tx.send(prompt);
+
+                const COFL_SIGNIN_TIMEOUT: Duration = Duration::from_secs(300);
+                let started = Instant::now();
+                let mut last_reminder = Instant::now();
+                while !twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
+                    if started.elapsed() >= COFL_SIGNIN_TIMEOUT {
+                        warn!(
+                            "COFL sign-in not confirmed within {}s — continuing to Minecraft login anyway (buying stays disabled until COFL authenticates)",
+                            COFL_SIGNIN_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                    sleep(Duration::from_millis(500)).await;
+                    if last_reminder.elapsed() >= Duration::from_secs(20) {
+                        let reminder =
+                            "§f[§4BAF§f]: §eStill waiting for COFL sign-in — use the link above."
+                                .to_string();
+                        print_mc_chat(&reminder);
+                        let _ = chat_tx.send(reminder);
+                        last_reminder = Instant::now();
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if last_reminder.elapsed() >= Duration::from_secs(20) {
-                    let m = format!(
-                        "§f[§4BAF§f]: §eStill waiting for COFL sign-in — open §f{}§e and log in.",
-                        twm::websocket::cofl_auth_url(&session_id)
-                    );
-                    print_mc_chat(&m);
-                    let _ = chat_tx.send(m);
-                    last_reminder = Instant::now();
+                if twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
+                    info!("COFL authenticated — proceeding to Minecraft login");
                 }
-            }
-            if twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
-                info!("COFL authenticated — proceeding to Minecraft login");
+            } else if !twm::websocket::COFL_LOGGED_IN.load(Ordering::Relaxed) {
+                info!("COFL did not request sign-in — starting Minecraft login; flip buying stays disabled until COFL authenticates");
             }
         }
     }
@@ -7203,6 +7215,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::wait_for_cofl_challenge;
     use super::{
         current_skyblock_area, is_ban_disconnect, is_direct_address, mark_activity,
         note_maintenance, parse_bz_list_flip_detail, parse_cofl_bz_h_total_profit,
@@ -7211,7 +7224,28 @@ mod tests {
         should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim,
         skyblock_in_maintenance, FlipTrackerMap, MAX_TRACKED_FLIP_AGE_SECS,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
     use twm::types::{BotState, CommandType};
+
+    #[tokio::test]
+    async fn only_a_real_cofl_challenge_delays_minecraft_login() {
+        let link_shown = AtomicBool::new(false);
+        let authenticated = AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cofl_challenge(&link_shown, &authenticated, Duration::from_millis(5)),
+        )
+        .await
+        .expect("unchallenged socket should let Minecraft login continue");
+        assert!(!result);
+
+        link_shown.store(true, Ordering::Relaxed);
+        assert!(wait_for_cofl_challenge(&link_shown, &authenticated, Duration::ZERO).await);
+
+        authenticated.store(true, Ordering::Relaxed);
+        assert!(!wait_for_cofl_challenge(&link_shown, &authenticated, Duration::ZERO).await);
+    }
 
     #[test]
     fn skyblock_area_from_scoreboard() {

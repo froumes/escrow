@@ -10,32 +10,15 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, warn};
 
-/// Set to `true` the instant COFL confirms the mod session is authenticated
-/// (`loggedIn` with `verified: true`). Written by the socket read task, which
-/// runs from the moment of connect — independent of the main event loop
-/// draining `CoflEvent`s. The startup sequence polls this to hold the
-/// Minecraft/Microsoft login until the user has finished signing into COFL, so
-/// the COFL sign-in link is dealt with FIRST and never buried behind (or
-/// scrolled away by) the Hypixel auth output.
+/// Set when COFL verifies login, or sends authenticated traffic without
+/// requesting sign-in. The socket reader updates this even before the main
+/// event loop starts draining messages; buying remains gated until then.
 pub static COFL_LOGGED_IN: AtomicBool = AtomicBool::new(false);
 
-/// True once COFL has actually pushed a sign-in link and it has been printed
-/// (see `CoflWebSocket::send_auth_prompt`). The startup gate reads this so it
-/// never tells the user to "open the link above" when nothing was printed —
-/// COFL only sends the prompt for a session id it considers unauthenticated,
-/// so on every other path the instruction pointed at empty terminal.
+/// True only after COFL itself pushes an authmod link. An unchallenged session
+/// must not block Minecraft login waiting for an event COFL might never send.
+/// Reset on a live region switch alongside the authenticated state.
 pub static COFL_AUTH_LINK_SHOWN: AtomicBool = AtomicBool::new(false);
-
-/// Build the COFL sign-in URL for a session id. `conId` in COFL's own authmod
-/// link is exactly the `SId` we generate locally and pass on the connect URL,
-/// so the bot can always print a working link itself instead of depending on
-/// COFL pushing one.
-pub fn cofl_auth_url(session_id: &str) -> String {
-    format!(
-        "https://sky.coflnet.com/authmod?refId=9KKPN9&conId={}",
-        session_id
-    )
-}
 
 /// Reset the process-global COFL auth latches so a live region switch starts
 /// the new connection's auth state clean, the same way a full process restart

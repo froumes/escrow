@@ -62,6 +62,10 @@ Existing loaders compiled against the old repo do not automatically migrate. See
 
 The web panel runs on port 8080 by default, serves HTTPS with a password, and includes Seller, account controls, flip history, and optional read-only stats sharing. Preserve an existing `web_gui_password` when migrating; consult the startup log for generated credentials on a fresh installation. The panel and share page link to the configured public releases repository.
 
+## First-run sign-in
+
+Enter the Minecraft Java in-game name when prompted. If Coflnet sends a sign-in challenge, use **its** auth link from the terminal or panel before Microsoft login. If no challenge arrives, TWM continues to Microsoft login after a short grace period instead of waiting on a speculative Coflnet URL. Buying still stays disabled until Coflnet confirms authentication. On a VPS, keep the terminal session available to follow Microsoft's device-login instructions.
+
 ## Pages
 
 The GitHub Pages workflow is manual-only now. If you intend this source repo to stay private, also disable GitHub Pages in repository settings so an old public site does not linger.
